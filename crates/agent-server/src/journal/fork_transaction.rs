@@ -1,39 +1,20 @@
-//! Optional atomic fork commit hook for durable backends.
+//! The write set of one fork, committed by
+//! [`super::thread_store::ThreadStore::commit_fork`].
 //!
-//! `agent_service_host::grpc::GrpcControlService::fork_thread`
-//! produces a destination thread by reading the source's committed
-//! state through a chosen turn boundary and writing the equivalent
-//! state under a freshly-minted `thread_id`. The in-memory store
-//! satisfies that contract by calling each per-store trait method
-//! sequentially — each individual mutation is atomic under its own
-//! write lock and the test harness doesn't care about partial
-//! recovery.
-//!
-//! Durable backends need a stronger contract. Without one, a crash
-//! mid-fork can leave a half-built thread behind (aggregate row
-//! exists, projection rewritten, but the events / checkpoint never
-//! committed) — and a retry under the same `request_id` would still
-//! either run into a `(thread_id, turn_number)` uniqueness conflict
-//! on the half-written checkpoint, or silently double-append events.
-//! Wrapping the entire write set in one transaction makes the fork
-//! all-or-nothing: a partial fork is impossible to observe, and a
-//! retry after a transport failure either sees an empty destination
-//! (operation did not start) or a complete one (operation already
-//! durably succeeded; the `request_id` replay catches it).
-//!
-//! The hook is optional: backends that can't transact across stores
-//! return `None` and the caller falls back to sequential writes
-//! with the documented partial-state caveats.
+//! `agent_service_host::grpc::GrpcControlService::fork_thread` reads the
+//! source's committed state through a chosen turn boundary and hands the
+//! store everything the destination needs. The store writes it as one unit:
+//! a crash or error leaves the destination not created, never half-built,
+//! so a retry under the same `request_id` sees either nothing or the whole
+//! fork.
 
-use anyhow::Result;
-use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 
 use super::checkpoint::NewCheckpointParams;
-use super::thread_store::{ThreadCreation, ThreadCreationOutcome};
+use super::thread_store::ThreadCreation;
 
 /// Authoritative input for a single atomic fork-state copy.
 ///
@@ -44,8 +25,7 @@ use super::thread_store::{ThreadCreation, ThreadCreationOutcome};
 /// backend wrap them in one transaction.
 #[derive(Clone, Debug)]
 pub struct ForkCommitParams {
-    /// Server-minted destination thread id. The hook is responsible
-    /// for inserting the thread aggregate row keyed on this id.
+    /// Destination thread id; the store inserts its aggregate row.
     pub new_thread_id: ThreadId,
     /// Caller-addressed creation identity. `None` preserves the legacy
     /// server-minted path; `Some` enables primary-key get-or-create.
@@ -87,35 +67,4 @@ pub struct ForkCommitParams {
     pub events: Vec<AgentEvent>,
     /// Maximum relay attempts for the coalesced outbox advisory.
     pub outbox_max_attempts: u32,
-}
-
-/// Backend-specific hook for atomically committing a fork.
-///
-/// Implement this on a durable backend that can coordinate the fork
-/// write set inside one transaction. The hook is queried via
-/// [`super::thread_store::ThreadStore::atomic_fork_committer`]; when
-/// the active backend exposes it, the gRPC handler delegates the
-/// state copy to this method instead of running the per-store
-/// mutations sequentially.
-#[async_trait]
-pub trait AtomicForkCommitter: Send + Sync {
-    /// Atomically commit the fork's state to the destination thread.
-    ///
-    /// Implementations must satisfy:
-    ///
-    /// 1. Either every mutation in `params` is durably visible after
-    ///    `Ok(())` returns, or none of them is. A crash or returned
-    ///    error must leave the destination thread in the
-    ///    not-created state.
-    /// 2. Sequence numbers for `params.events` are assigned inside
-    ///    the same transaction so the new thread's
-    ///    `EventRepository::next_sequence` is consistent with the
-    ///    committed events the moment the transaction commits.
-    /// 3. The thread aggregate's `committed_turns` ends at the
-    ///    `params.committed_turns` value; in-memory backends that
-    ///    don't implement this hook achieve the same end state by
-    ///    looping `commit_turn` outside the transaction.
-    /// Returns whether this call created the destination or found the exact
-    /// same caller-addressed fork already committed.
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome>;
 }

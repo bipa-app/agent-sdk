@@ -217,6 +217,12 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl AgentTaskStore for InMemoryJournalStore {
+        async fn commit_subagent_spawn(
+            &self,
+            params: crate::journal::SubagentSpawnCommit,
+        ) -> Result<crate::journal::SubagentSpawnOutcome> {
+            self.task.commit_subagent_spawn(params).await
+        }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.task.insert(task).await
         }
@@ -595,8 +601,17 @@ mod in_memory_bundle {
         fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
             self.thread.sequential_commit_lock()
         }
-        fn sequential_fork_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-            self.thread.sequential_fork_lock()
+        async fn commit_thread_creation(
+            &self,
+            params: crate::journal::ThreadCreationCommit,
+        ) -> Result<crate::journal::ThreadCreationRows> {
+            self.thread.commit_thread_creation(params).await
+        }
+        async fn commit_fork(
+            &self,
+            params: crate::journal::fork_transaction::ForkCommitParams,
+        ) -> Result<ThreadCreationOutcome> {
+            self.thread.commit_fork(params).await
         }
         async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
             self.thread.get_or_create(thread_id, now).await

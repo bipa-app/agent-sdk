@@ -43,7 +43,7 @@ use agent_server::journal::event_outbox_transaction::{
 };
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_intent::{ExecutionIntent, ExecutionIntentStore, OperationId};
-use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::message::{CompactionEntry, MessageProjection};
 use agent_server::journal::message_store::MessageProjectionStore;
@@ -77,8 +77,8 @@ use agent_server::journal::store::{
     validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
-    AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
-    started_event_from_invocation, subagent_started_event,
+    SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome, started_event_from_invocation,
+    subagent_started_event,
 };
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
@@ -89,7 +89,7 @@ use agent_server::journal::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
 use agent_server::journal::thread_creation_transaction::{
-    AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
+    ThreadCreationCommit, ThreadCreationRows,
 };
 use agent_server::journal::thread_store::{
     BeginPurge, ThreadCreation, ThreadCreationOutcome, ThreadIdConflict, ThreadStore,
@@ -3569,8 +3569,11 @@ impl SqliteDurableStore {
 
 #[async_trait]
 impl AgentTaskStore for SqliteDurableStore {
-    fn atomic_subagent_spawn_committer(&self) -> Option<&dyn AtomicSubagentSpawnCommitter> {
-        Some(self)
+    async fn commit_subagent_spawn(
+        &self,
+        params: SubagentSpawnCommit,
+    ) -> Result<SubagentSpawnOutcome> {
+        self.commit_subagent_spawn_atomic_inner(params).await
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -5173,12 +5176,15 @@ impl ThreadStore for SqliteDurableStore {
         Some(self)
     }
 
-    fn atomic_fork_committer(&self) -> Option<&dyn AtomicForkCommitter> {
-        Some(self)
+    async fn commit_thread_creation(
+        &self,
+        params: ThreadCreationCommit,
+    ) -> Result<ThreadCreationRows> {
+        self.commit_thread_creation_atomic_inner(params).await
     }
 
-    fn atomic_thread_creation_committer(&self) -> Option<&dyn AtomicThreadCreationCommitter> {
-        Some(self)
+    async fn commit_fork(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
+        self.commit_fork_atomic_inner(params).await
     }
 
     async fn get_or_create(&self, thread_id: &ThreadId, now: OffsetDateTime) -> Result<Thread> {
@@ -5624,33 +5630,6 @@ impl AtomicCompletedTurnCommitter for SqliteDurableStore {
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params).await
-    }
-}
-
-#[async_trait]
-impl AtomicSubagentSpawnCommitter for SqliteDurableStore {
-    async fn commit_subagent_spawn_atomic(
-        &self,
-        params: SubagentSpawnCommit,
-    ) -> Result<SubagentSpawnOutcome> {
-        self.commit_subagent_spawn_atomic_inner(params).await
-    }
-}
-
-#[async_trait]
-impl AtomicThreadCreationCommitter for SqliteDurableStore {
-    async fn commit_thread_creation_atomic(
-        &self,
-        params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
-        self.commit_thread_creation_atomic_inner(params).await
-    }
-}
-
-#[async_trait]
-impl AtomicForkCommitter for SqliteDurableStore {
-    async fn commit_fork_atomic(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
-        self.commit_fork_atomic_inner(params).await
     }
 }
 
@@ -8737,7 +8716,7 @@ INSERT INTO agent_sdk_turn_attempts (
         Ok(())
     }
 
-    /// `AtomicForkCommitter` on `SQLite` must commit thread aggregate
+    /// `ThreadStore::commit_fork` on `SQLite` must commit thread aggregate
     /// + projection + checkpoint + events as one transaction. This
     /// covers the happy path: every store reflects the committed
     /// fork state after a single `commit_fork_atomic` call.
@@ -8748,7 +8727,7 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::checkpoint_store::CheckpointStore;
         use agent_server::journal::event_repository::EventRepository;
-        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::fork_transaction::ForkCommitParams;
         use agent_server::journal::message_store::MessageProjectionStore;
         use agent_server::journal::store::AgentTaskStore;
         use agent_server::journal::task::AgentTask;
@@ -8816,7 +8795,7 @@ INSERT INTO agent_sdk_turn_attempts (
             outbox_max_attempts: 3,
         };
 
-        store.commit_fork_atomic(params).await?;
+        store.commit_fork(params).await?;
 
         let thread = ThreadStore::get(&store, &new_thread_id)
             .await?
@@ -8854,7 +8833,7 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_sdk_foundation::TokenUsage;
         use agent_sdk_foundation::llm::Message;
         use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
-        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::fork_transaction::ForkCommitParams;
         use agent_server::journal::store::AgentTaskStore;
         use agent_server::journal::task::AgentTask;
         use agent_server::journal::thread_store::ThreadStore;
@@ -8906,7 +8885,7 @@ INSERT INTO agent_sdk_turn_attempts (
             )],
             outbox_max_attempts: 3,
         };
-        store.commit_fork_atomic(params).await?;
+        store.commit_fork(params).await?;
 
         let thread = ThreadStore::get(&store, &new_thread_id)
             .await?
@@ -8933,7 +8912,7 @@ INSERT INTO agent_sdk_turn_attempts (
         use agent_sdk_foundation::llm::Message;
         use agent_server::journal::checkpoint::{CheckpointKind, NewCheckpointParams};
         use agent_server::journal::event_repository::EventRepository;
-        use agent_server::journal::fork_transaction::{AtomicForkCommitter, ForkCommitParams};
+        use agent_server::journal::fork_transaction::ForkCommitParams;
         use agent_server::journal::message_store::MessageProjectionStore;
         use agent_server::journal::store::AgentTaskStore;
         use agent_server::journal::task::AgentTask;
@@ -9015,7 +8994,7 @@ INSERT INTO agent_sdk_turn_attempts (
             outbox_max_attempts: 3,
         };
         let err = store
-            .commit_fork_atomic(params)
+            .commit_fork(params)
             .await
             .expect_err("checkpoint collision must fail the fork transaction");
         let _ = err; // payload-shape doesn't matter; rollback is what we're checking.

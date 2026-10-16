@@ -218,6 +218,9 @@ pub use worker::{
 };
 
 #[cfg(test)]
+mod architecture_test;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 

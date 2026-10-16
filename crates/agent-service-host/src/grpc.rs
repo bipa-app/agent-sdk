@@ -738,50 +738,24 @@ struct GrpcEventService {
 }
 
 impl GrpcControlService {
-    /// Create an anonymous thread's aggregate, projection, and
-    /// `ThreadCreated` event — in one transaction when the backend
-    /// exposes the atomic hook, sequentially otherwise.
+    /// Create an anonymous thread's aggregate, projection, `ThreadCreated`
+    /// event and its advisory in one store write.
     async fn commit_anonymous_thread_creation(
         &self,
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<(), Status> {
-        let creation_event = AgentEvent::thread_created(thread_id.clone(), None, None);
-        if let Some(committer) = self
-            .shared
+        self.shared
             .stores
             .thread_store
-            .atomic_thread_creation_committer()
-        {
-            committer
-                .commit_thread_creation_atomic(ThreadCreationCommit {
-                    thread_id: thread_id.clone(),
-                    event: creation_event,
-                    outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                    now,
-                })
-                .await
-                .map_err(internal_status("atomic thread creation"))?;
-        } else {
-            self.shared
-                .stores
-                .thread_store
-                .get_or_create(thread_id, now)
-                .await
-                .map_err(internal_status("creating thread"))?;
-            self.shared
-                .stores
-                .message_store
-                .get_or_create(thread_id, now)
-                .await
-                .map_err(internal_status("creating message projection"))?;
-            self.shared
-                .stores
-                .event_repo
-                .commit_event_batch(thread_id, vec![creation_event], now)
-                .await
-                .map_err(internal_status("committing creation event"))?;
-        }
+            .commit_thread_creation(ThreadCreationCommit {
+                thread_id: thread_id.clone(),
+                event: AgentEvent::thread_created(thread_id.clone(), None, None),
+                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                now,
+            })
+            .await
+            .map_err(internal_status("thread creation"))?;
         Ok(())
     }
 
@@ -868,17 +842,10 @@ impl GrpcControlService {
     /// 2. Build a [`ForkCommitParams`] that bundles every write the
     ///    destination needs (thread aggregate, projection,
     ///    checkpoint, events) under one consistent `now` timestamp.
-    /// 3. Dispatch to the backend's optional
-    ///    [`AtomicForkCommitter`](agent_server::journal::fork_transaction::AtomicForkCommitter)
-    ///    if it's exposed on the active [`ThreadStore`]. Durable
-    ///    backends (`SQLite`, `Postgres`) wrap the entire write set in
-    ///    one transaction so a crash mid-fork can never leave a
-    ///    partially-built destination thread visible. Backends that
-    ///    don't expose the hook (in-memory) fall back to running the
-    ///    same writes sequentially through the per-store trait
-    ///    methods — partial state is observable in-process but
-    ///    in-memory state evaporates on restart anyway, so the gap
-    ///    is closed for production deployments.
+    /// 3. Hand it to [`ThreadStore::commit_fork`], which writes the
+    ///    whole destination as one unit: the durable backends in one
+    ///    transaction, so a crash mid-fork never leaves a half-built
+    ///    destination visible.
     ///
     /// `fork_after == 0` short-circuits steps 1–3 of the read phase
     /// — the destination is created bare (thread aggregate +
@@ -908,24 +875,13 @@ impl GrpcControlService {
         // the same value as `next_sequence - 1`).
         let requested_event_count = (params.events.len() as u64).saturating_sub(1);
 
-        // Prefer the atomic hook when the backend exposes one. This
-        // is the load-bearing case: durable SQL backends commit the
-        // entire fork write set under one transaction so
-        // mid-operation failures can't leave a half-built
-        // destination observable to the next reader.
-        let outcome =
-            if let Some(committer) = self.shared.stores.thread_store.atomic_fork_committer() {
-                committer
-                    .commit_fork_atomic(params)
-                    .await
-                    .map_err(map_thread_creation_error("atomic fork commit"))?
-            } else {
-                let _guard = match self.shared.stores.thread_store.sequential_fork_lock() {
-                    Some(lock) => Some(lock.lock().await),
-                    None => None,
-                };
-                self.commit_fork_sequential(params).await?
-            };
+        let outcome = self
+            .shared
+            .stores
+            .thread_store
+            .commit_fork(params)
+            .await
+            .map_err(map_thread_creation_error("fork commit"))?;
 
         let (message_count, event_count) = match outcome {
             ThreadCreationOutcome::Created => (requested_message_count, requested_event_count),
@@ -956,10 +912,9 @@ impl GrpcControlService {
     }
 
     /// Read source state at the fork boundary and assemble the
-    /// [`ForkCommitParams`] the atomic committer (or the sequential
-    /// fallback) consumes. This phase is read-only on the source —
-    /// no destination state is mutated until either commit path
-    /// runs.
+    /// [`ForkCommitParams`] that [`ThreadStore::commit_fork`] consumes.
+    /// This phase is read-only on the source — no destination state is
+    /// mutated until the commit runs.
     async fn build_fork_commit_params(
         &self,
         source_thread_id: &ThreadId,
@@ -1060,105 +1015,6 @@ impl GrpcControlService {
             events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
         })
-    }
-
-    /// Sequential fallback for backends that don't expose
-    /// [`AtomicForkCommitter`].
-    ///
-    /// Mirrors what the atomic path does, but invokes the per-store
-    /// trait methods one at a time. Without a transaction, a failure
-    /// midway leaves a partially-built thread visible — the in-memory
-    /// reference store doesn't care because process restart wipes all
-    /// state, and durable backends bypass this fallback by exposing
-    /// the atomic hook.
-    async fn commit_fork_sequential(
-        &self,
-        params: ForkCommitParams,
-    ) -> Result<ThreadCreationOutcome, Status> {
-        // Bootstrap the destination's aggregate + projection rows. The
-        // caller-minted path claims its immutable creation parameters under
-        // the same thread-store write lock before any projection mutation.
-        let outcome = if let Some(creation) = params.creation.as_ref() {
-            self.shared
-                .stores
-                .thread_store
-                .get_or_create_for_creation(&params.new_thread_id, creation, params.now)
-                .await
-                .map_err(map_thread_creation_error("creating forked thread"))?
-        } else {
-            self.shared
-                .stores
-                .thread_store
-                .get_or_create(&params.new_thread_id, params.now)
-                .await
-                .map_err(internal_status("creating forked thread"))?;
-            ThreadCreationOutcome::Created
-        };
-        if outcome == ThreadCreationOutcome::Existing {
-            return Ok(outcome);
-        }
-        self.shared
-            .stores
-            .message_store
-            .get_or_create(&params.new_thread_id, params.now)
-            .await
-            .map_err(internal_status("creating forked message projection"))?;
-
-        if !params.messages.is_empty() {
-            self.shared
-                .stores
-                .message_store
-                .replace_history(&params.new_thread_id, params.messages, params.now)
-                .await
-                .map_err(internal_status("seeding forked message history"))?;
-        }
-
-        // Mirror the source's `committed_turns` count + cumulative
-        // `total_usage` at the fork boundary. Only the final
-        // iteration carries the cumulative usage so the destination
-        // ends at exactly that total without distributing arbitrary
-        // per-turn values across earlier commits (the per-turn
-        // breakdown is preserved on the source's checkpoint chain).
-        if params.committed_turns > 0 {
-            let zero = TokenUsage::default();
-            for turn_index in 0..params.committed_turns {
-                let usage_for_this_turn = if turn_index + 1 == params.committed_turns {
-                    &params.cumulative_total_usage
-                } else {
-                    &zero
-                };
-                self.shared
-                    .stores
-                    .thread_store
-                    .commit_turn(
-                        &params.new_thread_id,
-                        turn_index + 1,
-                        usage_for_this_turn,
-                        params.now,
-                    )
-                    .await
-                    .map_err(internal_status(
-                        "mirroring source committed_turns onto fork",
-                    ))?;
-            }
-        }
-
-        if let Some(checkpoint) = params.checkpoint {
-            self.shared
-                .stores
-                .checkpoint_store
-                .commit_checkpoint(checkpoint)
-                .await
-                .map_err(internal_status("seeding forked checkpoint"))?;
-        }
-
-        self.shared
-            .stores
-            .event_repo
-            .commit_event_batch(&params.new_thread_id, params.events, params.now)
-            .await
-            .map_err(internal_status("re-committing events on forked thread"))?;
-        Ok(outcome)
     }
 
     /// Replay a recorded `ForkThread` outcome under the same
@@ -6932,6 +6788,12 @@ mod tests {
 
     #[async_trait]
     impl AgentTaskStore for CountingTaskStore {
+        async fn commit_subagent_spawn(
+            &self,
+            params: agent_server::journal::SubagentSpawnCommit,
+        ) -> Result<agent_server::journal::SubagentSpawnOutcome> {
+            self.inner.commit_subagent_spawn(params).await
+        }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.inner.insert(task).await
         }

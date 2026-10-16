@@ -669,7 +669,7 @@ pub use store::{
     validate_mixed_children_spawn, validate_mixed_slot_coverage,
 };
 pub use subagent_spawn_transaction::{
-    AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
+    SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
 };
 pub use task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskSchemaError,
@@ -684,9 +684,7 @@ pub use thread::{
     PurgeReceipt, PurgeRecord, PurgeScope, PurgeSeed, Thread, ThreadNotFound, ThreadOperation,
     ThreadSchemaError, ThreadStateConflict, ThreadStatus,
 };
-pub use thread_creation_transaction::{
-    AtomicThreadCreationCommitter, ThreadCreationCommit, ThreadCreationRows,
-};
+pub use thread_creation_transaction::{ThreadCreationCommit, ThreadCreationRows};
 #[cfg(any(test, feature = "test-support"))]
 pub use thread_events_watch::CapturingThreadEventsWatchHandler;
 pub use thread_events_watch::{
@@ -694,7 +692,7 @@ pub use thread_events_watch::{
     dispatch_thread_events_payload,
 };
 pub use thread_recover::{ThreadRecoveryView, recover_thread};
-pub use thread_store::{BeginPurge, InMemoryThreadStore, ThreadStore};
+pub use thread_store::{BeginPurge, InMemoryThreadStore, ThreadJournalSink, ThreadStore};
 pub use tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventId, ToolAuditEventKind,
     ToolAuditEventParams, ToolAuditEventStore,

@@ -1372,27 +1372,18 @@ async fn execute_subagent_task_inner(
 
 /// Persist one durable subagent invocation under a running parent.
 ///
-/// This is the Phase 7.2 creation path:
-///
-/// - parent root task parks in `waiting_on_children`,
-/// - one parent-visible `subagent` invocation task is created,
-/// - one child thread is allocated and materialized before any child
-///   task row is persisted,
-/// - one initial child-thread `root_turn` task is admitted as
-///   runnable,
-/// - durable linkage among those records is persisted on the
-///   invocation task.
+/// The parent parks in `waiting_on_children`, the invocation, the child
+/// thread and its runnable root turn are created with their durable
+/// linkage, and the start event and the child's `ThreadCreated` are
+/// journaled, all in one [`AgentTaskStore::commit_subagent_spawn`].
 ///
 /// `child_thread_id` must be pre-allocated by the caller and reused
-/// across retries so [`ThreadStore::get_or_create`] is idempotent and
-/// failed attempts do not orphan thread rows.
+/// across retries.
 ///
 /// # Errors
 ///
-/// Returns an error if the parent task cannot be parked on child
-/// execution, if the invocation and child root tasks cannot be
-/// persisted, if the durable linkage is inconsistent, or if the child
-/// thread projection cannot be materialized.
+/// Returns an error if the spawned tool call is not a confirm-tier
+/// subagent call, or if the store refuses or fails the spawn.
 pub async fn spawn_subagent_invocation(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
@@ -1407,41 +1398,30 @@ pub async fn spawn_subagent_invocation(
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
     }
-    if let Some(committer) = deps.task_store.atomic_subagent_spawn_committer() {
-        let outcome = committer
-            .commit_subagent_spawn_atomic(SubagentSpawnCommit {
-                delivered_injection_ids,
-                parent_id: parent_id.clone(),
-                worker: worker.clone(),
-                lease: lease.clone(),
-                spawn,
-                event: SubagentSpawnEvent {
-                    subagent_id: pending_tool.id.clone(),
-                    subagent_name: canonical_subagent_name(&pending_tool.name).to_owned(),
-                },
-                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                now,
-            })
-            .await
-            .context("atomically persist subagent invocation")?;
-        return Ok(SpawnedSubagentInvocation {
-            parent_task: outcome.parent_task,
-            invocation_task: outcome.invocation_task,
-            child_thread: outcome.child_thread,
-            child_root_task: outcome.child_root_task,
-            committed_events: vec![outcome.committed_event],
-        });
-    }
-    spawn_subagent_invocation_sequential(
-        parent_id,
-        worker,
-        lease,
-        spawn,
-        delivered_injection_ids,
-        deps,
-        now,
-    )
-    .await
+    let outcome = deps
+        .task_store
+        .commit_subagent_spawn(SubagentSpawnCommit {
+            delivered_injection_ids,
+            parent_id: parent_id.clone(),
+            worker: worker.clone(),
+            lease: lease.clone(),
+            spawn,
+            event: SubagentSpawnEvent {
+                subagent_id: pending_tool.id.clone(),
+                subagent_name: canonical_subagent_name(&pending_tool.name).to_owned(),
+            },
+            outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+            now,
+        })
+        .await
+        .context("persist subagent invocation")?;
+    Ok(SpawnedSubagentInvocation {
+        parent_task: outcome.parent_task,
+        invocation_task: outcome.invocation_task,
+        child_thread: outcome.child_thread,
+        child_root_task: outcome.child_root_task,
+        committed_events: vec![outcome.committed_event],
+    })
 }
 
 /// The pending tool call a spawn's `spawn_index` points at inside its
@@ -1457,107 +1437,6 @@ fn pending_tool_for_spawn(
         "subagent spawn_index {spawn_index_usize} out of bounds for {pending_tool_count} pending tool calls",
     );
     Ok(spawn.payload.continuation.payload.pending_tool_calls[spawn_index_usize].clone())
-}
-
-/// Sequential fallback for stores without an atomic spawn committer
-/// (the in-memory backend): rows, the child's `ThreadCreated`, and the
-/// parent progress event commit one after another. In-memory state has
-/// no crash story to protect, so the non-transactional gap is
-/// acceptable there and only there.
-async fn spawn_subagent_invocation_sequential(
-    parent_id: &AgentTaskId,
-    worker: &WorkerId,
-    lease: &LeaseId,
-    spawn: SubagentInvocationSpawn,
-    delivered_injection_ids: Vec<AgentTaskId>,
-    deps: &SubagentInvocationDeps<'_>,
-    now: OffsetDateTime,
-) -> Result<SpawnedSubagentInvocation> {
-    let pending_tool = pending_tool_for_spawn(&spawn)?;
-    let child_thread = deps
-        .thread_store
-        .get_or_create(&spawn.child_thread_id, now)
-        .await
-        .context("materialize child thread projection")?;
-
-    let (parent_task, invocation_task, child_root_task) = deps
-        .task_store
-        .spawn_subagent_invocation(
-            parent_id,
-            worker,
-            lease,
-            spawn,
-            delivered_injection_ids,
-            now,
-        )
-        .await
-        .context("persist subagent invocation tasks")?;
-
-    // Consumer parity with the atomic committer: the child thread's
-    // journal opens with its ThreadCreated. This fallback is the
-    // in-memory path, so the two commits are sequential rather than
-    // transactional — in-memory state has no crash story to protect.
-    deps.event_repo
-        .commit_event(
-            &child_root_task.thread_id,
-            AgentEvent::thread_created(child_root_task.thread_id.clone(), None, None),
-            now,
-        )
-        .await
-        .context("commit child ThreadCreated")?;
-
-    let linkage = invocation_task
-        .state
-        .subagent_invocation()
-        .context("subagent invocation task missing durable linkage")?;
-    ensure!(
-        linkage.child_root_task_id == child_root_task.id,
-        "subagent invocation linkage points at child root {} but store returned {}",
-        linkage.child_root_task_id,
-        child_root_task.id,
-    );
-    ensure!(
-        linkage.child_thread_id == child_root_task.thread_id,
-        "subagent invocation linkage points at child thread {} but child root uses {}",
-        linkage.child_thread_id,
-        child_root_task.thread_id,
-    );
-
-    ensure!(
-        child_thread.thread_id == child_root_task.thread_id,
-        "materialized child thread {} but child root uses {}",
-        child_thread.thread_id,
-        child_root_task.thread_id,
-    );
-    let subagent_name = canonical_subagent_name(&pending_tool.name);
-    let started_event = build_parent_progress_event(&SubagentProgressSnapshot {
-        subagent_id: &pending_tool.id,
-        subagent_name,
-        spec: &linkage.spec,
-        child_thread_id: &child_thread.thread_id,
-        child_root_task_id: &child_root_task.id,
-        subagent_task_id: &invocation_task.id,
-        completed: false,
-        success: false,
-        current_turn: 0,
-        tool_count: 0,
-        usage: TokenUsage::default(),
-    });
-    let committed_events = commit_parent_subagent_progress(
-        deps.event_repo,
-        &parent_task.thread_id,
-        started_event,
-        now,
-    )
-    .await?;
-
-    Ok(SpawnedSubagentInvocation {
-        parent_task,
-        invocation_task,
-        child_thread,
-        child_root_task,
-        committed_events,
-    })
 }
 
 /// Records returned by [`spawn_subagent_batch_invocations`].
@@ -2321,32 +2200,6 @@ pub fn build_parent_progress_event(snapshot: &SubagentProgressSnapshot<'_>) -> A
         cache_read_input_tokens: u64::from(snapshot.usage.cached_input_tokens),
         cache_creation_input_tokens: u64::from(snapshot.usage.cache_creation_input_tokens),
     }
-}
-
-async fn commit_parent_subagent_progress(
-    event_repo: &dyn EventRepository,
-    parent_thread_id: &ThreadId,
-    event: AgentEvent,
-    now: OffsetDateTime,
-) -> Result<Vec<CommittedEvent>> {
-    if let Some(committer) = event_repo.atomic_event_outbox_committer() {
-        return committer
-            .commit_events_with_outbox(crate::journal::EventOutboxCommit {
-                thread_id: parent_thread_id.clone(),
-                events: vec![event],
-                outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                now,
-            })
-            .await
-            .map(|outcome| outcome.committed_events)
-            .context("commit parent subagent progress event with outbox advisory");
-    }
-    Ok(vec![
-        event_repo
-            .commit_event(parent_thread_id, event, now)
-            .await
-            .context("commit parent subagent progress event")?,
-    ])
 }
 
 fn pending_subagent_tool_call(

@@ -2449,7 +2449,7 @@ SELECT count(*) AS "blocked!" FROM blocked
     async fn settlement_postgres_subagent_spawn_waits_behind_a_thread_holder() -> Result<()> {
         use agent_server::journal::SubagentInvocationSpawn;
         use agent_server::journal::subagent_spawn_transaction::{
-            AtomicSubagentSpawnCommitter, SubagentSpawnCommit, SubagentSpawnEvent,
+            SubagentSpawnCommit, SubagentSpawnEvent,
         };
 
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -2470,7 +2470,7 @@ SELECT count(*) AS "blocked!" FROM blocked
             let root = root.id.clone();
             async move {
                 store
-                    .commit_subagent_spawn_atomic(SubagentSpawnCommit {
+                    .commit_subagent_spawn(SubagentSpawnCommit {
                         delivered_injection_ids: Vec::new(),
                         parent_id: root,
                         worker,
