@@ -386,7 +386,10 @@ impl GrpcShared {
             .map_or_else(|| tool_name.to_owned(), |tool| tool.description.clone())
     }
 
-    async fn execute_approved_confirmation(&self, task_id: &AgentTaskId) -> Result<()> {
+    async fn execute_approved_confirmation(
+        &self,
+        task_id: &AgentTaskId,
+    ) -> std::result::Result<(), ApprovalFailure> {
         let now = OffsetDateTime::now_utc();
         let worker_id = WorkerId::new();
         let lease_id = LeaseId::new();
@@ -396,8 +399,16 @@ impl GrpcShared {
             .task_store
             .approve_confirmation_and_acquire(task_id, worker_id, lease_id, lease_expires_at, now)
             .await
-            .context("approving and acquiring confirmation task")?;
+            .context("approving and acquiring confirmation task")
+            .map_err(ApprovalFailure::NotApproved)?;
+        self.drive_after_approval(acquired)
+            .await
+            .map_err(ApprovalFailure::AfterApproval)
+    }
 
+    /// Everything after this call's approval landed: start the approved
+    /// tool on a detached drive.
+    async fn drive_after_approval(&self, acquired: AgentTask) -> Result<()> {
         let watermark = self
             .stores
             .event_repo
@@ -1357,11 +1368,21 @@ impl GrpcControlService {
         )?;
         match decision {
             ConfirmationDecision::Approved => {
-                if let Err(error) =
-                    Box::pin(self.shared.execute_approved_confirmation(task_id)).await
-                {
-                    self.require_awaiting_confirmation(task_id).await?;
-                    return Err(internal_status("executing approved confirmation")(error).into());
+                match Box::pin(self.shared.execute_approved_confirmation(task_id)).await {
+                    Ok(()) => {}
+                    Err(ApprovalFailure::NotApproved(error)) => {
+                        self.require_awaiting_confirmation(task_id).await?;
+                        return Err(
+                            internal_status("executing approved confirmation")(error).into()
+                        );
+                    }
+                    Err(ApprovalFailure::AfterApproval(error)) => {
+                        return Err(Status::internal(format!(
+                            "this approval landed, but starting the approved tool failed: \
+                             {error:#}; the task is recovered when its lease expires"
+                        ))
+                        .into());
+                    }
                 }
             }
             other => {
@@ -3176,6 +3197,14 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
         started_at: Some(map_timestamp(receipt.started_at)?),
         completed_at: Some(map_timestamp(receipt.completed_at)?),
     })
+}
+
+/// Why approving a parked confirmation failed: the approval itself was
+/// refused (the task no longer awaits confirmation, or the store failed),
+/// or it landed and a later step failed before the tool's drive started.
+enum ApprovalFailure {
+    NotApproved(anyhow::Error),
+    AfterApproval(anyhow::Error),
 }
 
 /// A `request_id` whose earlier request reserved it for the same payload
@@ -6425,6 +6454,77 @@ mod tests {
             .await
     }
 
+    /// This call's approval lands, then starting the approved tool fails
+    /// (its parent can no longer be read). The caller is told its approval
+    /// landed and the drive failed, not that another attempt resolved the
+    /// task.
+    #[tokio::test]
+    async fn an_approval_that_lands_before_its_drive_fails_says_so() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            confirm_transfer_tool(),
+        ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![tool_use_response(
+                "resp_drive_1",
+                "tool_call_1",
+                "transfer",
+                json!({"amount": 42}),
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let decorator_armed = Arc::clone(&armed);
+        let daemon = LocalDaemon::start_with_store_decorator(
+            ServiceConfig::default(),
+            registry,
+            runtime,
+            move |mut stores| {
+                stores.task_store = Arc::new(CountingTaskStore {
+                    inner: Arc::clone(&stores.task_store),
+                    complete_calls: Arc::new(AtomicUsize::new(0)),
+                    complete_with_result_calls: Arc::new(AtomicUsize::new(0)),
+                    submit_root_turn_idempotent_calls: Arc::new(AtomicUsize::new(0)),
+                    fail_get: false,
+                    artifact_store_seen: None,
+                    artifact_store_alive_at_completion: None,
+                    committed_result: None,
+                    fail_root_reads: Some(decorator_armed),
+                });
+                stores
+            },
+        )
+        .await?;
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-drive-thread").await?;
+            let _task =
+                submit_text_work(&mut control, "submit-drive", &thread_id, "transfer 42").await?;
+            let parked = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            armed.store(true, Ordering::SeqCst);
+            let refused = control
+                .decide_confirmation(approval_request(
+                    "decide-drive",
+                    &thread_id,
+                    &parked.task_id,
+                    false,
+                ))
+                .await;
+            armed.store(false, Ordering::SeqCst);
+            let status = refused
+                .err()
+                .context("a failed drive surfaces as an error")?;
+            ensure!(
+                status.code() == tonic::Code::Internal
+                    && status.message().contains("this approval landed"),
+                "the caller learns its approval landed: {status}",
+            );
+            Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result
+    }
+
     fn confirm_transfer_tool() -> Tool {
         Tool {
             name: "transfer".into(),
@@ -6609,6 +6709,7 @@ mod tests {
                     artifact_store_seen: Some(decorator_store_seen),
                     artifact_store_alive_at_completion: Some(decorator_store_alive),
                     committed_result: Some(decorator_result),
+                    fail_root_reads: None,
                 });
                 stores
             },
@@ -6777,6 +6878,8 @@ mod tests {
         artifact_store_seen: Option<Arc<Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>>,
         artifact_store_alive_at_completion: Option<Arc<std::sync::atomic::AtomicBool>>,
         committed_result: Option<Arc<Mutex<Option<serde_json::Value>>>>,
+        /// While set, a read of a root-turn row fails.
+        fail_root_reads: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl CountingTaskStore {
@@ -6857,7 +6960,18 @@ mod tests {
             if self.fail_get {
                 bail!("injected task-store read failure for {id}");
             }
-            self.inner.get(id).await
+            let task = self.inner.get(id).await?;
+            if self
+                .fail_root_reads
+                .as_ref()
+                .is_some_and(|armed| armed.load(Ordering::SeqCst))
+                && task
+                    .as_ref()
+                    .is_some_and(|task| task.kind == agent_server::TaskKind::RootTurn)
+            {
+                bail!("injected root-turn read failure for {id}");
+            }
+            Ok(task)
         }
         async fn update(&self, task: AgentTask) -> Result<()> {
             self.inner.update(task).await
@@ -7278,6 +7392,7 @@ mod tests {
                     artifact_store_seen: None,
                     artifact_store_alive_at_completion: None,
                     committed_result: None,
+                    fail_root_reads: None,
                 });
                 stores
             },
@@ -10601,6 +10716,7 @@ mod tests {
             artifact_store_seen: None,
             artifact_store_alive_at_completion: None,
             committed_result: None,
+            fail_root_reads: None,
         });
         Arc::new(shared)
     }

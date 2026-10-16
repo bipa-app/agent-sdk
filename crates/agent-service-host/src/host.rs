@@ -9771,6 +9771,9 @@ mod tests {
         fail_task_attempts: AtomicUsize,
         heartbeat_rejections_remaining: AtomicUsize,
         cancel_failures_remaining: AtomicUsize,
+        /// `commit`s of a completion that fail with a store error, writing
+        /// nothing, before completions go through.
+        complete_failures_remaining: AtomicUsize,
         /// When non-zero, `list_children` (the subtree probe's expansion
         /// call) sleeps this many milliseconds before delegating, and fires
         /// `probe_started` as it begins — so a test can prove the heartbeat
@@ -9795,6 +9798,7 @@ mod tests {
                 fail_task_attempts: AtomicUsize::new(0),
                 heartbeat_rejections_remaining: AtomicUsize::new(0),
                 cancel_failures_remaining: AtomicUsize::new(0),
+                complete_failures_remaining: AtomicUsize::new(0),
                 list_children_stall_ms: AtomicUsize::new(0),
                 probe_started: Arc::new(tokio::sync::Notify::new()),
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
@@ -9838,6 +9842,12 @@ mod tests {
 
         fn failing_cancels(self, count: usize) -> Self {
             self.cancel_failures_remaining
+                .store(count, Ordering::SeqCst);
+            self
+        }
+
+        fn failing_completes(self, count: usize) -> Self {
+            self.complete_failures_remaining
                 .store(count, Ordering::SeqCst);
             self
         }
@@ -9925,7 +9935,20 @@ mod tests {
                     Write::SettleTask {
                         outcome: Settle::Complete { .. },
                         ..
-                    } => self.observe_completion(),
+                    } => {
+                        if self
+                            .complete_failures_remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                left.checked_sub(1)
+                            })
+                            .is_ok()
+                        {
+                            return Err(agent_server::journal::Rejected::Store(anyhow::anyhow!(
+                                "injected store failure completing a task"
+                            )));
+                        }
+                        self.observe_completion();
+                    }
                     Write::SettleTask {
                         outcome: Settle::Fail { .. } | Settle::FailWithReason { .. },
                         ..

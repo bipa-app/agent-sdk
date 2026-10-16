@@ -717,3 +717,95 @@ async fn subagent_completion_failpoint_keeps_the_invocation_running_without_its_
     );
     Ok(())
 }
+
+/// Site 15 without a crash: when the store fails the invocation's
+/// completion, `execute_subagent_task` returns the error, and neither the
+/// completion nor its progress was written.
+#[tokio::test]
+async fn a_failed_subagent_completion_surfaces_and_writes_neither_half() -> Result<()> {
+    let stores = StoreRegistry::in_memory(super::sample_registry());
+    let parent_thread = ThreadId::from_string("t-subagent-store-failure");
+    let now = OffsetDateTime::now_utc();
+    let (_, invocation, child_root) =
+        super::persist_subagent_fixture(&stores, &parent_thread, 60_000, now).await?;
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    stores
+        .task_store
+        .try_acquire_task(
+            &child_root.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            now + time::Duration::minutes(10),
+            now,
+        )
+        .await?
+        .context("the child root acquires")?;
+    stores
+        .task_store
+        .fail_task(
+            &child_root.id,
+            &child_worker,
+            &child_lease,
+            "child stopped".into(),
+            now,
+        )
+        .await?;
+    let running = stores
+        .task_store
+        .try_acquire_task(
+            &invocation.id,
+            WorkerId::new(),
+            LeaseId::new(),
+            now + time::Duration::minutes(10),
+            now,
+        )
+        .await?
+        .context("the invocation is runnable once its child root is terminal")?;
+    let failing: Arc<dyn AgentTaskStore> =
+        Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)).failing_completes(1));
+    let bootstrap =
+        agent_server::worker::resolve_subagent_bootstrap(running, failing.as_ref()).await?;
+    let deps = agent_server::worker::SubagentResultDeps {
+        task_store: failing.as_ref(),
+        thread_store: stores.thread_store.as_ref(),
+        message_store: stores.message_store.as_ref(),
+        event_repo: stores.event_repo.as_ref(),
+        artifact_store: None,
+    };
+
+    let error = agent_server::worker::execute_subagent_task(bootstrap, &deps, now)
+        .await
+        .err()
+        .context("a failed completion must surface")?;
+    anyhow::ensure!(
+        format!("{error:#}").contains("injected store failure completing a task"),
+        "{error:#}",
+    );
+    let after = stores
+        .task_store
+        .get(&invocation.id)
+        .await?
+        .context("the invocation row")?;
+    let completed_progress = stores
+        .event_repo
+        .get_events(&parent_thread)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                agent_sdk_foundation::AgentEvent::SubagentProgress {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    anyhow::ensure!(
+        after.status == TaskStatus::Running && completed_progress == 0,
+        "a failed completion wrote half: invocation {:?}, {completed_progress} completed progress",
+        after.status,
+    );
+    Ok(())
+}
