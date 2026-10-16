@@ -3111,6 +3111,10 @@ pub struct InMemoryAgentTaskStore {
     /// writes to, under the same lock as its task writes. `None` refuses
     /// such a transition.
     intent_store: Option<Arc<dyn super::execution_intent::ExecutionIntentStore>>,
+    /// Message projections a transition's
+    /// [`super::transition::Write::AppendCompaction`] writes to, under the
+    /// same lock as its events. `None` refuses such a transition.
+    message_store: Option<Arc<dyn super::message_store::MessageProjectionStore>>,
     /// Where the backstop probe over held rows resumes.
     held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
 }
@@ -3231,8 +3235,6 @@ impl InMemoryAgentTaskStore {
         self
     }
 
-    /// Fail a task parked on a confirmation and recompute its waiting
-    /// parent, under the caller's write lock.
     /// Re-park a steering exchange's parent under the caller's write lock,
     /// checking its ownership first.
     fn repark_after_steering_locked(
@@ -3410,6 +3412,16 @@ impl InMemoryAgentTaskStore {
         intent_store: Arc<dyn super::execution_intent::ExecutionIntentStore>,
     ) -> Self {
         self.intent_store = Some(intent_store);
+        self
+    }
+
+    /// Wire the message projections a compaction transition appends to.
+    #[must_use]
+    pub fn with_message_store(
+        mut self,
+        message_store: Arc<dyn super::message_store::MessageProjectionStore>,
+    ) -> Self {
+        self.message_store = Some(message_store);
         self
     }
 
@@ -5345,6 +5357,21 @@ impl Inner {
     }
 }
 
+/// `handle` when a transition needs it (`needed`), refusing the transition
+/// with `missing` when the store was built without it.
+fn required_handle<'a, T>(
+    needed: bool,
+    handle: Option<&'a T>,
+    missing: &str,
+) -> Result<Option<&'a T>, super::transition::Rejected> {
+    if !needed {
+        return Ok(None);
+    }
+    handle
+        .map(Some)
+        .ok_or_else(|| super::transition::Rejected::Store(anyhow!("{missing}")))
+}
+
 /// The in-memory store applies a transition under its one write lock: no
 /// reader sees the settled row before its events. It is not durable, so a
 /// failure between the row and the event commit cannot roll the row back;
@@ -5356,27 +5383,24 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         transition: super::transition::Transition,
         now: OffsetDateTime,
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
-        use super::transition::{Committed, Rejected, Write};
+        use super::transition::{Committed, Write};
 
         transition.validate()?;
-        let sink = if transition.appends_events() {
-            Some(self.marker_sink.as_ref().ok_or_else(|| {
-                Rejected::Store(anyhow!(
-                    "a transition that appends events needs the store's event sink"
-                ))
-            })?)
-        } else {
-            None
-        };
-        let intent_store = if transition.records_intents() {
-            Some(self.intent_store.as_ref().ok_or_else(|| {
-                Rejected::Store(anyhow!(
-                    "a transition that records intents needs the store's intent store"
-                ))
-            })?)
-        } else {
-            None
-        };
+        let sink = required_handle(
+            transition.appends_events(),
+            self.marker_sink.as_ref(),
+            "a transition that appends events needs the store's event sink",
+        )?;
+        let intent_store = required_handle(
+            transition.records_intents(),
+            self.intent_store.as_ref(),
+            "a transition that records intents needs the store's intent store",
+        )?;
+        let message_store = required_handle(
+            transition.appends_compactions(),
+            self.message_store.as_ref(),
+            "a transition that appends a compaction needs the store's message store",
+        )?;
         let mut inner = self.inner.write().await;
         for (index, guard) in transition.guards.iter().enumerate() {
             guard.check(index, inner.by_id.get(guard.task()))?;
@@ -5432,20 +5456,26 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                         .await
                         .context("record transition intent")?;
                 }
+                Write::AppendCompaction {
+                    thread,
+                    messages,
+                    source_message_count,
+                    retained_message_count,
+                } => {
+                    let message_store = message_store.ok_or_else(|| anyhow!("no message store"))?;
+                    let compacted = message_store
+                        .append_compaction(
+                            &thread,
+                            messages,
+                            source_message_count,
+                            retained_message_count,
+                            now,
+                        )
+                        .await?;
+                    committed.compacted.push(compacted);
+                }
                 Write::AppendEvents { thread, events } => {
-                    if events.is_empty() {
-                        continue;
-                    }
-                    crate::fail_point!("transition.before_events");
-                    let sink = sink.ok_or_else(|| anyhow!("no event sink"))?;
-                    let batch = sink
-                        .event_repo
-                        .commit_event_batch(&thread, events, now)
-                        .await
-                        .context("commit transition events")?;
-                    if let Some(last) = batch.last() {
-                        Self::insert_marker_advisory(sink, last, now).await?;
-                    }
+                    let batch = Self::append_transition_events(sink, &thread, events, now).await?;
                     committed.events.extend(batch);
                 }
             }
@@ -5456,6 +5486,30 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
 }
 
 impl InMemoryAgentTaskStore {
+    /// A transition's events and their advisory row, through the store's
+    /// event sink.
+    async fn append_transition_events(
+        sink: Option<&Arc<CancellationMarkerSink>>,
+        thread: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::fail_point!("transition.before_events");
+        let sink = sink.ok_or_else(|| anyhow!("no event sink"))?;
+        let batch = sink
+            .event_repo
+            .commit_event_batch(thread, events, now)
+            .await
+            .context("commit transition events")?;
+        if let Some(last) = batch.last() {
+            Self::insert_marker_advisory(sink, last, now).await?;
+        }
+        Ok(batch)
+    }
+
     async fn apply_settle_locked(
         &self,
         inner: &mut Inner,

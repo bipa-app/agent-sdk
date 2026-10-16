@@ -1660,6 +1660,96 @@ mod tests {
         Ok(())
     }
 
+    /// Site 10: a compaction and its `ContextCompacted` event commit
+    /// together. A compaction the projection refuses writes neither half,
+    /// and its typed refusal survives the transition; a good one appends the
+    /// compaction, the event and one advisory row.
+    async fn test_compaction_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        messages: &dyn MessageProjectionStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let thread = thread_id("conformance-compaction-transition");
+        let history = vec![
+            agent_sdk_foundation::llm::Message::user("first question"),
+            agent_sdk_foundation::llm::Message::assistant("first answer"),
+            agent_sdk_foundation::llm::Message::user("second question"),
+            agent_sdk_foundation::llm::Message::assistant("second answer"),
+        ];
+        messages
+            .commit_messages(&thread, history.clone(), t_plus(1))
+            .await?;
+        let advisories_before = thread_events_rows(outbox, &thread).await?;
+        let compaction = |source_message_count: usize| {
+            agent_server::journal::Transition::append_compaction(
+                thread.clone(),
+                vec![agent_sdk_foundation::llm::Message::user("[summary]")],
+                source_message_count,
+                0,
+                vec![AgentEvent::ContextCompacted {
+                    original_count: source_message_count,
+                    new_count: 1,
+                    original_tokens: 40,
+                    new_tokens: 4,
+                    trigger: None,
+                    engine: None,
+                    occupancy: None,
+                    threshold: None,
+                }],
+            )
+        };
+
+        let refused = task_store
+            .commit(compaction(history.len() + 1), t_plus(2))
+            .await;
+        let Err(agent_server::journal::Rejected::Store(error)) = refused else {
+            anyhow::bail!("a compaction past the history is refused: {refused:?}");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<agent_server::journal::message::MessageProjectionError>(),
+                Some(
+                    agent_server::journal::message::MessageProjectionError::CompactionSourceMismatch { .. }
+                )
+            ),
+            "the projection's typed refusal survives the transition: {error:#}",
+        );
+        let unchanged = messages.get(&thread).await?.context("projection")?;
+        assert!(unchanged.compactions.is_empty());
+        assert!(events.get_events(&thread).await?.is_empty());
+        assert_eq!(
+            thread_events_rows(outbox, &thread).await?,
+            advisories_before
+        );
+
+        let committed = task_store
+            .commit(compaction(history.len()), t_plus(3))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [compacted] = committed.compacted.as_slice() else {
+            anyhow::bail!("one compacted projection, got {:?}", committed.compacted);
+        };
+        assert_eq!(compacted.compactions.len(), 1);
+        let stored = messages.get(&thread).await?.context("projection")?;
+        assert_eq!(stored.compactions.len(), 1);
+        assert_eq!(
+            stored.messages.len(),
+            history.len(),
+            "the raw transcript stays"
+        );
+        let [event] = committed.events.as_slice() else {
+            anyhow::bail!("one committed event, got {:?}", committed.events);
+        };
+        assert!(matches!(event.event, AgentEvent::ContextCompacted { .. }));
+        assert_eq!(events.get_events(&thread).await?.len(), 1);
+        assert_eq!(
+            thread_events_rows(outbox, &thread).await?,
+            advisories_before + 1
+        );
+        Ok(())
+    }
+
     /// Cancel tree cancels the root **and all its descendants** (invariant
     /// #8). The root spawns two tool children (so the parent parks on
     /// `WaitingOnChildren`) before the cancel, and the cascade must drive
@@ -3500,6 +3590,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_compaction_transition() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_compaction_transition_is_all_or_nothing(
+            s.task.as_ref(),
+            s.message.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_pause_transition() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_pause_transition_is_all_or_nothing(
@@ -3771,6 +3873,8 @@ mod tests {
             std::sync::Arc::new(InMemoryEventRepository::new());
         let outbox: std::sync::Arc<InMemoryOutboxStore> =
             std::sync::Arc::new(InMemoryOutboxStore::new());
+        let message: std::sync::Arc<InMemoryMessageProjectionStore> =
+            std::sync::Arc::new(InMemoryMessageProjectionStore::new());
         let task = InMemoryAgentTaskStore::new()
             .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: event.clone(),
@@ -3782,12 +3886,13 @@ mod tests {
                     event.as_ref().clone(),
                     outbox.as_ref().clone(),
                 ),
-            ));
+            ))
+            .with_message_store(message.clone());
 
         InMemoryStores {
             task: std::sync::Arc::new(task),
             thread,
-            message: std::sync::Arc::new(InMemoryMessageProjectionStore::new()),
+            message,
             attempt: std::sync::Arc::new(InMemoryTurnAttemptStore::new()),
             checkpoint: std::sync::Arc::new(InMemoryCheckpointStore::new()),
             event,
@@ -3879,6 +3984,13 @@ mod tests {
     async fn conformance_sqlite_repark_transition() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_compaction_transition() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_compaction_transition_is_all_or_nothing(&store, &store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -4483,6 +4595,15 @@ mod tests {
             return Ok(());
         };
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_compaction_transition() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_compaction_transition_is_all_or_nothing(&store, &store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

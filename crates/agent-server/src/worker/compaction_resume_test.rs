@@ -231,6 +231,7 @@ impl Harness {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = InMemoryOutboxStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
         let tasks = InMemoryAgentTaskStore::new()
             .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: Arc::new(events.clone()),
@@ -240,7 +241,8 @@ impl Harness {
             .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
                 events.clone(),
                 outbox,
-            )));
+            )))
+            .with_message_store(Arc::new(messages.clone()));
         let threshold = match trigger {
             Trigger::Threshold => 1,
             Trigger::Overflow => usize::MAX,
@@ -260,7 +262,7 @@ impl Harness {
         Ok(Self {
             tasks,
             threads,
-            messages: InMemoryMessageProjectionStore::new(),
+            messages,
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events,

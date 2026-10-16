@@ -9,6 +9,7 @@
 //! (design invariants I1–I4, bip `docs/durable-transitions-design-2026-10-12.md`).
 
 use agent_sdk_foundation::events::AgentEvent;
+use agent_sdk_foundation::llm;
 use agent_sdk_foundation::{
     ContinuationEnvelope, ListenExecutionContext, TerminalReason, ThreadId,
 };
@@ -17,6 +18,7 @@ use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
 use super::execution_intent::ExecutionIntent;
+use super::message::MessageProjection;
 use super::task::{AgentTask, AgentTaskId, LeaseId, SuspensionPayload, TaskStatus, WorkerId};
 
 /// Guards and writes applied in one transaction.
@@ -59,9 +61,9 @@ pub enum Write {
     },
     /// Re-park a steering exchange's parent on `reattach`, its still-live
     /// children, under `(worker, lease)`. Unlike the other task writes it
-    /// takes no guard: the backend checks the parent's ownership itself,
-    /// after locking the children, so the store's child-before-parent lock
-    /// order holds.
+    /// takes no guard, and a guard on its task is refused: the backend
+    /// checks the parent's ownership itself, after locking the children, so
+    /// the store's child-before-parent lock order holds.
     ReparkAfterSteering {
         task: AgentTaskId,
         worker: WorkerId,
@@ -71,6 +73,16 @@ pub enum Write {
     },
     /// Store an execution intent's new status.
     RecordIntent(Box<ExecutionIntent>),
+    /// Append a compaction to `thread`'s message projection: `messages`, the
+    /// compactor's output, replace the `source_message_count` messages of
+    /// its effective view, and their last `retained_message_count` are that
+    /// view's unchanged tail (see [`MessageProjection::append_compaction`]).
+    AppendCompaction {
+        thread: ThreadId,
+        messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+    },
     /// Events on `thread`, without sequences: the backend allocates them
     /// and writes one coalesced outbox row per thread.
     AppendEvents {
@@ -105,6 +117,8 @@ pub struct Committed {
     pub paused: Vec<AgentTask>,
     /// For each [`Write::ReparkAfterSteering`]: the re-parked parent.
     pub reparked: Vec<AgentTask>,
+    /// For each [`Write::AppendCompaction`]: the compacted projection.
+    pub compacted: Vec<MessageProjection>,
     /// Every event the transition appended, with its sequence.
     pub events: Vec<CommittedEvent>,
 }
@@ -271,6 +285,30 @@ impl Transition {
         }
     }
 
+    /// Append a compaction to `thread`'s message projection and append
+    /// `events` to the same thread, one transaction.
+    #[must_use]
+    pub fn append_compaction(
+        thread: ThreadId,
+        messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        Self {
+            guards: Vec::new(),
+            writes: vec![
+                Write::AppendCompaction {
+                    thread: thread.clone(),
+                    messages,
+                    source_message_count,
+                    retained_message_count,
+                },
+                Write::AppendEvents { thread, events },
+            ],
+        }
+    }
+
     /// Whether a guard holds `task` in `status`.
     #[must_use]
     pub fn guards_status(&self, task: &AgentTaskId, status: TaskStatus) -> bool {
@@ -306,7 +344,8 @@ impl Transition {
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
-            | Write::RecordIntent(_) => false,
+            | Write::RecordIntent(_)
+            | Write::AppendCompaction { .. } => false,
         })
     }
 
@@ -318,10 +357,20 @@ impl Transition {
             .any(|write| matches!(write, Write::RecordIntent(_)))
     }
 
+    /// Whether any write appends a compaction.
+    #[must_use]
+    pub fn appends_compactions(&self) -> bool {
+        self.writes
+            .iter()
+            .any(|write| matches!(write, Write::AppendCompaction { .. }))
+    }
+
     /// Check the shape every backend relies on before it opens a
     /// transaction: each settle has a leased guard on its task, each pause
-    /// a leased guard that its task is running, and each confirmation
-    /// reject a guard that it is awaiting confirmation.
+    /// a leased guard that its task is running, each confirmation reject a
+    /// guard that it is awaiting confirmation, and no guard names a
+    /// re-parked task (its lock would come before the re-attached
+    /// children's, against the store's child-before-parent order).
     ///
     /// # Errors
     ///
@@ -354,9 +403,17 @@ impl Transition {
                         )));
                     }
                 }
-                Write::ReparkAfterSteering { .. }
-                | Write::RecordIntent(_)
-                | Write::AppendEvents { .. } => {}
+                Write::ReparkAfterSteering { task, .. } => {
+                    if self.guards.iter().any(|guard| guard.task() == task) {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "re-parking task {task} takes no guard on it: the backend checks \
+                             its ownership after locking its children"
+                        )));
+                    }
+                }
+                Write::RecordIntent(_)
+                | Write::AppendEvents { .. }
+                | Write::AppendCompaction { .. } => {}
             }
         }
         Ok(())
@@ -488,6 +545,45 @@ mod tests {
         );
         assert!(transition.validate().is_ok());
         transition.guards.clear();
+        assert!(matches!(transition.validate(), Err(Rejected::Store(_))));
+    }
+
+    #[test]
+    fn a_repark_refuses_a_guard_on_its_own_task() {
+        let task = running("w1", "l1");
+        let mut transition = Transition::repark_after_steering(
+            task.id.clone(),
+            (WorkerId::from_string("w1"), LeaseId::from_string("l1")),
+            SuspensionPayload {
+                continuation: ContinuationEnvelope::wrap(agent_sdk_foundation::AgentContinuation {
+                    thread_id: task.thread_id.clone(),
+                    turn: 1,
+                    total_usage: agent_sdk_foundation::TokenUsage::default(),
+                    turn_usage: agent_sdk_foundation::TokenUsage::default(),
+                    pending_tool_calls: Vec::new(),
+                    awaiting_index: 0,
+                    completed_results: Vec::new(),
+                    state: agent_sdk_foundation::AgentState::new(task.thread_id.clone()),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: Vec::new(),
+                }),
+                suspended_messages: Vec::new(),
+                child_join_policy: crate::ChildJoinPolicy::default(),
+            },
+            Vec::new(),
+            task.thread_id.clone(),
+            Vec::new(),
+        );
+        assert!(transition.validate().is_ok());
+        transition
+            .guards
+            .push(guard_on(&running("w1", "l1"), "w1", "l1"));
+        assert!(
+            transition.validate().is_ok(),
+            "a guard on another task is allowed"
+        );
+        transition.guards.push(guard_on(&task, "w1", "l1"));
         assert!(matches!(transition.validate(), Err(Rejected::Store(_))));
     }
 }

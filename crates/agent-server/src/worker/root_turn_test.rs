@@ -386,6 +386,7 @@ impl TestStores {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = InMemoryOutboxStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
         let tasks = InMemoryAgentTaskStore::new()
             .with_cancellation_markers(CancellationMarkerSink {
                 event_repo: Arc::new(events.clone()),
@@ -397,11 +398,12 @@ impl TestStores {
                     events.clone(),
                     outbox.clone(),
                 ),
-            ));
+            ))
+            .with_message_store(Arc::new(messages.clone()));
         Self {
             tasks,
             threads,
-            messages: InMemoryMessageProjectionStore::new(),
+            messages,
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events,

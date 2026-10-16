@@ -394,6 +394,9 @@ impl GrpcShared {
         let worker_id = WorkerId::new();
         let lease_id = LeaseId::new();
         let lease_expires_at = now + self.lease_duration;
+        // The server's root turn stages no listen context (every tool child
+        // it spawns has `listen_context: None`), so there is no prepared
+        // operation to carry into the drive.
         let (acquired, _prepared_operation) = self
             .stores
             .task_store
@@ -1379,7 +1382,7 @@ impl GrpcControlService {
                     Err(ApprovalFailure::AfterApproval(error)) => {
                         return Err(Status::internal(format!(
                             "this approval landed, but starting the approved tool failed: \
-                             {error:#}; the task is recovered when its lease expires"
+                             {error:#}; when its lease expires the confirmation is asked again"
                         ))
                         .into());
                     }

@@ -28,16 +28,17 @@
 //! Both helpers append a durable compaction entry before they touch the
 //! in-memory staged buffer:
 //!
-//! 1. `MessageProjectionStore::append_compaction` preserves every committed
+//! 1. One [`Write::AppendCompaction`](crate::journal::transition::Write) and
+//!    its [`agent_sdk_foundation::events::AgentEvent::ContextCompacted`]
+//!    event commit in one transition. The compaction preserves every committed
 //!    message, folds any recovery draft into that raw transcript, and appends a
-//!    range-addressed replacement prefix atomically.
+//!    range-addressed replacement prefix; the event lets renderers collapse the
+//!    compacted span while the full raw transcript remains addressable through
+//!    the projection snapshot.
 //! 2. `MessageProjectionStore::get_history` rebuilds the effective LLM view
 //!    from the latest replacement prefix plus the retained raw tail. The
 //!    in-memory [`StagedMessageStore`] is re-pointed to that same view and resets
 //!    `seed_len`, so the post-compaction commit appends only later deltas.
-//! 3. A [`agent_sdk_foundation::events::AgentEvent::ContextCompacted`] event is
-//!    committed so renderers can collapse the compacted span while the full raw
-//!    transcript remains addressable through the projection snapshot.
 //!
 //! If the host crashes after step 1, recovery rebuilds the compacted LLM view
 //! from the append-only projection. The staged buffer is process-local and is
@@ -61,6 +62,7 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 
 use crate::journal::staged::StagedMessageStore;
+use crate::journal::transition::{Rejected, Transition};
 use crate::journal::turn_attempt::{TurnAttempt, TurnAttemptOutcome};
 
 use super::root_turn::RootTurnDeps;
@@ -958,7 +960,7 @@ pub(crate) async fn compact_after_overflow(
     .map_err(|failure| failure.with_context("overflow recovery compaction"))
 }
 
-/// True when a failed `append_compaction` was refused for breaking the
+/// True when a failed compaction commit was refused for breaking the
 /// provider `tool_use`/`tool_result` sequence (ENG-9651) — the signal to skip
 /// the compaction rather than fail the turn.
 fn is_tool_sequence_refusal(error: &anyhow::Error) -> bool {
@@ -987,13 +989,14 @@ fn is_no_progress(error: &anyhow::Error) -> bool {
             .is_some()
 }
 
-/// Run the compactor and apply its result: append the durable compaction,
-/// swap the staged view, and emit `ContextCompacted`.
+/// Run the compactor and apply its result: append the durable compaction
+/// and its `ContextCompacted` event in one transition, then swap the staged
+/// view.
 ///
 /// Snapcompact artifacts a result already published are reclaimed when the
-/// result drops before `append_compaction` succeeds (cancellation,
-/// tool-sequence refusal, append failure); its rollback token is committed
-/// right after the append. The cancel arm drops the compaction future while
+/// result drops before the compaction commits (cancellation, tool-sequence
+/// refusal, commit failure); its rollback token is committed right after
+/// the commit. The cancel arm drops the compaction future while
 /// the Snapcompact `spawn_blocking` worker keeps running, so callers wire the
 /// same cancel token into the compactor as that worker's publish fence.
 async fn apply_compaction(
@@ -1054,38 +1057,6 @@ async fn apply_compaction(
         return Ok(spend.outcome(false));
     }
 
-    // A boundary that would cut a tool_use/tool_result pair is refused by
-    // the storage layer (ENG-9651). That refusal must never fail the turn:
-    // the compaction is skipped and the provider call goes out with the
-    // uncompacted history.
-    let appended = deps
-        .message_store
-        .append_compaction(
-            thread_id,
-            result.messages.clone(),
-            result.original_count,
-            result.retained_count,
-            now,
-        )
-        .await;
-    if let Err(error) = appended {
-        if is_tool_sequence_refusal(&error) {
-            log::warn!(
-                "thread {thread_id}: compaction result broke the provider tool sequence; skipping compaction"
-            );
-            return Ok(spend.outcome(false));
-        }
-        return Err(spend.failure(error.context("append durable compaction entry")));
-    }
-    result.published_artifacts.commit();
-
-    staged_messages
-        .replace_history(thread_id, result.messages.clone())
-        .await
-        .context("replace staged buffer history")
-        .map_err(|error| spend.failure(error))?;
-    staged_messages.bump_history_generation();
-
     let event = AgentEvent::ContextCompacted {
         original_count: result.original_count,
         new_count: result.new_count,
@@ -1096,13 +1067,46 @@ async fn apply_compaction(
         occupancy: cause.occupancy,
         threshold: Some(cause.threshold),
     };
-    let committed = deps
-        .event_repo
-        .commit_event(thread_id, event, now)
+    let committed = match deps
+        .task_store
+        .commit(
+            Transition::append_compaction(
+                thread_id.clone(),
+                result.messages.clone(),
+                result.original_count,
+                result.retained_count,
+                vec![event],
+            ),
+            now,
+        )
         .await
-        .context("commit ContextCompacted event")
+    {
+        Ok(committed) => committed,
+        // A boundary that would cut a tool_use/tool_result pair is refused
+        // by the storage layer (ENG-9651). That refusal must never fail the
+        // turn: the compaction is skipped and the provider call goes out
+        // with the uncompacted history.
+        Err(Rejected::Store(error)) if is_tool_sequence_refusal(&error) => {
+            log::warn!(
+                "thread {thread_id}: compaction result broke the provider tool sequence; skipping compaction"
+            );
+            return Ok(spend.outcome(false));
+        }
+        Err(rejected @ (Rejected::Store(_) | Rejected::Guard { .. })) => {
+            return Err(spend.failure(
+                anyhow::Error::from(rejected).context("append durable compaction entry"),
+            ));
+        }
+    };
+    result.published_artifacts.commit();
+
+    staged_messages
+        .replace_history(thread_id, result.messages.clone())
+        .await
+        .context("replace staged buffer history")
         .map_err(|error| spend.failure(error))?;
-    deps.event_notifier.notify(std::slice::from_ref(&committed));
+    staged_messages.bump_history_generation();
+    deps.event_notifier.notify(&committed.events);
 
     log::info!(
         "Auto-compaction complete (thread={thread_id}, \

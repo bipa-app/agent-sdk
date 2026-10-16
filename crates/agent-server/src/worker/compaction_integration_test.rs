@@ -50,7 +50,8 @@ use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
 use crate::journal::message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
-use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+use crate::journal::outbox::InMemoryOutboxStore;
+use crate::journal::store::{AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, LeaseId, WorkerId};
 use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::turn_attempt::TurnAttemptOutcome;
@@ -332,13 +333,23 @@ struct Fixtures {
 
 impl Fixtures {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
+        let events = InMemoryEventRepository::new();
+        let tasks = InMemoryAgentTaskStore::new()
+            .with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(InMemoryOutboxStore::new()),
+                thread_store: Arc::new(threads.clone()),
+            })
+            .with_message_store(Arc::new(messages.clone()));
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
-            messages: InMemoryMessageProjectionStore::new(),
+            tasks,
+            threads,
+            messages,
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }

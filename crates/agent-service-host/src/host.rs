@@ -9951,7 +9951,8 @@ mod tests {
                     | Write::PauseOnConfirmation { .. }
                     | Write::ReparkAfterSteering { .. }
                     | Write::RecordIntent(_)
-                    | Write::AppendEvents { .. } => {}
+                    | Write::AppendEvents { .. }
+                    | Write::AppendCompaction { .. } => {}
                 }
             }
             self.inner.commit(transition, now).await
