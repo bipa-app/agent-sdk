@@ -97,7 +97,8 @@ use crate::journal::execution_intent::{
     GuardedExecutionDeps, classify_tool_effect, guarded_tool_execution,
 };
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, AgentTaskId, TaskKind};
+use crate::journal::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
+use crate::journal::transition::{Guard, Settle, Transition, Write};
 use crate::worker::tool_task::{ToolTaskBootstrap, ToolTaskOutcome};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -332,7 +333,6 @@ pub async fn apply_confirmation_decision(
     child_id: &AgentTaskId,
     decision: ConfirmationDecision,
     task_store: &dyn AgentTaskStore,
-    event_repo: &dyn EventRepository,
     now: OffsetDateTime,
 ) -> anyhow::Result<ConfirmationDecisionOutcome> {
     match decision {
@@ -355,12 +355,10 @@ pub async fn apply_confirmation_decision(
             // child's typed state, so we can close the lifecycle below.
             let tool_call = paused_tool_call(child_id, task_store).await;
             let error = format!("{CONFIRMATION_REJECTED_PREFIX} {reason}");
-            let (child, parent) = task_store
-                .reject_confirmation(child_id, error.clone(), now)
-                .await
-                .with_context(|| format!("failed to reject child {child_id}"))?;
-
-            emit_confirmation_tool_call_end(event_repo, tool_call, error, now).await;
+            let (child, parent) =
+                reject_with_tool_call_end(task_store, child_id, tool_call, error, now)
+                    .await
+                    .with_context(|| format!("failed to reject child {child_id}"))?;
 
             Ok(ConfirmationDecisionOutcome::Rejected {
                 child,
@@ -373,12 +371,10 @@ pub async fn apply_confirmation_decision(
             let error = format!(
                 "{CONFIRMATION_TIMEOUT_PREFIX} no decision received within the allowed window"
             );
-            let (child, parent) = task_store
-                .reject_confirmation(child_id, error.clone(), now)
-                .await
-                .with_context(|| format!("failed to time out child {child_id}"))?;
-
-            emit_confirmation_tool_call_end(event_repo, tool_call, error, now).await;
+            let (child, parent) =
+                reject_with_tool_call_end(task_store, child_id, tool_call, error, now)
+                    .await
+                    .with_context(|| format!("failed to time out child {child_id}"))?;
 
             Ok(ConfirmationDecisionOutcome::TimedOut { child, parent })
         }
@@ -410,42 +406,63 @@ async fn paused_tool_call(
     Some((child.thread_id.clone(), tool_call))
 }
 
-/// Commit a failure `ToolCallEnd` closing a rejected / timed-out
-/// confirmation's tool lifecycle. No-op when `tool_call` is `None`.
+/// Fail a child parked on a confirmation and commit the `ToolCallEnd`
+/// that closes its tool call, in one transition: both land or neither
+/// does. The guard requires the child to still await confirmation.
 ///
-/// Best-effort: the child is already durably failed, so an event-commit
-/// failure is logged rather than propagated (it must not override the
-/// reject outcome).
-async fn emit_confirmation_tool_call_end(
-    event_repo: &dyn EventRepository,
+/// Without `tool_call` (the child carries no readable pending call) the
+/// reject commits alone, with a warning: there is no call to close.
+async fn reject_with_tool_call_end(
+    task_store: &dyn AgentTaskStore,
+    child_id: &AgentTaskId,
     tool_call: Option<(agent_sdk_foundation::ThreadId, PendingToolCallInfo)>,
     error: String,
     now: OffsetDateTime,
-) {
-    let Some((thread_id, tool_call)) = tool_call else {
-        return;
+) -> anyhow::Result<(AgentTask, Option<AgentTask>)> {
+    let transition = match tool_call {
+        Some((thread_id, tool_call)) => {
+            let end_event = AgentEvent::tool_call_end(
+                &tool_call.id,
+                &tool_call.name,
+                &tool_call.display_name,
+                ToolResult {
+                    success: false,
+                    output: error.clone(),
+                    artifact: None,
+                    data: None,
+                    documents: Vec::new(),
+                    duration_ms: None,
+                },
+            );
+            Transition::reject_confirmation(child_id.clone(), error, thread_id, vec![end_event])
+        }
+        None => {
+            log::warn!(
+                "rejecting confirmation of {child_id} without a ToolCallEnd: no pending tool call \
+                 is readable"
+            );
+            Transition {
+                guards: vec![Guard::TaskIs {
+                    task: child_id.clone(),
+                    status: TaskStatus::AwaitingConfirmation,
+                    lease: None,
+                }],
+                writes: vec![Write::RejectConfirmation {
+                    task: child_id.clone(),
+                    error,
+                }],
+            }
+        }
     };
-    let error_result = ToolResult {
-        success: false,
-        output: error,
-        artifact: None,
-        data: None,
-        documents: Vec::new(),
-        duration_ms: None,
-    };
-    let end_event = AgentEvent::tool_call_end(
-        &tool_call.id,
-        &tool_call.name,
-        &tool_call.display_name,
-        error_result,
-    );
-    if let Err(error) = event_repo.commit_event(&thread_id, end_event, now).await {
-        log::warn!(
-            "failed to commit ToolCallEnd after confirmation rejection/timeout \
-             for tool {} on thread {thread_id}: {error:#}",
-            tool_call.id,
-        );
-    }
+    let committed = task_store
+        .commit(transition, now)
+        .await
+        .map_err(anyhow::Error::from)?;
+    committed
+        .settled
+        .into_iter()
+        .next()
+        .context("a reject transition returns its rejected task")
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -503,39 +520,46 @@ where
 
     if let PolicyVerdict::Denied { reason } = verdict {
         let error = format!("{CONFIRMATION_POLICY_DENIED_PREFIX} {reason}");
-        let (child, parent) = deps
-            .task_store
-            .fail_task_with_reason(
-                &bootstrap.task_id,
-                &bootstrap.worker_id,
-                &bootstrap.lease_id,
-                error.clone(),
-                TerminalReason::ConfirmationRejected,
-                now,
-            )
-            .await
-            .with_context(|| format!("fail_task after policy denial for {}", bootstrap.task_id))?;
-
-        // Close the tool lifecycle with a ToolCallEnd event so observers
-        // see a complete ToolCallStart → ToolCallEnd pair.
-        let error_result = ToolResult {
-            success: false,
-            output: error,
-            artifact: None,
-            data: None,
-            documents: Vec::new(),
-            duration_ms: None,
-        };
+        // Fail the child and close its tool call with a ToolCallEnd in one
+        // transition, so observers see a complete ToolCallStart → ToolCallEnd
+        // pair even across a crash.
         let end_event = AgentEvent::tool_call_end(
             &bootstrap.tool_call.id,
             &bootstrap.tool_call.name,
             &bootstrap.tool_call.display_name,
-            error_result,
+            ToolResult {
+                success: false,
+                output: error.clone(),
+                artifact: None,
+                data: None,
+                documents: Vec::new(),
+                duration_ms: None,
+            },
         );
-        deps.event_repo
-            .commit_event(&bootstrap.thread_id, end_event, now)
+        let committed = deps
+            .task_store
+            .commit(
+                Transition::settle(
+                    bootstrap.task_id.clone(),
+                    bootstrap.worker_id.clone(),
+                    bootstrap.lease_id.clone(),
+                    Settle::FailWithReason {
+                        error,
+                        reason: TerminalReason::ConfirmationRejected,
+                    },
+                    bootstrap.thread_id.clone(),
+                    vec![end_event],
+                ),
+                now,
+            )
             .await
-            .context("commit ToolCallEnd event after policy denial")?;
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("fail_task after policy denial for {}", bootstrap.task_id))?;
+        let (child, parent) = committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")?;
 
         return Ok(ConfirmationResumeOutcome::PolicyDenied {
             child,

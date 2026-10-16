@@ -175,6 +175,16 @@ async fn run_tool(store: &SqliteDurableStore, bootstrap: ToolTaskBootstrap) -> R
 /// The child's row and its `ToolCallEnd` must agree after a crash: either
 /// both committed or neither did.
 async fn assert_neither_half(store: &SqliteDurableStore, child: &AgentTaskId) -> Result<()> {
+    assert_unchanged(store, child, TaskStatus::Running).await
+}
+
+/// After a crash inside a transition the task is still `status` and its
+/// tool call has no `ToolCallEnd`.
+async fn assert_unchanged(
+    store: &SqliteDurableStore,
+    child: &AgentTaskId,
+    status: TaskStatus,
+) -> Result<()> {
     let task = AgentTaskStore::get(store, child)
         .await?
         .context("the tool child is gone")?;
@@ -184,7 +194,7 @@ async fn assert_neither_half(store: &SqliteDurableStore, child: &AgentTaskId) ->
         .filter(|event| matches!(&event.event, AgentEvent::ToolCallEnd { id, .. } if id == CALL_ID))
         .count();
     ensure!(
-        task.status == TaskStatus::Running && ends == 0,
+        task.status == status && ends == 0,
         "the settle and its ToolCallEnd disagree after a crash: child {:?}, {ends} ToolCallEnd",
         task.status,
     );
@@ -280,4 +290,214 @@ async fn kill_nine_inside_the_tool_settle_failpoint_leaves_neither_half() -> Res
 
     let store = SqliteDurableStore::connect(&url).await?;
     assert_neither_half(&store, &task_id).await
+}
+
+/// Run `crashing` with the transition failpoint armed to panic, and require
+/// that it fired.
+async fn crash_in_transition<F: std::future::Future>(crashing: F) -> Result<()> {
+    fail::cfg(FAILPOINT, "panic").map_err(|error| anyhow::anyhow!("{error}"))?;
+    let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(crashing)).await;
+    fail::remove(FAILPOINT);
+    ensure!(
+        result.is_err(),
+        "the failpoint between the writes must fire"
+    );
+    Ok(())
+}
+
+async fn paused_on_confirmation(store: &SqliteDurableStore) -> Result<ToolTaskBootstrap> {
+    let bootstrap = leased_tool_child(store).await?;
+    agent_server::worker::pause_tool_for_confirmation(&bootstrap, store, store, at(12)).await?;
+    Ok(bootstrap)
+}
+
+async fn fresh_store(temp: &tempfile::TempDir) -> Result<SqliteDurableStore> {
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path().join("settle.db").display()
+    );
+    SqliteDurableStore::connect(&url).await
+}
+
+#[tokio::test]
+async fn reject_failpoint_keeps_the_confirmation_parked_without_its_tool_call_end() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let child = paused_on_confirmation(&store).await?.task_id;
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(agent_server::worker::apply_confirmation_decision(
+        &child,
+        agent_server::worker::ConfirmationDecision::Rejected {
+            reason: "no".into(),
+        },
+        &store,
+        at(13),
+    ))
+    .await?;
+    assert_unchanged(&store, &child, TaskStatus::AwaitingConfirmation).await
+}
+
+struct DenyAll;
+
+#[async_trait]
+impl agent_server::worker::ConfirmationPolicy for DenyAll {
+    async fn check_policy(
+        &self,
+        _tool_call: &agent_sdk_foundation::PendingToolCallInfo,
+    ) -> Result<agent_server::worker::PolicyVerdict> {
+        Ok(agent_server::worker::PolicyVerdict::Denied {
+            reason: "policy changed".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_end() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let child = paused_on_confirmation(&store).await?.task_id;
+    agent_server::worker::apply_confirmation_decision(
+        &child,
+        agent_server::worker::ConfirmationDecision::Approved,
+        &store,
+        at(13),
+    )
+    .await?;
+    let resumed = store
+        .try_acquire_task(
+            &child,
+            WorkerId::from_string("resume-worker"),
+            LeaseId::from_string("resume-lease"),
+            at(700),
+            at(14),
+        )
+        .await?
+        .context("the approved child was not acquired")?;
+    let bootstrap = resolve_tool_bootstrap(resumed, &store, ActivityBeacon::default()).await?;
+    let deps = agent_server::journal::execution_intent::GuardedExecutionDeps {
+        task_store: &store,
+        intent_store: &store,
+        event_repo: &store,
+    };
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(agent_server::worker::resume_confirmed_tool(
+        bootstrap,
+        &deps,
+        &DenyAll,
+        &CancellationToken::new(),
+        |_call, _collector| async { Ok(ToolResult::success("must not run")) },
+        at(15),
+    ))
+    .await?;
+    assert_unchanged(&store, &child, TaskStatus::Running).await
+}
+
+#[tokio::test]
+async fn interrupt_failpoint_keeps_the_child_and_its_intent_unsettled() -> Result<()> {
+    use agent_server::journal::execution_intent::{
+        ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, IntentStatus, OperationId,
+        ToolEffectClass, guarded_tool_execution,
+    };
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let bootstrap = leased_tool_child(&store).await?;
+    let child = bootstrap.task_id.clone();
+    let operation = OperationId::new(&child, &bootstrap.tool_call.id);
+    let mut started = ExecutionIntent::new(
+        operation.clone(),
+        ToolEffectClass::SideEffecting,
+        &bootstrap.tool_call,
+        child.clone(),
+        at(11),
+    );
+    store.persist_intent(&started).await?;
+    started.mark_started(at(11));
+    store.update_intent(&started).await?;
+
+    let deps = GuardedExecutionDeps {
+        task_store: &store,
+        intent_store: &store,
+        event_repo: &store,
+    };
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(guarded_tool_execution(
+        bootstrap,
+        &deps,
+        &CancellationToken::new(),
+        ToolEffectClass::SideEffecting,
+        |_call, _collector| async { Ok(ToolResult::success("must not run")) },
+        at(12),
+    ))
+    .await?;
+    assert_unchanged(&store, &child, TaskStatus::Running).await?;
+    let intent = store
+        .get_intent(&operation)
+        .await?
+        .context("the intent is gone")?;
+    ensure!(
+        intent.status == IntentStatus::Started,
+        "the intent's Failed status must roll back with the settle, got {:?}",
+        intent.status,
+    );
+    Ok(())
+}
+
+struct ClaimFails;
+
+#[async_trait]
+impl agent_server::journal::execution_intent::ExecutionIntentStore for ClaimFails {
+    async fn persist_intent(
+        &self,
+        _intent: &agent_server::journal::execution_intent::ExecutionIntent,
+    ) -> Result<()> {
+        bail!("intent store unavailable")
+    }
+
+    async fn update_intent(
+        &self,
+        _intent: &agent_server::journal::execution_intent::ExecutionIntent,
+    ) -> Result<()> {
+        bail!("intent store unavailable")
+    }
+
+    async fn get_intent(
+        &self,
+        _operation_id: &agent_server::journal::execution_intent::OperationId,
+    ) -> Result<Option<agent_server::journal::execution_intent::ExecutionIntent>> {
+        Ok(None)
+    }
+
+    async fn get_intent_by_task(
+        &self,
+        _child_task_id: &AgentTaskId,
+    ) -> Result<Option<agent_server::journal::execution_intent::ExecutionIntent>> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn claim_failure_failpoint_keeps_the_child_running_without_its_tool_call_end() -> Result<()> {
+    use agent_server::journal::execution_intent::{
+        GuardedExecutionDeps, ToolEffectClass, guarded_tool_execution,
+    };
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let bootstrap = leased_tool_child(&store).await?;
+    let child = bootstrap.task_id.clone();
+    let deps = GuardedExecutionDeps {
+        task_store: &store,
+        intent_store: &ClaimFails,
+        event_repo: &store,
+    };
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(guarded_tool_execution(
+        bootstrap,
+        &deps,
+        &CancellationToken::new(),
+        ToolEffectClass::SideEffecting,
+        |_call, _collector| async { Ok(ToolResult::success("must not run")) },
+        at(12),
+    ))
+    .await?;
+    assert_unchanged(&store, &child, TaskStatus::Running).await
 }

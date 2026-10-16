@@ -2561,6 +2561,87 @@ WHERE parent_id = $1
         }
     }
 
+    /// Fail a task parked on a confirmation and recompute its waiting
+    /// parent, inside the caller's transaction.
+    async fn reject_confirmation_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: &AgentTaskId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let old = Self::load_task_tx(tx, id, true)
+            .await?
+            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "reject_confirmation rejected: task {id} is not awaiting confirmation (status {status:?})"
+            ));
+        }
+        let failed = old
+            .clone()
+            .reject_confirmation(error, now)
+            .context("reject_confirmation: fail transition failed")?;
+        Self::update_task_tx(tx, &failed).await?;
+
+        let parent = if let Some(parent_id) = &failed.parent_id {
+            let old_parent = Self::load_task_tx(tx, parent_id, true)
+                .await?
+                .ok_or_else(|| {
+                    anyhow!("reject_confirmation: child {id} references missing parent {parent_id}")
+                })?;
+            if old_parent.status == TaskStatus::WaitingOnChildren {
+                let live = Self::load_live_child_count_tx(tx, parent_id).await?;
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .context("reject_confirmation: recompute_pending_children failed")?;
+                Self::update_task_tx(tx, &new_parent).await?;
+                Some(new_parent)
+            } else {
+                Some(old_parent)
+            }
+        } else {
+            None
+        };
+
+        Ok((failed, parent))
+    }
+
+    /// Record an execution intent's new status inside the caller's
+    /// transaction.
+    async fn update_intent_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        intent: &ExecutionIntent,
+    ) -> Result<()> {
+        let status_wire = enum_to_wire(&intent.status)?;
+
+        let result = sqlx::query!(
+            r"
+UPDATE agent_sdk_execution_intents
+SET status     = $2,
+    error      = $3,
+    updated_at = $4
+WHERE operation_id = $1
+",
+            intent.operation_id.as_str(),
+            status_wire,
+            intent.error,
+            intent.updated_at,
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("update execution intent {}", intent.operation_id))?;
+
+        ensure!(
+            result.rows_affected() == 1,
+            "update execution intent affected {} rows for {}",
+            result.rows_affected(),
+            intent.operation_id
+        );
+        Ok(())
+    }
+
     async fn apply_task_terminal_transition_tx(
         tx: &mut Transaction<'_, Postgres>,
         child_id: &AgentTaskId,
@@ -3909,79 +3990,112 @@ impl PostgresDurableStore {
         transition: &agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
-        use agent_server::journal::{Committed, Settle, Write};
+        use agent_server::journal::Committed;
 
         let mut tx = self.begin().await?;
         Self::lock_and_check_guards_tx(&mut tx, transition).await?;
         let mut committed = Committed::default();
         for write in transition.writes.iter().cloned() {
-            match write {
-                Write::SettleTask { task, outcome } => {
-                    let (worker, lease) = transition
-                        .lease_for(&task)
-                        .map(|(worker, lease)| (worker.clone(), lease.clone()))
-                        .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
-                    let settled = match outcome {
-                        Settle::Complete { result } => {
-                            Self::apply_task_terminal_transition_tx(
-                                &mut tx,
-                                &task,
-                                &worker,
-                                &lease,
-                                now,
-                                "commit",
-                                move |child| child.complete_with_result(result, now),
-                            )
-                            .await
-                        }
-                        Settle::Fail { error } => {
-                            Self::apply_task_terminal_transition_tx(
-                                &mut tx,
-                                &task,
-                                &worker,
-                                &lease,
-                                now,
-                                "commit",
-                                move |child| child.fail(error, now),
-                            )
-                            .await
-                        }
-                        Settle::FailWithReason { error, reason } => {
-                            Self::apply_task_terminal_transition_tx(
-                                &mut tx,
-                                &task,
-                                &worker,
-                                &lease,
-                                now,
-                                "commit",
-                                move |child| child.fail_with_terminal_reason(error, reason, now),
-                            )
-                            .await
-                        }
-                    }?;
-                    committed.settled.push(settled);
-                }
-                Write::AppendEvents { thread, events } => {
-                    if events.is_empty() {
-                        continue;
-                    }
-                    agent_server::fail_point!("transition.before_events");
-                    let start = Self::next_event_sequence_tx(&mut tx, &thread).await?;
-                    let batch =
-                        Self::insert_events_tx(&mut tx, &thread, events, start, now).await?;
-                    Self::insert_thread_events_outbox_row_tx(
-                        &mut tx,
-                        &batch,
-                        DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-                        now,
-                    )
-                    .await?;
-                    committed.events.extend(batch);
-                }
-            }
+            Self::apply_write_tx(&mut tx, transition, write, now, &mut committed).await?;
         }
         tx.commit().await.context("commit transition")?;
         Ok(committed)
+    }
+}
+
+impl PostgresDurableStore {
+    /// Apply one write of a transition inside its transaction.
+    async fn apply_write_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        transition: &agent_server::journal::Transition,
+        write: agent_server::journal::Write,
+        now: OffsetDateTime,
+        committed: &mut agent_server::journal::Committed,
+    ) -> Result<()> {
+        use agent_server::journal::Write;
+
+        match write {
+            Write::SettleTask { task, outcome } => {
+                let settled = Self::apply_settle_tx(tx, transition, &task, outcome, now).await?;
+                committed.settled.push(settled);
+            }
+            Write::RejectConfirmation { task, error } => {
+                let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
+                committed.settled.push(rejected);
+            }
+            Write::RecordIntent(intent) => Self::update_intent_tx(tx, &intent).await?,
+            Write::AppendEvents { thread, events } => {
+                if events.is_empty() {
+                    return Ok(());
+                }
+                agent_server::fail_point!("transition.before_events");
+                let start = Self::next_event_sequence_tx(tx, &thread).await?;
+                let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
+                Self::insert_thread_events_outbox_row_tx(
+                    tx,
+                    &batch,
+                    DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                    now,
+                )
+                .await?;
+                committed.events.extend(batch);
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle a leased task with the existing terminal-transition helper.
+    async fn apply_settle_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        transition: &agent_server::journal::Transition,
+        task: &AgentTaskId,
+        outcome: agent_server::journal::Settle,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        use agent_server::journal::Settle;
+
+        let (worker, lease) = transition
+            .lease_for(task)
+            .map(|(worker, lease)| (worker.clone(), lease.clone()))
+            .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
+        match outcome {
+            Settle::Complete { result } => {
+                Self::apply_task_terminal_transition_tx(
+                    tx,
+                    task,
+                    &worker,
+                    &lease,
+                    now,
+                    "commit",
+                    move |child| child.complete_with_result(result, now),
+                )
+                .await
+            }
+            Settle::Fail { error } => {
+                Self::apply_task_terminal_transition_tx(
+                    tx,
+                    task,
+                    &worker,
+                    &lease,
+                    now,
+                    "commit",
+                    move |child| child.fail(error, now),
+                )
+                .await
+            }
+            Settle::FailWithReason { error, reason } => {
+                Self::apply_task_terminal_transition_tx(
+                    tx,
+                    task,
+                    &worker,
+                    &lease,
+                    now,
+                    "commit",
+                    move |child| child.fail_with_terminal_reason(error, reason, now),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -5800,44 +5914,9 @@ ORDER BY descendant.root_id
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, id, true)
-            .await?
-            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
-        if old.status != TaskStatus::AwaitingConfirmation {
-            let status = old.status;
-            return Err(anyhow!(
-                "reject_confirmation rejected: task {id} is not awaiting confirmation (status {status:?})"
-            ));
-        }
-        let failed = old
-            .clone()
-            .reject_confirmation(error, now)
-            .context("reject_confirmation: fail transition failed")?;
-        Self::update_task_tx(&mut tx, &failed).await?;
-
-        let parent = if let Some(parent_id) = &failed.parent_id {
-            let old_parent = Self::load_task_tx(&mut tx, parent_id, true)
-                .await?
-                .ok_or_else(|| {
-                    anyhow!("reject_confirmation: child {id} references missing parent {parent_id}")
-                })?;
-            if old_parent.status == TaskStatus::WaitingOnChildren {
-                let live = Self::load_live_child_count_tx(&mut tx, parent_id).await?;
-                let new_parent = old_parent
-                    .clone()
-                    .recompute_pending_children(live, now)
-                    .context("reject_confirmation: recompute_pending_children failed")?;
-                Self::update_task_tx(&mut tx, &new_parent).await?;
-                Some(new_parent)
-            } else {
-                Some(old_parent)
-            }
-        } else {
-            None
-        };
-
+        let result = Self::reject_confirmation_tx(&mut tx, id, error, now).await?;
         tx.commit().await.context("commit reject_confirmation")?;
-        Ok((failed, parent))
+        Ok(result)
     }
 
     async fn clear(&self) -> Result<()> {
@@ -7480,32 +7559,9 @@ ON CONFLICT (operation_id) DO NOTHING
     }
 
     async fn update_intent(&self, intent: &ExecutionIntent) -> Result<()> {
-        let status_wire = enum_to_wire(&intent.status)?;
-
-        let result = sqlx::query!(
-            r"
-UPDATE agent_sdk_execution_intents
-SET status     = $2,
-    error      = $3,
-    updated_at = $4
-WHERE operation_id = $1
-",
-            intent.operation_id.as_str(),
-            status_wire,
-            intent.error,
-            intent.updated_at,
-        )
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("update execution intent {}", intent.operation_id))?;
-
-        ensure!(
-            result.rows_affected() == 1,
-            "update execution intent affected {} rows for {}",
-            result.rows_affected(),
-            intent.operation_id
-        );
-        Ok(())
+        let mut tx = self.begin().await?;
+        Self::update_intent_tx(&mut tx, intent).await?;
+        tx.commit().await.context("commit update_intent")
     }
 
     async fn get_intent(&self, operation_id: &OperationId) -> Result<Option<ExecutionIntent>> {

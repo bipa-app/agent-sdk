@@ -1148,6 +1148,97 @@ mod tests {
         Ok(())
     }
 
+    /// A leased tool child parked on a confirmation.
+    async fn awaiting_confirmation_child(
+        task_store: &dyn AgentTaskStore,
+        name: &str,
+    ) -> Result<AgentTask> {
+        let (child, worker, lease) = leased_tool_child(task_store, name).await?;
+        let continuation = agent_sdk_foundation::ContinuationEnvelope::wrap(
+            agent_sdk_foundation::AgentContinuation {
+                thread_id: thread_id(name),
+                turn: 1,
+                total_usage: TokenUsage::default(),
+                turn_usage: TokenUsage::default(),
+                pending_tool_calls: vec![],
+                awaiting_index: 0,
+                completed_results: vec![],
+                state: agent_sdk_foundation::AgentState::new(thread_id(name)),
+                response_id: None,
+                stop_reason: None,
+                response_content: vec![],
+            },
+        );
+        task_store
+            .pause_on_confirmation(&child.id, &worker, &lease, continuation, None, t_plus(64))
+            .await
+    }
+
+    fn reject_with_tool_call_end(child: &AgentTask) -> agent_server::journal::Transition {
+        agent_server::journal::Transition::reject_confirmation(
+            child.id.clone(),
+            "confirmation_rejected: no".to_owned(),
+            child.thread_id.clone(),
+            vec![AgentEvent::tool_call_end(
+                "call-1",
+                "probe",
+                "Probe",
+                agent_sdk_foundation::ToolResult {
+                    success: false,
+                    output: "confirmation_rejected: no".to_owned(),
+                    artifact: None,
+                    data: None,
+                    documents: Vec::new(),
+                    duration_ms: None,
+                },
+            )],
+        )
+    }
+
+    /// I1–I4 for [`agent_server::journal::Write::RejectConfirmation`]: a
+    /// child that no longer awaits confirmation is a guard rejection with
+    /// nothing written; a parked child fails, resumes its parent, and its
+    /// `ToolCallEnd` and advisory row commit with it.
+    async fn test_reject_confirmation_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let (running, _, _) = leased_tool_child(task_store, "conformance-reject-running").await?;
+        let rejected = task_store
+            .commit(reject_with_tool_call_end(&running), t_plus(65))
+            .await;
+        assert!(
+            matches!(
+                rejected,
+                Err(agent_server::journal::Rejected::Guard { index: 0, .. })
+            ),
+            "a running child is not awaiting confirmation: {rejected:?}",
+        );
+        assert!(events.get_events(&running.thread_id).await?.is_empty());
+
+        let parked = awaiting_confirmation_child(task_store, "conformance-reject-parked").await?;
+        let advisories_before = thread_events_rows(outbox, &parked.thread_id).await?;
+        let committed = task_store
+            .commit(reject_with_tool_call_end(&parked), t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [(child, parent)] = committed.settled.as_slice() else {
+            anyhow::bail!("one rejected task, got {:?}", committed.settled);
+        };
+        assert_eq!(child.status, TaskStatus::Failed);
+        assert_eq!(
+            parent.as_ref().map(|parent| parent.status),
+            Some(TaskStatus::Pending)
+        );
+        assert_eq!(events.get_events(&parked.thread_id).await?.len(), 1);
+        assert_eq!(
+            thread_events_rows(outbox, &parked.thread_id).await?,
+            advisories_before + 1
+        );
+        Ok(())
+    }
+
     /// A crash between the task write and the event write of a transition
     /// leaves neither: the backend's transaction drops both. The caller
     /// holds the `fail::FailScenario`.
@@ -3188,6 +3279,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_reject_confirmation_transition() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_reject_confirmation_transition_is_all_or_nothing(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_transition_is_all_or_nothing() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_transition_is_all_or_nothing(s.task.as_ref(), s.event.as_ref(), s.outbox.as_ref())
@@ -3538,6 +3640,13 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_reject_confirmation_transition() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_reject_confirmation_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -4119,6 +4228,15 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_reject_confirmation_transition() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_reject_confirmation_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

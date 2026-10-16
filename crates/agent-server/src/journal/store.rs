@@ -3098,6 +3098,10 @@ pub struct InMemoryAgentTaskStore {
     /// from cancellation markers because cancellation retains its own
     /// idempotent retry protocol.
     spawn_event_committer: Option<Arc<dyn AtomicSpawnEventCommitter>>,
+    /// Intent store a transition's [`super::transition::Write::RecordIntent`]
+    /// writes to, under the same lock as its task writes. `None` refuses
+    /// such a transition.
+    intent_store: Option<Arc<dyn super::execution_intent::ExecutionIntentStore>>,
     /// Where the backstop probe over held rows resumes.
     held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
 }
@@ -3215,6 +3219,76 @@ impl InMemoryAgentTaskStore {
         committer: Arc<dyn AtomicSpawnEventCommitter>,
     ) -> Self {
         self.spawn_event_committer = Some(committer);
+        self
+    }
+
+    /// Fail a task parked on a confirmation and recompute its waiting
+    /// parent, under the caller's write lock.
+    fn reject_confirmation_locked(
+        inner: &mut Inner,
+        id: &AgentTaskId,
+        error: String,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        let old = inner
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
+
+        if old.status != TaskStatus::AwaitingConfirmation {
+            let status = old.status;
+            return Err(anyhow!(
+                "reject_confirmation rejected: task {id} is not awaiting confirmation \
+                 (status {status:?})"
+            ));
+        }
+
+        let failed = old
+            .clone()
+            .reject_confirmation(error, now)
+            .context("reject_confirmation: fail transition failed")?;
+        inner.rebalance_after_row_change(&old, &failed);
+        inner.by_id.insert(failed.id.clone(), failed.clone());
+
+        // Recompute the parent's pending_child_count the same way
+        // `apply_task_terminal_transition` does in complete_task /
+        // fail_task. If this was the last live child the parent
+        // becomes Pending with ReadyToResume.
+        let parent = if let Some(parent_id) = &failed.parent_id {
+            let Some(old_parent) = inner.by_id.get(parent_id).cloned() else {
+                return Err(anyhow!(
+                    "reject_confirmation: child {id} references missing parent {parent_id}"
+                ));
+            };
+            if old_parent.status == TaskStatus::WaitingOnChildren {
+                let live = inner.count_live_children(parent_id);
+                let new_parent = old_parent
+                    .clone()
+                    .recompute_pending_children(live, now)
+                    .context("reject_confirmation: recompute_pending_children failed")?;
+                inner.rebalance_after_row_change(&old_parent, &new_parent);
+                inner
+                    .by_id
+                    .insert(new_parent.id.clone(), new_parent.clone());
+                Some(new_parent)
+            } else {
+                Some(old_parent)
+            }
+        } else {
+            None
+        };
+
+        Ok((failed, parent))
+    }
+
+    /// Wire the intent store a transition's intent writes go to.
+    #[must_use]
+    pub fn with_intent_store(
+        mut self,
+        intent_store: Arc<dyn super::execution_intent::ExecutionIntentStore>,
+    ) -> Self {
+        self.intent_store = Some(intent_store);
         self
     }
 
@@ -5159,13 +5233,22 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         transition: super::transition::Transition,
         now: OffsetDateTime,
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
-        use super::transition::{Committed, Rejected, Settle, Write};
+        use super::transition::{Committed, Rejected, Write};
 
         transition.validate()?;
         let sink = if transition.appends_events() {
             Some(self.marker_sink.as_ref().ok_or_else(|| {
                 Rejected::Store(anyhow!(
                     "a transition that appends events needs the store's event sink"
+                ))
+            })?)
+        } else {
+            None
+        };
+        let intent_store = if transition.records_intents() {
+            Some(self.intent_store.as_ref().ok_or_else(|| {
+                Rejected::Store(anyhow!(
+                    "a transition that records intents needs the store's intent store"
                 ))
             })?)
         } else {
@@ -5179,45 +5262,21 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         for write in transition.writes.iter().cloned() {
             match write {
                 Write::SettleTask { task, outcome } => {
-                    let (worker, lease) = transition
-                        .lease_for(&task)
-                        .map(|(worker, lease)| (worker.clone(), lease.clone()))
-                        .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
-                    let thread = self.thread_admission_locked(&inner, &task).await?;
-                    let settled = match outcome {
-                        Settle::Complete { result } => inner.apply_task_terminal_transition(
-                            &task,
-                            (&worker, &lease),
-                            thread,
-                            now,
-                            "commit",
-                            move |child| child.complete_with_result(result, now),
-                        ),
-                        Settle::Fail { error } => inner.apply_task_terminal_transition(
-                            &task,
-                            (&worker, &lease),
-                            thread,
-                            now,
-                            "commit",
-                            move |child| {
-                                child.fail_with_terminal_reason(
-                                    error,
-                                    TerminalReason::InternalError,
-                                    now,
-                                )
-                            },
-                        ),
-                        Settle::FailWithReason { error, reason } => inner
-                            .apply_task_terminal_transition(
-                                &task,
-                                (&worker, &lease),
-                                thread,
-                                now,
-                                "commit",
-                                move |child| child.fail_with_terminal_reason(error, reason, now),
-                            ),
-                    }?;
+                    let settled = self
+                        .apply_settle_locked(&mut inner, &transition, &task, outcome, now)
+                        .await?;
                     committed.settled.push(settled);
+                }
+                Write::RejectConfirmation { task, error } => {
+                    let rejected = Self::reject_confirmation_locked(&mut inner, &task, error, now)?;
+                    committed.settled.push(rejected);
+                }
+                Write::RecordIntent(intent) => {
+                    let intent_store = intent_store.ok_or_else(|| anyhow!("no intent store"))?;
+                    intent_store
+                        .update_intent(&intent)
+                        .await
+                        .context("record transition intent")?;
                 }
                 Write::AppendEvents { thread, events } => {
                     if events.is_empty() {
@@ -5239,6 +5298,53 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         }
         drop(inner);
         Ok(committed)
+    }
+}
+
+impl InMemoryAgentTaskStore {
+    async fn apply_settle_locked(
+        &self,
+        inner: &mut Inner,
+        transition: &super::transition::Transition,
+        task: &AgentTaskId,
+        outcome: super::transition::Settle,
+        now: OffsetDateTime,
+    ) -> Result<(AgentTask, Option<AgentTask>)> {
+        use super::transition::Settle;
+
+        let (worker, lease) = transition
+            .lease_for(task)
+            .map(|(worker, lease)| (worker.clone(), lease.clone()))
+            .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
+        let thread = self.thread_admission_locked(inner, task).await?;
+        match outcome {
+            Settle::Complete { result } => inner.apply_task_terminal_transition(
+                task,
+                (&worker, &lease),
+                thread,
+                now,
+                "commit",
+                move |child| child.complete_with_result(result, now),
+            ),
+            Settle::Fail { error } => inner.apply_task_terminal_transition(
+                task,
+                (&worker, &lease),
+                thread,
+                now,
+                "commit",
+                move |child| {
+                    child.fail_with_terminal_reason(error, TerminalReason::InternalError, now)
+                },
+            ),
+            Settle::FailWithReason { error, reason } => inner.apply_task_terminal_transition(
+                task,
+                (&worker, &lease),
+                thread,
+                now,
+                "commit",
+                move |child| child.fail_with_terminal_reason(error, reason, now),
+            ),
+        }
     }
 }
 
@@ -6767,57 +6873,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
         let mut inner = self.inner.write().await;
-        let old = inner
-            .by_id
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("reject_confirmation rejected: task {id} does not exist"))?;
-
-        if old.status != TaskStatus::AwaitingConfirmation {
-            let status = old.status;
-            return Err(anyhow!(
-                "reject_confirmation rejected: task {id} is not awaiting confirmation \
-                 (status {status:?})"
-            ));
-        }
-
-        let failed = old
-            .clone()
-            .reject_confirmation(error, now)
-            .context("reject_confirmation: fail transition failed")?;
-        inner.rebalance_after_row_change(&old, &failed);
-        inner.by_id.insert(failed.id.clone(), failed.clone());
-
-        // Recompute the parent's pending_child_count the same way
-        // `apply_task_terminal_transition` does in complete_task /
-        // fail_task. If this was the last live child the parent
-        // becomes Pending with ReadyToResume.
-        let parent = if let Some(parent_id) = &failed.parent_id {
-            let Some(old_parent) = inner.by_id.get(parent_id).cloned() else {
-                return Err(anyhow!(
-                    "reject_confirmation: child {id} references missing parent {parent_id}"
-                ));
-            };
-            if old_parent.status == TaskStatus::WaitingOnChildren {
-                let live = inner.count_live_children(parent_id);
-                let new_parent = old_parent
-                    .clone()
-                    .recompute_pending_children(live, now)
-                    .context("reject_confirmation: recompute_pending_children failed")?;
-                inner.rebalance_after_row_change(&old_parent, &new_parent);
-                inner
-                    .by_id
-                    .insert(new_parent.id.clone(), new_parent.clone());
-                Some(new_parent)
-            } else {
-                Some(old_parent)
-            }
-        } else {
-            None
-        };
-
-        drop(inner);
-        Ok((failed, parent))
+        Self::reject_confirmation_locked(&mut inner, id, error, now)
     }
 
     async fn clear(&self) -> Result<()> {

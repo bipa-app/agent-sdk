@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
+use super::execution_intent::ExecutionIntent;
 use super::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
 
 /// Guards and writes applied in one transaction.
@@ -42,6 +43,12 @@ pub enum Write {
     /// recomputes the parent and releases held siblings, in the same
     /// transaction. Needs a [`Guard::TaskIs`] with a lease on the same task.
     SettleTask { task: AgentTaskId, outcome: Settle },
+    /// Fail a task parked on a confirmation (rejected or timed out) and
+    /// recompute its parent. Needs a [`Guard::TaskIs`] for
+    /// [`TaskStatus::AwaitingConfirmation`] on the same task.
+    RejectConfirmation { task: AgentTaskId, error: String },
+    /// Store an execution intent's new status.
+    RecordIntent(Box<ExecutionIntent>),
     /// Events on `thread`, without sequences: the backend allocates them
     /// and writes one coalesced outbox row per thread.
     AppendEvents {
@@ -68,7 +75,8 @@ pub enum Settle {
 /// What a committed transition produced, in write order.
 #[derive(Clone, Debug, Default)]
 pub struct Committed {
-    /// For each [`Write::SettleTask`]: the settled task and its parent
+    /// For each [`Write::SettleTask`] and [`Write::RejectConfirmation`]:
+    /// the terminal task and its parent
     /// after the parent was recomputed (`None` for a root).
     pub settled: Vec<(AgentTask, Option<AgentTask>)>,
     /// Every event the transition appended, with its sequence.
@@ -128,6 +136,40 @@ impl Transition {
         }
     }
 
+    /// Fail a task parked on a confirmation and append `events`, one
+    /// transaction.
+    #[must_use]
+    pub fn reject_confirmation(
+        task: AgentTaskId,
+        error: String,
+        thread: ThreadId,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task: task.clone(),
+                status: TaskStatus::AwaitingConfirmation,
+                lease: None,
+            }],
+            writes: vec![
+                Write::RejectConfirmation { task, error },
+                Write::AppendEvents { thread, events },
+            ],
+        }
+    }
+
+    /// Whether a guard holds `task` in `status`.
+    #[must_use]
+    pub fn guards_status(&self, task: &AgentTaskId, status: TaskStatus) -> bool {
+        self.guards.iter().any(|guard| match guard {
+            Guard::TaskIs {
+                task: guarded,
+                status: guarded_status,
+                ..
+            } => guarded == task && *guarded_status == status,
+        })
+    }
+
     /// The (worker, lease) a guard holds on `task`, which a
     /// [`Write::SettleTask`] on that task settles under.
     #[must_use]
@@ -147,12 +189,23 @@ impl Transition {
     pub fn appends_events(&self) -> bool {
         self.writes.iter().any(|write| match write {
             Write::AppendEvents { events, .. } => !events.is_empty(),
-            Write::SettleTask { .. } => false,
+            Write::SettleTask { .. }
+            | Write::RejectConfirmation { .. }
+            | Write::RecordIntent(_) => false,
         })
     }
 
+    /// Whether any write records an execution intent.
+    #[must_use]
+    pub fn records_intents(&self) -> bool {
+        self.writes
+            .iter()
+            .any(|write| matches!(write, Write::RecordIntent(_)))
+    }
+
     /// Check the shape every backend relies on before it opens a
-    /// transaction: each settle has a leased guard on its task.
+    /// transaction: each settle has a leased guard on its task, and each
+    /// confirmation reject a guard that it is awaiting confirmation.
     ///
     /// # Errors
     ///
@@ -167,7 +220,15 @@ impl Transition {
                         )));
                     }
                 }
-                Write::AppendEvents { .. } => {}
+                Write::RejectConfirmation { task, .. } => {
+                    if !self.guards_status(task, TaskStatus::AwaitingConfirmation) {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "rejecting the confirmation of task {task} needs a TaskIs guard \
+                             that it is awaiting confirmation"
+                        )));
+                    }
+                }
+                Write::RecordIntent(_) | Write::AppendEvents { .. } => {}
             }
         }
         Ok(())
