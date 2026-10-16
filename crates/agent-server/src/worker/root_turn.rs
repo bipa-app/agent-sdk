@@ -5896,7 +5896,7 @@ fn complete_preflight_children(
 /// Everything a tool-suspension path hands to the shared spawn tail: the
 /// parked payload, the per-call spawn specs, the host-preflight
 /// completions, the already-built content + `ToolCallStart` events, and
-/// the boundary injections delivered this turn. The three context strings
+/// the boundary injections delivered this turn. The two context strings
 /// keep error backtraces pointing at the originating call site.
 struct ToolSuspensionSpawn {
     payload: SuspensionPayload,
@@ -5906,7 +5906,6 @@ struct ToolSuspensionSpawn {
     delivered_injection_ids: Vec<AgentTaskId>,
     tool_children_context: &'static str,
     draft_context: &'static str,
-    commit_context: &'static str,
 }
 
 /// Shared spawn tail of the tool-suspension paths
@@ -5935,7 +5934,6 @@ async fn spawn_suspended_tool_children(
         delivered_injection_ids,
         tool_children_context,
         draft_context,
-        commit_context,
     } = spawn;
     let task_id = &inputs.bootstrap.task_id;
 
@@ -5955,10 +5953,14 @@ async fn spawn_suspended_tool_children(
         // tools and only consults the selector for dispatchable calls.
         classify_batch_for_inputs(inputs, deps, pending_calls, &preflight_calls).await?
     };
-    let mut boundary_events = if preflight_calls.is_empty() {
-        Vec::new()
+    // The suspension's events commit in the spawn transaction: as boundary
+    // events ahead of the preflight ToolCallEnds when calls were settled
+    // before spawn, and otherwise after the subagent starts, the order
+    // clients have always seen.
+    let (mut boundary_events, trailing_events) = if preflight_calls.is_empty() {
+        (Vec::new(), suspension_events)
     } else {
-        suspension_events.clone()
+        (suspension_events, Vec::new())
     };
     boundary_events.extend(preflight_end_events(&preflight_calls));
 
@@ -5986,6 +5988,7 @@ async fn spawn_suspended_tool_children(
                 payload,
                 delivered_injection_ids,
                 boundary_events,
+                trailing_events,
             },
             specs,
             reattach: Vec::new(),
@@ -6010,30 +6013,10 @@ async fn spawn_suspended_tool_children(
         .await;
     }
 
-    // Preflight-completed children can make the parent runnable as soon as
-    // they are published. Their ToolCallEnd events were therefore committed
-    // in the same boundary transaction as the children and ToolCallStart.
-    //
-    // Without preflight, the spawn transaction's own events (a subagent's
-    // `SubagentProgress` start) were committed BEFORE the suspension batch
-    // and must ride the outcome ahead of it: `publish_events` feeds the
-    // same-process live tail in vec order, and the tail drops any
-    // sequence at or below the last one it yielded. Returning only the
-    // suspension batch left the spawn event to the outbox advisory, which
-    // lands after the higher sequences — so live subscribers never saw
-    // the subagent open.
-    let committed = if preflight_calls.is_empty() {
-        let mut committed = atomic_committed;
-        committed.extend(
-            deps.event_repo
-                .commit_event_batch(&inputs.bootstrap.thread_id, suspension_events, now)
-                .await
-                .context(commit_context)?,
-        );
-        committed
-    } else {
-        atomic_committed
-    };
+    // Every event of the suspension committed with the spawn, in sequence
+    // order: `publish_events` feeds the same-process live tail in vec order,
+    // and the tail drops any sequence at or below the last one it yielded.
+    let committed = atomic_committed;
 
     let (parent_task, child_tasks) =
         complete_preflight_children(deps, parent_task, child_tasks, preflight_calls)?;
@@ -6158,7 +6141,6 @@ async fn suspend_at_tool_boundary(
             delivered_injection_ids: close_ctx.delivered_injections.clone(),
             tool_children_context: "spawn tool children",
             draft_context: "snapshot suspended_messages to message projection draft",
-            commit_context: "commit suspension events",
         },
         now,
     )
@@ -6353,7 +6335,7 @@ async fn spawn_mixed_batch_children(
     routing: MixedRoutingInputs,
     payload: SuspensionPayload,
     delivered_injection_ids: Vec<AgentTaskId>,
-    boundary_events: Vec<AgentEvent>,
+    (boundary_events, trailing_events): (Vec<AgentEvent>, Vec<AgentEvent>),
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedMixedBatch> {
     let MixedRoutingInputs {
@@ -6402,6 +6384,7 @@ async fn spawn_mixed_batch_children(
         super::subagent::MixedChildrenRequest {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach: Vec::new(),
@@ -6457,6 +6440,9 @@ struct SuspendedBatch {
     payload: SuspensionPayload,
     delivered_injection_ids: Vec<AgentTaskId>,
     boundary_events: Vec<AgentEvent>,
+    /// Events committed in the spawn transaction after the subagent starts:
+    /// an ordinary suspension's content and tool call starts.
+    trailing_events: Vec<AgentEvent>,
 }
 
 struct BatchRoutingApplication {
@@ -6485,58 +6471,9 @@ async fn apply_reattached_batch_routing(
         payload,
         delivered_injection_ids,
         boundary_events,
+        trailing_events,
     } = batch;
-    let (subagents, tool_children) = match routing {
-        super::subagent_spawn_selector::BatchRouting::AllTools => {
-            let tools = specs
-                .into_iter()
-                .enumerate()
-                .map(|(index, spec)| {
-                    Ok(crate::journal::store::ToolChildSpawn {
-                        spawn_index: u32::try_from(index)
-                            .context("tool spawn_index exceeds u32")?,
-                        spec,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (Vec::new(), tools)
-        }
-        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => (
-            vec![reattached_subagent_entry(spawn_index, &plan)?],
-            Vec::new(),
-        ),
-        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => (
-            plans
-                .into_iter()
-                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
-                .collect::<Result<Vec<_>>>()?,
-            Vec::new(),
-        ),
-        super::subagent_spawn_selector::BatchRouting::Mixed {
-            plans,
-            tool_indices,
-        } => {
-            let subagents = plans
-                .into_iter()
-                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
-                .collect::<Result<Vec<_>>>()?;
-            let tool_children = tool_indices
-                .into_iter()
-                .map(|index| {
-                    let spec = specs
-                        .get(index)
-                        .cloned()
-                        .with_context(|| format!("tool spawn_index {index} has no spawn spec"))?;
-                    Ok(crate::journal::store::ToolChildSpawn {
-                        spawn_index: u32::try_from(index)
-                            .context("tool spawn_index exceeds u32")?,
-                        spec,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            (subagents, tool_children)
-        }
-    };
+    let (subagents, tool_children) = partition_attached_batch(routing, &specs)?;
     let invocation_deps = super::subagent::SubagentInvocationDeps {
         task_store: deps.task_store,
         thread_store: deps.thread_store,
@@ -6549,6 +6486,7 @@ async fn apply_reattached_batch_routing(
         super::subagent::MixedChildrenRequest {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach,
@@ -6571,6 +6509,69 @@ async fn apply_reattached_batch_routing(
         deps.wake_workers_for_batch();
     }
     Ok((spawned.parent_task, children, spawned.committed_events))
+}
+
+/// Split an attached batch's routing into the subagent and tool halves
+/// [`super::subagent::spawn_mixed_children_invocations`] persists.
+fn partition_attached_batch(
+    routing: super::subagent_spawn_selector::BatchRouting,
+    specs: &[ChildSpawnSpec],
+) -> Result<(
+    Vec<super::subagent::SubagentBatchEntry>,
+    Vec<crate::journal::store::ToolChildSpawn>,
+)> {
+    match routing {
+        super::subagent_spawn_selector::BatchRouting::AllTools => {
+            let tools = specs
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, spec)| {
+                    Ok(crate::journal::store::ToolChildSpawn {
+                        spawn_index: u32::try_from(index)
+                            .context("tool spawn_index exceeds u32")?,
+                        spec,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((Vec::new(), tools))
+        }
+        super::subagent_spawn_selector::BatchRouting::SingleSubagent { spawn_index, plan } => Ok((
+            vec![reattached_subagent_entry(spawn_index, &plan)?],
+            Vec::new(),
+        )),
+        super::subagent_spawn_selector::BatchRouting::MultiSubagent { plans } => Ok((
+            plans
+                .into_iter()
+                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
+                .collect::<Result<Vec<_>>>()?,
+            Vec::new(),
+        )),
+        super::subagent_spawn_selector::BatchRouting::Mixed {
+            plans,
+            tool_indices,
+        } => {
+            let subagents = plans
+                .into_iter()
+                .map(|(index, plan)| reattached_subagent_entry(index, &plan))
+                .collect::<Result<Vec<_>>>()?;
+            let tool_children = tool_indices
+                .into_iter()
+                .map(|index| {
+                    let spec = specs
+                        .get(index)
+                        .cloned()
+                        .with_context(|| format!("tool spawn_index {index} has no spawn spec"))?;
+                    Ok(crate::journal::store::ToolChildSpawn {
+                        spawn_index: u32::try_from(index)
+                            .context("tool spawn_index exceeds u32")?,
+                        spec,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((subagents, tool_children))
+        }
+    }
 }
 
 fn reattached_subagent_entry(
@@ -6615,6 +6616,7 @@ async fn spawn_mixed_routed_children(
         payload,
         delivered_injection_ids,
         boundary_events,
+        trailing_events,
     } = batch;
     let spawned = spawn_mixed_batch_children(
         inputs,
@@ -6626,7 +6628,7 @@ async fn spawn_mixed_routed_children(
         },
         payload,
         delivered_injection_ids,
-        boundary_events,
+        (boundary_events, trailing_events),
         now,
     )
     .await?;
@@ -6690,7 +6692,10 @@ async fn spawn_routed_batch(
     // preflight batch must never fall through to `spawn_tool_children`,
     // which deliberately rejects precompleted specs and cannot persist
     // their ToolCallEnd events atomically.
-    if !application.reattach.is_empty() || !application.batch.boundary_events.is_empty() {
+    if !application.reattach.is_empty()
+        || !application.batch.boundary_events.is_empty()
+        || !application.batch.trailing_events.is_empty()
+    {
         return apply_reattached_batch_routing(inputs, deps, application, now).await;
     }
     let BatchRoutingApplication {
@@ -8268,7 +8273,6 @@ async fn suspend_resumed_turn(
             delivered_injection_ids: close.delivered_injections.to_vec(),
             tool_children_context: "re-spawn tool children on resume",
             draft_context: "refresh resumed suspended_messages draft",
-            commit_context: "commit resumed suspension events",
         },
         now,
     )
@@ -9949,6 +9953,7 @@ async fn repark_after_steering_exchange(
                 batch: SuspendedBatch {
                     payload,
                     boundary_events,
+                    trailing_events: Vec::new(),
                     delivered_injection_ids: Vec::new(),
                 },
                 specs,

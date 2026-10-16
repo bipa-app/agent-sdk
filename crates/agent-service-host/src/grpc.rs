@@ -1258,13 +1258,10 @@ impl GrpcControlService {
         Ok((task, parent_task))
     }
 
-    /// Run the host's [`ConfirmationDecisionGuard`] on a decision for a task
-    /// that is still parked. It runs before the idempotency claim, so a
-    /// refusal reserves nothing and a retry gets the same refusal. A task
-    /// that is missing, foreign, or no longer parked is left to the claim
-    /// (a replay) and to [`Self::run_confirmation_decision`] (the errors).
-    /// Refuse a decision whose task no longer awaits confirmation, before
-    /// an unrecorded `request_id` runs its decision again.
+    /// Refuse a decision whose task no longer awaits confirmation: before an
+    /// unrecorded `request_id` runs its decision again, and after a decision
+    /// fails, so a caller that lost the race to an earlier attempt, or to
+    /// another decision, gets `FAILED_PRECONDITION`, not `INTERNAL`.
     async fn require_awaiting_confirmation(&self, task_id: &AgentTaskId) -> RpcResult<()> {
         let task = self
             .shared
@@ -1285,6 +1282,11 @@ impl GrpcControlService {
         .into())
     }
 
+    /// Run the host's [`ConfirmationDecisionGuard`] on a decision for a task
+    /// that is still parked. It runs before the idempotency claim, so a
+    /// refusal reserves nothing and a retry gets the same refusal. A task
+    /// that is missing, foreign, or no longer parked is left to the claim
+    /// (a replay) and to [`Self::run_confirmation_decision`] (the errors).
     async fn check_confirmation_guard(
         &self,
         request: &pb::DecideConfirmationRequest,
@@ -1355,20 +1357,26 @@ impl GrpcControlService {
         )?;
         match decision {
             ConfirmationDecision::Approved => {
-                Box::pin(self.shared.execute_approved_confirmation(task_id))
-                    .await
-                    .map_err(internal_status("executing approved confirmation"))?;
+                if let Err(error) =
+                    Box::pin(self.shared.execute_approved_confirmation(task_id)).await
+                {
+                    self.require_awaiting_confirmation(task_id).await?;
+                    return Err(internal_status("executing approved confirmation")(error).into());
+                }
             }
             other => {
                 let now = OffsetDateTime::now_utc();
-                let _ = apply_confirmation_decision(
+                if let Err(error) = apply_confirmation_decision(
                     task_id,
                     other,
                     self.shared.stores.task_store.as_ref(),
                     now,
                 )
                 .await
-                .map_err(internal_status("applying confirmation decision"))?;
+                {
+                    self.require_awaiting_confirmation(task_id).await?;
+                    return Err(internal_status("applying confirmation decision")(error).into());
+                }
                 crate::host::settle_tool_child(
                     self.shared.runtime.wakeup_signal(),
                     self.shared.stores.task_store.as_ref(),
@@ -6388,6 +6396,35 @@ mod tests {
         Ok(())
     }
 
+    /// A decision on a task another decision already resolved is
+    /// `FAILED_PRECONDITION` naming that, not `INTERNAL`.
+    fn expect_moved_on(
+        result: std::result::Result<tonic::Response<pb::DecideConfirmationResponse>, tonic::Status>,
+    ) -> Result<()> {
+        let status = result
+            .err()
+            .context("a decision on a resolved task is refused")?;
+        ensure!(
+            status.code() == tonic::Code::FailedPrecondition
+                && status.message().contains("no longer awaits confirmation"),
+            "a lost decision is FAILED_PRECONDITION: {status}",
+        );
+        Ok(())
+    }
+
+    async fn decision_claim(
+        task_store: &dyn AgentTaskStore,
+        request: &pb::DecideConfirmationRequest,
+    ) -> Result<IdempotencyClaim> {
+        task_store
+            .claim_idempotency(
+                &request.request_id,
+                IdempotencyKind::DecideConfirmation,
+                &decide_confirmation_fingerprint(request),
+            )
+            .await
+    }
+
     fn confirm_transfer_tool() -> Tool {
         Tool {
             name: "transfer".into(),
@@ -6453,16 +6490,9 @@ mod tests {
                     .await?;
             let parked = wait_for_awaiting_confirmation(&control, &thread_id).await?;
             let request = approval_request("decide-in-flight", &thread_id, &parked.task_id, false);
-            let earlier = task_store
-                .claim_idempotency(
-                    &request.request_id,
-                    IdempotencyKind::DecideConfirmation,
-                    &decide_confirmation_fingerprint(&request),
-                )
-                .await?;
             ensure!(
-                earlier == IdempotencyClaim::Fresh,
-                "the earlier attempt reserves the key: {earlier:?}",
+                decision_claim(task_store.as_ref(), &request).await? == IdempotencyClaim::Fresh,
+                "the earlier attempt reserves the key",
             );
 
             let decided = control
@@ -6479,16 +6509,12 @@ mod tests {
                 task.status != pb::TaskStatus::AwaitingConfirmation as i32,
                 "the decision applied: {task:?}",
             );
-            let replayed = task_store
-                .claim_idempotency(
-                    &request.request_id,
-                    IdempotencyKind::DecideConfirmation,
-                    &decide_confirmation_fingerprint(&request),
-                )
-                .await?;
             ensure!(
-                matches!(replayed, IdempotencyClaim::Replay(_)),
-                "the key is recorded after the decision: {replayed:?}",
+                matches!(
+                    decision_claim(task_store.as_ref(), &request).await?,
+                    IdempotencyClaim::Replay(_)
+                ),
+                "the key is recorded after the decision",
             );
             let again = control
                 .decide_confirmation(request)
@@ -6499,7 +6525,16 @@ mod tests {
                 again.task.map(|task| task.task_id) == Some(parked.task_id.clone()),
                 "the replay names the same task",
             );
-            Ok(())
+            expect_moved_on(
+                control
+                    .decide_confirmation(approval_request(
+                        "decide-after-resolved",
+                        &thread_id,
+                        &parked.task_id,
+                        false,
+                    ))
+                    .await,
+            )
         }
         .await;
         daemon.stop().await?;

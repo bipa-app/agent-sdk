@@ -1331,19 +1331,35 @@ async fn execute_subagent_task_inner(
         .context("build tool result")?;
     let result_payload =
         serde_json::to_value(&tool_result).context("serialize subagent tool result")?;
-    let (invocation_task, parent_task) = deps
+    let committed = deps
         .task_store
-        .complete_task_with_result(
-            &bootstrap.task_id,
-            &bootstrap.worker_id,
-            &bootstrap.lease_id,
-            result_payload,
+        .commit(
+            crate::journal::Transition::settle(
+                bootstrap.task_id.clone(),
+                bootstrap.worker_id.clone(),
+                bootstrap.lease_id.clone(),
+                crate::journal::Settle::Complete {
+                    result: result_payload,
+                },
+                bootstrap.thread_id.clone(),
+                vec![completed_progress_event(
+                    &bootstrap,
+                    &subagent_result.summary,
+                )],
+            ),
             now,
         )
         .await
+        .map_err(|rejected| {
+            crate::journal::transition::wrapper_error("complete_task_with_result", rejected)
+        })
         .context("complete subagent invocation task")?;
-    let committed_events =
-        commit_completed_subagent_progress(&bootstrap, &subagent_result.summary, deps, now).await?;
+    let (invocation_task, parent_task) = committed
+        .settled
+        .into_iter()
+        .next()
+        .context("a settle transition returns its settled task")?;
+    let committed_events = committed.events;
 
     Ok(SubagentTaskOutcome {
         invocation_task,
@@ -1960,6 +1976,9 @@ pub struct MixedChildrenRequest {
     /// Parent-thread boundary events committed atomically before any
     /// precompleted child can make the parent runnable.
     pub boundary_events: Vec<AgentEvent>,
+    /// Parent-thread events committed atomically after the subagent
+    /// `SubagentProgress` starts (see [`MixedChildrenSpawn::trailing_events`]).
+    pub trailing_events: Vec<AgentEvent>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentBatchEntry>,
     /// Tool-runtime children to persist, in input order.
@@ -1978,13 +1997,13 @@ fn validate_mixed_request_slots(
     subagents: &[SubagentBatchEntry],
     tool_children: &[ToolChildSpawn],
     reattach: &[ReattachedChild],
-    boundary_events: &[AgentEvent],
+    carries_events: bool,
 ) -> Result<()> {
     let subagent_slots: Vec<u32> = subagents.iter().map(|entry| entry.spawn_index).collect();
     let tool_slots: Vec<u32> = tool_children.iter().map(|tool| tool.spawn_index).collect();
-    if subagents.is_empty() && reattach.is_empty() && !boundary_events.is_empty() {
+    if reattach.is_empty() && carries_events {
         return validate_reattached_slot_coverage(
-            &[],
+            &subagent_slots,
             &tool_slots,
             &[],
             payload.continuation.payload.pending_tool_calls.len(),
@@ -2046,10 +2065,11 @@ pub async fn spawn_mixed_children_invocations(
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedMixedBatch> {
-    let boundary_event_count = request.boundary_events.len();
+    let event_counts = (request.boundary_events.len(), request.trailing_events.len());
     let MixedChildrenRequest {
         delivered_injection_ids,
         boundary_events,
+        trailing_events,
         mut subagents,
         tool_children,
         reattach,
@@ -2067,7 +2087,7 @@ pub async fn spawn_mixed_children_invocations(
         &subagents,
         &tool_children,
         &reattach,
-        &boundary_events,
+        !(boundary_events.is_empty() && trailing_events.is_empty()),
     )?;
     let pending_tools_by_entry = validate_batch_spawns(&payload, &subagents)?;
 
@@ -2095,6 +2115,7 @@ pub async fn spawn_mixed_children_invocations(
             MixedChildrenSpawn {
                 delivered_injection_ids,
                 boundary_events,
+                trailing_events,
                 subagents: spawns,
                 tool_children,
                 reattach,
@@ -2111,7 +2132,7 @@ pub async fn spawn_mixed_children_invocations(
         spawned,
         child_threads,
         pending_tools_by_entry.len(),
-        boundary_event_count,
+        event_counts,
     )
 }
 
@@ -2119,7 +2140,7 @@ pub(crate) fn assemble_mixed_spawned_batch(
     spawned: SpawnedMixedChildren,
     child_threads: Vec<Thread>,
     pending_tool_count: usize,
-    boundary_event_count: usize,
+    (boundary_event_count, trailing_event_count): (usize, usize),
 ) -> Result<SpawnedMixedBatch> {
     let SpawnedMixedChildren {
         mut committed_events,
@@ -2139,12 +2160,14 @@ pub(crate) fn assemble_mixed_spawned_batch(
         prepared.len(),
     );
     ensure!(
-        committed_events.len() >= boundary_event_count,
-        "spawn_mixed_children returned {} committed events for {boundary_event_count} boundary events",
+        committed_events.len() >= boundary_event_count + trailing_event_count,
+        "spawn_mixed_children returned {} committed events for {boundary_event_count} boundary \
+         and {trailing_event_count} trailing events",
         committed_events.len(),
     );
     let all_committed_events = committed_events.clone();
-    let spawn_committed_events = committed_events.split_off(boundary_event_count);
+    let mut spawn_committed_events = committed_events.split_off(boundary_event_count);
+    spawn_committed_events.truncate(spawn_committed_events.len() - trailing_event_count);
     let per_entry_events = distribute_committed_events(spawn_committed_events, prepared.len())?;
     let mut invocations = Vec::with_capacity(prepared.len());
     for (((invocation_task, child_root_task), child_thread), committed) in prepared
@@ -2451,13 +2474,14 @@ async fn materialize_terminal_subagent_result(
     })
 }
 
-async fn commit_completed_subagent_progress(
+/// The parent-visible `SubagentProgress` that reports an invocation's
+/// completion. It commits in the same transition as the invocation's
+/// settle, so the parent never sees the result without the event.
+fn completed_progress_event(
     bootstrap: &SubagentTaskBootstrap,
     summary: &SubagentSummary,
-    deps: &SubagentResultDeps<'_>,
-    now: OffsetDateTime,
-) -> Result<Vec<CommittedEvent>> {
-    let completed_event = build_parent_progress_event(&SubagentProgressSnapshot {
+) -> AgentEvent {
+    build_parent_progress_event(&SubagentProgressSnapshot {
         subagent_id: &bootstrap.subagent_id,
         subagent_name: &bootstrap.subagent_name,
         spec: &bootstrap.spec,
@@ -2469,16 +2493,7 @@ async fn commit_completed_subagent_progress(
         current_turn: summary.total_turns,
         tool_count: summary.tool_count,
         usage: summary.total_usage.clone(),
-    });
-
-    // The card's contract: a failed progress commit PROPAGATES — the
-    // swallowed-error arm is deleted, not bypassed. The invocation row
-    // completed above; a failed event commit surfaces to the worker,
-    // whose retry/lease machinery re-drives the completion path rather
-    // than silently losing the parent-visible completion event.
-    commit_parent_subagent_progress(deps.event_repo, &bootstrap.thread_id, completed_event, now)
-        .await
-        .context("commit completed subagent progress event")
+    })
 }
 
 fn validate_request(request: &SubagentSpawnRequest) -> Result<()> {

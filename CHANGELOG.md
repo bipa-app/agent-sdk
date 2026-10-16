@@ -84,6 +84,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone.
   - In-memory fixtures that drive tool tasks must wire
     `with_cancellation_markers`.
+- **Breaking: a suspension's events commit with its spawn (site 8).** An
+  ordinary suspension spawned its children in one transaction and committed
+  its content and `ToolCallStart` events in a second. Every suspension now
+  goes through `spawn_mixed_children`, which writes the rows, the events and
+  their outbox rows together. `MixedChildrenSpawn` gains `trailing_events`,
+  committed after each new subagent's `SubagentProgress` start, so clients
+  see the same order as before. A spawn that carries events may be any
+  covering of its pending calls (only tools, only subagents, or both).
+  In-memory stores that drive suspensions need
+  `with_spawn_event_committer`, as `StoreRegistry::in_memory` already wires.
+- **Breaking: a subagent invocation's completion and its progress commit
+  in one transaction (site 15).** `execute_subagent_task` settles the
+  invocation and commits the parent's completed `SubagentProgress` through
+  one `commit`, so a decorating store's `commit` sees subagent
+  completions. The event no longer goes through
+  `SubagentResultDeps::event_repo`.
+- A `DecideConfirmation` whose decision fails because the task no longer
+  awaits confirmation answers `FAILED_PRECONDITION`, not `INTERNAL`.
 - **Breaking: a child parked on a confirmation and its prompt commit in
   one transaction.** `Write::PauseOnConfirmation` (guarded on `Running` with
   the lease) joins the transition writes, and `Committed` gains `paused`.

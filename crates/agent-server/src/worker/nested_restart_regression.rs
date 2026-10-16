@@ -267,14 +267,20 @@ impl TestStores {
     fn new() -> Self {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
-                crate::journal::CancellationMarkerSink {
+            tasks: InMemoryAgentTaskStore::new()
+                .with_cancellation_markers(crate::journal::CancellationMarkerSink {
                     event_repo: Arc::new(events.clone()),
-                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    outbox_store: Arc::new(outbox.clone()),
                     thread_store: Arc::new(threads.clone()),
-                },
-            ),
+                })
+                .with_spawn_event_committer(Arc::new(
+                    crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                        events.clone(),
+                        outbox,
+                    ),
+                )),
             threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),

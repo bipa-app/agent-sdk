@@ -313,6 +313,10 @@ pub struct MixedChildrenSpawn {
     /// Parent-thread boundary events (Thinking + tool call starts) committed
     /// before any precompleted child can wake the parent.
     pub boundary_events: Vec<AgentEvent>,
+    /// Parent-thread events committed in the same transaction after each
+    /// new subagent's `SubagentProgress` start: an ordinary suspension's
+    /// content and tool call starts, which follow the subagent starts.
+    pub trailing_events: Vec<AgentEvent>,
     /// Durable subagent invocations to persist, in input order.
     pub subagents: Vec<SubagentInvocationSpawn>,
     /// Tool-runtime children to persist, in input order.
@@ -373,14 +377,16 @@ pub fn validate_mixed_children_spawn(spawn: &MixedChildrenSpawn) -> Result<()> {
         .iter()
         .map(|child| child.spawn_index)
         .collect();
-    // The atomic preflight path deliberately reuses this transaction with
-    // only tool children so their boundary ToolCallEnd events cannot be
-    // overtaken by a resumed parent. Ordinary callers still require a true
-    // mixed partition below.
-    if spawn.subagents.is_empty() && spawn.reattach.is_empty() && !spawn.boundary_events.is_empty()
+    // A suspension that commits its events with the spawn (the preflight
+    // path's boundary events, an ordinary suspension's trailing events)
+    // reuses this transaction for any batch shape: only tools, only
+    // subagents, or both. It must still cover every pending call once.
+    // Callers without events still require a true mixed partition below.
+    if spawn.reattach.is_empty()
+        && !(spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty())
     {
         return validate_reattached_slot_coverage(
-            &[],
+            &subagent_slots,
             &tool_slots,
             &[],
             spawn.payload.continuation.payload.pending_tool_calls.len(),
@@ -1504,8 +1510,9 @@ fn validate_parked_question_identities<'a>(
 /// persisted, [`QuestionAnswerMismatch`] when the batch does not resolve
 /// the parked questions one-to-one, a plain error when a legacy parked batch
 /// has malformed identities, and a plain error when the task is not awaiting
-/// a question (a client retrying a delivered answer must reuse its original
-/// `request_id`, which replays at the RPC layer).
+/// a question. A retry under the original `request_id` replays at the RPC
+/// layer once the answer is recorded; once the turn has consumed an answer
+/// whose result was never recorded, the retry gets this error too.
 pub fn apply_question_answer(
     old: &AgentTask,
     receipt_id: &str,
@@ -1530,8 +1537,9 @@ pub fn apply_question_answer(
     }
     if old.status != TaskStatus::AwaitingQuestion {
         return Err(anyhow!(
-            "answer_question rejected: task {id} is not awaiting a question (status {:?}); \
-             a retry of an already-delivered answer must reuse its original request_id",
+            "answer_question rejected: task {id} is not awaiting a question (status {:?}): \
+             no question is open, or an answer was delivered and the turn has moved past it; \
+             read the task's state",
             old.status
         ));
     }
@@ -3937,12 +3945,14 @@ impl InMemoryAgentTaskStore {
         prepared: &[(AgentTask, AgentTask)],
         mut boundary_events: Vec<AgentEvent>,
         events: Vec<SubagentSpawnEvent>,
+        trailing_events: Vec<AgentEvent>,
     ) -> Result<Vec<AtomicSpawnEventBatch>> {
         for (event, (invocation, child_root)) in events.into_iter().zip(prepared) {
             boundary_events.push(started_event_from_invocation(
                 event, invocation, child_root,
             )?);
         }
+        boundary_events.extend(trailing_events);
         let mut batches =
             Vec::with_capacity(usize::from(!boundary_events.is_empty()) + prepared.len());
         if !boundary_events.is_empty() {
@@ -6568,7 +6578,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<SpawnedMixedChildren> {
         validate_mixed_children_spawn(&spawn)?;
-        if self.marker_sink.is_none() && !spawn.boundary_events.is_empty() {
+        if self.marker_sink.is_none()
+            && !(spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty())
+        {
             return Err(anyhow!(
                 "spawn rejected: boundary events require an in-memory event sink"
             ));
@@ -6577,6 +6589,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
+            trailing_events,
             subagents,
             tool_children,
             reattach,
@@ -6626,6 +6639,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 &prepared,
                 boundary_events,
                 events,
+                trailing_events,
             )?
         } else {
             Vec::new()
@@ -7043,6 +7057,25 @@ mod tests {
             ids.iter().map(|id| question_payload(id)).collect(),
             t_plus(2),
         )?)
+    }
+
+    #[test]
+    fn an_answer_for_a_task_past_its_question_does_not_blame_the_request_id() -> Result<()> {
+        let mut task = awaiting_question_with_ids(&["call-1"])?;
+        task.status = TaskStatus::Running;
+        task.state = TaskState::None;
+        let error =
+            apply_question_answer(&task, "receipt-1", &[question_answer("call-1")], t_plus(3))
+                .err()
+                .context("a task past its question refuses the answer")?;
+        let message = error.to_string();
+        assert!(
+            message.contains("is not awaiting a question")
+                && message.contains("read the task's state")
+                && !message.contains("reuse"),
+            "{message}",
+        );
+        Ok(())
     }
 
     #[test]
@@ -12441,6 +12474,7 @@ mod tests {
         MixedChildrenSpawn {
             delivered_injection_ids: Vec::new(),
             boundary_events: Vec::new(),
+            trailing_events: Vec::new(),
             subagents,
             tool_children,
             reattach: Vec::new(),

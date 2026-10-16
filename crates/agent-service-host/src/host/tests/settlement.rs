@@ -607,3 +607,113 @@ async fn the_lease_sweep_forwards_what_its_fail_close_settled() -> Result<()> {
     );
     Ok(())
 }
+
+/// Site 15: a subagent invocation's settle and the parent's completed
+/// `SubagentProgress` commit in one transaction. A crash between the two
+/// writes leaves the invocation running with no completed progress on the
+/// parent thread.
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+#[tokio::test]
+async fn subagent_completion_failpoint_keeps_the_invocation_running_without_its_progress()
+-> Result<()> {
+    let _scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir()?;
+    let storage = StorageConfig {
+        backend: StorageBackend::Sqlite {
+            path: Some(dir.path().join("subagent-settle.db").display().to_string()),
+            max_connections: None,
+        },
+        ..StorageConfig::default()
+    };
+    let stores = StoreRegistry::from_config(&storage, super::sample_registry())?;
+    stores.initialize().await?;
+    let parent_thread = ThreadId::from_string("t-subagent-settle");
+    let now = OffsetDateTime::now_utc();
+    let (_, invocation, child_root) =
+        super::persist_subagent_fixture(&stores, &parent_thread, 60_000, now).await?;
+
+    let child_worker = WorkerId::new();
+    let child_lease = LeaseId::new();
+    stores
+        .task_store
+        .try_acquire_task(
+            &child_root.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            now + time::Duration::minutes(10),
+            now,
+        )
+        .await?
+        .context("the child root acquires")?;
+    stores
+        .task_store
+        .fail_task(
+            &child_root.id,
+            &child_worker,
+            &child_lease,
+            "child stopped".into(),
+            now,
+        )
+        .await?;
+    let running = stores
+        .task_store
+        .try_acquire_task(
+            &invocation.id,
+            WorkerId::new(),
+            LeaseId::new(),
+            now + time::Duration::minutes(10),
+            now,
+        )
+        .await?
+        .context("the invocation is runnable once its child root is terminal")?;
+    let bootstrap =
+        agent_server::worker::resolve_subagent_bootstrap(running, stores.task_store.as_ref())
+            .await?;
+    let deps = agent_server::worker::SubagentResultDeps {
+        task_store: stores.task_store.as_ref(),
+        thread_store: stores.thread_store.as_ref(),
+        message_store: stores.message_store.as_ref(),
+        event_repo: stores.event_repo.as_ref(),
+        artifact_store: None,
+    };
+
+    fail::cfg("transition.before_events", "panic")
+        .map_err(|error| anyhow::anyhow!("configure failpoint: {error}"))?;
+    let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        agent_server::worker::execute_subagent_task(bootstrap, &deps, now),
+    ))
+    .await;
+    fail::remove("transition.before_events");
+    anyhow::ensure!(
+        crashed.is_err(),
+        "the failpoint between the writes must fire"
+    );
+
+    let after = stores
+        .task_store
+        .get(&invocation.id)
+        .await?
+        .context("the invocation row")?;
+    let completed_progress = stores
+        .event_repo
+        .get_events(&parent_thread)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                agent_sdk_foundation::AgentEvent::SubagentProgress {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    anyhow::ensure!(
+        after.status == TaskStatus::Running && completed_progress == 0,
+        "the settle and its progress disagree after a crash: invocation {:?}, {completed_progress} \
+         completed progress events",
+        after.status,
+    );
+    Ok(())
+}

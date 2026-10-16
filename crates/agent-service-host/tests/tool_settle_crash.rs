@@ -98,9 +98,13 @@ impl LlmProvider for OneToolCallProvider {
     }
 }
 
-/// A tool child of a fresh root turn, leased and ready to run.
-async fn leased_tool_child(store: &SqliteDurableStore) -> Result<ToolTaskBootstrap> {
-    let thread_id = ThreadId::from_string("tool-settle-thread");
+const THREAD: &str = "tool-settle-thread";
+
+/// Run a fresh root turn whose model calls one tool, up to its suspension.
+async fn suspend_root_on_one_tool_call(
+    store: &SqliteDurableStore,
+) -> Result<(AgentTaskId, RootTurnOutcome)> {
+    let thread_id = ThreadId::from_string(THREAD);
     ThreadStore::get_or_create(store, &thread_id, at(0)).await?;
     MessageProjectionStore::get_or_create(store, &thread_id, at(0)).await?;
     let root = AgentTask::new_root_turn(thread_id.clone(), at(0), 3);
@@ -114,7 +118,7 @@ async fn leased_tool_child(store: &SqliteDurableStore) -> Result<ToolTaskBootstr
         .context("root was not acquired")?;
     let bootstrap = WorkerBootstrapContext {
         thread_id,
-        task_id: root_id,
+        task_id: root_id.clone(),
         task: root,
         worker_id: worker,
         lease_id: lease,
@@ -141,6 +145,12 @@ async fn leased_tool_child(store: &SqliteDurableStore) -> Result<ToolTaskBootstr
     };
     let outcome =
         execute_root_turn(inputs, "Run the tool", &OneToolCallProvider, &deps, at(2)).await?;
+    Ok((root_id, outcome))
+}
+
+/// A tool child of a fresh root turn, leased and ready to run.
+async fn leased_tool_child(store: &SqliteDurableStore) -> Result<ToolTaskBootstrap> {
+    let (_, outcome) = suspend_root_on_one_tool_call(store).await?;
     let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
         bail!("the root turn did not suspend on its tool call");
     };
@@ -363,6 +373,68 @@ async fn pause_failpoint_keeps_the_child_running_without_its_prompt() -> Result<
         task.status == TaskStatus::Running && prompts == 0,
         "the pause and its prompt disagree after a crash: child {:?}, {prompts} prompts",
         task.status,
+    );
+    Ok(())
+}
+
+/// Site 8: a root turn parks on its tool children and commits its
+/// suspension (content and `ToolCallStart`) in one transaction. A crash
+/// inside that transaction leaves the root running with no children and no
+/// suspension event.
+#[tokio::test]
+async fn suspension_failpoint_leaves_the_root_running_without_children_or_events() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let _scenario = fail::FailScenario::setup();
+    fail::cfg("atomic_spawn_batch.after_rows", "panic")
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        suspend_root_on_one_tool_call(&store),
+    ))
+    .await;
+    fail::remove("atomic_spawn_batch.after_rows");
+    ensure!(
+        crashed.is_err(),
+        "the failpoint inside the spawn transaction must fire"
+    );
+
+    let thread = ThreadId::from_string(THREAD);
+    let roots = AgentTaskStore::list_by_thread(&store, &thread).await?;
+    let [root] = roots.as_slice() else {
+        bail!("one root and no children expected, got {}", roots.len());
+    };
+    let starts = EventRepository::get_events(&store, &thread)
+        .await?
+        .into_iter()
+        .filter(|event| matches!(event.event, AgentEvent::ToolCallStart { .. }))
+        .count();
+    ensure!(
+        root.status == TaskStatus::Running && starts == 0,
+        "the spawn and its suspension events disagree after a crash: root {:?}, {starts} \
+         ToolCallStart",
+        root.status,
+    );
+    Ok(())
+}
+
+/// The suspension's events commit with the spawn: after a clean suspend,
+/// the root's `ToolCallStart` is in the journal.
+#[tokio::test]
+async fn a_suspension_commits_its_tool_call_start_with_the_spawn() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let (_, outcome) = suspend_root_on_one_tool_call(&store).await?;
+    let RootTurnOutcome::Suspended {
+        committed_events, ..
+    } = outcome
+    else {
+        bail!("the root turn did not suspend");
+    };
+    ensure!(
+        committed_events
+            .iter()
+            .any(|event| matches!(event.event, AgentEvent::ToolCallStart { .. })),
+        "the outcome carries the suspension's ToolCallStart",
     );
     Ok(())
 }

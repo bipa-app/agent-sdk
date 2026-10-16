@@ -132,73 +132,6 @@ impl LlmProvider for MockToolCallProvider {
     }
 }
 
-struct FailingEventRepository;
-
-#[async_trait]
-impl EventRepository for FailingEventRepository {
-    async fn commit_event(
-        &self,
-        _thread_id: &ThreadId,
-        _event: AgentEvent,
-        _now: OffsetDateTime,
-    ) -> Result<crate::journal::CommittedEvent> {
-        anyhow::bail!("synthetic event commit failure");
-    }
-
-    async fn commit_event_batch(
-        &self,
-        _thread_id: &ThreadId,
-        _events: Vec<AgentEvent>,
-        _now: OffsetDateTime,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
-        anyhow::bail!("synthetic event batch commit failure");
-    }
-
-    async fn next_sequence(&self, _thread_id: &ThreadId) -> Result<u64> {
-        Ok(0)
-    }
-
-    async fn get_events(
-        &self,
-        _thread_id: &ThreadId,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_events_in_range(
-        &self,
-        _thread_id: &ThreadId,
-        _after_sequence: u64,
-        _up_to_sequence: u64,
-    ) -> Result<Vec<crate::journal::CommittedEvent>> {
-        Ok(Vec::new())
-    }
-
-    async fn threads_with_events_before(
-        &self,
-        _cutoff: OffsetDateTime,
-        _limit: u32,
-    ) -> Result<Vec<ThreadId>> {
-        Ok(Vec::new())
-    }
-
-    async fn max_sequence_before(
-        &self,
-        _thread_id: &ThreadId,
-        _cutoff: OffsetDateTime,
-    ) -> Result<Option<u64>> {
-        Ok(None)
-    }
-
-    async fn min_sequence_at_or_after(
-        &self,
-        _thread_id: &ThreadId,
-        _cutoff: OffsetDateTime,
-    ) -> Result<Option<u64>> {
-        Ok(None)
-    }
-}
-
 struct TestStores {
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
@@ -213,14 +146,20 @@ impl TestStores {
     fn new() -> Self {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
+        let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
-                crate::journal::CancellationMarkerSink {
+            tasks: InMemoryAgentTaskStore::new()
+                .with_cancellation_markers(crate::journal::CancellationMarkerSink {
                     event_repo: Arc::new(events.clone()),
-                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    outbox_store: Arc::new(outbox.clone()),
                     thread_store: Arc::new(threads.clone()),
-                },
-            ),
+                })
+                .with_spawn_event_committer(Arc::new(
+                    crate::journal::store::InMemoryAtomicSpawnEventCommitter::new(
+                        events.clone(),
+                        outbox,
+                    ),
+                )),
             threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
@@ -838,84 +777,6 @@ async fn cancelled_child_thread_does_not_count_unexecuted_tool_tasks() -> Result
     assert_eq!(
         structured.error_details.as_deref(),
         Some("subagent execution was cancelled")
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn completion_surfaces_parent_progress_commit_failures() -> Result<()> {
-    let stores = TestStores::new();
-    let parent_thread_id = ThreadId::from_string("t-parent-subagent-progress-failure");
-    let (parent, worker, lease) =
-        create_running_parent_root(&stores.tasks, &parent_thread_id).await?;
-
-    let spawned: SpawnedSubagentInvocation = spawn_subagent_invocation(
-        &parent.id,
-        &worker,
-        &lease,
-        child_spawn(&parent_thread_id),
-        Vec::new(),
-        &SubagentInvocationDeps {
-            task_store: &stores.tasks,
-            thread_store: &stores.threads,
-            event_repo: &stores.events,
-        },
-        t_plus(2),
-    )
-    .await?;
-
-    let persisted_child_root = Box::pin(run_child_until_ready_to_resume(&stores, &spawned)).await?;
-    Box::pin(resume_child_root_to_completion(
-        &stores,
-        &spawned,
-        &persisted_child_root,
-    ))
-    .await?;
-
-    let invocation_running = stores
-        .tasks
-        .try_acquire_task(
-            &spawned.invocation_task.id,
-            WorkerId::from_string("w-subagent-failing-progress"),
-            LeaseId::from_string("l-subagent-failing-progress"),
-            t_plus(60),
-            t_plus(9),
-        )
-        .await?
-        .context("claim invocation task")?;
-    let subagent_bootstrap = resolve_subagent_bootstrap(invocation_running, &stores.tasks).await?;
-    let failing_events = FailingEventRepository;
-    let error = execute_subagent_task(
-        subagent_bootstrap,
-        &SubagentResultDeps {
-            task_store: &stores.tasks,
-            thread_store: &stores.threads,
-            message_store: &stores.messages,
-            event_repo: &failing_events,
-            artifact_store: None,
-        },
-        t_plus(10),
-    )
-    .await
-    .err()
-    .context("a failed completion-progress commit must PROPAGATE, not be swallowed")?;
-    assert!(
-        format!("{error:#}").contains("commit completed subagent progress event"),
-        "unexpected error: {error:#}",
-    );
-
-    // The invocation row completed before the event commit — the
-    // surfaced error hands the re-drive to the worker's retry/lease
-    // machinery instead of silently losing the parent-visible event.
-    let invocation_after = stores
-        .tasks
-        .get(&spawned.invocation_task.id)
-        .await?
-        .context("invocation row survives the failed event commit")?;
-    assert_eq!(
-        invocation_after.status,
-        crate::journal::TaskStatus::Completed
     );
 
     Ok(())
