@@ -3902,7 +3902,7 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
                     if attempt < COMMIT_LOCK_CONFLICT_RETRIES && is_lock_conflict(&error) =>
                 {
                     attempt += 1;
-                    tracing::debug!(attempt, %error, "retrying a transition after a lock conflict");
+                    tracing::warn!(attempt, %error, "retrying a transition after a lock conflict");
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
                 }
@@ -3962,6 +3962,17 @@ impl PostgresDurableStore {
         let mut checked = vec![false; transition.guards.len()];
         for (index, task) in &guarded {
             let stored = Self::load_task_tx(tx, &task.id, true).await?;
+            if let Some(stored) = &stored
+                && stored.thread_id != task.thread_id
+            {
+                return Err(anyhow::anyhow!(
+                    "task {} is on thread {}, not the thread locked for it ({})",
+                    stored.id,
+                    stored.thread_id,
+                    task.thread_id,
+                )
+                .into());
+            }
             transition.guards[*index].check(*index, stored.as_ref())?;
             checked[*index] = true;
         }
