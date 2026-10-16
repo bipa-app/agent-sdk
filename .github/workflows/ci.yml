@@ -382,3 +382,33 @@ jobs:
         run: >-
           cargo nextest run -p agent-sdk-providers --profile ci
           -E 'test(/tool_use/) + test(/truncated_after_tool_start/) + test(/tool_use_json/)'
+
+  # The single status check the `main` ruleset requires. It passes only
+  # when every PR-gating job above succeeded (skipped jobs count as
+  # passing; the nightly-only live and tool-call smokes are not listed).
+  all:
+    name: all
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() }}
+    needs:
+      - check
+      - cross-platform
+      - test
+      - postgres
+      - clippy
+      - fmt
+      - doc
+      - examples
+      - feature-matrix
+      - host-feature-matrix
+      - loom
+    steps:
+      - name: Every gating job passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled)"'; then
+            echo "::error::a required CI job did not pass"
+            exit 1
+          fi
