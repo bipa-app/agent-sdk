@@ -683,11 +683,8 @@ mod tests {
     /// Completed-turn commit creates a checkpoint.
     async fn test_completed_turn_commit(
         task_store: &dyn AgentTaskStore,
-        thread_store: &dyn ThreadStore,
-        message_store: &dyn MessageProjectionStore,
         attempt_store: &dyn TurnAttemptStore,
         checkpoint_store: &dyn CheckpointStore,
-        event_repo: &dyn EventRepository,
     ) -> Result<()> {
         let tid = thread_id("conformance-commit");
         let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
@@ -735,11 +732,6 @@ mod tests {
                 now: t_plus(55),
             },
             task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
         )
         .await?;
 
@@ -859,16 +851,12 @@ mod tests {
     /// Nothing may be written (no thread advance, no checkpoint), and
     /// the rejection carries the typed [`LostCommitOwnership`] root
     /// cause so the shift loop treats it as terminal instead of
-    /// shifting again. Durable backends only: the non-atomic
-    /// in-memory backend has no cross-store transaction to enforce
-    /// the guard in (documented on `CompletedTurnCommit::owner_guard`).
+    /// shifting again.
     async fn test_owner_guarded_commit_rejects_lost_ownership(
         task_store: &dyn AgentTaskStore,
         thread_store: &dyn ThreadStore,
-        message_store: &dyn MessageProjectionStore,
         attempt_store: &dyn TurnAttemptStore,
         checkpoint_store: &dyn CheckpointStore,
-        event_repo: &dyn EventRepository,
     ) -> Result<()> {
         use agent_server::journal::commit::{CommitOwnerGuard, LostCommitOwnership};
 
@@ -885,18 +873,10 @@ mod tests {
         let cancelled = task_store.cancel_tree(&root.id, t_plus(504)).await?;
         assert_eq!(cancelled.transitioned, vec![root.id.clone()]);
 
-        let error = commit_completed_turn(
-            params,
-            task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
-        )
-        .await
-        .err()
-        .context("owner-guarded commit against a cancelled row must be rejected")?;
+        let error = commit_completed_turn(params, task_store)
+            .await
+            .err()
+            .context("owner-guarded commit against a cancelled row must be rejected")?;
         assert!(
             error.downcast_ref::<LostCommitOwnership>().is_some(),
             "expected the typed LostCommitOwnership root cause, got: {error:#}",
@@ -921,16 +901,96 @@ mod tests {
         Ok(())
     }
 
+    /// An owner-guarded commit whose lease expired and was taken by
+    /// another worker is rejected with [`LostCommitOwnership`] and
+    /// writes nothing: the attempt stays open, the thread stays at turn
+    /// 0, and there is no checkpoint, no message, no event and no
+    /// advisory. The row is still `Running`, so only the guard's
+    /// `(worker, lease)` comparison can catch it.
+    async fn test_owner_guarded_commit_rejects_a_stolen_lease(
+        stores: ThreadJournalStores<'_>,
+        attempt_store: &dyn TurnAttemptStore,
+    ) -> Result<()> {
+        use agent_server::journal::commit::{CommitOwnerGuard, LostCommitOwnership};
+
+        let task_store = stores.task;
+        let tid = thread_id("conformance-owner-guard-stolen");
+        let (root, worker, lease, mut params) = guarded_commit_fixture(
+            task_store,
+            attempt_store,
+            "conformance-owner-guard-stolen",
+            560,
+        )
+        .await?;
+        params.owner_guard = Some(CommitOwnerGuard {
+            worker_id: worker,
+            lease_id: lease,
+        });
+        params.events = vec![AgentEvent::text("msg_stolen", "never committed")];
+        let attempt_id = params.turn_attempt_id.clone();
+        params.now = t_plus(630);
+
+        let released = task_store.release_expired_leases(t_plus(621)).await?;
+        assert_eq!(released.len(), 1, "the first worker's lease expired");
+        let thief = task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(700),
+                t_plus(622),
+            )
+            .await?
+            .context("a second worker takes the expired root")?;
+        assert_eq!(thief.status, TaskStatus::Running);
+
+        let error = commit_completed_turn(params, task_store)
+            .await
+            .err()
+            .context("owner-guarded commit under a stolen lease must be rejected")?;
+        assert!(
+            error.downcast_ref::<LostCommitOwnership>().is_some(),
+            "expected the typed LostCommitOwnership root cause, got: {error:#}",
+        );
+
+        let attempt = attempt_store
+            .get(&attempt_id)
+            .await?
+            .context("attempt row")?;
+        assert!(
+            !attempt.is_closed(),
+            "the rejected commit left the attempt open"
+        );
+        assert_eq!(
+            stores
+                .thread
+                .get(&tid)
+                .await?
+                .map_or(0, |thread| thread.committed_turns),
+            0,
+            "the rejected commit did not advance the thread",
+        );
+        assert!(stores.checkpoint.get_by_turn(&tid, 1).await?.is_none());
+        assert_eq!(stores.message.get_history(&tid).await?, Vec::new());
+        assert!(stores.event.get_events(&tid).await?.is_empty());
+        assert!(
+            !stores
+                .outbox
+                .list_by_thread(&tid)
+                .await?
+                .iter()
+                .any(|row| row.kind == OutboxMessageKind::ThreadEventsAvailable),
+            "the rejected commit wrote no event advisory",
+        );
+        Ok(())
+    }
+
     /// Owner-guard positive arm: an owner-guarded commit whose worker
     /// still owns the live `Running` row succeeds — the guard only
     /// bites on lost ownership.
     async fn test_owner_guarded_commit_succeeds_while_owned(
         task_store: &dyn AgentTaskStore,
-        thread_store: &dyn ThreadStore,
-        message_store: &dyn MessageProjectionStore,
         attempt_store: &dyn TurnAttemptStore,
-        checkpoint_store: &dyn CheckpointStore,
-        event_repo: &dyn EventRepository,
     ) -> Result<()> {
         use agent_server::journal::commit::CommitOwnerGuard;
 
@@ -942,17 +1002,9 @@ mod tests {
             lease_id: lease,
         });
 
-        let outcome = commit_completed_turn(
-            params,
-            task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
-        )
-        .await
-        .context("owner-guarded commit while still owned")?;
+        let outcome = commit_completed_turn(params, task_store)
+            .await
+            .context("owner-guarded commit while still owned")?;
         assert_eq!(outcome.thread.committed_turns, 1);
         assert_eq!(outcome.checkpoint.turn_number, 1);
         Ok(())
@@ -965,28 +1017,16 @@ mod tests {
     /// historical message for logs).
     async fn test_stale_turn_commit_rejection_is_typed(
         task_store: &dyn AgentTaskStore,
-        thread_store: &dyn ThreadStore,
-        message_store: &dyn MessageProjectionStore,
         attempt_store: &dyn TurnAttemptStore,
-        checkpoint_store: &dyn CheckpointStore,
-        event_repo: &dyn EventRepository,
     ) -> Result<()> {
         use agent_server::journal::commit::StaleTurnCommit;
 
         let (root, _worker, _lease, params) =
             guarded_commit_fixture(task_store, attempt_store, "conformance-stale-typed", 540)
                 .await?;
-        commit_completed_turn(
-            params,
-            task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
-        )
-        .await
-        .context("first commit of turn 1")?;
+        commit_completed_turn(params, task_store)
+            .await
+            .context("first commit of turn 1")?;
 
         // A second commit of the SAME expected turn (fresh attempt,
         // same slot) must fail the CAS with the typed root cause.
@@ -1031,18 +1071,10 @@ mod tests {
             owner_guard: None,
             now: t_plus(547),
         };
-        let error = commit_completed_turn(
-            stale,
-            task_store,
-            thread_store,
-            message_store,
-            attempt_store,
-            checkpoint_store,
-            event_repo,
-        )
-        .await
-        .err()
-        .context("second commit of the same slot must be rejected")?;
+        let error = commit_completed_turn(stale, task_store)
+            .await
+            .err()
+            .context("second commit of the same slot must be rejected")?;
         let typed = error
             .downcast_ref::<StaleTurnCommit>()
             .context("rejection must carry the typed StaleTurnCommit root cause")?;
@@ -3638,12 +3670,17 @@ mod tests {
             .commit_thread_creation(
                 agent_server::journal::thread_creation_transaction::ThreadCreationCommit {
                     thread_id: created.clone(),
+                    naming:
+                        agent_server::journal::thread_creation_transaction::ThreadNaming::Minted,
                     event: AgentEvent::thread_created(created.clone(), None, None),
                     outbox_max_attempts: 3,
                     now: t0(),
                 },
             )
             .await?;
+        let agent_server::journal::ThreadCreationCommitted::Created(rows) = rows else {
+            anyhow::bail!("a minted creation always creates");
+        };
         assert_eq!(rows.thread.thread_id, created);
         assert_eq!(rows.committed_event.sequence, 0);
         assert!(stores.thread.get(&created).await?.is_some());
@@ -3654,6 +3691,69 @@ mod tests {
             [only] if matches!(only.event, AgentEvent::ThreadCreated { .. })
         ));
         assert_eq!(journal_counts(&stores, &created).await?, (1, 1, Some(0)));
+        Ok(())
+    }
+
+    /// A caller-named creation claims its id, writes the thread row, its
+    /// head, one `ThreadCreated` and one advisory together. A retry returns
+    /// `Existing` and writes nothing; an id that exists without that
+    /// creation identity is refused and gets no event.
+    async fn test_caller_named_thread_creation_commits_once(
+        stores: ThreadJournalStores<'_>,
+    ) -> Result<()> {
+        use agent_server::journal::thread_creation_transaction::{
+            ThreadCreationCommit, ThreadCreationCommitted, ThreadNaming,
+        };
+        use agent_server::journal::thread_store::{
+            ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
+        };
+
+        let create = |thread_id: &ThreadId| ThreadCreationCommit {
+            thread_id: thread_id.clone(),
+            naming: ThreadNaming::CallerNamed,
+            event: AgentEvent::thread_created(thread_id.clone(), None, None),
+            outbox_max_attempts: 3,
+            now: t0(),
+        };
+        let named = ThreadId::new();
+        let ThreadCreationCommitted::Created(rows) =
+            stores.thread.commit_thread_creation(create(&named)).await?
+        else {
+            anyhow::bail!("the first caller-named creation creates");
+        };
+        assert_eq!(rows.committed_event.sequence, 0);
+        assert!(stores.message.get(&named).await?.is_some());
+        assert_eq!(journal_counts(&stores, &named).await?, (1, 1, Some(0)));
+        assert_eq!(
+            stores
+                .thread
+                .get_or_create_for_creation(&named, &ThreadCreation::Create, t_plus(1))
+                .await?,
+            ThreadCreationOutcome::Existing,
+            "the creation identity landed with the thread",
+        );
+
+        let replay = stores.thread.commit_thread_creation(create(&named)).await?;
+        assert!(matches!(replay, ThreadCreationCommitted::Existing));
+        assert_eq!(
+            journal_counts(&stores, &named).await?,
+            (1, 1, Some(0)),
+            "a replayed creation emits no second ThreadCreated",
+        );
+
+        let unclaimed = ThreadId::new();
+        stores.thread.get_or_create(&unclaimed, t0()).await?;
+        let error = stores
+            .thread
+            .commit_thread_creation(create(&unclaimed))
+            .await
+            .err()
+            .context("an id that exists without a creation identity is refused")?;
+        assert!(
+            error.downcast_ref::<ThreadIdConflict>().is_some(),
+            "expected ThreadIdConflict, got: {error:#}",
+        );
+        assert_eq!(journal_counts(&stores, &unclaimed).await?, (0, 0, None));
         Ok(())
     }
 
@@ -3819,6 +3919,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_caller_named_thread_creation_commits_once() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_caller_named_thread_creation_commits_once(s.journal_stores()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_fork_commits_together() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_fork_commits_whole_destination_or_nothing(s.journal_stores()).await
@@ -3829,6 +3935,13 @@ mod tests {
     async fn conformance_sqlite_thread_creation_commits_together() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_thread_creation_commits_row_head_event_and_advisory((&store).into()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_caller_named_thread_creation_commits_once() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_caller_named_thread_creation_commits_once((&store).into()).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -3845,6 +3958,15 @@ mod tests {
             return Ok(());
         };
         test_thread_creation_commits_row_head_event_and_advisory((&store).into()).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_caller_named_thread_creation_commits_once() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_caller_named_thread_creation_commits_once((&store).into()).await
     }
 
     #[cfg(feature = "postgres")]
@@ -3988,31 +4110,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conformance_in_memory_completed_turn() -> Result<()> {
+    async fn conformance_in_memory_owner_guarded_commit_rejects_lost_ownership() -> Result<()> {
         let s = fresh_in_memory_stores();
-        test_completed_turn_commit(
+        test_owner_guarded_commit_rejects_lost_ownership(
             s.task.as_ref(),
             s.thread.as_ref(),
-            s.message.as_ref(),
             s.attempt.as_ref(),
             s.checkpoint.as_ref(),
-            s.event.as_ref(),
         )
         .await
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_owner_guarded_commit_rejects_a_stolen_lease() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_owner_guarded_commit_rejects_a_stolen_lease(s.journal_stores(), s.attempt.as_ref())
+            .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_owner_guarded_commit_succeeds_while_owned() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_owner_guarded_commit_succeeds_while_owned(s.task.as_ref(), s.attempt.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_completed_turn() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_completed_turn_commit(s.task.as_ref(), s.attempt.as_ref(), s.checkpoint.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_stale_turn_commit_is_typed() -> Result<()> {
         let s = fresh_in_memory_stores();
-        test_stale_turn_commit_rejection_is_typed(
-            s.task.as_ref(),
-            s.thread.as_ref(),
-            s.message.as_ref(),
-            s.attempt.as_ref(),
-            s.checkpoint.as_ref(),
-            s.event.as_ref(),
-        )
-        .await
+        test_stale_turn_commit_rejection_is_typed(s.task.as_ref(), s.attempt.as_ref()).await
     }
 
     #[tokio::test]
@@ -4308,7 +4439,8 @@ mod tests {
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
         use agent_server::journal::outbox::InMemoryOutboxStore;
         use agent_server::journal::store::{
-            CancellationMarkerSink, InMemoryAgentTaskStore, InMemoryAtomicSpawnEventCommitter,
+            CancellationMarkerSink, CompletedTurnSink, InMemoryAgentTaskStore,
+            InMemoryAtomicSpawnEventCommitter,
         };
         use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadJournalSink};
         use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
@@ -4325,6 +4457,8 @@ mod tests {
             std::sync::Arc::new(InMemoryMessageProjectionStore::new());
         let checkpoint: std::sync::Arc<InMemoryCheckpointStore> =
             std::sync::Arc::new(InMemoryCheckpointStore::new());
+        let attempt: std::sync::Arc<InMemoryTurnAttemptStore> =
+            std::sync::Arc::new(InMemoryTurnAttemptStore::new());
         let thread: std::sync::Arc<InMemoryThreadStore> =
             std::sync::Arc::new(InMemoryThreadStore::new().with_journal(ThreadJournalSink {
                 message_store: message.clone(),
@@ -4344,13 +4478,17 @@ mod tests {
                     outbox.as_ref().clone(),
                 ),
             ))
-            .with_message_store(message.clone());
+            .with_message_store(message.clone())
+            .with_completed_turns(CompletedTurnSink {
+                attempt_store: attempt.clone(),
+                checkpoint_store: checkpoint.clone(),
+            });
 
         InMemoryStores {
             task: std::sync::Arc::new(task),
             thread,
             message,
-            attempt: std::sync::Arc::new(InMemoryTurnAttemptStore::new()),
+            attempt,
             checkpoint,
             event,
             outbox,
@@ -4419,35 +4557,36 @@ mod tests {
     #[tokio::test]
     async fn conformance_sqlite_completed_turn() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_completed_turn_commit(&store, &store, &store, &store, &store, &store).await
+        test_completed_turn_commit(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn conformance_sqlite_stale_turn_commit_is_typed() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_stale_turn_commit_rejection_is_typed(&store, &store, &store, &store, &store, &store)
-            .await
+        test_stale_turn_commit_rejection_is_typed(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn conformance_sqlite_owner_guarded_commit_rejects_lost_ownership() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_owner_guarded_commit_rejects_lost_ownership(
-            &store, &store, &store, &store, &store, &store,
-        )
-        .await
+        test_owner_guarded_commit_rejects_lost_ownership(&store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_owner_guarded_commit_rejects_a_stolen_lease() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_owner_guarded_commit_rejects_a_stolen_lease(ThreadJournalStores::from(&store), &store)
+            .await
     }
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn conformance_sqlite_owner_guarded_commit_succeeds_while_owned() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_owner_guarded_commit_succeeds_while_owned(
-            &store, &store, &store, &store, &store, &store,
-        )
-        .await
+        test_owner_guarded_commit_succeeds_while_owned(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -5022,7 +5161,7 @@ mod tests {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_completed_turn_commit(&store, &store, &store, &store, &store, &store).await
+        test_completed_turn_commit(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]
@@ -5031,8 +5170,7 @@ mod tests {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_stale_turn_commit_rejection_is_typed(&store, &store, &store, &store, &store, &store)
-            .await
+        test_stale_turn_commit_rejection_is_typed(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]
@@ -5041,10 +5179,17 @@ mod tests {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_owner_guarded_commit_rejects_lost_ownership(
-            &store, &store, &store, &store, &store, &store,
-        )
-        .await
+        test_owner_guarded_commit_rejects_lost_ownership(&store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_owner_guarded_commit_rejects_a_stolen_lease() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_owner_guarded_commit_rejects_a_stolen_lease(ThreadJournalStores::from(&store), &store)
+            .await
     }
 
     #[cfg(feature = "postgres")]
@@ -5071,10 +5216,7 @@ mod tests {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_owner_guarded_commit_succeeds_while_owned(
-            &store, &store, &store, &store, &store, &store,
-        )
-        .await
+        test_owner_guarded_commit_succeeds_while_owned(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]
@@ -5814,6 +5956,7 @@ mod tests {
         store
             .commit_thread_creation(ThreadCreationCommit {
                 thread_id: created.clone(),
+                naming: agent_server::journal::thread_creation_transaction::ThreadNaming::Minted,
                 event: AgentEvent::thread_created(created.clone(), None, None),
                 outbox_max_attempts: 3,
                 now,
@@ -5943,6 +6086,7 @@ mod tests {
         let crashed =
             std::panic::AssertUnwindSafe(store.commit_thread_creation(ThreadCreationCommit {
                 thread_id: thread.clone(),
+                naming: agent_server::journal::thread_creation_transaction::ThreadNaming::Minted,
                 event: AgentEvent::thread_created(thread.clone(), None, None),
                 outbox_max_attempts: 3,
                 now: t0(),

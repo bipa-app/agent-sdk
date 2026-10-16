@@ -355,11 +355,6 @@ mod tests {
                 now: at,
             },
             store,
-            store,
-            store,
-            store,
-            store,
-            store,
         )
         .await
         .context("commit completed turn")?;
@@ -973,11 +968,6 @@ mod tests {
                 owner_guard: None,
                 now: at,
             },
-            store,
-            store,
-            store,
-            store,
-            store,
             store,
         )
         .await

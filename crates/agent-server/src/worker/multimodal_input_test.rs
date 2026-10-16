@@ -154,13 +154,24 @@ struct Stores {
 
 impl Stores {
     fn new() -> Self {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
+        let threads = InMemoryThreadStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
-            messages: InMemoryMessageProjectionStore::new(),
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            tasks: InMemoryAgentTaskStore::committing_turns_to(
+                &threads,
+                &messages,
+                &attempts,
+                &checkpoints,
+                &events,
+            ),
+            threads,
+            messages,
+            attempts,
+            checkpoints,
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }

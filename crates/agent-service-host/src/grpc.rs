@@ -25,7 +25,7 @@ use agent_server::journal::task_state::TaskState;
 use agent_server::journal::thread::{
     PurgeReceipt, PurgeScope, PurgeSeed, ThreadNotFound, ThreadOperation, ThreadStateConflict,
 };
-use agent_server::journal::thread_creation_transaction::ThreadCreationCommit;
+use agent_server::journal::thread_creation_transaction::{ThreadCreationCommit, ThreadNaming};
 use agent_server::journal::thread_store::BeginPurge;
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
@@ -738,24 +738,28 @@ struct GrpcEventService {
 }
 
 impl GrpcControlService {
-    /// Create an anonymous thread's aggregate, projection, `ThreadCreated`
-    /// event and its advisory in one store write.
-    async fn commit_anonymous_thread_creation(
+    /// Create a thread's aggregate, projection, `ThreadCreated` event and
+    /// its advisory in one store write. A caller-named id is claimed in
+    /// the same write; a retry of a creation that landed writes nothing.
+    async fn commit_thread_creation(
         &self,
         thread_id: &ThreadId,
+        naming: ThreadNaming,
         now: OffsetDateTime,
     ) -> Result<(), Status> {
-        self.shared
+        let _committed = self
+            .shared
             .stores
             .thread_store
             .commit_thread_creation(ThreadCreationCommit {
                 thread_id: thread_id.clone(),
+                naming,
                 event: AgentEvent::thread_created(thread_id.clone(), None, None),
                 outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
                 now,
             })
             .await
-            .map_err(internal_status("thread creation"))?;
+            .map_err(map_thread_creation_error("thread creation"))?;
         Ok(())
     }
 
@@ -1461,22 +1465,12 @@ impl AgentControlService for GrpcControlService {
         require_request_id(&request.request_id)?;
 
         if let Some(thread_id) = parse_caller_thread_id(&request.thread_id)? {
-            let now = OffsetDateTime::now_utc();
-            let _outcome = self
-                .shared
-                .stores
-                .thread_store
-                .get_or_create_for_creation(&thread_id, &ThreadCreation::Create, now)
-                .await
-                .map_err(map_thread_creation_error(
-                    "creating caller-addressed thread",
-                ))?;
-            self.shared
-                .stores
-                .message_store
-                .get_or_create(&thread_id, now)
-                .await
-                .map_err(internal_status("creating message projection"))?;
+            self.commit_thread_creation(
+                &thread_id,
+                ThreadNaming::CallerNamed,
+                OffsetDateTime::now_utc(),
+            )
+            .await?;
             return Ok(Response::new(pb::CreateThreadResponse {
                 thread: Some(self.shared.thread_view(&thread_id).await?),
             }));
@@ -1525,7 +1519,7 @@ impl AgentControlService for GrpcControlService {
 
         let now = OffsetDateTime::now_utc();
         let thread_id = ThreadId::new();
-        self.commit_anonymous_thread_creation(&thread_id, now)
+        self.commit_thread_creation(&thread_id, ThreadNaming::Minted, now)
             .await?;
 
         let result_json = serde_json::to_value(CreateThreadResult {
@@ -6794,6 +6788,12 @@ mod tests {
         ) -> Result<agent_server::journal::SubagentSpawnOutcome> {
             self.inner.commit_subagent_spawn(params).await
         }
+        async fn commit_completed_turn(
+            &self,
+            params: agent_server::journal::CompletedTurnCommit,
+        ) -> Result<agent_server::journal::CommitOutcome> {
+            self.inner.commit_completed_turn(params).await
+        }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.inner.insert(task).await
         }
@@ -7502,6 +7502,125 @@ mod tests {
                 .count(),
             1,
             "racing caller-addressed creates must insert one primary-key row",
+        );
+        Ok(())
+    }
+
+    /// `ThreadCreated` events and their advisories on `thread_id`.
+    async fn thread_created_counts(
+        stores: &StoreRegistry,
+        thread_id: &str,
+    ) -> Result<(usize, usize)> {
+        let thread_id = ThreadId::from_string(thread_id);
+        let created = stores
+            .event_repo
+            .get_events(&thread_id)
+            .await?
+            .iter()
+            .filter(|event| matches!(event.event, AgentEvent::ThreadCreated { .. }))
+            .count();
+        let advisories = stores
+            .outbox_store
+            .list_by_thread(&thread_id)
+            .await?
+            .iter()
+            .filter(|row| {
+                row.kind == agent_server::journal::outbox_message::OutboxMessageKind::ThreadEventsAvailable
+            })
+            .count();
+        Ok((created, advisories))
+    }
+
+    #[tokio::test]
+    async fn caller_named_create_emits_one_thread_created_and_none_on_replay() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let thread_id = caller_uuid(5);
+        caller_create_direct(&service, "created-once-1", &thread_id).await?;
+        assert_eq!(
+            thread_created_counts(&shared.stores, &thread_id).await?,
+            (1, 1)
+        );
+        caller_create_direct(&service, "created-once-2", &thread_id).await?;
+        assert_eq!(
+            thread_created_counts(&shared.stores, &thread_id).await?,
+            (1, 1),
+            "a replayed caller-named create emits nothing",
+        );
+        Ok(())
+    }
+
+    /// A caller-named `CreateThread` that crashes inside the store's
+    /// creation transaction leaves nothing behind: no thread, no head, no
+    /// event, no advisory and no creation identity, so the retry creates
+    /// the thread once. Split back into a claim and a separate head write,
+    /// the failpoint never fires and the create lands without its event.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caller_named_create_crash_on_sqlite_leaves_no_thread() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let temp = tempfile::tempdir()?;
+        let config = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Sqlite {
+                path: Some(temp.path().join("create.db").to_string_lossy().into_owned()),
+                max_connections: None,
+            },
+            postgres: crate::config::PostgresStorageConfig::default(),
+        };
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::from_config(&config, registry)?;
+        stores.initialize().await?;
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let shared = Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_secs(10),
+            AdmissionConfig::default(),
+        ));
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let thread_id = caller_uuid(6);
+
+        fail::cfg("atomic_create.after_rows", "panic")
+            .map_err(|error| anyhow!("configure create failpoint: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(service.create_thread(Request::new(
+            pb::CreateThreadRequest {
+                request_id: "crash-create-1".into(),
+                thread_id: thread_id.clone(),
+            },
+        )));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("atomic_create.after_rows");
+        assert!(
+            result.is_err(),
+            "the caller-named create must commit inside the store's creation transaction, got {:?}",
+            result.map(|outcome| outcome.map(|_| ()))
+        );
+        let id = ThreadId::from_string(&thread_id);
+        assert!(shared.stores.thread_store.get(&id).await?.is_none());
+        assert!(shared.stores.message_store.get(&id).await?.is_none());
+        assert_eq!(
+            thread_created_counts(&shared.stores, &thread_id).await?,
+            (0, 0)
+        );
+
+        caller_create_direct(&service, "crash-create-2", &thread_id).await?;
+        caller_create_direct(&service, "crash-create-3", &thread_id).await?;
+        assert_eq!(
+            thread_created_counts(&shared.stores, &thread_id).await?,
+            (1, 1),
+            "the retry creates the thread once, with no orphan creation identity",
         );
         Ok(())
     }

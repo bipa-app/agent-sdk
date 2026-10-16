@@ -1183,6 +1183,17 @@ pub struct CancellationMarkerSink {
     pub thread_store: Arc<dyn ThreadStore>,
 }
 
+/// The stores [`InMemoryAgentTaskStore`] writes a completed turn to beside
+/// the thread, message and event stores it already holds. Wire the same
+/// instances the rest of the composed in-memory backend reads.
+#[derive(Clone)]
+pub struct CompletedTurnSink {
+    /// Turn attempts a completed turn closes.
+    pub attempt_store: Arc<dyn super::turn_attempt_store::TurnAttemptStore>,
+    /// Checkpoints a completed turn writes.
+    pub checkpoint_store: Arc<dyn super::checkpoint_store::CheckpointStore>,
+}
+
 /// One thread-scoped event batch staged as part of an in-memory mixed spawn.
 #[derive(Clone, Debug)]
 pub struct AtomicSpawnEventBatch {
@@ -1657,6 +1668,27 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
         params: super::subagent_spawn_transaction::SubagentSpawnCommit,
     ) -> Result<super::subagent_spawn_transaction::SubagentSpawnOutcome>;
 
+    /// Commit a completed turn as one unit: close the turn attempt, advance
+    /// the thread aggregate, append the messages, write the checkpoint,
+    /// clear the in-flight draft, complete the delivered injections, and
+    /// append the lifecycle events with their coalesced
+    /// `thread_events_available` advisory.
+    ///
+    /// With [`CompletedTurnCommit::owner_guard`](super::commit::CompletedTurnCommit::owner_guard)
+    /// set, the task row must still be `Running` under that worker and
+    /// lease, checked inside the same unit.
+    ///
+    /// # Errors
+    /// - [`StaleTurnCommit`](super::commit::StaleTurnCommit) when the thread
+    ///   is not at `expected_turn - 1`.
+    /// - [`LostCommitOwnership`](super::commit::LostCommitOwnership) when the
+    ///   owner guard fails.
+    /// - Store-level write errors. The durable backends then write nothing.
+    async fn commit_completed_turn(
+        &self,
+        params: super::commit::CompletedTurnCommit,
+    ) -> Result<super::commit::CommitOutcome>;
+
     /// Insert a new task row. **Not a mutation API** — see the
     /// [CAS discipline](Self#cas-discipline-phase-27) table for the
     /// correct entry point for each state transition.
@@ -1817,24 +1849,6 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
         id: &AgentTaskId,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>>;
-
-    /// Complete every delivered boundary-injection row in `ids`.
-    ///
-    /// Provided default: one [`Self::complete_input_injection`] per id —
-    /// used by the non-atomic in-memory commit path, where each store
-    /// call is already atomic under its own write lock. Durable backends
-    /// never reach this: their completed-turn committer flips the rows
-    /// inside the commit transaction itself.
-    async fn complete_delivered_injections(
-        &self,
-        ids: &[AgentTaskId],
-        now: OffsetDateTime,
-    ) -> Result<()> {
-        for id in ids {
-            let _ = self.complete_input_injection(id, now).await?;
-        }
-        Ok(())
-    }
 
     /// The direct children of `parent_id`, read for the subagent stall probe
     /// with the READ ITSELF BOUNDED (ADR-0003 I5).
@@ -3126,8 +3140,36 @@ pub struct InMemoryAgentTaskStore {
     /// [`super::transition::Write::AppendCompaction`] writes to, under the
     /// same lock as its events. `None` refuses such a transition.
     message_store: Option<Arc<dyn super::message_store::MessageProjectionStore>>,
+    /// The attempt and checkpoint stores a completed turn writes to. `None`
+    /// refuses [`AgentTaskStore::commit_completed_turn`].
+    turn_sink: Option<Arc<CompletedTurnSink>>,
     /// Where the backstop probe over held rows resumes.
     held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
+}
+
+#[cfg(test)]
+impl InMemoryAgentTaskStore {
+    /// A task store that commits completed turns into the given stores,
+    /// with an outbox of its own for the advisories.
+    pub(crate) fn committing_turns_to(
+        threads: &super::thread_store::InMemoryThreadStore,
+        messages: &super::message_store::InMemoryMessageProjectionStore,
+        attempts: &super::turn_attempt_store::InMemoryTurnAttemptStore,
+        checkpoints: &super::checkpoint_store::InMemoryCheckpointStore,
+        events: &InMemoryEventRepository,
+    ) -> Self {
+        Self::new()
+            .with_cancellation_markers(CancellationMarkerSink {
+                event_repo: Arc::new(events.clone()),
+                outbox_store: Arc::new(InMemoryOutboxStore::new()),
+                thread_store: Arc::new(threads.clone()),
+            })
+            .with_message_store(Arc::new(messages.clone()))
+            .with_completed_turns(CompletedTurnSink {
+                attempt_store: Arc::new(attempts.clone()),
+                checkpoint_store: Arc::new(checkpoints.clone()),
+            })
+    }
 }
 
 /// A one-subagent mixed spawn as [`AgentTaskStore::commit_subagent_spawn`]
@@ -3448,6 +3490,15 @@ impl InMemoryAgentTaskStore {
         intent_store: Arc<dyn super::execution_intent::ExecutionIntentStore>,
     ) -> Self {
         self.intent_store = Some(intent_store);
+        self
+    }
+
+    /// Wire the attempt and checkpoint stores a completed turn writes to.
+    /// A completed turn also needs [`Self::with_cancellation_markers`] and
+    /// [`Self::with_message_store`].
+    #[must_use]
+    pub fn with_completed_turns(mut self, sink: CompletedTurnSink) -> Self {
+        self.turn_sink = Some(Arc::new(sink));
         self
     }
 
@@ -4271,6 +4322,51 @@ impl InMemoryAgentTaskStore {
 }
 
 impl Inner {
+    /// Complete one queued input-injection row; any other row is left
+    /// alone and yields `None`.
+    fn complete_input_injection(
+        &mut self,
+        id: &AgentTaskId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let Some(old) = self.by_id.get(id).cloned() else {
+            return Ok(None);
+        };
+        if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
+            return Ok(None);
+        }
+        let completed = old
+            .clone()
+            .complete_input_injection(now)
+            .context("complete input injection transition failed")?;
+        self.rebalance_after_row_change(&old, &completed);
+        self.by_id.insert(completed.id.clone(), completed.clone());
+        Ok(Some(completed))
+    }
+
+    /// Refuse a completed turn whose owner guard no longer holds the task:
+    /// the row must be `Running` under the guard's worker and lease.
+    fn enforce_commit_owner_guard(
+        &self,
+        task_id: &AgentTaskId,
+        owner_guard: Option<&super::commit::CommitOwnerGuard>,
+    ) -> Result<()> {
+        let Some(guard) = owner_guard else {
+            return Ok(());
+        };
+        let owned = self.by_id.get(task_id).is_some_and(|task| {
+            task.status == TaskStatus::Running
+                && task.worker_id.as_ref() == Some(&guard.worker_id)
+                && task.lease_id.as_ref() == Some(&guard.lease_id)
+        });
+        if owned {
+            return Ok(());
+        }
+        Err(anyhow::Error::new(super::commit::LostCommitOwnership {
+            task_id: task_id.clone(),
+        }))
+    }
+
     fn add_to_indexes(&mut self, task: &AgentTask) {
         self.by_thread
             .entry(task.thread_id.clone())
@@ -5577,6 +5673,117 @@ impl InMemoryAgentTaskStore {
 
 #[async_trait]
 impl AgentTaskStore for InMemoryAgentTaskStore {
+    /// Holds the task store's write lock across every write, so the owner
+    /// guard is checked against the row a lease change would have to
+    /// rewrite, and two completed turns never interleave. Every check runs
+    /// before the first write. The in-memory store is not durable: a write
+    /// that fails after the first one cannot roll the earlier ones back.
+    async fn commit_completed_turn(
+        &self,
+        params: super::commit::CompletedTurnCommit,
+    ) -> Result<super::commit::CommitOutcome> {
+        let (Some(marker_sink), Some(message_store), Some(turn_sink)) =
+            (&self.marker_sink, &self.message_store, &self.turn_sink)
+        else {
+            return Err(anyhow!(
+                "a completed turn needs the in-memory task store's cancellation markers, \
+                 message store and completed-turn sink (InMemoryAgentTaskStore::\
+                 with_cancellation_markers, with_message_store, with_completed_turns)"
+            ));
+        };
+        let mut inner = self.inner.write().await;
+        inner.enforce_commit_owner_guard(&params.task_id, params.owner_guard.as_ref())?;
+        let committed_turns = match marker_sink.thread_store.get(&params.thread_id).await? {
+            Some(thread) => {
+                thread
+                    .require_active(super::thread::ThreadOperation::Commit)
+                    .context("commit: advance thread aggregate")?;
+                thread.committed_turns
+            }
+            None => 0,
+        };
+        if committed_turns.saturating_add(1) != params.expected_turn {
+            return Err(anyhow::Error::new(super::commit::StaleTurnCommit {
+                expected_turn: params.expected_turn,
+                committed_turns,
+            }));
+        }
+
+        let closed_attempt = turn_sink
+            .attempt_store
+            .close_attempt(
+                &params.turn_attempt_id,
+                params.close_attempt_params,
+                params.now,
+            )
+            .await
+            .context("commit: close turn attempt")?;
+        let thread = marker_sink
+            .thread_store
+            .commit_turn(
+                &params.thread_id,
+                params.expected_turn,
+                &params.turn_usage,
+                params.now,
+            )
+            .await
+            .context("commit: advance thread aggregate")?;
+        let updated_projection = message_store
+            .commit_messages(&params.thread_id, params.messages, params.now)
+            .await
+            .context("commit: append messages")?;
+        let checkpoint = turn_sink
+            .checkpoint_store
+            .commit_checkpoint(super::checkpoint::NewCheckpointParams {
+                thread_id: params.thread_id.clone(),
+                turn_number: thread.committed_turns,
+                task_id: params.task_id,
+                messages: updated_projection.context_history(),
+                agent_state_snapshot: params.agent_state_snapshot,
+                turn_usage: params.turn_usage,
+                kind: params.checkpoint_kind,
+                now: params.now,
+            })
+            .await
+            .context("commit: create checkpoint")?;
+        message_store
+            .clear_draft(&params.thread_id, params.now)
+            .await
+            .context("commit: clear in-flight draft")?;
+
+        crate::fail_point!("commit.before_event_commit");
+
+        for id in &params.delivered_injection_ids {
+            let _ = inner.complete_input_injection(id, params.now)?;
+        }
+        let committed_events = if params.events.is_empty() {
+            Vec::new()
+        } else {
+            let committed = marker_sink
+                .event_repo
+                .commit_event_batch(&params.thread_id, params.events, params.now)
+                .await
+                .context("commit: persist lifecycle events")?;
+            if let Some(last) = committed.last() {
+                super::outbox::insert_events_available_advisory(
+                    marker_sink.outbox_store.as_ref(),
+                    last,
+                    params.outbox_max_attempts,
+                    params.now,
+                )
+                .await?;
+            }
+            committed
+        };
+        drop(inner);
+        Ok(super::commit::CommitOutcome {
+            thread,
+            checkpoint,
+            closed_attempt,
+            committed_events,
+        })
+    }
+
     async fn insert(&self, task: AgentTask) -> Result<()> {
         task.validate()
             .context("insert rejected: task failed schema validation")?;
@@ -5667,20 +5874,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let mut inner = self.inner.write().await;
-        let Some(old) = inner.by_id.get(id).cloned() else {
-            return Ok(None);
-        };
-        if old.kind != TaskKind::InputInjection || old.status != TaskStatus::Queued {
-            return Ok(None);
-        }
-        let completed = old
-            .clone()
-            .complete_input_injection(now)
-            .context("complete input injection transition failed")?;
-        inner.rebalance_after_row_change(&old, &completed);
-        inner.by_id.insert(completed.id.clone(), completed.clone());
+        let completed = inner.complete_input_injection(id, now)?;
         drop(inner);
-        Ok(Some(completed))
+        Ok(completed)
     }
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {

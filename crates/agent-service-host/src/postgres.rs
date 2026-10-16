@@ -412,11 +412,11 @@ mod tests {
 
         let commit_with_outbox = units
             .iter()
-            .find(|u| u.name == "commit_events_with_outbox")
-            .context("missing commit_events_with_outbox unit of work")?;
+            .find(|u| u.name == "append_events_with_advisory")
+            .context("missing append_events_with_advisory unit of work")?;
         ensure!(
             commit_with_outbox.tables == ["agent_sdk_committed_events", "agent_sdk_outbox"],
-            "commit_events_with_outbox tables drifted: {:?}",
+            "append_events_with_advisory tables drifted: {:?}",
             commit_with_outbox.tables,
         );
 

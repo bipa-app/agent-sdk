@@ -89,13 +89,24 @@ struct ReplayStores {
 
 impl ReplayStores {
     fn new() -> Self {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
+        let threads = InMemoryThreadStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
-            messages: InMemoryMessageProjectionStore::new(),
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            tasks: crate::journal::store::InMemoryAgentTaskStore::committing_turns_to(
+                &threads,
+                &messages,
+                &attempts,
+                &checkpoints,
+                &events,
+            ),
+            threads,
+            messages,
+            attempts,
+            checkpoints,
+            events,
         }
     }
 
@@ -163,17 +174,9 @@ impl ReplayStores {
             let params = self
                 .open_attempt(turn, u32::try_from(i + 1).context("attempt number")?)
                 .await?;
-            commit_completed_turn(
-                params,
-                &self.tasks,
-                &self.threads,
-                &self.messages,
-                &self.attempts,
-                &self.checkpoints,
-                &self.events,
-            )
-            .await
-            .with_context(|| format!("replay commit turn {i}"))?;
+            commit_completed_turn(params, &self.tasks)
+                .await
+                .with_context(|| format!("replay commit turn {i}"))?;
         }
         Ok(())
     }

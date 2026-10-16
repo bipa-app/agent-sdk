@@ -30,7 +30,6 @@
 //! | `load()` returns an independent deep-equal copy | every `get*` returns owned clones |
 //! | `load()` of unknown key → `None` | `get`/`get_history` on a fresh thread |
 //! | semantic (not byte) equality on roundtrip | JSON-value comparison, not string comparison |
-//! | optional methods absent → auto-skip | [`EventRepository::atomic_event_outbox_committer`] |
 //! | `delete()` cascades main→subkeys | [`AgentTaskStore::clear`] across parent/child chains |
 //! | safe no-op delete for append-only | [`CheckpointStore::delete_checkpoints_beyond_limit`] when under the cap |
 //! | subkey vs main-session count separation | root tasks vs child tasks ([`AgentTask::is_root`]) |
@@ -46,12 +45,10 @@
 //!
 //! # Failing loudly
 //!
-//! The battery fails loudly if a backend violates a contract. The only
-//! silent skip is for genuinely-optional methods (the atomic
-//! event+outbox committer, which in-memory backends legitimately do not
-//! provide); even there, the skip is recorded in
+//! The battery fails loudly if a backend violates a contract, and it
+//! skips nothing: every case runs on every backend, and
 //! [`ConformanceReport`](crate::journal::conformance::ConformanceReport)
-//! so a caller can assert which arms actually ran.
+//! records which arms ran.
 
 use std::sync::Arc;
 
@@ -144,6 +141,9 @@ impl InMemoryJournalStore {
         // The sink's Arc owns the outbox; the bundle itself does not
         // expose an OutboxStore surface, so no field is kept.
         let outbox = super::outbox::InMemoryOutboxStore::new();
+        let message = super::message_store::InMemoryMessageProjectionStore::new();
+        let attempt = super::turn_attempt_store::InMemoryTurnAttemptStore::new();
+        let checkpoint = super::checkpoint_store::InMemoryCheckpointStore::new();
         let task = super::store::InMemoryAgentTaskStore::new()
             .with_cancellation_markers(super::store::CancellationMarkerSink {
                 event_repo: std::sync::Arc::new(event.clone()),
@@ -152,13 +152,18 @@ impl InMemoryJournalStore {
             })
             .with_spawn_event_committer(std::sync::Arc::new(
                 super::store::InMemoryAtomicSpawnEventCommitter::new(event.clone(), outbox),
-            ));
+            ))
+            .with_message_store(std::sync::Arc::new(message.clone()))
+            .with_completed_turns(super::store::CompletedTurnSink {
+                attempt_store: std::sync::Arc::new(attempt.clone()),
+                checkpoint_store: std::sync::Arc::new(checkpoint.clone()),
+            });
         Self {
             task,
             thread,
-            message: super::message_store::InMemoryMessageProjectionStore::new(),
-            attempt: super::turn_attempt_store::InMemoryTurnAttemptStore::new(),
-            checkpoint: super::checkpoint_store::InMemoryCheckpointStore::new(),
+            message,
+            attempt,
+            checkpoint,
             event,
         }
     }
@@ -184,7 +189,6 @@ mod in_memory_bundle {
     };
     use crate::journal::checkpoint::{Checkpoint, CheckpointId, NewCheckpointParams};
     use crate::journal::committed_event::CommittedEvent;
-    use crate::journal::event_outbox_transaction::AtomicEventOutboxCommitter;
     use crate::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
     use crate::journal::message::MessageProjection;
     use crate::journal::recovery::RecoveryRecord;
@@ -222,6 +226,12 @@ mod in_memory_bundle {
             params: crate::journal::SubagentSpawnCommit,
         ) -> Result<crate::journal::SubagentSpawnOutcome> {
             self.task.commit_subagent_spawn(params).await
+        }
+        async fn commit_completed_turn(
+            &self,
+            params: crate::journal::CompletedTurnCommit,
+        ) -> Result<crate::journal::CommitOutcome> {
+            self.task.commit_completed_turn(params).await
         }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.task.insert(task).await
@@ -598,13 +608,10 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl ThreadStore for InMemoryJournalStore {
-        fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-            self.thread.sequential_commit_lock()
-        }
         async fn commit_thread_creation(
             &self,
             params: crate::journal::ThreadCreationCommit,
-        ) -> Result<crate::journal::ThreadCreationRows> {
+        ) -> Result<crate::journal::ThreadCreationCommitted> {
             self.thread.commit_thread_creation(params).await
         }
         async fn commit_fork(
@@ -817,9 +824,6 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl EventRepository for InMemoryJournalStore {
-        fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
-            self.event.atomic_event_outbox_committer()
-        }
         async fn commit_event(
             &self,
             thread_id: &ThreadId,
@@ -1818,25 +1822,17 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
 
 /// Outcome of one [`run_journal_store_conformance`] run.
 ///
-/// Records which conformance cases ran and which optional cases were
-/// auto-skipped because the backend legitimately does not provide the
-/// optional method. A caller can assert that the expected arms ran (no
-/// silent skips of mandatory cases).
+/// Records which conformance cases ran, so a caller can assert that the
+/// expected arms ran.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConformanceReport {
     /// Names of mandatory cases that ran and passed.
     pub passed: Vec<String>,
-    /// Names of optional cases that auto-skipped (with the reason).
-    pub skipped: Vec<(String, String)>,
 }
 
 impl ConformanceReport {
     fn passed(&mut self, name: &str) {
         self.passed.push(name.to_owned());
-    }
-
-    fn skipped(&mut self, name: &str, reason: &str) {
-        self.skipped.push((name.to_owned(), reason.to_owned()));
     }
 }
 
@@ -1850,8 +1846,8 @@ impl ConformanceReport {
 /// to self-verify. It exercises every conformance case in the plan's
 /// §A2.1 / §6.1 edge-case matrix, adapted to the real journal traits.
 ///
-/// On success it returns a [`ConformanceReport`] listing which cases ran
-/// and which optional cases auto-skipped. On the first contract
+/// On success it returns a [`ConformanceReport`] listing which cases ran.
+/// On the first contract
 /// violation it returns an error describing the failure — the battery
 /// never silently swallows a mandatory-case failure.
 ///
@@ -1881,8 +1877,6 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_semantic_equality_on_roundtrip(store).await?;
     report.passed("semantic_equality_on_roundtrip");
-
-    case_optional_method_absent_autoskips(store, &mut report);
 
     case_delete_cascades_main_to_subkeys(store).await?;
     report.passed("delete_cascades_main_to_subkeys");
@@ -2544,26 +2538,6 @@ async fn case_semantic_equality_on_roundtrip<S: JournalStore>(store: &S) -> Resu
     Ok(())
 }
 
-// ── optional methods absent → auto-skip ──────────────────────────────
-
-fn case_optional_method_absent_autoskips<S: JournalStore>(
-    store: &S,
-    report: &mut ConformanceReport,
-) {
-    // The atomic event+outbox committer is a genuinely-optional method:
-    // in-memory backends return None, durable backends return Some.
-    // When present, it must be usable; when absent, we auto-skip — the
-    // one legitimate skip in the battery.
-    if EventRepository::atomic_event_outbox_committer(store).is_some() {
-        report.passed("optional_atomic_outbox_committer_present");
-    } else {
-        report.skipped(
-            "optional_atomic_outbox_committer",
-            "backend does not provide an atomic event+outbox committer",
-        );
-    }
-}
-
 // ── delete cascades main→subkeys ─────────────────────────────────────
 
 async fn case_delete_cascades_main_to_subkeys<S: JournalStore>(store: &S) -> Result<()> {
@@ -3131,11 +3105,6 @@ async fn commit_one_turn<S: JournalStore>(
             now,
         },
         store,
-        store,
-        store,
-        store,
-        store,
-        store,
     )
     .await?;
     Ok(outcome.checkpoint)
@@ -3236,18 +3205,6 @@ async fn case_before_plus_limit_pagination<S: JournalStore>(store: &S) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The bundle must forward the inner thread store's
-    /// sequential-commit lock — a `None` here silently disables
-    /// in-process commit serialization for every bundle consumer.
-    #[tokio::test]
-    async fn bundle_forwards_the_sequential_commit_lock() {
-        let store = InMemoryJournalStore::new();
-        assert!(
-            ThreadStore::sequential_commit_lock(&store).is_some(),
-            "the bundle must expose the inner store's sequential-commit lock",
-        );
-    }
 
     /// The requeue boundary event is atomic with the ownership CAS —
     /// it lands (before the row is acquirable) on a `Requeued`
@@ -3372,9 +3329,6 @@ mod tests {
         let store = InMemoryJournalStore::new();
         let report = run_journal_store_conformance(&store).await?;
 
-        // Every mandatory case ran; the optional outbox committer is
-        // legitimately absent on the in-memory backend, so it is the one
-        // recorded skip.
         assert!(
             report
                 .passed
@@ -3392,14 +3346,6 @@ mod tests {
                 .passed
                 .contains(&"mixed_batch_spawns_subagents_and_tools".to_owned()),
             "the mixed-batch atomicity case must run",
-        );
-        assert_eq!(
-            report.skipped,
-            vec![(
-                "optional_atomic_outbox_committer".to_owned(),
-                "backend does not provide an atomic event+outbox committer".to_owned(),
-            )],
-            "the only skip is the genuinely-optional outbox committer",
         );
         assert!(
             report.passed.len() >= 21,

@@ -72,12 +72,18 @@ async fn worker_publishes_estimate_at_dispatch_and_anchors_on_settle() -> Result
     // Unique thread id: the registry under test is process-global.
     let thread_id = ThreadId::from_string("t-ctx-estimate-worker");
 
-    let tasks = InMemoryAgentTaskStore::new();
     let threads = InMemoryThreadStore::new();
     let messages = InMemoryMessageProjectionStore::new();
     let attempts = InMemoryTurnAttemptStore::new();
     let checkpoints = InMemoryCheckpointStore::new();
     let events = InMemoryEventRepository::new();
+    let tasks = InMemoryAgentTaskStore::committing_turns_to(
+        &threads,
+        &messages,
+        &attempts,
+        &checkpoints,
+        &events,
+    );
     let event_notifier = Arc::new(EventNotifier::new());
 
     let task = AgentTask::new_root_turn(thread_id.clone(), t0(), 3);

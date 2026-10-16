@@ -1397,11 +1397,6 @@ pub(crate) async fn commit_partial_turn_on_cancel(
             now,
         },
         deps.task_store,
-        deps.thread_store,
-        deps.message_store,
-        deps.attempt_store,
-        deps.checkpoint_store,
-        deps.event_repo,
     )
     .await;
     if let Err(error) = commit_result {
@@ -1410,9 +1405,9 @@ pub(crate) async fn commit_partial_turn_on_cancel(
         // error) must not leak it open forever on a soon-terminal task —
         // nothing sweeps orphaned attempts, and the cancel seam's
         // snapshot-scoped close was taken before this attempt existed.
-        // Best-effort: the atomic backends roll the in-transaction close
-        // back on failure (row still open), while the in-memory
-        // non-atomic path may have already closed it (step 1) — that
+        // Best-effort: the durable backends roll the in-transaction close
+        // back on failure (row still open), while the in-memory store
+        // may have already closed it before a later write failed — that
         // close then rejects `AlreadyClosed` and is swallowed.
         close_attempt_with(
             &synthetic,
@@ -2445,29 +2440,25 @@ fn remap_turn_indexed_events(events: &mut [AgentEvent], turn: usize) {
 ///   The original CAS error propagates unchanged.
 ///
 /// The retry is safe because a rejected commit leaves no side effects
-/// on any backend: the in-memory guard runs before the first
-/// projection write, and the durable committers roll the whole
-/// transaction back (the attempt row stays open for the retry to
-/// close).
+/// on any backend: the in-memory task store runs its stale-turn and
+/// owner checks before the first projection write, and the durable
+/// stores roll the whole transaction back (the attempt row stays open
+/// for the retry to close).
 ///
 /// # Ownership is re-validated INSIDE the retried commit
 ///
 /// The eligibility re-read in [`shifted_turn_slot`] and the retried
 /// commit are not atomic — a cancellation or lease loss can land
 /// between them. The retry therefore carries
-/// [`CompletedTurnCommit::owner_guard`]: the durable committers
-/// re-read the task row inside the commit transaction (`FOR UPDATE`
-/// on Postgres) and reject with
+/// [`CompletedTurnCommit::owner_guard`]: every store re-reads the task
+/// row inside the commit (`FOR UPDATE` on Postgres, `SQLite`'s write
+/// transaction, the in-memory task store's write lock) and rejects with
 /// [`LostCommitOwnership`](crate::journal::commit::LostCommitOwnership)
 /// unless the row is still `Running` under this `(worker, lease)` —
 /// so a shifted commit can never splice a dead root's turn into the
-/// slot on a durable backend. The non-atomic in-memory backend cannot
-/// enforce the guard transactionally (no cross-store transaction);
-/// there the pre-retry re-read is the strongest available check and a
-/// residual in-process window remains — the same class as every other
-/// non-atomic in-memory commit step. Closing that generally (CAS task
-/// ownership inside every completed-turn commit) is a store-level
-/// follow-up; it was deliberately scoped to the shifted retry here
+/// slot. Closing that generally (CAS task
+/// ownership inside every completed-turn commit) is a follow-up; it
+/// was deliberately scoped to the shifted retry here
 /// because unconditional fencing would discard fully-billed answers
 /// on benign cancel-after-completion races.
 ///
@@ -2529,17 +2520,7 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
         .await;
         let error = match precheck {
             Ok(()) => {
-                match commit_completed_turn(
-                    params.clone(),
-                    deps.task_store,
-                    deps.thread_store,
-                    deps.message_store,
-                    deps.attempt_store,
-                    deps.checkpoint_store,
-                    deps.event_repo,
-                )
-                .await
-                {
+                match commit_completed_turn(params.clone(), deps.task_store).await {
                     Ok(outcome) => {
                         // The thread aggregate just took ownership of this
                         // turn's tokens; the beacon must stop reporting them.
@@ -2605,9 +2586,9 @@ pub(crate) async fn commit_completed_turn_shifting_slot(
         {
             *turn_count = serde_json::json!(next_turn);
         }
-        // Every shifted retry is owner-guarded: the durable committers
-        // re-validate (Running, worker, lease) on the task row inside
-        // the commit transaction, closing the guard→retry TOCTOU.
+        // Every shifted retry is owner-guarded: the store re-validates
+        // (Running, worker, lease) on the task row inside the commit,
+        // closing the guard→retry TOCTOU.
         params.owner_guard = Some(CommitOwnerGuard {
             worker_id: worker_id.clone(),
             lease_id: lease_id.clone(),
@@ -2690,10 +2671,14 @@ async fn shifted_turn_slot(
     //    successor's history. This re-read is only the ELIGIBILITY
     //    check — it is not atomic with the retried commit. The
     //    authoritative enforcement is the `owner_guard` the retry
-    //    carries: the durable committers re-validate (Running, worker,
-    //    lease) on the task row INSIDE the commit transaction. On the
-    //    non-atomic in-memory backend this re-read is the strongest
-    //    available check (documented residual window).
+    //    carries: the store re-validates (Running, worker, lease) on
+    //    the task row inside the commit.
+    //
+    //    On the in-memory backend this read also waits for any
+    //    completed turn in flight, which holds the task store's write
+    //    lock from its stale-turn check through its checkpoint write;
+    //    so the checkpoint lookup below sees the commit whose
+    //    aggregate advance we lost to.
     let own_row = match deps.task_store.get(&params.task_id).await {
         Ok(row) => row,
         Err(error) => {
@@ -2717,34 +2702,19 @@ async fn shifted_turn_slot(
     //    task. Our own task id there means this call is a duplicate of
     //    a commit that already landed — rejecting is the idempotency
     //    guarantee the CAS exists for.
-    //
-    // The read synchronizes on the sequential-commit lock when the
-    // backend exposes one: the in-memory committer
-    // holds that lock from the stale-turn pre-check through the
-    // checkpoint write, so acquiring it here guarantees any commit
-    // whose aggregate advance we lost to has finished writing its
-    // checkpoint — a `None` under the lock is authoritative, not a
-    // visibility gap. Durable backends return no lock; their atomic
-    // transaction gives the same read consistency.
-    let occupant = {
-        let _commit_guard = match deps.thread_store.sequential_commit_lock() {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        match deps
-            .checkpoint_store
-            .get_by_turn(&params.thread_id, params.expected_turn)
-            .await
-        {
-            Ok(occupant) => occupant,
-            Err(error) => {
-                log::warn!(
-                    "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
-                    params.expected_turn,
-                    params.thread_id,
-                );
-                return None;
-            }
+    let occupant = match deps
+        .checkpoint_store
+        .get_by_turn(&params.thread_id, params.expected_turn)
+        .await
+    {
+        Ok(occupant) => occupant,
+        Err(error) => {
+            log::warn!(
+                "turn-slot shift: checkpoint lookup for turn {} on thread {} failed: {error:#}",
+                params.expected_turn,
+                params.thread_id,
+            );
+            return None;
         }
     };
     match occupant {
@@ -2775,8 +2745,7 @@ async fn shifted_turn_slot(
     }
 
     // 3. Advance exactly ONE slot. The thread may have advanced
-    //    further (two late commits can land back-to-back on the
-    //    non-atomic in-memory backend), but jumping straight to the
+    //    further (two late commits can land back-to-back), but jumping straight to the
     //    head would skip validating the intervening occupants — one of
     //    them could be a billed full turn the shift must refuse.
     //    Landing on the very next slot re-collides when it is also

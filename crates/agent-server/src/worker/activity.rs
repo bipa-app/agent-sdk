@@ -35,7 +35,6 @@ use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{ThreadId, TokenUsage};
 
 use crate::journal::committed_event::CommittedEvent;
-use crate::journal::event_outbox_transaction::AtomicEventOutboxCommitter;
 use crate::journal::event_repository::EventRepository;
 
 /// A shared, monotonic clock of the newest sign of work on one task.
@@ -210,16 +209,6 @@ impl ActivityBeacon {
 ///
 /// Only *successful* commits count — the `?` short-circuits on error, so a
 /// failed write is not evidence of work.
-///
-/// ## Known boundary
-///
-/// [`EventRepository::atomic_event_outbox_committer`] hands out a raw committer
-/// that writes events **without** passing through [`Self::commit_event`], so a
-/// caller using it would bypass the beacon. It is delegated unchanged (there is
-/// no production caller on any commit path today, and suppressing it would
-/// silently drop the backends' atomic event+outbox unit of work). If a commit
-/// path ever adopts that hook it must bump the beacon itself — see ADR-0003's
-/// Consequences.
 pub struct ActivityTrackingEventRepo<'a> {
     inner: &'a dyn EventRepository,
     activity: ActivityBeacon,
@@ -234,10 +223,6 @@ impl<'a> ActivityTrackingEventRepo<'a> {
 
 #[async_trait]
 impl EventRepository for ActivityTrackingEventRepo<'_> {
-    fn atomic_event_outbox_committer(&self) -> Option<&dyn AtomicEventOutboxCommitter> {
-        self.inner.atomic_event_outbox_committer()
-    }
-
     async fn commit_event(
         &self,
         thread_id: &ThreadId,

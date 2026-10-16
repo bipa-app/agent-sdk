@@ -380,6 +380,8 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
         // Mirror the composed in-memory backend: `cancel_tree` commits
         // its terminal `Cancelled` markers through the shared event /
         // outbox / thread stores (issue #354).
@@ -399,13 +401,17 @@ impl TestStores {
                     outbox.clone(),
                 ),
             ))
-            .with_message_store(Arc::new(messages.clone()));
+            .with_message_store(Arc::new(messages.clone()))
+            .with_completed_turns(crate::journal::store::CompletedTurnSink {
+                attempt_store: std::sync::Arc::new(attempts.clone()),
+                checkpoint_store: std::sync::Arc::new(checkpoints.clone()),
+            });
         Self {
             tasks,
             threads,
             messages,
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
+            attempts,
+            checkpoints,
             events,
             outbox,
             event_notifier: Arc::new(EventNotifier::new()),
@@ -11792,11 +11798,6 @@ impl SalvageRacingAttemptStore {
                     now,
                 },
                 &self.stores.tasks,
-                &self.stores.threads,
-                &self.stores.messages,
-                &self.inner,
-                &self.stores.checkpoints,
-                &self.stores.events,
             )
             .await
             .context("racing salvage commit")?;

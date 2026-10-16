@@ -913,13 +913,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl EventRepository for RacingEventRepo {
-        fn atomic_event_outbox_committer(
-            &self,
-        ) -> Option<&dyn crate::journal::event_outbox_transaction::AtomicEventOutboxCommitter>
-        {
-            None
-        }
-
         async fn commit_event(
             &self,
             thread_id: &ThreadId,

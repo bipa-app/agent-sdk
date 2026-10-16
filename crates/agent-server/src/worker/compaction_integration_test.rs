@@ -333,6 +333,8 @@ struct Fixtures {
 
 impl Fixtures {
     fn new() -> Self {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
         let threads = InMemoryThreadStore::new();
         let messages = InMemoryMessageProjectionStore::new();
         let events = InMemoryEventRepository::new();
@@ -342,13 +344,17 @@ impl Fixtures {
                 outbox_store: Arc::new(InMemoryOutboxStore::new()),
                 thread_store: Arc::new(threads.clone()),
             })
-            .with_message_store(Arc::new(messages.clone()));
+            .with_message_store(Arc::new(messages.clone()))
+            .with_completed_turns(crate::journal::store::CompletedTurnSink {
+                attempt_store: std::sync::Arc::new(attempts.clone()),
+                checkpoint_store: std::sync::Arc::new(checkpoints.clone()),
+            });
         Self {
             tasks,
             threads,
             messages,
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
+            attempts,
+            checkpoints,
             events,
             event_notifier: Arc::new(EventNotifier::new()),
         }

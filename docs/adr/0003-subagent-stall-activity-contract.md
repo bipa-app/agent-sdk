@@ -295,12 +295,11 @@ for call sites that do not exist yet. `RootTurnDeps::wire_activity` sets
 the beacon and the decorated repository **together**, because wiring one
 without the other is precisely the bug.
 
-**Known boundary:** `EventRepository::atomic_event_outbox_committer` hands
-out a raw committer that writes events *without* passing through
-`commit_event`. It is delegated unchanged (no production commit path uses
-it today, and suppressing it would drop the backends' atomic event+outbox
-unit of work). A commit path that adopts that hook must bump the beacon
-itself.
+**Known boundary:** a store transaction that appends its own events
+(`DurableStore::commit`, `AgentTaskStore::commit_completed_turn`, and the
+thread creation, fork and subagent spawn methods) writes them *without*
+passing through `commit_event`, so it does not bump the beacon. A commit
+path that must count as activity bumps the beacon itself.
 
 ---
 

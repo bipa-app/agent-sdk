@@ -270,18 +270,27 @@ mod tests {
         messages: InMemoryMessageProjectionStore,
         attempts: InMemoryTurnAttemptStore,
         checkpoints: InMemoryCheckpointStore,
-        events: InMemoryEventRepository,
     }
 
     impl Stores {
         fn new() -> Self {
+            let threads = InMemoryThreadStore::new();
+            let messages = InMemoryMessageProjectionStore::new();
+            let attempts = InMemoryTurnAttemptStore::new();
+            let checkpoints = InMemoryCheckpointStore::new();
+            let tasks = crate::journal::store::InMemoryAgentTaskStore::committing_turns_to(
+                &threads,
+                &messages,
+                &attempts,
+                &checkpoints,
+                &InMemoryEventRepository::new(),
+            );
             Self {
-                tasks: crate::journal::store::InMemoryAgentTaskStore::new(),
-                threads: InMemoryThreadStore::new(),
-                messages: InMemoryMessageProjectionStore::new(),
-                attempts: InMemoryTurnAttemptStore::new(),
-                checkpoints: InMemoryCheckpointStore::new(),
-                events: InMemoryEventRepository::new(),
+                tasks,
+                threads,
+                messages,
+                attempts,
+                checkpoints,
             }
         }
 
@@ -331,11 +340,6 @@ mod tests {
                     now: at,
                 },
                 &self.tasks,
-                &self.threads,
-                &self.messages,
-                &self.attempts,
-                &self.checkpoints,
-                &self.events,
             )
             .await
         }

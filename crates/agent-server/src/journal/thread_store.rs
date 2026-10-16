@@ -35,7 +35,6 @@ use tokio::sync::RwLock;
 
 use super::checkpoint_store::CheckpointStore;
 use super::committed_event::CommittedEvent;
-use super::completed_turn_transaction::AtomicCompletedTurnCommitter;
 use super::event_repository::EventRepository;
 use super::fork_transaction::ForkCommitParams;
 use super::message_store::MessageProjectionStore;
@@ -43,7 +42,9 @@ use super::outbox::{OutboxStore, insert_events_available_advisory};
 use super::thread::{
     PurgeReceipt, PurgeSeed, Thread, ThreadNotFound, ThreadOperation, ThreadStatus,
 };
-use super::thread_creation_transaction::{ThreadCreationCommit, ThreadCreationRows};
+use super::thread_creation_transaction::{
+    ThreadCreationCommit, ThreadCreationCommitted, ThreadCreationRows, ThreadNaming,
+};
 
 /// Parameters that define the operation which first claimed a thread id.
 ///
@@ -146,28 +147,22 @@ pub enum BeginPurge {
 
 #[async_trait]
 pub trait ThreadStore: Send + Sync {
-    /// Optional backend-specific hook that can commit the completed
-    /// turn projections inside one durable transaction.
-    ///
-    /// In-memory stores leave this as `None`; durable backends such as
-    /// Postgres override it to surface an atomic commit boundary to
-    /// [`super::commit::commit_completed_turn`].
-    #[must_use]
-    fn atomic_completed_turn_committer(&self) -> Option<&dyn AtomicCompletedTurnCommitter> {
-        None
-    }
-
     /// Create a thread, its empty message projection, its creation event
     /// and the event's coalesced `thread_events_available` advisory as one
-    /// unit.
+    /// unit. A [`ThreadNaming::CallerNamed`] creation also claims the id's
+    /// creation identity in that unit; when the id already holds exactly
+    /// that identity it returns [`ThreadCreationCommitted::Existing`] and
+    /// writes nothing.
     ///
     /// # Errors
-    /// Returns an error if the thread is not active or a write fails; the
-    /// durable backends then write nothing.
+    /// - [`ThreadIdConflict`] when a caller-named id was claimed by
+    ///   different parameters, or exists without a creation identity.
+    /// - The thread is not active, or a write fails. The durable backends
+    ///   then write nothing.
     async fn commit_thread_creation(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows>;
+    ) -> Result<ThreadCreationCommitted>;
 
     /// Write a fork's destination as one unit: the thread aggregate (with
     /// its creation identity when `params.creation` is set), the mirrored
@@ -208,22 +203,6 @@ pub trait ThreadStore: Send + Sync {
         creation: &ThreadCreation,
         now: OffsetDateTime,
     ) -> Result<ThreadCreationOutcome>;
-
-    /// Optional process-wide serialization lock for the NON-ATOMIC
-    /// sequential commit path in [`super::commit::commit_completed_turn`].
-    ///
-    /// A backend with no atomic completed-turn transaction (the
-    /// in-memory store) returns its lock here; the sequential path
-    /// holds it across the stale-turn pre-check and every projection
-    /// step, so two in-process committers can never interleave — the
-    /// loser is rejected by the pre-check BEFORE closing its attempt,
-    /// which is what keeps the slot-shift retry viable. Durable
-    /// backends return `None`: their atomic committer
-    /// hook bypasses the sequential path entirely, and transaction
-    /// rollback already provides the same guarantee.
-    fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-        None
-    }
 
     /// Look up a thread by id.
     ///
@@ -322,9 +301,6 @@ struct Inner {
 #[derive(Clone, Default)]
 pub struct InMemoryThreadStore {
     inner: Arc<RwLock<Inner>>,
-    /// See [`ThreadStore::sequential_commit_lock`]. Shared across
-    /// clones so every handle serializes against the same lock.
-    sequential_commit_lock: Arc<tokio::sync::Mutex<()>>,
     /// The stores a thread creation or fork writes beside the thread row.
     /// `None` refuses [`ThreadStore::commit_thread_creation`] and
     /// [`ThreadStore::commit_fork`].
@@ -394,10 +370,6 @@ impl InMemoryThreadStore {
 
 #[async_trait]
 impl ThreadStore for InMemoryThreadStore {
-    fn sequential_commit_lock(&self) -> Option<&tokio::sync::Mutex<()>> {
-        Some(&self.sequential_commit_lock)
-    }
-
     /// Holds the store's write lock across every write, so no reader of
     /// this store sees the thread before its projection and event. The
     /// in-memory store is not durable: a failure after the first side-store
@@ -405,9 +377,23 @@ impl ThreadStore for InMemoryThreadStore {
     async fn commit_thread_creation(
         &self,
         params: ThreadCreationCommit,
-    ) -> Result<ThreadCreationRows> {
+    ) -> Result<ThreadCreationCommitted> {
         let sink = self.journal()?;
         let mut inner = self.inner.write().await;
+        match params.naming {
+            ThreadNaming::Minted => {}
+            ThreadNaming::CallerNamed => {
+                if inner.by_id.contains_key(&params.thread_id) {
+                    if inner.creation_by_id.get(&params.thread_id) == Some(&ThreadCreation::Create)
+                    {
+                        return Ok(ThreadCreationCommitted::Existing);
+                    }
+                    return Err(anyhow::Error::new(ThreadIdConflict {
+                        thread_id: params.thread_id,
+                    }));
+                }
+            }
+        }
         let thread = inner
             .by_id
             .get(&params.thread_id)
@@ -429,12 +415,22 @@ impl ThreadStore for InMemoryThreadStore {
         let committed_event = committed
             .pop()
             .context("thread creation event batch was empty")?;
+        match params.naming {
+            ThreadNaming::Minted => {}
+            ThreadNaming::CallerNamed => {
+                inner
+                    .creation_by_id
+                    .insert(params.thread_id.clone(), ThreadCreation::Create);
+            }
+        }
         inner.by_id.insert(params.thread_id, thread.clone());
         drop(inner);
-        Ok(ThreadCreationRows {
-            thread,
-            committed_event,
-        })
+        Ok(ThreadCreationCommitted::Created(Box::new(
+            ThreadCreationRows {
+                thread,
+                committed_event,
+            },
+        )))
     }
 
     /// Holds the store's write lock across every write, so a concurrent

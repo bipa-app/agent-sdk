@@ -8,9 +8,7 @@
 //! - [`RelayWorker`] is the unit of work that scans pending rows,
 //!   dispatches them through a publisher, and updates row status.
 //!
-//! It also defines [`TaskWakeupEmitter`], the analogue of
-//! [`super::event_outbox_transaction::AtomicEventOutboxCommitter`] for
-//! task-journal mutations:
+//! It also defines [`TaskWakeupEmitter`] for task-journal mutations:
 //! same-transaction insertion of a `task_wakeup` row when a task
 //! becomes runnable.  Durable backends implement it as the task
 //! journal acquires the necessary commit hooks.
@@ -275,7 +273,7 @@ impl RelayWorker for OutboxRelayWorker {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// TaskWakeupEmitter — analogue of AtomicEventOutboxCommitter for tasks
+// TaskWakeupEmitter
 // ─────────────────────────────────────────────────────────────────────
 
 /// Reference to the task-journal mutation that produced a wakeup.

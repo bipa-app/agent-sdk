@@ -19,7 +19,9 @@ message CreateThreadRequest {
   // Optional caller-minted thread identity. When non-empty, this is the
   // idempotency key for thread creation: matching retries return the existing
   // thread, while reuse by a conflicting lifecycle operation is rejected.
-  // Empty preserves server-side id minting for existing callers.
+  // Empty preserves server-side id minting for existing callers. Either way
+  // the thread is created with its `ThreadCreated` event in one write, and a
+  // matching retry writes nothing.
   string thread_id = 2;
 }
 

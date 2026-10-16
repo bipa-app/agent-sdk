@@ -74,19 +74,6 @@ mod tests {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         let report = run_journal_store_conformance(&store).await?;
         assert_full_battery(&report);
-        // The durable SQLite backend provides the atomic event+outbox
-        // committer, so the optional arm runs rather than skips.
-        assert!(
-            report.skipped.is_empty(),
-            "SQLite provides every optional method, got skips: {:?}",
-            report.skipped,
-        );
-        assert!(
-            report
-                .passed
-                .contains(&"optional_atomic_outbox_committer_present".to_owned()),
-            "SQLite must report the optional outbox committer as present",
-        );
         Ok(())
     }
 
@@ -197,19 +184,6 @@ mod tests {
         };
         let report = run_journal_store_conformance(&store).await?;
         assert_full_battery(&report);
-        // The durable Postgres backend provides the atomic event+outbox
-        // committer, so the optional arm runs rather than skips.
-        assert!(
-            report.skipped.is_empty(),
-            "Postgres provides every optional method, got skips: {:?}",
-            report.skipped,
-        );
-        assert!(
-            report
-                .passed
-                .contains(&"optional_atomic_outbox_committer_present".to_owned()),
-            "Postgres must report the optional outbox committer as present",
-        );
         Ok(())
     }
 }

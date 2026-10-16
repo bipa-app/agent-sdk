@@ -135,6 +135,9 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let attempts = InMemoryTurnAttemptStore::new();
+        let messages = InMemoryMessageProjectionStore::new();
+        let checkpoints = InMemoryCheckpointStore::new();
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
@@ -150,11 +153,16 @@ impl TestStores {
                         events.clone(),
                         outbox,
                     ),
-                )),
+                ))
+                .with_message_store(std::sync::Arc::new(messages.clone()))
+                .with_completed_turns(crate::journal::store::CompletedTurnSink {
+                    attempt_store: std::sync::Arc::new(attempts.clone()),
+                    checkpoint_store: std::sync::Arc::new(checkpoints.clone()),
+                }),
             threads,
-            messages: InMemoryMessageProjectionStore::new(),
-            attempts: InMemoryTurnAttemptStore::new(),
-            checkpoints: InMemoryCheckpointStore::new(),
+            messages,
+            attempts,
+            checkpoints,
             events,
             event_notifier: Arc::new(EventNotifier::new()),
         }

@@ -94,6 +94,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wires both. Fixtures that compact must wire them too.
   - `Transition::validate` refuses a guard on a re-parked task: its lock
     would come before the re-attached children's.
+- **Breaking: a completed turn commits through a required store method,
+  and the last committer traits are gone.** `AgentTaskStore::commit_completed_turn`
+  has no default, and `journal::commit::commit_completed_turn(params, task_store)`
+  takes only the task store. `AtomicCompletedTurnCommitter`,
+  `ThreadStore::atomic_completed_turn_committer`,
+  `ThreadStore::sequential_commit_lock` and the sequential in-memory path
+  are gone, and so are `AtomicEventOutboxCommitter`, `EventOutboxCommit`,
+  `EventOutboxCommitOutcome` and `EventRepository::atomic_event_outbox_committer`,
+  which had no caller left. `AgentTaskStore::complete_delivered_injections`
+  is gone too (its only caller was the sequential path). A store that wraps
+  another must forward `commit_completed_turn`.
+  - `InMemoryAgentTaskStore` commits a completed turn under its write lock
+    and needs `with_cancellation_markers`, `with_message_store` and the new
+    `with_completed_turns` (`CompletedTurnSink`: attempt and checkpoint
+    stores). It now enforces `CompletedTurnCommit::owner_guard`, and writes
+    the turn's `thread_events_available` advisory, as the durable backends do.
+    `StoreRegistry::in_memory` wires it.
+  - `ConformanceReport::skipped` is gone: with no optional method left, the
+    journal battery skips nothing.
+- **Breaking: a caller-named `CreateThread` commits in one write.**
+  `ThreadCreationCommit` takes a `naming: ThreadNaming` (`Minted` or
+  `CallerNamed`), and `ThreadStore::commit_thread_creation` returns
+  `ThreadCreationCommitted` (`Created(ThreadCreationRows)` or `Existing`). A
+  caller-named creation claims the id's creation identity, writes the
+  thread, its head, its `ThreadCreated` and the advisory together; a
+  matching retry writes nothing. `CreateThread` with a caller-named id used
+  to claim the id and write the head with no `ThreadCreated` event and no
+  advisory.
 - **Breaking: subagent spawn, thread creation and fork commit through
   required store methods (sites 11–13).** `AgentTaskStore::commit_subagent_spawn`,
   `ThreadStore::commit_thread_creation` and `ThreadStore::commit_fork` have

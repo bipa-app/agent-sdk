@@ -25,8 +25,8 @@
 //! # Coalescing
 //!
 //! - `thread_events_available` rows are coalesced **per commit batch**
-//!   — one row per `commit_events_with_outbox` call regardless of how
-//!   many events landed.  The payload's `last_sequence` is the highest
+//!   — one row per thread per transaction that appends events,
+//!   regardless of how many events landed.  The payload's `last_sequence` is the highest
 //!   sequence the consumer is guaranteed to be able to read.
 //! - `task_wakeup` rows are emitted **per task transition**, since
 //!   each task lookup is independent on the consumer side.
@@ -296,9 +296,7 @@ pub trait OutboxStore: Send + Sync {
     ///
     /// In durable backends, callers are expected to invoke this
     /// inside the same SQL transaction as the journal mutation that
-    /// advertised the row — see
-    /// [`AtomicEventOutboxCommitter`](super::event_outbox_transaction::AtomicEventOutboxCommitter)
-    /// for the events path.  The in-memory implementation accepts
+    /// advertised the row.  The in-memory implementation accepts
     /// stand-alone calls so tests can construct fixtures.
     async fn insert_batch(&self, rows: Vec<NewOutboxRow>) -> Result<Vec<OutboxRow>>;
 
