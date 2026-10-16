@@ -101,6 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     calls separately from `commit` and must hook both.
   - The in-memory store refuses `RecordIntent` without `with_intent_store`,
     and `InMemoryExecutionIntentStore` clones share their state.
+  - On Postgres, `commit` locks a thread only when it appends events to it
+    or settles that thread's root turn, so a child's settle without events
+    never waits on a cancel holding the child's thread.
 - **Breaking: replay after a crash is a tool declaration, not the tier.**
   `classify_tool_effect` made every `ToolTier::Observe` call replay-safe, and
   hosts lower mutating tools to `Observe` to skip prompts, so a durable host

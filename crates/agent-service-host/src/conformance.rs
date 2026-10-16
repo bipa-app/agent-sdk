@@ -4290,6 +4290,58 @@ mod tests {
         Ok(())
     }
 
+    /// A root turn's settle locks the root's thread, so `fail_task` on a
+    /// root, which appends no events, must still wait on the thread before
+    /// it takes the root's row. The probe holds the thread, then asks for
+    /// the root's row under a lock timeout shorter than deadlock detection.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_root_settle_without_events_takes_the_thread_lock_first() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let root = fresh_root("pg-root-settle-lock-order", 60);
+        let _ = AgentTaskStore::submit_root_turn(&store, root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        AgentTaskStore::try_acquire_task(
+            &store,
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            t_plus(90),
+            t_plus(61),
+        )
+        .await?
+        .context("the root must acquire")?;
+        let mut probe = store.pool_for_test().begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *probe)
+            .await?;
+        sqlx::query("SELECT 1 FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+            .bind(root.thread_id.0.clone())
+            .execute(&mut *probe)
+            .await?;
+        let failing = tokio::spawn({
+            let store = store.clone();
+            let id = root.id.clone();
+            async move {
+                AgentTaskStore::fail_task(&store, &id, &worker, &lease, "boom".into(), t_plus(65))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE")
+            .bind(root.id.as_str())
+            .execute(&mut *probe)
+            .await
+            .context("the root's settle must not hold the root while it waits on the thread")?;
+        probe.commit().await?;
+        let (failed, _) = failing.await??;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        Ok(())
+    }
+
     /// A cancel of the tree that runs while a tool child's settle is in
     /// flight waits for the settle and then cancels the rest: neither side
     /// deadlocks or loses its write.

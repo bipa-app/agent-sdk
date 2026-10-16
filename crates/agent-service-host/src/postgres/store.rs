@@ -123,9 +123,12 @@ use super::migrations::apply_durable_core_migrations;
 /// only by transactions that already hold the root's thread, so their order
 /// relative to the root does not matter.
 ///
-/// A transition (`DurableStore::commit`) locks every thread it touches
-/// first, then its guarded tasks, then the rows its writes reach, so a
-/// settle that also appends events keeps this order.
+/// A transition (`DurableStore::commit`) first locks the threads it needs:
+/// each thread it appends events to, and the thread of each guarded root
+/// turn (whose terminal transition locks it). Then it locks its guarded
+/// tasks, then the rows its writes reach. A settle of a child that appends
+/// no events takes no thread lock, like the settle methods it replaces, so
+/// it never waits on a cancel that holds the child's thread.
 #[derive(Clone)]
 pub struct PostgresDurableStore {
     pool: PgPool,
@@ -3941,10 +3944,12 @@ impl PostgresDurableStore {
         let mut threads = std::collections::BTreeMap::new();
         for (index, guard) in transition.guards.iter().enumerate() {
             if let Some(task) = Self::load_task_tx(tx, guard.task(), false).await? {
-                threads.insert(
-                    thread_key(&task.thread_id).to_owned(),
-                    task.thread_id.clone(),
-                );
+                if task.kind == TaskKind::RootTurn && task.is_root() {
+                    threads.insert(
+                        thread_key(&task.thread_id).to_owned(),
+                        task.thread_id.clone(),
+                    );
+                }
                 guarded.push((index, task));
             }
         }
@@ -3966,7 +3971,7 @@ impl PostgresDurableStore {
                 && stored.thread_id != task.thread_id
             {
                 return Err(anyhow::anyhow!(
-                    "task {} is on thread {}, not the thread locked for it ({})",
+                    "task {} moved to thread {} from thread {} while the transition locked it",
                     stored.id,
                     stored.thread_id,
                     task.thread_id,
@@ -3988,8 +3993,8 @@ impl PostgresDurableStore {
     /// [`PostgresDurableStore`]):
     ///
     /// 1. read each guarded task without a lock, to learn its thread;
-    /// 2. lock every thread the transition touches (its guarded tasks'
-    ///    threads and its event threads), by thread key;
+    /// 2. lock the threads it needs (its event threads and its guarded
+    ///    root turns' threads), by thread key;
     /// 3. lock and check each guarded task in `task_lock_order`;
     /// 4. apply the writes, whose own task locks (a settled child, then its
     ///    parent) follow the same order.
