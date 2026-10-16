@@ -97,11 +97,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `reject_confirmation rejected: ...` again.
 - **Breaking: `IdempotencyClaim::InFlight`.** A key reserved for the same
   kind and payload whose result was never recorded (an earlier request is
-  still running, or failed before it recorded one) is `InFlight`, no longer
-  `Conflict`. The gRPC methods answer it with `ABORTED` and a message that
-  says nothing ran, instead of `ALREADY_EXISTS` "already used for a
-  different request". A different payload under the key is still
-  `Conflict` / `ALREADY_EXISTS`.
+  still running, or stopped before it recorded one) is `InFlight`, no
+  longer `Conflict`. A different payload under the key is still `Conflict`
+  / `ALREADY_EXISTS`. The gRPC methods treat it by whether running the
+  request again converges:
+  - `DecideConfirmation` and `AnswerQuestion` run it again: the decision is
+    guarded on the task awaiting confirmation, and the answer is keyed by
+    its receipt. A decision whose task no longer awaits confirmation is
+    `FAILED_PRECONDITION`.
+  - `ForkThread` with a caller-named destination runs it again: claiming
+    the destination again returns the thread the earlier attempt created.
+    A host's fork that stopped between its commit and its record now
+    converges on that destination instead of failing.
+  - `CreateThread` and `ForkThread` without a caller-named id answer
+    `ABORTED`, saying nothing ran and to retry with the same request_id:
+    the earlier attempt may have created a thread the caller never
+    learned, and a new request_id could create a second one.
+- A fork that finds its caller-named destination already created reports
+  the same `event_count` as the fork that created it (it counted the
+  creation event).
 - On Postgres, `AgentTaskStore::update` locks a root turn's thread before
   the root's row, the store's thread → task order.
 - **Breaking: every tool-child failure closes its call in the same

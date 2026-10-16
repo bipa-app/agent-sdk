@@ -935,7 +935,9 @@ impl GrpcControlService {
             .event_repo
             .next_sequence(thread_id)
             .await
-            .map_err(internal_status("loading existing fork event sequence"))?;
+            .map_err(internal_status("loading existing fork event sequence"))?
+            .checked_sub(1)
+            .ok_or_else(|| Status::internal("forked thread is missing its creation event"))?;
         Ok((message_count, event_count))
     }
 
@@ -1261,6 +1263,28 @@ impl GrpcControlService {
     /// refusal reserves nothing and a retry gets the same refusal. A task
     /// that is missing, foreign, or no longer parked is left to the claim
     /// (a replay) and to [`Self::run_confirmation_decision`] (the errors).
+    /// Refuse a decision whose task no longer awaits confirmation, before
+    /// an unrecorded `request_id` runs its decision again.
+    async fn require_awaiting_confirmation(&self, task_id: &AgentTaskId) -> RpcResult<()> {
+        let task = self
+            .shared
+            .stores
+            .task_store
+            .get(task_id)
+            .await
+            .map_err(internal_status("loading confirmation task"))?
+            .ok_or_else(|| not_found_status("task", &task_id.to_string()))?;
+        if matches!(task.state, TaskState::AwaitingConfirmation { .. }) {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "task {task_id} no longer awaits confirmation (status {:?}): an earlier attempt \
+             with this request_id, or another decision, resolved it; read the task's state",
+            task.status
+        ))
+        .into())
+    }
+
     async fn check_confirmation_guard(
         &self,
         request: &pb::DecideConfirmationRequest,
@@ -1873,16 +1897,15 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
+            // A caller-named destination converges: claiming it again
+            // returns the thread the earlier attempt created, so an attempt
+            // that stopped before it recorded its result is run again.
+            IdempotencyClaim::InFlight if caller_minted => {}
             IdempotencyClaim::InFlight => {
                 return Err(idempotency_in_flight_status(
                     "ForkThread",
                     &request.request_id,
                 ));
-            }
-            IdempotencyClaim::Replay(record) if caller_minted && record.result_json.is_null() => {
-                // A prior caller-minted attempt died between claim and
-                // record; fall through — the destination PK claim is
-                // idempotent, so re-driving is safe.
             }
             IdempotencyClaim::Replay(record) => {
                 let result: ForkThreadResult = decode_idempotency_result(&record.result_json)?;
@@ -1974,11 +1997,10 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
+            // The decision is guarded on the task awaiting confirmation, so
+            // running it again can never apply a second one.
             IdempotencyClaim::InFlight => {
-                return Err(idempotency_in_flight_status(
-                    "DecideConfirmation",
-                    &request.request_id,
-                ));
+                self.require_awaiting_confirmation(&task_id).await?;
             }
             IdempotencyClaim::Replay(record) => {
                 let result: DecideConfirmationResult =
@@ -2049,13 +2071,7 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
-            IdempotencyClaim::InFlight => {
-                return Err(idempotency_in_flight_status(
-                    "AnswerQuestion",
-                    &request.request_id,
-                ));
-            }
-            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) => {}
+            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) | IdempotencyClaim::InFlight => {}
         }
 
         let current = self
@@ -2079,27 +2095,31 @@ impl AgentControlService for GrpcControlService {
             {
                 current
             }
-            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) => self
-                .shared
-                .stores
-                .task_store
-                .answer_question(
-                    &task_id,
-                    &request.request_id,
-                    answers,
-                    OffsetDateTime::now_utc(),
-                )
-                .await
-                .map_err(|error| {
-                    if error.downcast_ref::<QuestionAnswerConflict>().is_some() {
-                        Status::already_exists(error.to_string())
-                    } else if error.downcast_ref::<QuestionAnswerMismatch>().is_some() {
-                        Status::invalid_argument(error.to_string())
-                    } else {
-                        Status::failed_precondition(error.to_string())
-                    }
-                })?,
-            IdempotencyClaim::Conflict | IdempotencyClaim::InFlight => {
+            // The store keys the answer by its receipt (the request_id), so
+            // an attempt that stopped before it recorded its result is run
+            // again and replays the answer that landed.
+            IdempotencyClaim::Fresh | IdempotencyClaim::Replay(_) | IdempotencyClaim::InFlight => {
+                self.shared
+                    .stores
+                    .task_store
+                    .answer_question(
+                        &task_id,
+                        &request.request_id,
+                        answers,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        if error.downcast_ref::<QuestionAnswerConflict>().is_some() {
+                            Status::already_exists(error.to_string())
+                        } else if error.downcast_ref::<QuestionAnswerMismatch>().is_some() {
+                            Status::invalid_argument(error.to_string())
+                        } else {
+                            Status::failed_precondition(error.to_string())
+                        }
+                    })?
+            }
+            IdempotencyClaim::Conflict => {
                 return Err(idempotency_conflict_status(
                     "AnswerQuestion",
                     &request.request_id,
@@ -3151,14 +3171,17 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
 }
 
 /// A `request_id` whose earlier request reserved it for the same payload
-/// but never recorded a result: it is still running, or it failed first.
-/// Nothing ran for this call.
+/// but never recorded a result, on a method that creates a thread the
+/// caller did not name. Nothing ran for this call. Only the same
+/// `request_id` is safe to retry: the earlier attempt may have created a
+/// thread whose id the caller never learned, and a new `request_id` would
+/// create a second one.
 fn idempotency_in_flight_status(method: &str, request_id: &str) -> Status {
     Status::aborted(format!(
         "request_id '{request_id}' is held by an earlier {method} request with the same \
-         payload that has not recorded a result: it is still running, or it failed before \
-         it recorded one. Nothing ran for this call; read the current state, or retry with a \
-         new request_id"
+         payload that has not recorded a result: it is still running, or it stopped before \
+         it recorded one. Nothing ran for this call. Retry with the same request_id; a new \
+         request_id could create a second thread"
     ))
 }
 
@@ -6366,11 +6389,11 @@ mod tests {
     }
 
     /// A `DecideConfirmation` retried under a `request_id` whose earlier
-    /// attempt reserved the key but never recorded a result is refused as
-    /// in flight, not as a key reused for a different request, and runs
-    /// nothing: the child stays parked.
+    /// attempt reserved the key and stopped before it recorded a result
+    /// runs the decision: the child leaves the parked state, and the key
+    /// is recorded, so the next retry replays.
     #[tokio::test]
-    async fn a_decision_on_an_unrecorded_request_id_is_refused_as_in_flight() -> Result<()> {
+    async fn a_decision_on_an_unrecorded_request_id_runs_again() -> Result<()> {
         let transfer_tool = Tool {
             name: "transfer".into(),
             description: "Transfer funds".into(),
@@ -6439,18 +6462,40 @@ mod tests {
                 "the earlier attempt reserves the key: {earlier:?}",
             );
 
-            let status = control
+            let decided = control
+                .decide_confirmation(request.clone())
+                .await
+                .context("the decision runs again")?
+                .into_inner();
+            let task = decided.task.context("the decision returns the task")?;
+            ensure!(
+                task.task_id == parked.task_id,
+                "the decision is on the parked child"
+            );
+            ensure!(
+                task.status != pb::TaskStatus::AwaitingConfirmation as i32,
+                "the decision applied: {task:?}",
+            );
+            let replayed = task_store
+                .claim_idempotency(
+                    &request.request_id,
+                    IdempotencyKind::DecideConfirmation,
+                    &decide_confirmation_fingerprint(&request),
+                )
+                .await?;
+            ensure!(
+                matches!(replayed, IdempotencyClaim::Replay(_)),
+                "the key is recorded after the decision: {replayed:?}",
+            );
+            let again = control
                 .decide_confirmation(request)
                 .await
-                .err()
-                .context("a decision on an unrecorded request_id is refused")?;
+                .context("a retry after the record replays")?
+                .into_inner();
             ensure!(
-                status.code() == tonic::Code::Aborted
-                    && status.message().contains("has not recorded a result"),
-                "an in-flight refusal, not a reused key: {status}",
+                again.task.map(|task| task.task_id) == Some(parked.task_id.clone()),
+                "the replay names the same task",
             );
-            let still = wait_for_awaiting_confirmation(&control, &thread_id).await?;
-            ensure!(still.task_id == parked.task_id, "the child stays parked");
             Ok(())
         }
         .await;
@@ -7551,6 +7596,234 @@ mod tests {
                 .await?
                 .is_empty(),
             "conflicting retry must not mutate the existing destination",
+        );
+        Ok(())
+    }
+
+    fn fork_thread_id(response: &pb::ForkThreadResponse) -> Option<String> {
+        response
+            .thread
+            .as_ref()
+            .and_then(|view| view.thread.as_ref())
+            .map(|snapshot| snapshot.thread_id.clone())
+    }
+
+    /// Reserve `request_id` the way an attempt that stopped before it
+    /// recorded its result leaves it.
+    async fn reserve_unrecorded(
+        shared: &GrpcShared,
+        request_id: &str,
+        kind: IdempotencyKind,
+        fingerprint: &[u8],
+    ) -> Result<()> {
+        let claim = shared
+            .stores
+            .task_store
+            .claim_idempotency(request_id, kind, fingerprint)
+            .await?;
+        ensure!(
+            claim == IdempotencyClaim::Fresh,
+            "reserve {request_id}: {claim:?}"
+        );
+        Ok(())
+    }
+
+    fn caller_fork_request(
+        request_id: &str,
+        source: &str,
+        destination: &str,
+    ) -> pb::ForkThreadRequest {
+        pb::ForkThreadRequest {
+            request_id: request_id.to_owned(),
+            source_thread_id: source.to_owned(),
+            fork_after_committed_turns: 0,
+            thread_id: destination.to_owned(),
+        }
+    }
+
+    /// bip's durable fork intent retries `ForkThread` with the same
+    /// `(request_id, destination)` after a crash. Here the earlier attempt
+    /// committed the destination and stopped before it recorded its
+    /// result: the retry converges on that destination, with the same
+    /// counts, and records the key so the next retry replays.
+    #[tokio::test]
+    async fn a_caller_named_fork_that_stopped_after_its_commit_converges() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let source = caller_create_direct(&service, "recover-source", &caller_uuid(21)).await?;
+        let destination = caller_uuid(22);
+        let committed = service
+            .fork_thread(Request::new(caller_fork_request(
+                "recover-commit",
+                &source,
+                &destination,
+            )))
+            .await?
+            .into_inner();
+        let request = caller_fork_request("recover-intent", &source, &destination);
+        reserve_unrecorded(
+            &shared,
+            &request.request_id,
+            IdempotencyKind::ForkThread,
+            &fork_thread_fingerprint(&request),
+        )
+        .await?;
+
+        let recovered = service
+            .fork_thread(Request::new(request.clone()))
+            .await
+            .context("the retry of an unrecorded caller-named fork converges")?
+            .into_inner();
+        assert_eq!(fork_thread_id(&recovered), Some(destination.clone()));
+        assert_eq!(recovered.message_count, committed.message_count);
+        assert_eq!(recovered.event_count, committed.event_count);
+        let replay = service
+            .fork_thread(Request::new(request.clone()))
+            .await?
+            .into_inner();
+        assert_eq!(fork_thread_id(&replay), Some(destination.clone()));
+        assert!(matches!(
+            shared
+                .stores
+                .task_store
+                .claim_idempotency(
+                    &request.request_id,
+                    IdempotencyKind::ForkThread,
+                    &fork_thread_fingerprint(&request),
+                )
+                .await?,
+            IdempotencyClaim::Replay(_)
+        ));
+        let rows = shared.stores.thread_store.list().await?;
+        assert_eq!(
+            rows.iter()
+                .filter(|thread| thread.thread_id.0 == destination)
+                .count(),
+            1,
+        );
+        Ok(())
+    }
+
+    /// The same retry when the earlier attempt stopped before its commit:
+    /// the retry creates the destination.
+    #[tokio::test]
+    async fn a_caller_named_fork_that_stopped_before_its_commit_runs_again() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let source = caller_create_direct(&service, "rerun-source", &caller_uuid(23)).await?;
+        let destination = caller_uuid(24);
+        let request = caller_fork_request("rerun-intent", &source, &destination);
+        reserve_unrecorded(
+            &shared,
+            &request.request_id,
+            IdempotencyKind::ForkThread,
+            &fork_thread_fingerprint(&request),
+        )
+        .await?;
+
+        let forked = service
+            .fork_thread(Request::new(request))
+            .await
+            .context("the retry of an unrecorded caller-named fork runs")?
+            .into_inner();
+        assert_eq!(fork_thread_id(&forked), Some(destination.clone()));
+        assert!(
+            shared
+                .stores
+                .thread_store
+                .get(&ThreadId::from_string(destination))
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// Without a caller-named destination, an unrecorded key is refused:
+    /// the earlier attempt may have created a thread whose id the caller
+    /// never learned. Nothing is created, and the answer says to retry with
+    /// the same request_id.
+    #[tokio::test]
+    async fn an_unrecorded_anonymous_fork_or_create_is_refused_without_a_new_thread() -> Result<()>
+    {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let source = caller_create_direct(&service, "anon-source", &caller_uuid(25)).await?;
+        let fork = caller_fork_request("anon-fork", &source, "");
+        reserve_unrecorded(
+            &shared,
+            &fork.request_id,
+            IdempotencyKind::ForkThread,
+            &fork_thread_fingerprint(&fork),
+        )
+        .await?;
+        reserve_unrecorded(&shared, "anon-create", IdempotencyKind::CreateThread, &[]).await?;
+        let threads_before = shared.stores.thread_store.list().await?.len();
+
+        let forked = service
+            .fork_thread(Request::new(fork))
+            .await
+            .err()
+            .context("an unrecorded anonymous fork is refused")?;
+        let created = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "anon-create".into(),
+                thread_id: String::new(),
+            }))
+            .await
+            .err()
+            .context("an unrecorded anonymous create is refused")?;
+        for status in [&forked, &created] {
+            ensure!(
+                status.code() == tonic::Code::Aborted
+                    && status.message().contains("Retry with the same request_id"),
+                "{status}",
+            );
+        }
+        assert_eq!(
+            shared.stores.thread_store.list().await?.len(),
+            threads_before
+        );
+        Ok(())
+    }
+
+    /// Two concurrent calls with the same `(request_id, destination)`: one
+    /// claims the key, the other finds it unrecorded and runs too. Both
+    /// converge on one destination.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn caller_minted_fork_same_request_concurrent_calls_converge() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let source = caller_create_direct(&service, "fork-same-source", &caller_uuid(26)).await?;
+        let destination = caller_uuid(27);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let service = service.clone();
+            let barrier = Arc::clone(&barrier);
+            let source = source.clone();
+            let destination = destination.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                caller_fork_direct(&service, "fork-same-request", &source, &destination).await
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.await??, destination);
+        }
+        let rows = shared.stores.thread_store.list().await?;
+        assert_eq!(
+            rows.iter()
+                .filter(|thread| thread.thread_id.0 == destination)
+                .count(),
+            1,
         );
         Ok(())
     }
@@ -8755,6 +9028,45 @@ mod tests {
                 OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
             )
             .await?;
+        Ok(())
+    }
+
+    /// An answer retried under a `request_id` whose earlier attempt
+    /// stopped before it recorded a result runs again: the store keys the
+    /// answer by that receipt, so it lands once.
+    #[tokio::test]
+    async fn an_answer_on_an_unrecorded_request_id_runs_again() -> Result<()> {
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let (thread_id, task_id) = seed_pending_root(&service, "answer-unrecorded").await?;
+        park_rpc_question(&shared, &thread_id, &task_id).await?;
+        let request = pb::AnswerQuestionRequest {
+            request_id: "answer-unrecorded-1".into(),
+            thread_id,
+            task_id,
+            answers: vec![pb::QuestionAnswerEntry {
+                tool_call_id: "question-call-rpc".into(),
+                answer: "A".into(),
+            }],
+        };
+        reserve_unrecorded(
+            &shared,
+            &request.request_id,
+            IdempotencyKind::AnswerQuestion,
+            &answer_question_fingerprint(&request),
+        )
+        .await?;
+
+        let answered = service
+            .answer_question(Request::new(request.clone()))
+            .await
+            .context("the answer runs again")?
+            .into_inner();
+        assert_eq!(answered.receipt_id, request.request_id);
+        let task = answered.task.context("the answer returns the task")?;
+        assert_ne!(task.status, pb::TaskStatus::AwaitingQuestion as i32);
         Ok(())
     }
 
