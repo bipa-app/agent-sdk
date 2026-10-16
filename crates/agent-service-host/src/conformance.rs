@@ -4130,6 +4130,90 @@ mod tests {
         test_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
+    /// A session that holds a tool child's thread and then asks for the
+    /// child's row must get it: the transition waits on the thread before it
+    /// takes any task row, so the two never wait on each other. The probe's
+    /// lock timeout is shorter than Postgres's deadlock detection, so a
+    /// transition that held the child first fails the probe here.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_transition_takes_the_thread_lock_before_any_task_lock() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (child, worker, lease) = leased_tool_child(&store, "pg-transition-lock-order").await?;
+        let mut probe = store.pool_for_test().begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *probe)
+            .await?;
+        sqlx::query("SELECT 1 FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+            .bind(child.thread_id.0.clone())
+            .execute(&mut *probe)
+            .await?;
+        let committing = tokio::spawn({
+            let store = store.clone();
+            let transition = settle_with_tool_call_end(&child, &worker, &lease);
+            async move {
+                agent_server::journal::DurableStore::commit(&store, transition, t_plus(65)).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        sqlx::query("SELECT 1 FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE")
+            .bind(child.id.as_str())
+            .execute(&mut *probe)
+            .await
+            .context("the transition must not hold the child while it waits on the thread")?;
+        probe.commit().await?;
+        let committed = committing.await?.map_err(anyhow::Error::from)?;
+        let [(settled, _)] = committed.settled.as_slice() else {
+            anyhow::bail!("one settled task, got {:?}", committed.settled);
+        };
+        assert_eq!(settled.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    /// A cancel of the tree that runs while a tool child's settle is in
+    /// flight waits for the settle and then cancels the rest: neither side
+    /// deadlocks or loses its write.
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_cancel_during_a_settle_failpoint_neither_deadlocks() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (child, worker, lease) = leased_tool_child(&store, "pg-transition-cancel-race").await?;
+        let root_id = child.parent_id.clone().context("tool child has a parent")?;
+        fail::cfg("transition.before_events", "sleep(700)")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let settling = tokio::spawn({
+            let store = store.clone();
+            let transition = settle_with_tool_call_end(&child, &worker, &lease);
+            async move {
+                agent_server::journal::DurableStore::commit(&store, transition, t_plus(65)).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let cancelling = tokio::spawn({
+            let store = store.clone();
+            async move { AgentTaskStore::cancel_tree(&store, &root_id, t_plus(66)).await }
+        });
+        let settled = settling.await?;
+        let cancelled = cancelling.await?;
+        fail::remove("transition.before_events");
+        let committed = settled.map_err(anyhow::Error::from)?;
+        cancelled.context("the cancel must not deadlock against the settle")?;
+        let [(settled_child, _)] = committed.settled.as_slice() else {
+            anyhow::bail!("one settled task, got {:?}", committed.settled);
+        };
+        assert_eq!(settled_child.status, TaskStatus::Completed);
+        let root = AgentTaskStore::get(&store, &settled_child.parent_id.clone().context("parent")?)
+            .await?
+            .context("root")?;
+        assert_eq!(root.status, TaskStatus::Cancelled);
+        Ok(())
+    }
+
     #[cfg(all(feature = "postgres", feature = "failpoints"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_transition_failpoint_writes_neither_half() -> Result<()> {
