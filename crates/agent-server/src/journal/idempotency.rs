@@ -120,9 +120,12 @@ pub enum IdempotencyClaim {
     Conflict,
     /// The key is reserved for the same kind and payload, but its result
     /// was never recorded (the placeholder is still `JSON null`): an
-    /// earlier claim is still running its effect, or it failed before it
-    /// recorded one. The caller must **not** run the effect; whether it
-    /// landed is only known from the state it would have changed.
+    /// earlier claim is still running its effect, or it stopped before it
+    /// recorded one. The store cannot tell which, nor whether the effect
+    /// landed. A caller may run the effect again only when running it twice
+    /// converges (a guarded transition, or a create keyed by a caller-named
+    /// id), and then records the result as for `Fresh`; otherwise it must
+    /// refuse.
     InFlight,
 }
 
