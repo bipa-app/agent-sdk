@@ -190,13 +190,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -435,7 +443,6 @@ async fn bootstrap_maps_multiple_children_to_correct_tool_calls() -> Result<()> 
     execute_tool_task(
         ctx_0.clone(),
         &stores.tasks,
-        &stores.events,
         &CancellationToken::new(),
         |_info, _collector| async { Ok(ToolResult::success("listed")) },
         t_plus(10),
@@ -500,7 +507,6 @@ async fn execute_success_completes_child_and_decrements_parent() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("command output")) },
         t_plus(20),
@@ -563,7 +569,6 @@ async fn execute_failure_fails_child_without_corrupting_parent() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Err(anyhow::anyhow!("command failed with exit code 1")) },
         t_plus(20),
@@ -623,7 +628,6 @@ async fn execute_cancelled_before_tool_returns_cancelled() -> Result<()> {
     let outcome = execute_tool_task(
         ctx,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("should not reach")) },
         t_plus(20),
@@ -681,7 +685,6 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
     let outcome_0 = execute_tool_task(
         ctx_0,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("ls output")) },
         t_plus(20),
@@ -716,7 +719,6 @@ async fn multi_child_complete_all_makes_parent_resumable() -> Result<()> {
     let outcome_1 = execute_tool_task(
         ctx_1,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("file contents")) },
         t_plus(30),
@@ -771,7 +773,6 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
     execute_tool_task(
         ctx_0,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("ok")) },
         t_plus(20),
@@ -794,7 +795,6 @@ async fn mixed_success_and_failure_still_makes_parent_resumable() -> Result<()> 
     let outcome = execute_tool_task(
         ctx_1,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Err(anyhow::anyhow!("file not found")) },
         t_plus(30),
@@ -837,7 +837,6 @@ async fn execute_with_wrong_lease_fails_at_complete() -> Result<()> {
     let result = execute_tool_task(
         ctx,
         &stores.tasks,
-        &stores.events,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("ok")) },
         t_plus(20),

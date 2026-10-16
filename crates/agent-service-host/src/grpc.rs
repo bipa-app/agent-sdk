@@ -6565,6 +6565,51 @@ mod tests {
         committed_result: Option<Arc<Mutex<Option<serde_json::Value>>>>,
     }
 
+    impl CountingTaskStore {
+        fn observe_completion(&self, result: &serde_json::Value) {
+            self.complete_with_result_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if let (Some(seen), Some(alive)) = (
+                &self.artifact_store_seen,
+                &self.artifact_store_alive_at_completion,
+            ) {
+                let is_alive = seen
+                    .lock()
+                    .ok()
+                    .and_then(|seen| seen.as_ref().cloned())
+                    .and_then(|store| store.upgrade())
+                    .is_some();
+                alive.store(is_alive, Ordering::SeqCst);
+            }
+            if let Some(committed_result) = &self.committed_result
+                && let Ok(mut slot) = committed_result.lock()
+            {
+                *slot = Some(result.clone());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl agent_server::journal::DurableStore for CountingTaskStore {
+        async fn commit(
+            &self,
+            transition: agent_server::journal::Transition,
+            now: time::OffsetDateTime,
+        ) -> std::result::Result<agent_server::journal::Committed, agent_server::journal::Rejected>
+        {
+            for write in &transition.writes {
+                if let agent_server::journal::Write::SettleTask {
+                    outcome: agent_server::journal::Settle::Complete { result },
+                    ..
+                } = write
+                {
+                    self.observe_completion(result);
+                }
+            }
+            self.inner.commit(transition, now).await
+        }
+    }
+
     #[async_trait]
     impl AgentTaskStore for CountingTaskStore {
         async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -6874,25 +6919,7 @@ mod tests {
             result: serde_json::Value,
             now: OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
-            self.complete_with_result_calls
-                .fetch_add(1, Ordering::SeqCst);
-            if let (Some(seen), Some(alive)) = (
-                &self.artifact_store_seen,
-                &self.artifact_store_alive_at_completion,
-            ) {
-                let is_alive = seen
-                    .lock()
-                    .ok()
-                    .and_then(|seen| seen.as_ref().cloned())
-                    .and_then(|store| store.upgrade())
-                    .is_some();
-                alive.store(is_alive, Ordering::SeqCst);
-            }
-            if let Some(committed_result) = &self.committed_result
-                && let Ok(mut slot) = committed_result.lock()
-            {
-                *slot = Some(result.clone());
-            }
+            self.observe_completion(&result);
             self.inner
                 .complete_task_with_result(task_id, worker, lease, result, now)
                 .await

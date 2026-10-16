@@ -9809,6 +9809,29 @@ mod tests {
 
         /// Consume one injected failure from `remaining`, returning
         /// `true` while injections are left.
+        fn observe_completion(&self) {
+            let artifact_store_alive = self
+                .artifact_store_at_completion
+                .as_ref()
+                .and_then(|seen| seen.lock().ok())
+                .and_then(|seen| seen.as_ref().cloned())
+                .and_then(|store| store.upgrade())
+                .is_some();
+            self.artifact_store_alive_at_completion
+                .store(artifact_store_alive, Ordering::SeqCst);
+        }
+
+        fn observe_failure(&self, now: time::OffsetDateTime) -> Result<()> {
+            self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut slot) = self.fail_task_now.lock() {
+                *slot = Some(now);
+            }
+            if Self::take_injected_failure(&self.fail_task_failures_remaining) {
+                bail!("injected transient fail_task failure");
+            }
+            Ok(())
+        }
+
         fn take_injected_failure(remaining: &AtomicUsize) -> bool {
             let mut current = remaining.load(Ordering::SeqCst);
             while let Some(next) = current.checked_sub(1) {
@@ -9836,6 +9859,32 @@ mod tests {
         AgentTaskStore, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
     };
     use agent_server::journal::task::{AgentTaskId, ChildSpawnSpec, SuspensionPayload};
+
+    #[async_trait]
+    impl agent_server::journal::DurableStore for FlakyTaskStore {
+        async fn commit(
+            &self,
+            transition: agent_server::journal::Transition,
+            now: time::OffsetDateTime,
+        ) -> std::result::Result<agent_server::journal::Committed, agent_server::journal::Rejected>
+        {
+            use agent_server::journal::{Settle, Write};
+            for write in &transition.writes {
+                match write {
+                    Write::SettleTask {
+                        outcome: Settle::Complete { .. },
+                        ..
+                    } => self.observe_completion(),
+                    Write::SettleTask {
+                        outcome: Settle::Fail { .. } | Settle::FailWithReason { .. },
+                        ..
+                    } => self.observe_failure(now)?,
+                    Write::AppendEvents { .. } => {}
+                }
+            }
+            self.inner.commit(transition, now).await
+        }
+    }
 
     #[async_trait]
     impl AgentTaskStore for FlakyTaskStore {
@@ -10167,15 +10216,7 @@ mod tests {
             result: serde_json::Value,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
-            let artifact_store_alive = self
-                .artifact_store_at_completion
-                .as_ref()
-                .and_then(|seen| seen.lock().ok())
-                .and_then(|seen| seen.as_ref().cloned())
-                .and_then(|store| store.upgrade())
-                .is_some();
-            self.artifact_store_alive_at_completion
-                .store(artifact_store_alive, Ordering::SeqCst);
+            self.observe_completion();
             self.inner
                 .complete_task_with_result(task_id, worker, lease, result, now)
                 .await
@@ -10188,13 +10229,7 @@ mod tests {
             error: String,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
-            self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
-            if let Ok(mut slot) = self.fail_task_now.lock() {
-                *slot = Some(now);
-            }
-            if Self::take_injected_failure(&self.fail_task_failures_remaining) {
-                bail!("injected transient fail_task failure");
-            }
+            self.observe_failure(now)?;
             self.inner
                 .fail_task(task_id, worker, lease, error, now)
                 .await
@@ -10216,13 +10251,7 @@ mod tests {
             reason: agent_sdk_foundation::TerminalReason,
             now: time::OffsetDateTime,
         ) -> Result<(AgentTask, Option<AgentTask>)> {
-            self.fail_task_attempts.fetch_add(1, Ordering::SeqCst);
-            if let Ok(mut slot) = self.fail_task_now.lock() {
-                *slot = Some(now);
-            }
-            if Self::take_injected_failure(&self.fail_task_failures_remaining) {
-                bail!("injected transient fail_task failure");
-            }
+            self.observe_failure(now)?;
             self.inner
                 .fail_task_with_reason(task_id, worker, lease, error, reason, now)
                 .await

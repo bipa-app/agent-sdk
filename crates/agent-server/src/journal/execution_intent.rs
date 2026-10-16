@@ -572,15 +572,7 @@ where
 
     // ── Replay-safe shortcut ─────────────────────────────────────
     if !effect_class.requires_intent() {
-        return execute_tool_task(
-            bootstrap,
-            deps.task_store,
-            deps.event_repo,
-            cancel,
-            executor,
-            now,
-        )
-        .await;
+        return execute_tool_task(bootstrap, deps.task_store, cancel, executor, now).await;
     }
 
     // ── Retry-safety check ───────────────────────────────────────
@@ -621,15 +613,7 @@ where
     record_intent_update(deps.intent_store, &intent, "started", "Started").await;
 
     // ── Execute ──────────────────────────────────────────────────
-    let outcome = execute_tool_task(
-        bootstrap,
-        deps.task_store,
-        deps.event_repo,
-        cancel,
-        executor,
-        now,
-    )
-    .await;
+    let outcome = execute_tool_task(bootstrap, deps.task_store, cancel, executor, now).await;
 
     // ── Update intent to terminal status ─────────────────────────
     apply_terminal_status(&mut intent, &outcome, now);

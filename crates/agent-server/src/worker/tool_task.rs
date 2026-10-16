@@ -56,9 +56,9 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::committed_event::CommittedEvent;
-use crate::journal::event_repository::EventRepository;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
+use crate::journal::transition::{Settle, Transition};
 use crate::worker::activity::ActivityBeacon;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -336,7 +336,6 @@ pub enum ToolTaskOutcome {
 pub async fn execute_tool_task<F, Fut>(
     bootstrap: ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
-    event_repo: &dyn EventRepository,
     cancel: &CancellationToken,
     executor: F,
     now: OffsetDateTime,
@@ -352,7 +351,7 @@ where
     // machine stays small enough that clippy::large_futures does
     // not fire on every test that drives tool execution.
     let result = Box::pin(execute_tool_task_inner(
-        bootstrap, task_store, event_repo, cancel, executor, now,
+        bootstrap, task_store, cancel, executor, now,
     ))
     .await;
 
@@ -382,7 +381,6 @@ where
 async fn execute_tool_task_inner<F, Fut>(
     bootstrap: ToolTaskBootstrap,
     task_store: &dyn AgentTaskStore,
-    event_repo: &dyn EventRepository,
     cancel: &CancellationToken,
     executor: F,
     // The instant the task was acquired, kept only for signature symmetry;
@@ -404,8 +402,6 @@ where
         .record_task_acquired(crate::observability::attrs::KIND_TOOL);
 
     let task_id = &bootstrap.task_id;
-    let worker_id = &bootstrap.worker_id;
-    let lease_id = &bootstrap.lease_id;
 
     // ── Execute the tool ─────────────────────────────────────────
     // The collector carries this task's activity beacon: nothing the tool
@@ -441,33 +437,28 @@ where
         Ok(result) => {
             let result_payload = serde_json::to_value(&result)
                 .context("serialize tool result for durable storage")?;
-
-            let (child, parent) = task_store
-                .complete_task_with_result(task_id, worker_id, lease_id, result_payload, now)
-                .await
-                .with_context(|| format!("complete_task_with_result failed for child {task_id}"))?;
-
-            // Commit progress events + ToolCallEnd in a single batch
-            // AFTER the CAS-guarded store operation succeeds, so only
-            // the winning worker writes events.
             let end_event = AgentEvent::tool_call_end(
                 &bootstrap.tool_call.id,
                 &bootstrap.tool_call.name,
                 &bootstrap.tool_call.display_name,
                 result.clone(),
             );
-            let committed_events = commit_tool_events(
-                event_repo,
-                &bootstrap.thread_id,
+            let (child, parent, committed_events) = settle_with_events(
+                task_store,
+                &bootstrap,
+                Settle::Complete {
+                    result: result_payload,
+                },
                 progress_events,
                 end_event,
                 now,
             )
-            .await?;
-            // No beacon bump here: `complete_task_with_result` above has
-            // already made this row terminal, so a beacon-driven heartbeat
-            // write would be CAS-rejected. The completion instant is
-            // instead recorded durably on the terminal transition itself
+            .await
+            .with_context(|| format!("complete_task_with_result failed for child {task_id}"))?;
+            // No beacon bump here: the settle above has already made this
+            // row terminal, so a beacon-driven heartbeat write would be
+            // CAS-rejected. The completion instant is instead recorded
+            // durably on the terminal transition itself
             // (`AgentTask::complete`), which is what a parent's stall probe
             // reads.
 
@@ -480,11 +471,6 @@ where
         }
         Err(err) => {
             let error_msg = format!("{err:#}");
-            let (child, parent) = task_store
-                .fail_task(task_id, worker_id, lease_id, error_msg.clone(), now)
-                .await
-                .with_context(|| format!("fail_task failed for child {task_id}"))?;
-
             let error_result = ToolResult {
                 success: false,
                 output: error_msg.clone(),
@@ -499,14 +485,18 @@ where
                 &bootstrap.tool_call.display_name,
                 error_result,
             );
-            let committed_events = commit_tool_events(
-                event_repo,
-                &bootstrap.thread_id,
+            let (child, parent, committed_events) = settle_with_events(
+                task_store,
+                &bootstrap,
+                Settle::Fail {
+                    error: error_msg.clone(),
+                },
                 progress_events,
                 end_event,
                 now,
             )
-            .await?;
+            .await
+            .with_context(|| format!("fail_task failed for child {task_id}"))?;
 
             Ok(ToolTaskOutcome::Failed {
                 child,
@@ -518,23 +508,40 @@ where
     }
 }
 
-/// Commit progress events and a terminal event in a single batch.
-///
-/// Called after the CAS-guarded store operation succeeds so only the
-/// winning worker writes events to the journal.
-async fn commit_tool_events(
-    event_repo: &dyn EventRepository,
-    thread_id: &ThreadId,
+/// Settle the tool child and commit its progress events and its
+/// `ToolCallEnd` in one transition, so the row and the event that reports
+/// it commit together or not at all. The lease guard runs first: a worker
+/// that lost its lease writes neither.
+async fn settle_with_events(
+    task_store: &dyn AgentTaskStore,
+    bootstrap: &ToolTaskBootstrap,
+    outcome: Settle,
     progress_events: Vec<AgentEvent>,
     end_event: AgentEvent,
     now: OffsetDateTime,
-) -> anyhow::Result<Vec<CommittedEvent>> {
-    let mut batch = progress_events;
-    batch.push(end_event);
-    event_repo
-        .commit_event_batch(thread_id, batch, now)
+) -> anyhow::Result<(AgentTask, Option<AgentTask>, Vec<CommittedEvent>)> {
+    let mut events = progress_events;
+    events.push(end_event);
+    let committed = task_store
+        .commit(
+            Transition::settle(
+                bootstrap.task_id.clone(),
+                bootstrap.worker_id.clone(),
+                bootstrap.lease_id.clone(),
+                outcome,
+                bootstrap.thread_id.clone(),
+                events,
+            ),
+            now,
+        )
         .await
-        .context("commit tool events")
+        .map_err(anyhow::Error::from)?;
+    let (child, parent) = committed
+        .settled
+        .into_iter()
+        .next()
+        .context("a settle transition returns its settled task")?;
+    Ok((child, parent, committed.events))
 }
 
 #[cfg(test)]

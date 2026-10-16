@@ -122,10 +122,22 @@ use super::migrations::apply_durable_core_migrations;
 /// `lock_for_transition_tx`). A root's input injections are locked
 /// only by transactions that already hold the root's thread, so their order
 /// relative to the root does not matter.
+///
+/// A transition (`DurableStore::commit`) locks every thread it touches
+/// first, then its guarded tasks, then the rows its writes reach, so a
+/// settle that also appends events keeps this order.
 #[derive(Clone)]
 pub struct PostgresDurableStore {
     pool: PgPool,
     held_probe: HeldProbe<HeldKey>,
+}
+
+impl PostgresDurableStore {
+    /// The connection pool, for tests that hold rows from a second session.
+    #[cfg(test)]
+    pub(crate) const fn pool_for_test(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order.
@@ -3785,6 +3797,192 @@ fn prepare_reattached_rows(
         rows.push(child);
     }
     Ok(rows)
+}
+
+/// Applies a transition in one database transaction: the guards are read
+/// first, then the writes in order, then each thread's coalesced outbox
+/// row. Any error drops the transaction, so nothing was written.
+#[async_trait]
+impl agent_server::journal::DurableStore for PostgresDurableStore {
+    /// Retries a commit that Postgres aborted for a deadlock or a
+    /// serialization failure: the aborted transaction wrote nothing, and a
+    /// later attempt reads the rows again. With the lock order of
+    /// `commit_once` no cycle is expected; this is the backstop.
+    async fn commit(
+        &self,
+        transition: agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        transition.validate()?;
+        let mut attempt = 0;
+        loop {
+            match self.commit_once(&transition, now).await {
+                Err(agent_server::journal::Rejected::Store(error))
+                    if attempt < COMMIT_LOCK_CONFLICT_RETRIES && is_lock_conflict(&error) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(attempt, %error, "retrying a transition after a lock conflict");
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
+                        .await;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// How many times [`PostgresDurableStore::commit`] retries a transition
+/// Postgres aborted for a lock conflict.
+const COMMIT_LOCK_CONFLICT_RETRIES: u32 = 3;
+
+/// Whether `error` is a Postgres deadlock (`40P01`) or serialization
+/// failure (`40001`), which abort the transaction without writing.
+fn is_lock_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(sqlx::error::DatabaseError::code)
+            .is_some_and(|code| code == "40P01" || code == "40001")
+    })
+}
+
+impl PostgresDurableStore {
+    /// Steps 1–3 of `commit_once`: lock the threads, then the guarded
+    /// tasks, and check every guard.
+    async fn lock_and_check_guards_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        transition: &agent_server::journal::Transition,
+    ) -> Result<(), agent_server::journal::Rejected> {
+        use agent_server::journal::Write;
+
+        let mut guarded = Vec::with_capacity(transition.guards.len());
+        let mut threads = std::collections::BTreeMap::new();
+        for (index, guard) in transition.guards.iter().enumerate() {
+            if let Some(task) = Self::load_task_tx(tx, guard.task(), false).await? {
+                threads.insert(
+                    thread_key(&task.thread_id).to_owned(),
+                    task.thread_id.clone(),
+                );
+                guarded.push((index, task));
+            }
+        }
+        for write in &transition.writes {
+            if let Write::AppendEvents { thread, events } = write
+                && !events.is_empty()
+            {
+                threads.insert(thread_key(thread).to_owned(), thread.clone());
+            }
+        }
+        for thread in threads.values() {
+            Self::lock_thread_tx(tx, thread).await?;
+        }
+        guarded.sort_by(|(_, a), (_, b)| task_lock_order(a).cmp(&task_lock_order(b)));
+        let mut checked = vec![false; transition.guards.len()];
+        for (index, task) in &guarded {
+            let stored = Self::load_task_tx(tx, &task.id, true).await?;
+            transition.guards[*index].check(*index, stored.as_ref())?;
+            checked[*index] = true;
+        }
+        for (index, guard) in transition.guards.iter().enumerate() {
+            if !checked[index] {
+                guard.check(index, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One attempt at a transition, in the store's lock order (see
+    /// [`PostgresDurableStore`]):
+    ///
+    /// 1. read each guarded task without a lock, to learn its thread;
+    /// 2. lock every thread the transition touches (its guarded tasks'
+    ///    threads and its event threads), by thread key;
+    /// 3. lock and check each guarded task in `task_lock_order`;
+    /// 4. apply the writes, whose own task locks (a settled child, then its
+    ///    parent) follow the same order.
+    ///
+    /// The guards are read under their row locks, so a lease stolen after
+    /// the guard read cannot reach a write: it is a `Rejected::Guard`.
+    async fn commit_once(
+        &self,
+        transition: &agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        use agent_server::journal::{Committed, Settle, Write};
+
+        let mut tx = self.begin().await?;
+        Self::lock_and_check_guards_tx(&mut tx, transition).await?;
+        let mut committed = Committed::default();
+        for write in transition.writes.iter().cloned() {
+            match write {
+                Write::SettleTask { task, outcome } => {
+                    let (worker, lease) = transition
+                        .lease_for(&task)
+                        .map(|(worker, lease)| (worker.clone(), lease.clone()))
+                        .ok_or_else(|| anyhow!("settling task {task} needs a leased guard"))?;
+                    let settled = match outcome {
+                        Settle::Complete { result } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.complete_with_result(result, now),
+                            )
+                            .await
+                        }
+                        Settle::Fail { error } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.fail(error, now),
+                            )
+                            .await
+                        }
+                        Settle::FailWithReason { error, reason } => {
+                            Self::apply_task_terminal_transition_tx(
+                                &mut tx,
+                                &task,
+                                &worker,
+                                &lease,
+                                now,
+                                "commit",
+                                move |child| child.fail_with_terminal_reason(error, reason, now),
+                            )
+                            .await
+                        }
+                    }?;
+                    committed.settled.push(settled);
+                }
+                Write::AppendEvents { thread, events } => {
+                    if events.is_empty() {
+                        continue;
+                    }
+                    agent_server::fail_point!("transition.before_events");
+                    let start = Self::next_event_sequence_tx(&mut tx, &thread).await?;
+                    let batch =
+                        Self::insert_events_tx(&mut tx, &thread, events, start, now).await?;
+                    Self::insert_thread_events_outbox_row_tx(
+                        &mut tx,
+                        &batch,
+                        DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
+                        now,
+                    )
+                    .await?;
+                    committed.events.extend(batch);
+                }
+            }
+        }
+        tx.commit().await.context("commit transition")?;
+        Ok(committed)
+    }
 }
 
 #[async_trait]

@@ -66,6 +66,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MODEL_GEMINI_35_FLASH_LITE`.
 
 ### Changed
+- **Breaking: a tool child's settle and its `ToolCallEnd` commit in one
+  transaction.** `journal::transition` adds `Transition` (guards, then
+  writes), `DurableStore::commit`, and the first writes:
+  `Write::SettleTask` and `Write::AppendEvents`. Every backend checks the
+  guards before the first write, applies the writes in order, and gives
+  each thread's events one coalesced `thread_events_available` outbox row,
+  all in one transaction. The in-memory store applies the same writes
+  under its one write lock and refuses `AppendEvents` without its event
+  sink.
+  - `AgentTaskStore` now requires `DurableStore`, so a decorating store
+    must implement `commit` and apply its settle hooks there too.
+  - `execute_tool_task` settles the child and commits its progress events
+    and `ToolCallEnd` through one `commit`. A crash between the two writes
+    can no longer leave a terminal child with no `ToolCallEnd`, or a
+    `ToolCallEnd` without its advisory row. Its `event_repo` parameter is
+    gone.
+  - In-memory fixtures that drive tool tasks must wire
+    `with_cancellation_markers`.
 - **Breaking: replay after a crash is a tool declaration, not the tier.**
   `classify_tool_effect` made every `ToolTier::Observe` call replay-safe, and
   hosts lower mutating tools to `Observe` to skip prompts, so a durable host

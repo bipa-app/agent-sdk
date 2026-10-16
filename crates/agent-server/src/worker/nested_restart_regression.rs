@@ -265,13 +265,21 @@ struct TestStores {
 
 impl TestStores {
     fn new() -> Self {
+        let threads = InMemoryThreadStore::new();
+        let events = InMemoryEventRepository::new();
         Self {
-            tasks: InMemoryAgentTaskStore::new(),
-            threads: InMemoryThreadStore::new(),
+            tasks: InMemoryAgentTaskStore::new().with_cancellation_markers(
+                crate::journal::CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(crate::journal::outbox::InMemoryOutboxStore::new()),
+                    thread_store: Arc::new(threads.clone()),
+                },
+            ),
+            threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
-            events: InMemoryEventRepository::new(),
+            events,
             event_notifier: Arc::new(EventNotifier::new()),
         }
     }
@@ -625,7 +633,6 @@ async fn drive_child_to_completion(
     let tool_outcome = execute_tool_task(
         tool_bootstrap,
         &stores.tasks,
-        &stores.events,
         &CancellationToken::new(),
         |_tool_call, _collector| async { Ok(ToolResult::success("child ls output")) },
         clock,
@@ -860,7 +867,6 @@ async fn run_tool_task_to_completion(
     let tool_outcome = execute_tool_task(
         tool_bootstrap,
         &stores.tasks,
-        &stores.events,
         &CancellationToken::new(),
         move |_tool_call, _collector| async move { Ok(ToolResult::success(result_text)) },
         exec_at,

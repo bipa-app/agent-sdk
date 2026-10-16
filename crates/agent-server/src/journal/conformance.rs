@@ -205,6 +205,17 @@ mod in_memory_bundle {
     use async_trait::async_trait;
 
     #[async_trait]
+    impl crate::journal::DurableStore for InMemoryJournalStore {
+        async fn commit(
+            &self,
+            transition: crate::journal::Transition,
+            now: time::OffsetDateTime,
+        ) -> std::result::Result<crate::journal::Committed, crate::journal::Rejected> {
+            self.task.commit(transition, now).await
+        }
+    }
+
+    #[async_trait]
     impl AgentTaskStore for InMemoryJournalStore {
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.task.insert(task).await
