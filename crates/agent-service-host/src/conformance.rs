@@ -1154,24 +1154,113 @@ mod tests {
         name: &str,
     ) -> Result<AgentTask> {
         let (child, worker, lease) = leased_tool_child(task_store, name).await?;
-        let continuation = agent_sdk_foundation::ContinuationEnvelope::wrap(
-            agent_sdk_foundation::AgentContinuation {
-                thread_id: thread_id(name),
-                turn: 1,
-                total_usage: TokenUsage::default(),
-                turn_usage: TokenUsage::default(),
-                pending_tool_calls: vec![],
-                awaiting_index: 0,
-                completed_results: vec![],
-                state: agent_sdk_foundation::AgentState::new(thread_id(name)),
-                response_id: None,
-                stop_reason: None,
-                response_content: vec![],
-            },
-        );
         task_store
-            .pause_on_confirmation(&child.id, &worker, &lease, continuation, None, t_plus(64))
+            .pause_on_confirmation(
+                &child.id,
+                &worker,
+                &lease,
+                continuation_for(name),
+                None,
+                t_plus(64),
+            )
             .await
+    }
+
+    fn continuation_for(name: &str) -> agent_sdk_foundation::ContinuationEnvelope {
+        agent_sdk_foundation::ContinuationEnvelope::wrap(agent_sdk_foundation::AgentContinuation {
+            thread_id: thread_id(name),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: vec![],
+            awaiting_index: 0,
+            completed_results: vec![],
+            state: agent_sdk_foundation::AgentState::new(thread_id(name)),
+            response_id: None,
+            stop_reason: None,
+            response_content: vec![],
+        })
+    }
+
+    fn pause_with_prompt(
+        child: &AgentTask,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        name: &str,
+    ) -> agent_server::journal::Transition {
+        agent_server::journal::Transition::pause_on_confirmation(
+            child.id.clone(),
+            worker.clone(),
+            lease.clone(),
+            continuation_for(name),
+            None,
+            child.thread_id.clone(),
+            vec![AgentEvent::tool_requires_confirmation(
+                "conformance-call",
+                "probe",
+                "Probe",
+                serde_json::json!({}),
+                "Tool Probe requires confirmation",
+            )],
+        )
+    }
+
+    /// I1–I4 for [`agent_server::journal::Write::PauseOnConfirmation`]: a
+    /// stale lease is a guard rejection with nothing written; a good pause
+    /// parks the child, and its prompt and advisory row commit with it.
+    async fn test_pause_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+        outbox: &dyn OutboxStore,
+    ) -> Result<()> {
+        let name = "conformance-pause";
+        let (child, worker, lease) = leased_tool_child(task_store, name).await?;
+        let advisories_before = thread_events_rows(outbox, &child.thread_id).await?;
+        let stale = task_store
+            .commit(
+                pause_with_prompt(&child, &worker, &LeaseId::new(), name),
+                t_plus(65),
+            )
+            .await;
+        assert!(
+            matches!(
+                stale,
+                Err(agent_server::journal::Rejected::Guard { index: 0, .. })
+            ),
+            "a stale lease cannot pause the child: {stale:?}",
+        );
+        let unchanged = task_store.get(&child.id).await?.context("child")?;
+        assert_eq!(unchanged.status, TaskStatus::Running);
+        assert!(events.get_events(&child.thread_id).await?.is_empty());
+        assert_eq!(
+            thread_events_rows(outbox, &child.thread_id).await?,
+            advisories_before
+        );
+
+        let committed = task_store
+            .commit(pause_with_prompt(&child, &worker, &lease, name), t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [paused] = committed.paused.as_slice() else {
+            anyhow::bail!("one parked task, got {:?}", committed.paused);
+        };
+        assert_eq!(paused.status, TaskStatus::AwaitingConfirmation);
+        assert!(paused.lease_id.is_none());
+        let stored = task_store.get(&child.id).await?.context("child")?;
+        assert_eq!(stored.status, TaskStatus::AwaitingConfirmation);
+        let journal = events.get_events(&child.thread_id).await?;
+        assert!(
+            matches!(
+                journal.as_slice(),
+                [one] if matches!(one.event, AgentEvent::ToolRequiresConfirmation { .. })
+            ),
+            "one ToolRequiresConfirmation, got {journal:?}",
+        );
+        assert_eq!(
+            thread_events_rows(outbox, &child.thread_id).await?,
+            advisories_before + 1
+        );
+        Ok(())
     }
 
     fn reject_with_tool_call_end(child: &AgentTask) -> agent_server::journal::Transition {
@@ -3279,6 +3368,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_pause_transition() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_pause_transition_is_all_or_nothing(
+            s.task.as_ref(),
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_reject_confirmation_transition() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_reject_confirmation_transition_is_all_or_nothing(
@@ -3640,6 +3740,13 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_pause_transition() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_pause_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -4228,6 +4335,15 @@ mod tests {
             &store, &store, &store, &store, &store, &store,
         )
         .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_pause_transition() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_pause_transition_is_all_or_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

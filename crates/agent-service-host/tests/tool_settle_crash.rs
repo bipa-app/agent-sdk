@@ -337,6 +337,36 @@ async fn reject_failpoint_keeps_the_confirmation_parked_without_its_tool_call_en
     assert_unchanged(&store, &child, TaskStatus::AwaitingConfirmation).await
 }
 
+#[tokio::test]
+async fn pause_failpoint_keeps_the_child_running_without_its_prompt() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let bootstrap = leased_tool_child(&store).await?;
+    let _scenario = fail::FailScenario::setup();
+    crash_in_transition(agent_server::worker::pause_tool_for_confirmation(
+        &bootstrap,
+        &store,
+        at(12),
+    ))
+    .await?;
+    let task = AgentTaskStore::get(&store, &bootstrap.task_id)
+        .await?
+        .context("the tool child is gone")?;
+    let prompts = EventRepository::get_events(&store, &task.thread_id)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(&event.event, AgentEvent::ToolRequiresConfirmation { id, .. } if id == CALL_ID)
+        })
+        .count();
+    ensure!(
+        task.status == TaskStatus::Running && prompts == 0,
+        "the pause and its prompt disagree after a crash: child {:?}, {prompts} prompts",
+        task.status,
+    );
+    Ok(())
+}
+
 struct DenyAll;
 
 #[async_trait]

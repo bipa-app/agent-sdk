@@ -864,9 +864,16 @@ async fn reject_on_non_awaiting_row_fails() -> Result<()> {
     )
     .await;
 
+    let error = format!(
+        "{:#}",
+        result
+            .err()
+            .context("should reject non-AwaitingConfirmation row")?
+    );
     assert!(
-        result.is_err(),
-        "should reject non-AwaitingConfirmation row"
+        error.contains("reject_confirmation rejected: task")
+            && error.contains("is not awaiting confirmation"),
+        "the reject keeps its error text: {error}",
     );
 
     Ok(())
