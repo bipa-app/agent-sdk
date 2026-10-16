@@ -9936,13 +9936,7 @@ mod tests {
                         outcome: Settle::Complete { .. },
                         ..
                     } => {
-                        if self
-                            .complete_failures_remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                                left.checked_sub(1)
-                            })
-                            .is_ok()
-                        {
+                        if Self::take_injected_failure(&self.complete_failures_remaining) {
                             return Err(agent_server::journal::Rejected::Store(anyhow::anyhow!(
                                 "injected store failure completing a task"
                             )));
