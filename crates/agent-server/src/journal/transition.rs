@@ -136,6 +136,24 @@ impl Transition {
         }
     }
 
+    /// Settle a running, leased task with no events.
+    #[must_use]
+    pub fn settle_only(
+        task: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        outcome: Settle,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task: task.clone(),
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            }],
+            writes: vec![Write::SettleTask { task, outcome }],
+        }
+    }
+
     /// Fail a task parked on a confirmation and append `events`, one
     /// transaction.
     #[must_use]
@@ -235,6 +253,33 @@ impl Transition {
     }
 }
 
+/// How a guard names the status it expects, in the words the store's own
+/// rejections have always used.
+const fn status_words(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "queued",
+        TaskStatus::Pending => "pending",
+        TaskStatus::Running => "running",
+        TaskStatus::WaitingOnChildren => "waiting on children",
+        TaskStatus::AwaitingConfirmation => "awaiting confirmation",
+        TaskStatus::AwaitingQuestion => "awaiting a question",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The error a store method that wraps [`DurableStore::commit`] returns
+/// for `rejected`: a guard rejection reads `{method} rejected: {reason}`,
+/// the text that method returned before it became a wrapper.
+#[must_use]
+pub fn wrapper_error(method: &str, rejected: Rejected) -> anyhow::Error {
+    match rejected {
+        Rejected::Guard { reason, .. } => anyhow::anyhow!("{method} rejected: {reason}"),
+        Rejected::Store(error) => error,
+    }
+}
+
 impl Guard {
     /// Check this guard against the stored row of its task.
     ///
@@ -254,17 +299,18 @@ impl Guard {
                 };
                 if stored.status != *status {
                     return Err(reject(format!(
-                        "task {task} is {:?}, not {status:?}",
+                        "task {task} is not {} (status {:?})",
+                        status_words(*status),
                         stored.status
                     )));
                 }
-                if let Some((worker, lease)) = lease
-                    && (stored.worker_id.as_ref() != Some(worker)
-                        || stored.lease_id.as_ref() != Some(lease))
-                {
-                    return Err(reject(format!(
-                        "task {task} is not leased by worker {worker} with lease {lease}"
-                    )));
+                if let Some((worker, lease)) = lease {
+                    if stored.worker_id.as_ref() != Some(worker) {
+                        return Err(reject(format!("worker mismatch on task {task}")));
+                    }
+                    if stored.lease_id.as_ref() != Some(lease) {
+                        return Err(reject(format!("lease mismatch on task {task}")));
+                    }
                 }
                 Ok(())
             }

@@ -4794,21 +4794,27 @@ impl AgentTaskStore for SqliteDurableStore {
         result_payload: serde_json::Value,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(
-            &mut tx,
-            child_id,
-            worker,
-            lease,
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::settle_only(
+                child_id.clone(),
+                worker.clone(),
+                lease.clone(),
+                agent_server::journal::Settle::Complete {
+                    result: result_payload,
+                },
+            ),
             now,
-            "complete_task_with_result",
-            move |child| child.complete_with_result(result_payload, now),
         )
-        .await?;
-        tx.commit()
-            .await
-            .context("commit complete_task_with_result")?;
-        Ok(result)
+        .await
+        .map_err(|rejected| {
+            agent_server::journal::transition::wrapper_error("complete_task_with_result", rejected)
+        })?;
+        committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")
     }
 
     async fn fail_task(
@@ -4819,19 +4825,25 @@ impl AgentTaskStore for SqliteDurableStore {
         error: String,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(
-            &mut tx,
-            child_id,
-            worker,
-            lease,
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::settle_only(
+                child_id.clone(),
+                worker.clone(),
+                lease.clone(),
+                agent_server::journal::Settle::Fail { error },
+            ),
             now,
-            "fail_task",
-            move |child| child.fail(error, now),
         )
-        .await?;
-        tx.commit().await.context("commit fail_task")?;
-        Ok(result)
+        .await
+        .map_err(|rejected| {
+            agent_server::journal::transition::wrapper_error("fail_task", rejected)
+        })?;
+        committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")
     }
 
     async fn fail_task_with_reason(
@@ -4843,19 +4855,25 @@ impl AgentTaskStore for SqliteDurableStore {
         reason: TerminalReason,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let mut tx = self.begin().await?;
-        let result = Self::apply_task_terminal_transition_tx(
-            &mut tx,
-            child_id,
-            worker,
-            lease,
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::settle_only(
+                child_id.clone(),
+                worker.clone(),
+                lease.clone(),
+                agent_server::journal::Settle::FailWithReason { error, reason },
+            ),
             now,
-            "fail_task_with_reason",
-            move |child| child.fail_with_terminal_reason(error, reason, now),
         )
-        .await?;
-        tx.commit().await.context("commit fail_task_with_reason")?;
-        Ok(result)
+        .await
+        .map_err(|rejected| {
+            agent_server::journal::transition::wrapper_error("fail_task_with_reason", rejected)
+        })?;
+        committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")
     }
 
     async fn cancel_tree(

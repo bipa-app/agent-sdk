@@ -6729,18 +6729,27 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         result_payload: serde_json::Value,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let mut inner = self.inner.write().await;
-        let thread = self.thread_admission_locked(&inner, child_id).await?;
-        let result = inner.apply_task_terminal_transition(
-            child_id,
-            (worker, lease),
-            thread,
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition::settle_only(
+                child_id.clone(),
+                worker.clone(),
+                lease.clone(),
+                super::transition::Settle::Complete {
+                    result: result_payload,
+                },
+            ),
             now,
-            "complete_task_with_result",
-            |child| child.complete_with_result(result_payload, now),
-        )?;
-        drop(inner);
-        Ok(result)
+        )
+        .await
+        .map_err(|rejected| {
+            super::transition::wrapper_error("complete_task_with_result", rejected)
+        })?;
+        committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")
     }
 
     async fn fail_task(
@@ -6771,18 +6780,23 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         reason: TerminalReason,
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<AgentTask>)> {
-        let mut inner = self.inner.write().await;
-        let thread = self.thread_admission_locked(&inner, child_id).await?;
-        let result = inner.apply_task_terminal_transition(
-            child_id,
-            (worker, lease),
-            thread,
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition::settle_only(
+                child_id.clone(),
+                worker.clone(),
+                lease.clone(),
+                super::transition::Settle::FailWithReason { error, reason },
+            ),
             now,
-            "fail_task_with_reason",
-            move |child| child.fail_with_terminal_reason(error, reason, now),
-        )?;
-        drop(inner);
-        Ok(result)
+        )
+        .await
+        .map_err(|rejected| super::transition::wrapper_error("fail_task_with_reason", rejected))?;
+        committed
+            .settled
+            .into_iter()
+            .next()
+            .context("a settle transition returns its settled task")
     }
 
     async fn cancel_tree(

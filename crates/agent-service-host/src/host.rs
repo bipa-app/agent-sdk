@@ -8231,6 +8231,30 @@ mod tests {
              after the tool actually ran ({ran_at}) — a `now` bound at task entry predates \
              the executor and backdates the row by the whole execution",
         );
+
+        let settled = stores
+            .task_store
+            .get(&tool_child.id)
+            .await?
+            .context("tool child")?;
+        assert_eq!(settled.status, agent_server::TaskStatus::Failed);
+        let ends: Vec<_> = stores
+            .event_repo
+            .get_events(&child_root.thread_id)
+            .await?
+            .into_iter()
+            .filter_map(|event| {
+                if let agent_sdk_foundation::AgentEvent::ToolCallEnd { result, .. } = event.event {
+                    Some(result)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let [end] = ends.as_slice() else {
+            anyhow::bail!("the error arm must close the call once, got {ends:?}");
+        };
+        assert!(!end.success);
         Ok(())
     }
 

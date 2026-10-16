@@ -84,6 +84,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gone.
   - In-memory fixtures that drive tool tasks must wire
     `with_cancellation_markers`.
+- **Breaking: every tool-child failure closes its call in the same
+  transaction.** `Write::RejectConfirmation` (guarded on
+  `AwaitingConfirmation`) and `Write::RecordIntent` join the transition
+  writes.
+  - A rejected or timed-out confirmation fails the parked child and commits
+    its `ToolCallEnd` together; the event was best-effort before.
+    `apply_confirmation_decision` drops its `event_repo` parameter.
+  - A policy denial after approval, a failed intent claim, an interrupted
+    replay (with its intent marked `Failed`), and the host's error arm after
+    guarded execution each settle the child with its `ToolCallEnd` in one
+    `commit`. A failed claim now closes the call; before it left it open.
+  - `complete_task_with_result`, `fail_task` and `fail_task_with_reason` are
+    `commit` wrappers on every backend, with their error text unchanged, so
+    each backend has one settle path. A decorating store still sees these
+    calls separately from `commit` and must hook both.
+  - The in-memory store refuses `RecordIntent` without `with_intent_store`,
+    and `InMemoryExecutionIntentStore` clones share their state.
 - **Breaking: replay after a crash is a tool declaration, not the tier.**
   `classify_tool_effect` made every `ToolTier::Observe` call replay-safe, and
   hosts lower mutating tools to `Observe` to skip prompts, so a durable host
