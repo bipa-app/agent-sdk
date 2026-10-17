@@ -3009,6 +3009,9 @@ impl LocalDaemon {
             .context("initializing daemon stores")?;
         let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))
             .context("creating daemon host")?;
+        host.begin_epoch()
+            .await
+            .context("beginning the daemon's epoch before it serves")?;
         let health = Arc::clone(host.health());
         let shutdown = host.shutdown_token();
         let grpc = GrpcTransport::with_admission(
@@ -6261,6 +6264,82 @@ mod tests {
         assert!(order.text < order.done);
         assert_eq!(order.requires_confirmation_display_name, "Transfer");
         Ok(())
+    }
+
+    /// A single-host daemon reclaims an earlier process's lease before it
+    /// serves its first write: by the time `LocalDaemon::start` returns, its
+    /// epoch is begun and the dead lease is back to `Pending`. Otherwise a
+    /// write served first (an approval) gets a lease with no epoch, and the
+    /// start-up reclaim takes it back from its live holder.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_single_host_daemon_reclaims_before_it_serves() -> Result<()> {
+        use crate::config::{EpochRecovery, StorageBackend, StorageConfig, WorkerConfig};
+        use agent_server::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
+
+        let dir = tempfile::tempdir()?;
+        let storage = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(dir.path().join("daemon.db").display().to_string()),
+                max_connections: None,
+            },
+            ..StorageConfig::default()
+        };
+        let now = time::OffsetDateTime::now_utc();
+        let registry: Arc<dyn AgentDefinitionRegistry> = Arc::new(
+            InMemoryAgentDefinitionRegistry::new(mock_definition(Vec::new())),
+        );
+        let root = {
+            let previous = StoreRegistry::from_config(&storage, Arc::clone(&registry))?;
+            previous.initialize().await?;
+            let root = AgentTask::new_root_turn(ThreadId::from_string("reclaim-first"), now, 3);
+            previous.task_store.submit_root_turn(root.clone()).await?;
+            previous
+                .task_store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("worker-0"),
+                    LeaseId::from_string("dead-lease"),
+                    now + time::Duration::hours(1),
+                    now,
+                )
+                .await?
+                .context("the earlier process leases the root")?;
+            root
+        };
+
+        let config = ServiceConfig {
+            storage: storage.clone(),
+            worker: WorkerConfig {
+                epoch_recovery: EpochRecovery::SingleHost,
+                acquisition_interval_secs: 3_600,
+                sweep_interval_secs: 3_600,
+                ..WorkerConfig::default()
+            },
+            ..ServiceConfig::default()
+        };
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(config, Arc::clone(&registry), runtime).await?;
+        let observer = StoreRegistry::from_config(&storage, registry)?;
+        let row = observer
+            .task_store
+            .get(&root.id)
+            .await?
+            .context("the root")?;
+        let result = (|| {
+            anyhow::ensure!(
+                row.status != TaskStatus::Running
+                    || row.lease_id.as_ref() != Some(&LeaseId::from_string("dead-lease")),
+                "the dead lease was still held when the daemon began serving: {:?}",
+                row.status,
+            );
+            Ok(())
+        })();
+        daemon.stop().await?;
+        result
     }
 
     #[tokio::test]

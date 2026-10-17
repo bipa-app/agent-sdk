@@ -554,6 +554,13 @@ long as it needs. No migration, table, `Write` variant or protocol change.
     cannot tell the two apart.
   - Migration 0028 adds the `agent_sdk_host_epochs` table and the nullable
     `agent_sdk_tasks.lease_epoch` column, on Postgres and `SQLite`.
+  - `ServiceHost::begin_epoch` begins the epoch and does the `SingleHost`
+    reclaim. It is idempotent, and `ServiceHost::run` calls it before its
+    workers start. An embedder that serves writes beside the host must await
+    it before the first one: a lease granted earlier carries no epoch, and
+    the start-up reclaim would take it back from its live holder (crash
+    matrix F4: an approval served in that window wedged the turn).
+    `grpc::LocalDaemon` awaits it before it binds its listener.
   - Signals (`otel`):
     - `agent_server.tasks.lease_expired` gains a `scope` label (`expired` or
       `foreign_epoch`, `LeaseRecoveryScope::as_str`). The host's drain now

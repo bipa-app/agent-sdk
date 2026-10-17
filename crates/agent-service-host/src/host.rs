@@ -119,6 +119,8 @@ pub struct ServiceHost {
     health: Arc<HealthSurface>,
     metrics: Arc<dyn MetricsRecorder>,
     shutdown: CancellationToken,
+    /// The epoch this process began, once [`Self::begin_epoch`] ran.
+    epoch: tokio::sync::OnceCell<EpochId>,
     /// Hold the `db.pool.connections.{active,idle}`
     /// `ObservableGauge` handles for the host's lifetime so the
     /// callback registrations are not dropped early.  Empty unless
@@ -155,6 +157,7 @@ impl ServiceHost {
             health: HealthSurface::shared(),
             metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
+            epoch: tokio::sync::OnceCell::new(),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
         })
@@ -181,6 +184,7 @@ impl ServiceHost {
             health: HealthSurface::shared(),
             metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
+            epoch: tokio::sync::OnceCell::new(),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
         })
@@ -360,6 +364,32 @@ impl ServiceHost {
             .context("initialising storage backend")
     }
 
+    /// Begin this process's epoch and, under
+    /// [`EpochRecovery::SingleHost`], reclaim the leases of earlier
+    /// processes. Idempotent: only the first call writes; later calls
+    /// return the same epoch. [`Self::run`] calls it before its workers
+    /// start.
+    ///
+    /// An embedder that serves writes beside the host (the gRPC transport
+    /// of [`crate::grpc::LocalDaemon`]) must await it before it serves the
+    /// first one: a lease granted before the epoch begins carries no epoch,
+    /// and the start-up reclaim would take it back from its live holder.
+    ///
+    /// # Errors
+    /// The epoch could not be begun.
+    pub async fn begin_epoch(&self) -> Result<EpochId> {
+        self.epoch
+            .get_or_try_init(|| {
+                begin_epoch_and_reclaim(
+                    &self.stores,
+                    self.config.worker.epoch_recovery,
+                    time::OffsetDateTime::now_utc(),
+                )
+            })
+            .await
+            .cloned()
+    }
+
     /// Token that, when cancelled, triggers graceful shutdown.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -393,12 +423,7 @@ impl ServiceHost {
             signal(SignalKind::terminate()).context("registering SIGTERM handler")?
         };
 
-        begin_epoch_and_reclaim(
-            &self.stores,
-            self.config.worker.epoch_recovery,
-            time::OffsetDateTime::now_utc(),
-        )
-        .await?;
+        self.begin_epoch().await?;
 
         // Before any worker can pick up a task a previous process left
         // under a terminal root.

@@ -43,7 +43,7 @@ use agent_server::worker::{
     CompletionContext, CompletionOutput, CompletionPlan, RunMode, SubagentCompletionHook,
 };
 use agent_server::{AgentTaskId, ToolTaskBootstrap};
-use agent_service_host::config::{ServiceConfig, StorageConfig, WorkerConfig};
+use agent_service_host::config::{EpochRecovery, ServiceConfig, StorageConfig, WorkerConfig};
 use agent_service_host::grpc::LocalDaemon;
 use agent_service_host::proto::agent::service::v1 as pb;
 use agent_service_host::runtime::{
@@ -93,6 +93,9 @@ enum Scenario {
     LlmStream,
     Question,
     Confirmation,
+    /// S6 confirmation on a `SingleHost` daemon, which reclaims the dead
+    /// process's leases at boot (crash matrix F4).
+    ConfirmationSingleHost,
     Fork,
     CancelTree,
     HungTool,
@@ -102,12 +105,13 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
         Self::Question,
         Self::Confirmation,
+        Self::ConfirmationSingleHost,
         Self::Fork,
         Self::CancelTree,
         Self::HungTool,
@@ -123,6 +127,7 @@ impl Scenario {
             Self::LlmStream => "s3_llm_stream",
             Self::Question => "s6_question",
             Self::Confirmation => "s6_confirmation",
+            Self::ConfirmationSingleHost => "s6_confirmation_single_host",
             Self::Fork => "s4_fork",
             Self::CancelTree => "s5_cancel_tree",
             Self::HungTool => "s7_hung_tool",
@@ -144,7 +149,7 @@ impl Scenario {
         match self {
             Self::UnsafeTool => tool_use(UNSAFE_TOOL, json!({})),
             Self::SafeTool => tool_use(SAFE_TOOL, json!({})),
-            Self::Confirmation => tool_use(CONFIRM_TOOL, json!({})),
+            Self::Confirmation | Self::ConfirmationSingleHost => tool_use(CONFIRM_TOOL, json!({})),
             Self::Question => tool_use(QUESTION_TOOL, json!({"question": "Which target?"})),
             Self::LlmStream | Self::Fork => text(FINAL_TEXT),
             Self::CancelTree => tool_uses(
@@ -781,7 +786,8 @@ impl CaseDb {
 }
 
 /// Short leases so a dead process's work is reclaimed within seconds.
-fn service_config(storage: StorageConfig) -> ServiceConfig {
+/// `SingleHost` scenarios also reclaim the dead process's leases at boot.
+fn service_config(storage: StorageConfig, scenario: Scenario) -> ServiceConfig {
     ServiceConfig {
         storage,
         worker: WorkerConfig {
@@ -791,6 +797,11 @@ fn service_config(storage: StorageConfig) -> ServiceConfig {
             sweep_interval_secs: 1,
             acquisition_interval_secs: 1,
             tool_stall_budget_secs: STALL_BUDGET.as_secs(),
+            epoch_recovery: if scenario == Scenario::ConfirmationSingleHost {
+                EpochRecovery::SingleHost
+            } else {
+                EpochRecovery::default()
+            },
             ..WorkerConfig::default()
         },
         ..ServiceConfig::default()
@@ -963,7 +974,7 @@ async fn start_daemon(
     let hook = (scenario == Scenario::MergeBack)
         .then(|| Arc::new(MatrixHook { phase, dir }) as Arc<dyn SubagentCompletionHook>);
     let daemon = LocalDaemon::start_with_store_decorator(
-        service_config(storage),
+        service_config(storage, scenario),
         registry,
         runtime,
         move |stores| match hook {
@@ -1264,7 +1275,7 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
             .await?;
             None
         }
-        Scenario::Confirmation => {
+        Scenario::Confirmation | Scenario::ConfirmationSingleHost => {
             let child = wait_for_child(&stores, &root, TaskStatus::AwaitingConfirmation).await?;
             Some(child)
         }
@@ -1352,7 +1363,7 @@ async fn answer_prompt(
             // The same request again is a retry, not a second answer.
             let _ = control.answer_question(answer).await;
         }
-        Scenario::Confirmation => {
+        Scenario::Confirmation | Scenario::ConfirmationSingleHost => {
             let child = tool_child.context("no confirmation child")?;
             wait_for_task(stores, child, "awaiting confirmation", |task| {
                 task.status == TaskStatus::AwaitingConfirmation
@@ -1584,7 +1595,20 @@ async fn s6_question(backend: Backend) -> Result<()> {
 /// S6 (tool confirmation): the prompt is visible after the restart and
 /// the approval runs the tool once.
 async fn s6_confirmation(backend: Backend) -> Result<()> {
-    let Some(case) = crash_and_recover(backend, Scenario::Confirmation).await? else {
+    confirmation_case(backend, Scenario::Confirmation).await
+}
+
+/// S6 (tool confirmation) on a `SingleHost` daemon. The approval must not
+/// be served before the restarted daemon begins its epoch: a lease granted
+/// first carries no epoch, so the boot reclaim would requeue the approved
+/// child under its live drive and the turn would wedge (F4). The race is
+/// narrow; run it with `--stress-count 32` to measure it.
+async fn s6_confirmation_single_host(backend: Backend) -> Result<()> {
+    confirmation_case(backend, Scenario::ConfirmationSingleHost).await
+}
+
+async fn confirmation_case(backend: Backend, scenario: Scenario) -> Result<()> {
+    let Some(case) = crash_and_recover(backend, scenario).await? else {
         return Ok(());
     };
     ensure!(
@@ -2092,6 +2116,7 @@ matrix!(
         s5_cancel_tree,
         s6_question,
         s6_confirmation,
+        s6_confirmation_single_host,
         s7_hung_tool,
         s9_merge_back,
     ],
@@ -2111,6 +2136,7 @@ matrix!(
         s5_cancel_tree,
         s6_question,
         s6_confirmation,
+        s6_confirmation_single_host,
         s7_hung_tool,
         s9_merge_back,
     ],
