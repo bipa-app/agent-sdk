@@ -947,3 +947,40 @@ async fn completed_turn_commits_count_each_outcome() -> Result<()> {
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Read-time session view: the fold and stream recorders the view RPCs call
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn view_signals_record_the_fold_and_stream_steps() -> Result<()> {
+    use agent_server::journal::view::signals;
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    signals::folded(1_500, 0.004);
+    signals::stream(signals::OPENED);
+    signals::stream(signals::RESNAPSHOT);
+    signals::stream(signals::NOT_FOUND);
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    assert_eq!(
+        histogram_total_count(&snapshots, "agent_server.view.fold.duration"),
+        1
+    );
+    assert_eq!(
+        histogram_total_count(&snapshots, "agent_server.view.folded_events"),
+        1
+    );
+    let streams = collect_u64_counter(&snapshots, "agent_server.view.stream");
+    for event in ["opened", "resnapshot", "not_found"] {
+        assert!(
+            streams
+                .iter()
+                .any(|(set, _)| has_label(set, attrs::VIEW_STREAM_EVENT, event)),
+            "{event}: {streams:?}"
+        );
+    }
+    Ok(())
+}

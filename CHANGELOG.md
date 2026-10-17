@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Crash-safety Phase 4: the session view, folded at read time
+
+- `agent.service.v1.AgentEventService` gains `GetThreadView` (status and the
+  newest items), `GetThreadViewItems` (page back) and `StreamThreadView`. The
+  stream subscribes first, sends a snapshot, then one `ThreadViewChange` with
+  the ops of each later committed event. It sends a fresh snapshot when the
+  subscriber lags or a backfill fails, and backfills a skipped notification
+  from the journal.
+- A view is the fold of the thread's committed events
+  (`agent_sdk_foundation::view::fold`), computed when it is read. The host
+  keeps the folded views of the 32 most recently read threads in memory and
+  folds only the events after a cached view's sequence, or all retained
+  events again when some it never saw were pruned. No table, migration or
+  `Write` variant.
+- Off by default: `GrpcTransport::with_view_config` turns it on; otherwise
+  every view RPC answers `FAILED_PRECONDITION`. A thread being purged answers
+  `NOT_FOUND`. Status, items and ops travel as the serde JSON of the view
+  types.
+- `ThreadView::fold_in` and `ThreadView::apply_owned` fold and apply by
+  value, for a fold that keeps no ops.
+- With `otel`: `agent_server.view.fold.duration`,
+  `agent_server.view.folded_events` and `agent_server.view.stream`
+  (`view.stream.event`: opened, resnapshot, closed, refused, not_found).
+
 ### Crash-safety Phase 3: documents
 
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed

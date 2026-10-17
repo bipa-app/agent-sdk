@@ -81,6 +81,13 @@ const COMMIT_DURATION_BUCKETS_S: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 
 /// cases at 10 s.
 const WATCH_LAG_BUCKETS_MS: &[f64] = &[1.0, 5.0, 25.0, 100.0, 500.0, 2_000.0, 10_000.0];
 
+/// Bucket boundaries for `agent_server.view.folded_events`: the committed
+/// events one read-time view fold covered.
+const VIEW_FOLDED_BUCKETS: &[f64] = &[16.0, 128.0, 1_024.0, 8_192.0, 65_536.0, 524_288.0];
+
+/// Bucket boundaries for `agent_server.view.fold.duration` (seconds).
+const VIEW_FOLD_BUCKETS_S: &[f64] = &[0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+
 // ─────────────────────────────────────────────────────────────────────
 // Attribute keys and stable values
 // ─────────────────────────────────────────────────────────────────────
@@ -163,6 +170,8 @@ pub mod attrs {
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
 
+    /// A view stream's lifecycle step, or a refused view RPC.
+    pub const VIEW_STREAM_EVENT: &str = "view.stream.event";
     pub const COMMIT_KIND_ATOMIC: &str = "atomic";
     pub const COMMIT_KIND_NON_ATOMIC: &str = "non_atomic";
 }
@@ -198,6 +207,9 @@ pub struct ServerMetrics {
     /// `agent_server.journal.completed_turn.commits`: completed-turn commits
     /// by outcome.
     pub(crate) completed_turn_commits: Counter<u64>,
+    pub(crate) view_fold_duration: Histogram<f64>,
+    pub(crate) view_folded_events: Histogram<f64>,
+    pub(crate) view_stream: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -414,6 +426,20 @@ impl ServerMetrics {
         self.thread_events_watch_lag_ms.record(lag_ms, &[]);
     }
 
+    /// Record one read-time view fold: `agent_server.view.fold.duration`
+    /// and the events it covered, `agent_server.view.folded_events`.
+    pub fn record_view_fold(&self, events: usize, duration_secs: f64) {
+        self.view_fold_duration.record(duration_secs, &[]);
+        self.view_folded_events
+            .record(f64::from(u32::try_from(events).unwrap_or(u32::MAX)), &[]);
+    }
+
+    /// Record one `agent_server.view.stream` step.
+    pub fn record_view_stream(&self, event: &'static str) {
+        self.view_stream
+            .add(1, &[KeyValue::new(attrs::VIEW_STREAM_EVENT, event)]);
+    }
+
     /// Record one `agent_server.tool_audit.outcome` increment for
     /// the given tool-audit event.
     /// Count one completed-turn commit with its bounded outcome (see
@@ -579,6 +605,8 @@ impl ServerMetrics {
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
 
+        let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
+
         Self {
             workers_active,
             tasks_acquired,
@@ -595,6 +623,9 @@ impl ServerMetrics {
             effects,
             effect_duration,
             completed_turn_commits,
+            view_fold_duration,
+            view_folded_events,
+            view_stream,
             meter,
         }
     }
@@ -627,6 +658,27 @@ fn durability_instruments(
         .with_description("Effect run time, started to finished, by kind and outcome.")
         .build();
     (effects, effect_duration, completed_turn_commits)
+}
+
+fn view_instruments(
+    meter: &opentelemetry::metrics::Meter,
+) -> (Histogram<f64>, Histogram<f64>, Counter<u64>) {
+    let fold_duration = meter
+        .f64_histogram("agent_server.view.fold.duration")
+        .with_unit("s")
+        .with_description("Duration of one read-time fold of a thread's events into its view.")
+        .with_boundaries(VIEW_FOLD_BUCKETS_S.to_vec())
+        .build();
+    let folded_events = meter
+        .f64_histogram("agent_server.view.folded_events")
+        .with_description("Committed events one read-time view fold covered.")
+        .with_boundaries(VIEW_FOLDED_BUCKETS.to_vec())
+        .build();
+    let stream = meter
+        .u64_counter("agent_server.view.stream")
+        .with_description("Session view stream steps and refused view RPCs.")
+        .build();
+    (fold_duration, folded_events, stream)
 }
 
 // ─────────────────────────────────────────────────────────────────────
