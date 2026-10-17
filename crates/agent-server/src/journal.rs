@@ -696,8 +696,8 @@ pub use tool_audit::{
     ToolAuditEventParams, ToolAuditEventStore,
 };
 pub use transition::{
-    ChildSpawn, Committed, DurableStore, Guard, Lock, Rejected, Settle, SpawnedChildren,
-    SubagentSpawn, ThreadTier, ToolChildrenSpawn, Transition, Write,
+    ChildSpawn, Committed, DurableStore, Fence, Guard, Lock, MissingThread, Rejected, Settle,
+    SpawnedChildren, SubagentSpawn, ThreadTier, ToolChildrenSpawn, Transition, Write,
 };
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,

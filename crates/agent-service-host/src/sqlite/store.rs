@@ -3307,12 +3307,12 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut tx = self.begin().await?;
-        Self::check_declared_threads_tx(&mut tx, &transition, ThreadTier::Own, now).await?;
+        Self::check_declared_threads_tx(&mut tx, &transition, true, now).await?;
         for (index, guard) in transition.guards.iter().enumerate() {
             let stored = Self::load_task_tx(&mut tx, guard.task()).await?;
             guard.check(index, stored.as_ref())?;
         }
-        Self::check_declared_threads_tx(&mut tx, &transition, ThreadTier::Spawned, now).await?;
+        Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
         for write in transition.writes.iter().cloned() {
             Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed).await?;
@@ -3397,9 +3397,6 @@ impl SqliteDurableStore {
                 if events.is_empty() {
                     return Ok(());
                 }
-                if let Some(stored) = Self::get_thread_tx(tx, &thread).await? {
-                    stored.require_active(ThreadOperation::Append)?;
-                }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;
                 let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
@@ -3477,50 +3474,57 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
-    /// The purge fence of every thread at `tier` the transition declares
-    /// with an operation, creating the rows it declares with `create`.
-    /// `commit` checks its own threads before the guards and the spawned
-    /// subagents' threads after them, the order the spawn methods used: the
-    /// parent's thread, the parent's lease, then each child thread.
+    /// Check the purge fences the transition declares for one side of its
+    /// guards, creating the thread rows it declares with `create` there.
+    /// Before the guards: a spawn's parent thread. After them: a spawn's
+    /// child threads, and every append's thread (see
+    /// [`agent_server::journal::Fence::after_guards`]). So a spawn checks
+    /// the parent's thread, the parent's lease, then each child thread, the
+    /// order the spawn methods used, and an append reports a stale lease
+    /// before a purge.
     async fn check_declared_threads_tx(
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
-        tier: ThreadTier,
+        before_guards: bool,
         now: OffsetDateTime,
     ) -> Result<()> {
+        let checked_now = |tier: ThreadTier, fence: Option<&agent_server::journal::Fence>| {
+            let after = fence.is_some_and(agent_server::journal::Fence::after_guards)
+                || tier == ThreadTier::Spawned;
+            after != before_guards
+        };
         for lock in transition.locks() {
             match lock {
                 Lock::Thread {
                     thread,
-                    operation,
+                    tier,
+                    fence,
                     create,
-                    tier: declared,
                 } => {
-                    if declared != tier {
+                    if !checked_now(tier, fence.as_ref()) {
                         continue;
                     }
                     if create {
                         Self::bootstrap_thread_row_tx(tx, &thread, now).await?;
                     }
-                    if let Some(operation) = operation {
-                        Self::require_active_thread_tx(tx, &thread, operation).await?;
+                    if let Some(fence) = fence {
+                        let stored = Self::get_thread_tx(tx, &thread).await?;
+                        fence.check(&thread, stored.as_ref())?;
                     }
                 }
                 Lock::ThreadOf {
                     task,
-                    operation: Some(operation),
+                    fence: Some(fence),
                 } => {
-                    if tier != ThreadTier::Own {
+                    if !checked_now(ThreadTier::Own, Some(&fence)) {
                         continue;
                     }
                     if let Some(task) = Self::load_task_tx(tx, &task).await? {
-                        Self::require_active_thread_tx(tx, &task.thread_id, operation).await?;
+                        let stored = Self::get_thread_tx(tx, &task.thread_id).await?;
+                        fence.check(&task.thread_id, stored.as_ref())?;
                     }
                 }
-                Lock::ThreadOf {
-                    operation: None, ..
-                }
-                | Lock::Task(_) => {}
+                Lock::ThreadOf { fence: None, .. } | Lock::Task(_) => {}
             }
         }
         Ok(())

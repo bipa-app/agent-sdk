@@ -3992,7 +3992,7 @@ impl PostgresDurableStore {
         transition: &agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<(), agent_server::journal::Rejected> {
-        use agent_server::journal::{Lock, ThreadTier};
+        use agent_server::journal::{Fence, Lock, ThreadTier};
 
         let locks = transition.locks();
         let mut read = BTreeMap::new();
@@ -4008,15 +4008,15 @@ impl PostgresDurableStore {
         }
 
         let mut threads: BTreeMap<(ThreadTier, String), DeclaredThread> = BTreeMap::new();
-        let mut declare = |tier, thread: &ThreadId, operation, create| {
+        let mut declare = |tier, thread: &ThreadId, fence: Option<Fence>, create| {
             let declared = threads
                 .entry((tier, thread_key(thread).to_owned()))
                 .or_insert_with(|| DeclaredThread {
                     thread: thread.clone(),
-                    operation: None,
+                    fences: Vec::new(),
                     create: false,
                 });
-            declared.operation = declared.operation.or(operation);
+            declared.fences.extend(fence);
             declared.create |= create;
         };
         for guard in &transition.guards {
@@ -4032,31 +4032,29 @@ impl PostgresDurableStore {
                 Lock::Thread {
                     thread,
                     tier,
-                    operation,
+                    fence,
                     create,
-                } => declare(*tier, thread, *operation, *create),
-                Lock::ThreadOf { task, operation } => {
+                } => declare(*tier, thread, *fence, *create),
+                Lock::ThreadOf { task, fence } => {
                     if let Some(task) = read.get(task) {
-                        declare(ThreadTier::Own, &task.thread_id, *operation, false);
+                        declare(ThreadTier::Own, &task.thread_id, *fence, false);
                     }
                 }
                 Lock::Task(_) => {}
             }
         }
+        let mut fenced_after_guards = Vec::new();
         for declared in threads.values() {
             if declared.create {
                 Self::bootstrap_thread_row_tx(tx, &declared.thread, now).await?;
             }
             let locked = Self::lock_thread_tx(tx, &declared.thread).await?;
-            if let Some(operation) = declared.operation {
-                locked
-                    .ok_or_else(|| {
-                        anyhow::Error::new(ThreadNotFound {
-                            thread_id: declared.thread.clone(),
-                        })
-                    })?
-                    .require_active(operation)
-                    .map_err(anyhow::Error::new)?;
+            for fence in &declared.fences {
+                if fence.after_guards() {
+                    fenced_after_guards.push((*fence, &declared.thread, locked.clone()));
+                } else {
+                    fence.check(&declared.thread, locked.as_ref())?;
+                }
             }
         }
 
@@ -4088,6 +4086,9 @@ impl PostgresDurableStore {
         for (index, guard) in transition.guards.iter().enumerate() {
             guard.check(index, stored.get(guard.task()))?;
         }
+        for (fence, thread_id, locked) in fenced_after_guards {
+            fence.check(thread_id, locked.as_ref())?;
+        }
         Ok(())
     }
 
@@ -4099,9 +4100,10 @@ impl PostgresDurableStore {
     /// 2. lock the threads it needs (its event threads, its compacted
     ///    threads, its guarded root turns' threads and a spawn's parent
     ///    thread, then a spawn's child threads), in tree order then by
-    ///    thread key, checking the purge fence where a write asks for it;
+    ///    thread key, checking a spawn's purge fence;
     /// 3. lock every declared task in `task_lock_order`, a re-attached child
-    ///    before its parent, and check the guards;
+    ///    before its parent, check the guards, then each append's purge
+    ///    fence on the thread row it locked in step 2;
     /// 4. apply the writes, whose own task locks (a settled child, then its
     ///    parent) follow the same order.
     ///
@@ -4279,7 +4281,7 @@ impl PostgresDurableStore {
 /// A thread a transition locks, with what it declared about it.
 struct DeclaredThread {
     thread: ThreadId,
-    operation: Option<ThreadOperation>,
+    fences: Vec<agent_server::journal::Fence>,
     create: bool,
 }
 

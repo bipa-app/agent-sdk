@@ -1988,6 +1988,69 @@ mod tests {
         Ok(())
     }
 
+    /// An append to a thread that has no row is accepted: thread rows are
+    /// created lazily and a purge always leaves a `Deleted` row, so a
+    /// missing row is not a purged thread. The compaction creates the row,
+    /// and its event lands after it.
+    async fn test_an_append_to_a_thread_with_no_row_is_accepted(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        let thread = thread_id("conformance-rowless-append");
+        anyhow::ensure!(
+            thread_store.get(&thread).await?.is_none(),
+            "the thread starts with no row"
+        );
+        let committed = task_store
+            .commit(summary_compaction(&thread, 0), t_plus(80))
+            .await
+            .context("an append to a thread with no row is accepted")?;
+        assert_eq!(committed.compacted.len(), 1);
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(events.get_events(&thread).await?.len(), 1);
+        Ok(())
+    }
+
+    /// A compaction of `source` messages of `thread` into one summary, with
+    /// its `ContextCompacted` event.
+    fn summary_compaction(thread: &ThreadId, source: usize) -> agent_server::journal::Transition {
+        agent_server::journal::Transition::append_compaction(
+            thread.clone(),
+            vec![agent_sdk_foundation::llm::Message::user("[summary]")],
+            source,
+            0,
+            vec![AgentEvent::ContextCompacted {
+                original_count: source,
+                new_count: 1,
+                original_tokens: 20,
+                new_tokens: 2,
+                trigger: None,
+                engine: None,
+                occupancy: None,
+                threshold: None,
+            }],
+        )
+    }
+
+    /// A settle under a stale lease onto a purged thread is refused by its
+    /// guard: every backend checks the guards before an append's fence.
+    fn expect_guard_rejection(
+        committed: &std::result::Result<
+            agent_server::journal::Committed,
+            agent_server::journal::Rejected,
+        >,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(
+                committed,
+                Err(agent_server::journal::Rejected::Guard { .. })
+            ),
+            "every backend checks the guards before the append fence: {committed:?}",
+        );
+        Ok(())
+    }
+
     async fn test_appends_to_a_purged_thread_are_refused(
         stores: (
             &dyn AgentTaskStore,
@@ -2006,6 +2069,7 @@ mod tests {
         let (task_store, thread_store, messages, events, outbox) = stores;
         let (child, worker, lease) =
             leased_tool_child(task_store, "conformance-purge-fence").await?;
+        let stale = LeaseId::from_string("stale-lease");
         let thread = child.thread_id.clone();
         thread_store.get_or_create(&thread, t_plus(61)).await?;
         let history = vec![
@@ -2015,24 +2079,7 @@ mod tests {
         messages
             .commit_messages(&thread, history.clone(), t_plus(62))
             .await?;
-        let compaction = || {
-            agent_server::journal::Transition::append_compaction(
-                thread.clone(),
-                vec![agent_sdk_foundation::llm::Message::user("[summary]")],
-                history.len(),
-                0,
-                vec![AgentEvent::ContextCompacted {
-                    original_count: history.len(),
-                    new_count: 1,
-                    original_tokens: 20,
-                    new_tokens: 2,
-                    trigger: None,
-                    engine: None,
-                    occupancy: None,
-                    threshold: None,
-                }],
-            )
-        };
+        let compaction = || summary_compaction(&thread, history.len());
         let seed = PurgeSeed {
             root_thread_id: thread.clone(),
             scope: PurgeScope::Thread,
@@ -2058,14 +2105,18 @@ mod tests {
                 let _ = thread_store.finish_purge(&thread, &receipt).await?;
             }
             let at = t_plus(70 + i64::try_from(round)?);
-            let attempts = [
+            for (what, transition) in [
                 ("compaction", compaction()),
                 ("settle", settle_with_tool_call_end(&child, &worker, &lease)),
-            ];
-            for (what, transition) in attempts {
+            ] {
                 expect_append_refused(task_store.commit(transition, at).await, status)
                     .with_context(|| format!("a {what} on a {status} thread"))?;
             }
+            expect_guard_rejection(
+                &task_store
+                    .commit(settle_with_tool_call_end(&child, &worker, &stale), at)
+                    .await,
+            )?;
             expect_direct_appends_refused(appender, &thread, status, at).await?;
             if direct_fenced {
                 let error = messages
@@ -4336,6 +4387,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_an_append_to_a_thread_with_no_row_is_accepted() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_an_append_to_a_thread_with_no_row_is_accepted(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_appends_to_a_purged_thread_are_refused() -> Result<()> {
         let s = fresh_in_memory_stores();
         let appender = agent_server::journal::event_repository::PurgeFencedEventRepository::new(
@@ -4793,6 +4855,13 @@ mod tests {
     async fn conformance_sqlite_repark_transition() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_an_append_to_a_thread_with_no_row_is_accepted() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_an_append_to_a_thread_with_no_row_is_accepted(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -5437,6 +5506,15 @@ mod tests {
             return Ok(());
         };
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_an_append_to_a_thread_with_no_row_is_accepted() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_an_append_to_a_thread_with_no_row_is_accepted(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

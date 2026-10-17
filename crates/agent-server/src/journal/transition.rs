@@ -291,22 +291,99 @@ pub struct SpawnedChildren {
 /// locks them in that same tree order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lock {
-    /// A thread row. With `operation`, the thread must allow it (the purge
-    /// fence); with `create`, the row is created when it does not exist.
+    /// A thread row. With `fence`, the thread must allow its operation;
+    /// with `create`, the row is created when it does not exist.
     Thread {
         thread: ThreadId,
         tier: ThreadTier,
-        operation: Option<ThreadOperation>,
+        fence: Option<Fence>,
         create: bool,
     },
-    /// The thread row of `task`, at [`ThreadTier::Own`]. With `operation`,
-    /// the thread must allow it.
+    /// The thread row of `task`, at [`ThreadTier::Own`]. With `fence`, the
+    /// thread must allow its operation.
     ThreadOf {
         task: AgentTaskId,
-        operation: Option<ThreadOperation>,
+        fence: Option<Fence>,
     },
     /// A task row.
     Task(AgentTaskId),
+}
+
+/// The purge fence a thread lock checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fence {
+    /// The operation the thread's status must allow.
+    pub operation: ThreadOperation,
+    /// What a thread with no row means for the operation.
+    pub missing: MissingThread,
+}
+
+/// What a [`Fence`] does with a thread that has no row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingThread {
+    /// Refuse the transition with
+    /// [`ThreadNotFound`](super::thread::ThreadNotFound): a spawn needs its
+    /// threads to exist.
+    Refuse,
+    /// Let the transition through: thread rows are created lazily, and a
+    /// purge always leaves a `Deleted` row behind, so a missing row is never
+    /// a purged thread. Appends allow it.
+    Allow,
+}
+
+impl Fence {
+    /// An append's fence: a purged thread refuses it, a missing one does
+    /// not.
+    pub const APPEND: Self = Self {
+        operation: ThreadOperation::Append,
+        missing: MissingThread::Allow,
+    };
+    /// A spawn's fence: a purged or missing thread refuses it.
+    pub const SPAWN: Self = Self {
+        operation: ThreadOperation::Spawn,
+        missing: MissingThread::Refuse,
+    };
+
+    /// Whether a backend checks this fence after the transition's guards.
+    /// Every backend checks an append's fence after the guards, so a stale
+    /// lease is reported before a purge. A spawn's fence keeps the order
+    /// each backend's spawn methods checked it in before they became
+    /// wrappers (Postgres: before the guards; SQLite: the parent's before
+    /// and the children's after; in memory: before the write lock).
+    #[must_use]
+    pub const fn after_guards(&self) -> bool {
+        match self.operation {
+            ThreadOperation::Append => true,
+            ThreadOperation::Create
+            | ThreadOperation::Fork
+            | ThreadOperation::Submit
+            | ThreadOperation::Spawn
+            | ThreadOperation::Promote
+            | ThreadOperation::Acquire
+            | ThreadOperation::Commit => false,
+        }
+    }
+
+    /// Check `thread`, the row as locked (`None` when it has none).
+    ///
+    /// # Errors
+    /// [`ThreadNotFound`](super::thread::ThreadNotFound) for a missing row
+    /// under [`MissingThread::Refuse`], and the thread's
+    /// [`ThreadStateConflict`](super::thread::ThreadStateConflict) when its
+    /// status refuses the operation.
+    pub fn check(&self, thread_id: &ThreadId, thread: Option<&Thread>) -> anyhow::Result<()> {
+        match (thread, self.missing) {
+            (Some(thread), _) => thread
+                .require_active(self.operation)
+                .map_err(anyhow::Error::new),
+            (None, MissingThread::Allow) => Ok(()),
+            (None, MissingThread::Refuse) => {
+                Err(anyhow::Error::new(super::thread::ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                }))
+            }
+        }
+    }
 }
 
 /// Where a thread lock falls in a transition's thread order.
@@ -725,13 +802,13 @@ impl Write {
             Self::AppendEvents { thread, events } if !events.is_empty() => vec![Lock::Thread {
                 thread: thread.clone(),
                 tier: ThreadTier::Own,
-                operation: None,
+                fence: Some(Fence::APPEND),
                 create: false,
             }],
             Self::AppendCompaction { thread, .. } => vec![Lock::Thread {
                 thread: thread.clone(),
                 tier: ThreadTier::Own,
-                operation: None,
+                fence: Some(Fence::APPEND),
                 create: false,
             }],
             Self::ReparkAfterSteering { task, reattach, .. } => reattach
@@ -743,7 +820,7 @@ impl Write {
             Self::SpawnChildren { parent, spawn } => {
                 let mut locks = vec![Lock::ThreadOf {
                     task: parent.clone(),
-                    operation: Some(ThreadOperation::Spawn),
+                    fence: Some(Fence::SPAWN),
                 }];
                 let create = spawn.creates_child_threads();
                 locks.extend(
@@ -753,7 +830,7 @@ impl Write {
                         .map(|thread| Lock::Thread {
                             thread: thread.clone(),
                             tier: ThreadTier::Spawned,
-                            operation: Some(ThreadOperation::Spawn),
+                            fence: Some(Fence::SPAWN),
                             create,
                         }),
                 );

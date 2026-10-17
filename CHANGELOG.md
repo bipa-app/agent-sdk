@@ -110,7 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of the subagents it spawns, each by key), the order `cancel_tree`
     takes them in, then the declared tasks children first, so a spawn's
     re-attached children and delivered injections lock with the parent in
-    one order. A spawn's purge fence is checked in that lock phase.
+    one order.
+  - A thread lock carries its purge fence (`Fence`: the operation, and a
+    `MissingThread` policy). An append's fence allows a thread with no row
+    (rows are created lazily, and a purge always leaves a `Deleted` row);
+    a spawn's refuses one with `ThreadNotFound`. Every backend checks an
+    append's fence after the guards, so a stale lease is reported before a
+    purge (Postgres checked it before them); a spawn's fence keeps the
+    order each backend's spawn methods used (Postgres: in the lock phase,
+    before the guards; SQLite: the parent's thread, the lease, then the
+    child threads; in memory: before the write lock).
   - A malformed spawn (an empty batch, an event count that does not match
     its subagents, tool specs the pure tool spawn refuses, a mixed batch
     that does not cover its pending calls) is refused by
@@ -257,8 +266,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     periodic subagent progress onto a purged parent stops.
   - Still unfenced: the `MessageProjectionStore` writes other than
     `append_compaction` (`commit_messages`, `replace_history`,
-    `append_repair`, `set_draft`, `get_or_create`), and the in-memory
-    `MessageProjectionStore::append_compaction`.
+    `append_repair`, `set_draft`, `get_or_create`), the in-memory
+    `MessageProjectionStore::append_compaction`, and the lease-guarded
+    event writers `pause_on_question` and `requeue_owned_task`, which can
+    reach a purged thread only between `begin_purge` and its `cancel_tree`,
+    the window the `commit` fence covers.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).
