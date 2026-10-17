@@ -175,13 +175,16 @@ async fn interrupt_unsafe_replay(
         vec![failure_tool_call_end(bootstrap, &error_msg)],
     );
     if prior.state.is_started() {
-        transition.writes.push(Write::Effect(EffectWrite::Finish {
-            key: prior.key.clone(),
-            owner: prior.owner.clone(),
-            state: EffectState::Interrupted {
-                captured_output: None,
-            },
-        }));
+        transition.writes.insert(
+            0,
+            Write::Effect(EffectWrite::Finish {
+                key: prior.key.clone(),
+                owner: prior.owner.clone(),
+                state: EffectState::Interrupted {
+                    captured_output: None,
+                },
+            }),
+        );
     }
     commit_failed_settle(task_store, transition, error_msg, now)
         .await
@@ -195,6 +198,7 @@ const fn status_words(state: &EffectState) -> &'static str {
         EffectState::Failed { .. } => "Failed",
         EffectState::Interrupted { .. } => "Interrupted",
         EffectState::Salvaged { .. } => "Salvaged",
+        EffectState::Abandoned => "Abandoned",
     }
 }
 

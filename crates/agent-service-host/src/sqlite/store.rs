@@ -1596,6 +1596,40 @@ WHERE id = ?1
             result.rows_affected(),
             task.id
         );
+        if task.status.is_terminal() {
+            Self::abandon_started_effects_tx(tx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// End the still-`Started` effects of a task that just became
+    /// terminal as `Abandoned`, in the same transaction: a `Started`
+    /// record's owner is live. Every write of a task's status goes through
+    /// [`Self::update_task_tx`], so no path that ends an owner skips this.
+    async fn abandon_started_effects_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task: &AgentTask,
+    ) -> Result<()> {
+        let columns = EffectState::Abandoned.columns();
+        sqlx::query!(
+            r"
+UPDATE agent_sdk_execution_intents
+SET status     = ?1,
+    error      = ?2,
+    resolution = ?3,
+    updated_at = ?4
+WHERE child_task_id = ?5
+  AND status IN ('pending', 'started')
+",
+            columns.status,
+            columns.error,
+            columns.resolution,
+            task.updated_at,
+            task.id.as_str(),
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("abandon the started effects of task {}", task.id))?;
         Ok(())
     }
 

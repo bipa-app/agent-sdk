@@ -635,6 +635,68 @@ async fn a_refused_settle_leaves_the_record_started() -> Result<()> {
     Ok(())
 }
 
+/// The review's probe: the tree is cancelled while an unsafe call runs. The
+/// cancel ends the child, so it also abandons the child's started record in
+/// that transaction; the worker's end transition is refused, and nothing
+/// can run the call again because a terminal child is never acquired.
+#[tokio::test]
+async fn cancelling_the_tree_mid_call_abandons_the_record() -> Result<()> {
+    let stores = TestStores::new();
+    let cancel = CancellationToken::new();
+
+    let (parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "transfer".into(),
+            serde_json::json!({"amount": 100}),
+        )],
+    )
+    .await?;
+    let child = acquire_child(&stores.tasks, &children[0].id).await?;
+    let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
+    let key = EffectKey::tool(&ctx.task_id, &ctx.tool_call.id);
+    let child_id = ctx.task_id.clone();
+    let tasks = &stores.tasks;
+    let parent_id = parent.id.clone();
+
+    let result = run_tool_effect(
+        ctx,
+        tasks,
+        &cancel,
+        |_info, _collector| async move {
+            tasks.cancel_tree(&parent_id, t_plus(30)).await?;
+            Ok(ToolResult::success("transfer done"))
+        },
+        t_plus(20),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "the end transition under a cancelled child is refused"
+    );
+    let child = stores.tasks.get(&child_id).await?.context("child")?;
+    assert_eq!(child.status, TaskStatus::Cancelled);
+    let record = stores.tasks.effect(&key).await?.context("record")?;
+    assert_eq!(record.state, EffectState::Abandoned);
+    assert!(
+        stores
+            .tasks
+            .try_acquire_task(
+                &child_id,
+                WorkerId::from_string("next_worker"),
+                LeaseId::from_string("next_lease"),
+                t_plus(20_000),
+                t_plus(10_001),
+            )
+            .await?
+            .is_none(),
+        "a cancelled child is never acquired, so the call never runs again"
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Retry: completed record blocks re-execution
 // ─────────────────────────────────────────────────────────────────────

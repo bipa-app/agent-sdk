@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_execution_intents\nSET status     = ?1,\n    error      = ?2,\n    resolution = ?3,\n    updated_at = ?4\nWHERE child_task_id = ?5\n  AND status IN ('pending', 'started')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "d9ed2f8d457c054ed1fdf15e24bd8e33255b6f7fa928d86229f70489c32acb4a"
+}

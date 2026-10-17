@@ -7,8 +7,8 @@
 -- The other columns are NULL for every row written before this migration.
 --
 -- The status and effect_class checks from 0003 stay as they are. An
--- interrupted or salvaged effect is status 'failed' with error set (0003's
--- error check) and resolution naming which.
+-- interrupted, salvaged or abandoned effect is status 'failed' with error
+-- set (0003's error check) and resolution naming which.
 --
 -- The checks land NOT VALID, so this migration scans nothing under the
 -- ACCESS EXCLUSIVE lock its ALTERs take. Writes are checked at once; 0029
@@ -31,7 +31,7 @@ ALTER TABLE agent_sdk_execution_intents
     ADD CONSTRAINT agent_sdk_execution_intents_resolution_check
         CHECK (
             resolution IS NULL
-            OR (status = 'failed' AND resolution IN ('interrupted', 'salvaged'))
+            OR (status = 'failed' AND resolution IN ('interrupted', 'salvaged', 'abandoned'))
         ) NOT VALID,
     ADD CONSTRAINT agent_sdk_execution_intents_attempt_check
         CHECK (attempt >= 1) NOT VALID;

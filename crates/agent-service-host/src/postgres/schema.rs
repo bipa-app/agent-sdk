@@ -1335,7 +1335,7 @@ const AGENT_SDK_EXECUTION_INTENT_COLUMNS: &[ColumnContract] = &[
         name: "resolution",
         sql_type: "TEXT",
         nullable: true,
-        notes: "How recovery ended a `failed` effect that never finished (`interrupted`, `salvaged`).",
+        notes: "How a `failed` effect that never finished ended (`interrupted`, `salvaged`, `abandoned`).",
     },
     ColumnContract {
         name: "captured_output",
