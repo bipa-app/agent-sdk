@@ -393,9 +393,10 @@ impl Fence {
     /// status refuses the operation.
     pub fn check(&self, thread_id: &ThreadId, thread: Option<&Thread>) -> anyhow::Result<()> {
         match (thread, self.missing) {
-            (Some(thread), _) => thread
-                .require_active(self.operation)
-                .map_err(anyhow::Error::new),
+            (Some(thread), _) => thread.require_active(self.operation).map_err(|conflict| {
+                conflict.record();
+                anyhow::Error::new(conflict)
+            }),
             (None, MissingThread::Allow) => Ok(()),
             (None, MissingThread::Refuse) => {
                 Err(anyhow::Error::new(super::thread::ThreadNotFound {

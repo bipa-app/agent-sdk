@@ -401,6 +401,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_or_create` still adds an empty message head to a purged thread
     with none, on every backend. It writes no history, and readers of a
     deleted thread call it.
+  - Each refusal is counted on the new
+    `agent_server.journal.thread_fence.refused` counter (`otel`), by
+    `operation` and `thread_status`, and logged at debug with the thread
+    id. Refusals are recorded where the fence refuses a write
+    (`Fence::check` and the SQL backends' thread checks), not where a
+    store only probes a thread's status. `ThreadOperation` and
+    `ThreadStatus` gain `as_str`.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).

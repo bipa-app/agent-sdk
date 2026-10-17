@@ -637,7 +637,9 @@ WHERE thread_id = ?1
                 thread_id: thread_id.clone(),
             })
         })?;
-        thread.require_active(operation)?;
+        thread
+            .require_active(operation)
+            .inspect_err(agent_server::journal::thread::ThreadStateConflict::record)?;
         Ok(())
     }
 
