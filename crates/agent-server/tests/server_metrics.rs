@@ -799,3 +799,151 @@ async fn effect_signals_count_each_transition_by_kind() -> Result<()> {
     );
     Ok(())
 }
+
+/// An in-memory task store wired to commit completed turns, as a host
+/// wires it, with the attempt store it closes attempts in.
+fn committing_store() -> (
+    agent_server::journal::store::InMemoryAgentTaskStore,
+    agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore,
+) {
+    use agent_server::journal::checkpoint_store::InMemoryCheckpointStore;
+    use agent_server::journal::event_repository::InMemoryEventRepository;
+    use agent_server::journal::message_store::InMemoryMessageProjectionStore;
+    use agent_server::journal::outbox::InMemoryOutboxStore;
+    use agent_server::journal::store::{
+        CancellationMarkerSink, CompletedTurnSink, InMemoryAgentTaskStore,
+    };
+    use agent_server::journal::thread_store::InMemoryThreadStore;
+    use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
+
+    let attempts = InMemoryTurnAttemptStore::new();
+    let store = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
+            event_repo: Arc::new(InMemoryEventRepository::new()),
+            outbox_store: Arc::new(InMemoryOutboxStore::new()),
+            thread_store: Arc::new(InMemoryThreadStore::new()),
+        })
+        .with_message_store(Arc::new(InMemoryMessageProjectionStore::new()))
+        .with_completed_turns(CompletedTurnSink {
+            attempt_store: Arc::new(attempts.clone()),
+            checkpoint_store: Arc::new(InMemoryCheckpointStore::new()),
+        });
+    (store, attempts)
+}
+
+fn empty_close() -> agent_server::journal::turn_attempt::CloseAttemptParams {
+    use agent_server::journal::turn_attempt::{CloseAttemptParams, TurnAttemptOutcome};
+
+    CloseAttemptParams {
+        response_blob: serde_json::json!({}),
+        response_id: None,
+        response_model: None,
+        stop_reason: None,
+        outcome: TurnAttemptOutcome::Success,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        route_provider: None,
+        thinking_mode: None,
+        thinking_budget_tokens: None,
+        thinking_effort: None,
+    }
+}
+
+/// Every completed-turn commit is counted with its bounded outcome, the
+/// refusals included: a worker that lost its lease discards a finished turn,
+/// so its rate matters.
+#[tokio::test]
+async fn completed_turn_commits_count_each_outcome() -> Result<()> {
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::{TokenUsage, llm};
+    use agent_server::journal::checkpoint::CheckpointKind;
+    use agent_server::journal::commit::{
+        CommitOwnerGuard, CompletedTurnCommit, commit_completed_turn,
+    };
+    use agent_server::journal::store::AgentTaskStore;
+    use agent_server::journal::task::{AgentTask, LeaseId, WorkerId};
+    use agent_server::journal::turn_attempt::OpenAttemptParams;
+    use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+    use agent_server::journal::{Settle, Write};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let _ = ServerMetrics::global();
+
+    let (store, attempts) = committing_store();
+    let thread = ThreadId::from_string("completed-turn-metrics");
+    let root = AgentTask::new_root_turn(thread.clone(), t0(), 3);
+    store.submit_root_turn(root.clone()).await?;
+    let (worker, lease) = (WorkerId::new(), LeaseId::new());
+    store
+        .try_acquire_task(
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            t0() + time::Duration::hours(1),
+            t0(),
+        )
+        .await?
+        .context("acquire the root")?;
+    let attempt = attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: root.id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-5-5"),
+            request_blob: serde_json::json!({}),
+            now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+    let commit = |expected_turn: u32, lease: LeaseId| CompletedTurnCommit {
+        extra_writes: vec![Write::SettleTask {
+            task: root.id.clone(),
+            outcome: Settle::CompleteWithoutResult,
+        }],
+        delivered_injection_ids: Vec::new(),
+        checkpoint_kind: CheckpointKind::FullTurn,
+        thread_id: thread.clone(),
+        task_id: root.id.clone(),
+        expected_turn,
+        turn_attempt_id: attempt.id.clone(),
+        close_attempt_params: empty_close(),
+        messages: vec![llm::Message::assistant("done")],
+        turn_usage: TokenUsage::default(),
+        agent_state_snapshot: serde_json::json!({}),
+        events: Vec::new(),
+        outbox_max_attempts: 3,
+        owner_guard: Some(CommitOwnerGuard {
+            worker_id: worker.clone(),
+            lease_id: lease,
+        }),
+        now: t0(),
+    };
+
+    assert!(
+        commit_completed_turn(commit(1, LeaseId::new()), &store)
+            .await
+            .is_err()
+    );
+    assert!(
+        commit_completed_turn(commit(2, lease.clone()), &store)
+            .await
+            .is_err()
+    );
+    commit_completed_turn(commit(1, lease), &store).await?;
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.journal.completed_turn.commits");
+    for outcome in ["lost_ownership", "stale_turn", "ok"] {
+        let seen: u64 = counts
+            .iter()
+            .filter(|(set, _)| has_label(set, attrs::OUTCOME, outcome))
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(seen, 1, "outcome {outcome}: {counts:?}");
+    }
+    Ok(())
+}

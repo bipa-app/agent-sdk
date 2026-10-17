@@ -3019,13 +3019,12 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
-    /// inside the completed-turn transaction (issue #354): the
-    /// slot-shift retry validates — under `SQLite`'s exclusive write
-    /// transaction — that the presenting worker still owns a live
-    /// `Running` row, so a cancellation / lease loss between the
-    /// caller's shift-eligibility check and the retry rejects here
-    /// instead of splicing a dead root's turn into the shifted slot.
-    /// A `None` guard (every first, non-shifted commit) is a no-op.
+    /// inside the completed-turn transaction (issue #354): the worker
+    /// passes it on every root completion, so — under `SQLite`'s exclusive
+    /// write transaction — a cancellation or lease loss since the worker
+    /// last checked rejects the whole turn here, with its settle, instead
+    /// of committing a turn under a task the worker no longer owns. A
+    /// `None` guard (callers that complete no task) is a no-op.
     async fn enforce_commit_owner_guard_tx(
         tx: &mut Transaction<'_, Sqlite>,
         task_id: &AgentTaskId,

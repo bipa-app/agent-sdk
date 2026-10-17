@@ -199,6 +199,7 @@ inventory covers the whole observability surface.
 | `agent_server.journal.transition.duration` | Histogram (s) | `backend` (`memory`/`sqlite`/`postgres`), `outcome` (`committed`/`guard`/`expectation`/`store`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
 | `agent_server.journal.transition.lock_conflict_retries` | Counter | `backend` | `[agent-service-host]` Postgres `commit` | crash-safety Phase 3 |
 | `agent_server.journal.documents.written` | Counter | `backend`, `scope` (`host`/`thread`/`task`), `op` (`put`/`retire`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
+| `agent_server.journal.completed_turn.commits` | Counter | `outcome` (`ok`, `lost_ownership`, `stale_turn`, `error`) | `[agent-server]` `commit_completed_turn` | Phase 2 |
 | `agent_server.effects` | Counter | `kind`, `transition` (`started`, `refused`, `finished`, `reclaimed`, `abandoned`) | `[agent-server]` (abandons also from the SQL stores) | Phase 2 |
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |

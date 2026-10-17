@@ -1657,7 +1657,10 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     ///
     /// With [`CompletedTurnCommit::owner_guard`](super::commit::CompletedTurnCommit::owner_guard)
     /// set, the task row must still be `Running` under that worker and
-    /// lease, checked inside the same unit.
+    /// lease, checked inside the same unit. The
+    /// [`extra_writes`](super::commit::CompletedTurnCommit::extra_writes) (the
+    /// task's own settle) are applied in the same unit, after the delivered
+    /// injections, so the turn and the root's terminal row commit together.
     ///
     /// # Errors
     /// - [`StaleTurnCommit`](super::commit::StaleTurnCommit) when the thread

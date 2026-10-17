@@ -110,6 +110,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A store decorator that watched `complete_task` for root completions
     must read `CommitOutcome::settled` from `commit_completed_turn`
     instead.
+  - The new counter `agent_server.journal.completed_turn.commits{outcome}`
+    (`ok`, `lost_ownership`, `stale_turn`, `error`) counts every
+    completed-turn commit. A refusal also logs a warning.
 - `ABORTED_RESPONSE_NOTE` and `is_aborted_response_note`: the user
   message recovery will append after a cut-off response (Phase 2's
   `LlmRequest` salvage). Clients that render messages skip it.

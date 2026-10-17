@@ -2279,13 +2279,12 @@ FOR UPDATE
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the locked task
-    /// row inside the completed-turn transaction: the slot-shift retry
-    /// validates that the presenting worker still owns a live `Running`
-    /// row, so a cancellation / lease loss that landed between the
-    /// caller's shift-eligibility check and the retry rejects here —
-    /// inside the transaction — instead of splicing a dead root's turn
-    /// into the shifted slot. A `None` guard (every first, non-shifted
-    /// commit) is a no-op.
+    /// row (`FOR UPDATE`) inside the completed-turn transaction: the
+    /// worker passes it on every root completion, so a cancellation or
+    /// lease loss since the worker last checked rejects the whole turn
+    /// here, with its settle, instead of committing a turn under a task the
+    /// worker no longer owns. A `None` guard (callers that complete no
+    /// task) is a no-op.
     async fn enforce_commit_owner_guard_tx(
         tx: &mut Transaction<'_, Postgres>,
         task_id: &AgentTaskId,

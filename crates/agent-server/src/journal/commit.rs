@@ -121,8 +121,8 @@ pub struct CompletedTurnCommit {
     /// Maximum relay attempts for the coalesced advisory outbox row
     /// written alongside `events`. Ignored when `events` is empty.
     pub outbox_max_attempts: u32,
-    /// Optional task-row ownership validation performed **inside** the
-    /// commit transaction.
+    /// Task-row ownership validation performed **inside** the commit
+    /// transaction.
     ///
     /// When set, the store re-reads the task row (`FOR UPDATE` on
     /// Postgres; under `SQLite`'s exclusive write transaction; under the
@@ -131,9 +131,9 @@ pub struct CompletedTurnCommit {
     /// unless the row is still `Running` and owned by exactly this
     /// `(worker, lease)` pair — closing the window where a
     /// cancellation or lease loss lands between a caller-side
-    /// ownership check and the commit. Used only by the worker's
-    /// turn-slot-shift retry; the first (non-shifted) commit attempt
-    /// passes `None` so the normal path is unchanged.
+    /// ownership check and the commit. The worker passes it on every root
+    /// completion, the first commit and each turn-slot-shift retry alike,
+    /// because the root's settle among [`Self::extra_writes`] needs it.
     pub owner_guard: Option<CommitOwnerGuard>,
     /// Further writes applied inside the completed turn's transaction,
     /// after its own rows and events. Only the task's own
@@ -324,16 +324,45 @@ pub async fn commit_completed_turn(
 ) -> Result<CommitOutcome> {
     #[cfg(feature = "otel")]
     let started_at = std::time::Instant::now();
+    let task_id = params.task_id.clone();
 
-    let outcome = task_store.commit_completed_turn(params).await?;
+    let result = task_store.commit_completed_turn(params).await;
 
+    let outcome = commit_outcome_label(&result);
     #[cfg(feature = "otel")]
-    crate::observability::ServerMetrics::global().record_journal_commit(
-        crate::observability::attrs::COMMIT_KIND_ATOMIC,
-        started_at.elapsed().as_secs_f64(),
-    );
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        metrics.record_completed_turn_commit(outcome);
+        if result.is_ok() {
+            metrics.record_journal_commit(
+                crate::observability::attrs::COMMIT_KIND_ATOMIC,
+                started_at.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    if let Err(error) = &result
+        && outcome != "error"
+    {
+        log::warn!(
+            task_id = task_id.as_str(),
+            outcome = outcome;
+            "completed turn refused; the finished turn is discarded: {error:#}"
+        );
+    }
+    result
+}
 
-    Ok(outcome)
+/// The bounded outcome of a completed-turn commit: `ok`, `lost_ownership`
+/// (the worker no longer owns the task), `stale_turn` (another commit took
+/// the turn slot) or `error`.
+#[must_use]
+pub fn commit_outcome_label(result: &Result<CommitOutcome>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(error) if error.downcast_ref::<LostCommitOwnership>().is_some() => "lost_ownership",
+        Err(error) if error.downcast_ref::<StaleTurnCommit>().is_some() => "stale_turn",
+        Err(_) => "error",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
