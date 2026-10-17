@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Primitive 10 (S-2): the subagent completion hook
+
+- **Breaking:** `SubagentResultDeps` gains `completion_hook:
+  Option<InstalledCompletionHook>`. Code that builds it as a struct literal
+  adds `completion_hook: None`, which keeps today's settle.
+- `SubagentCompletionHook` (`agent_server::worker`): host work that a
+  subagent invocation runs after its child root is terminal and before the
+  settle that resumes the parent. Install it with
+  `ServiceHost::with_subagent_completion_hook` (or
+  `StoreRegistry::with_subagent_completion_hook`).
+  - `plan(ctx)` names a git step (`CompletionPlan { step, repo, unit }`) or
+    none. With a step, the SDK commits a `Started` `GitStep` record keyed
+    `{invocation}:git:{step}` under the invocation's lease before the hook
+    runs.
+  - `run(ctx, prior, mode)` gets the earlier attempt's `Started` record as
+    `prior`, and `RunMode::Inspect` on the invocation's last attempt when
+    it is a retry. A first attempt always executes, so an invocation stored
+    with a budget of 1 (spawned before S-1) still lands its work.
+  - One transition then finishes the record, settles the invocation with
+    the hook's result, appends the parent's completed `SubagentProgress`
+    and applies the hook's `extra_writes` (`Document` and `AppendEvents`
+    only). The parent resumes in it.
+  - `CompletionContext::store` reads effect records and refuses `commit`.
+  - `CompletionOutput::park` is refused as `CompletionHookError::Unsupported`
+    until the durable prompt row can own a parked invocation. A refused
+    output or an `Err` from `run` fails the invocation closed, which
+    abandons the record.
+  - With no hook installed, an invocation commits exactly the settle it
+    committed before.
+- Signals: span `agent_server.subagent.completion_hook`;
+  `agent_server.effects{kind="git_step"}` with the new transition
+  `continued`; `agent_server.effect.duration{kind="git_step"}`; counter
+  `agent_server.subagent.completion_hook.refused{reason}`.
+- Failpoint `subagent.completion_hook.before_settle`: after the hook ran,
+  before the settle commits.
+
 ### Primitive 10 (S-1): git-step effects and the invocation retry budget
 
 - **Breaking** (for code that matches these enums exhaustively):

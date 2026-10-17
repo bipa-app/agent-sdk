@@ -87,6 +87,7 @@
 pub mod activity;
 pub mod bootstrap;
 pub mod compaction;
+pub mod completion_hook;
 pub mod confirmation;
 pub mod connectivity;
 pub mod definition;
@@ -105,6 +106,8 @@ mod bootstrap_test;
 mod compaction_integration_test;
 #[cfg(test)]
 mod compaction_resume_test;
+#[cfg(test)]
+mod completion_hook_test;
 #[cfg(test)]
 mod confirmation_test;
 #[cfg(test)]
@@ -140,6 +143,10 @@ mod turn_end_settlement_test;
 
 pub use activity::{ActivityBeacon, ActivityTrackingEventRepo};
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
+pub use completion_hook::{
+    CompletionContext, CompletionHookError, CompletionOutput, CompletionPlan,
+    InstalledCompletionHook, PromptRequest, RunMode, SubagentCompletionHook,
+};
 pub use connectivity::{ConnectivityWait, ConnectivityWaitGuard, ConnectivityWaitRegistry};
 pub use definition::{
     AgentDefinition, ChildJoinPolicy, ProviderRequestKind, RequestContextFn, RequestContextInput,

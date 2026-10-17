@@ -325,6 +325,7 @@ impl TestStores {
             message_store: &self.messages,
             event_repo: &self.events,
             artifact_store: None,
+            completion_hook: None,
         }
     }
 

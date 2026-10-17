@@ -1199,6 +1199,9 @@ pub struct SubagentResultDeps<'a> {
     pub message_store: &'a dyn MessageProjectionStore,
     pub event_repo: &'a dyn EventRepository,
     pub artifact_store: Option<&'a ArtifactStore>,
+    /// The host's completion hook, if one is installed. Without one the
+    /// invocation settles with the child's result.
+    pub completion_hook: Option<super::completion_hook::InstalledCompletionHook>,
 }
 
 /// Successful completion of a `subagent` invocation task.
@@ -1372,6 +1375,17 @@ async fn execute_subagent_task_inner(
     let subagent_result = materialize_terminal_subagent_result(&bootstrap, deps, now).await?;
     let tool_result = build_parent_tool_result(&subagent_result, deps.artifact_store)
         .context("build tool result")?;
+    if let Some(installed) = &deps.completion_hook {
+        return super::completion_hook::settle_with_hook(
+            installed,
+            &bootstrap,
+            deps.task_store,
+            subagent_result,
+            tool_result,
+            now,
+        )
+        .await;
+    }
     let result_payload =
         serde_json::to_value(&tool_result).context("serialize subagent tool result")?;
     let committed = deps
@@ -2373,7 +2387,7 @@ async fn materialize_terminal_subagent_result(
 /// The parent-visible `SubagentProgress` that reports an invocation's
 /// completion. It commits in the same transition as the invocation's
 /// settle, so the parent never sees the result without the event.
-fn completed_progress_event(
+pub(super) fn completed_progress_event(
     bootstrap: &SubagentTaskBootstrap,
     summary: &SubagentSummary,
 ) -> AgentEvent {

@@ -34,10 +34,14 @@ use agent_sdk_foundation::{
     AgentEvent, ThreadId, ToolConcurrency, ToolReplay, ToolResult, ToolTier,
 };
 use agent_sdk_providers::{LlmProvider, StreamBox, StreamDelta};
+use agent_server::journal::effect::{EffectKey, EffectRecord, EffectState};
 use agent_server::journal::task::{AgentTask, TaskStatus};
 use agent_server::worker::ToolEventCollector;
 use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_server::worker::registry::InMemoryAgentDefinitionRegistry;
+use agent_server::worker::{
+    CompletionContext, CompletionOutput, CompletionPlan, RunMode, SubagentCompletionHook,
+};
 use agent_server::{AgentTaskId, ToolTaskBootstrap};
 use agent_service_host::config::{ServiceConfig, StorageConfig, WorkerConfig};
 use agent_service_host::grpc::LocalDaemon;
@@ -94,10 +98,11 @@ enum Scenario {
     HungTool,
     HungSubagent,
     Overlap,
+    MergeBack,
 }
 
 impl Scenario {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
@@ -108,6 +113,7 @@ impl Scenario {
         Self::HungTool,
         Self::HungSubagent,
         Self::Overlap,
+        Self::MergeBack,
     ];
 
     const fn name(self) -> &'static str {
@@ -122,6 +128,7 @@ impl Scenario {
             Self::HungTool => "s7_hung_tool",
             Self::HungSubagent => "s7_hung_subagent",
             Self::Overlap => "s8_overlap",
+            Self::MergeBack => "s9_merge_back",
         }
     }
 
@@ -147,7 +154,7 @@ impl Scenario {
                     .collect(),
             ),
             Self::HungTool => tool_use(HANG_TOOL, json!({})),
-            Self::HungSubagent => tool_use(SUBAGENT_TOOL, json!({})),
+            Self::HungSubagent | Self::MergeBack => tool_use(SUBAGENT_TOOL, json!({})),
             Self::Overlap => tool_uses(vec![
                 ("cm-call-1".to_owned(), UNSAFE_TOOL),
                 ("cm-call-2".to_owned(), SAFE_TOOL),
@@ -384,6 +391,50 @@ impl LlmProvider for MatrixProvider {
 
     fn provider(&self) -> &'static str {
         "cm"
+    }
+}
+
+/// S9's completion hook: one `merge_back` git step. The crashed process
+/// publishes the invocation id from inside the hook (after its `Started`
+/// record committed) and waits to be killed; the recovering process records
+/// the attempt, mode and prior record it ran with, and finishes the step.
+struct MatrixHook {
+    phase: Phase,
+    dir: Arc<CaseDir>,
+}
+
+#[async_trait]
+impl SubagentCompletionHook for MatrixHook {
+    fn plan(&self, _ctx: &CompletionContext) -> Option<CompletionPlan> {
+        Some(CompletionPlan {
+            step: "merge_back".into(),
+            repo: "repo_1".into(),
+            unit: "unit_1".into(),
+        })
+    }
+
+    async fn run(
+        &self,
+        ctx: &CompletionContext,
+        prior: Option<&EffectRecord>,
+        mode: RunMode,
+    ) -> Result<CompletionOutput> {
+        if self.phase == Phase::Crash {
+            self.dir.signal_ready(ctx.invocation.as_str())?;
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            bail!("the crash-matrix child was not killed while its hook ran");
+        }
+        self.dir.record_run(&format!(
+            "merge_back attempt={} mode={mode:?} prior={}",
+            ctx.attempt,
+            prior.map_or("none", |record| record.state.outcome_label()),
+        ))?;
+        Ok(CompletionOutput {
+            result: ToolResult::success("merged unit_1"),
+            state: EffectState::Completed,
+            extra_writes: Vec::new(),
+            park: None,
+        })
     }
 }
 
@@ -899,14 +950,28 @@ async fn start_daemon(
     let runtime = Arc::new(
         ExecutionRuntime::new(
             resolver,
-            Arc::new(MatrixTools { phase, dir }),
+            Arc::new(MatrixTools {
+                phase,
+                dir: Arc::clone(&dir),
+            }),
             Arc::new(AllowAllConfirmationPolicy),
         )
         .with_subagent_spawn_selector(Arc::new(MatrixSelector)),
     );
     let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(definition()));
     let config_backend = storage.backend.clone();
-    let daemon = LocalDaemon::start(service_config(storage), registry, runtime).await?;
+    let hook = (scenario == Scenario::MergeBack)
+        .then(|| Arc::new(MatrixHook { phase, dir }) as Arc<dyn SubagentCompletionHook>);
+    let daemon = LocalDaemon::start_with_store_decorator(
+        service_config(storage),
+        registry,
+        runtime,
+        move |stores| match hook {
+            Some(hook) => stores.with_subagent_completion_hook(hook),
+            None => stores,
+        },
+    )
+    .await?;
     Ok(Daemon {
         host: daemon,
         provider,
@@ -1210,7 +1275,8 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::CancelTree
         | Scenario::HungTool
         | Scenario::HungSubagent
-        | Scenario::Overlap => {
+        | Scenario::Overlap
+        | Scenario::MergeBack => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
             (scenario != Scenario::LlmStream).then(|| AgentTaskId::from_string(ready.trim()))
         }
@@ -1315,7 +1381,8 @@ async fn answer_prompt(
         | Scenario::CancelTree
         | Scenario::HungTool
         | Scenario::HungSubagent
-        | Scenario::Overlap => {}
+        | Scenario::Overlap
+        | Scenario::MergeBack => {}
     }
     Ok(())
 }
@@ -1934,6 +2001,60 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
 // The matrix: each scenario on each backend
 // ─────────────────────────────────────────────────────────────────────
 
+/// S9 (prim10 design §5.3, the SDK half): a kill -9 while a subagent
+/// invocation's completion hook runs. The hook's `GitStep` record committed
+/// before the hook ran, so after the restart the requeued invocation
+/// continues that record: the hook runs once more, on attempt 2 in
+/// `Execute` with `prior = Started`, the record finishes `Completed` in the
+/// settle, and the parent gets one result and completes.
+async fn s9_merge_back(backend: Backend) -> Result<()> {
+    let Some(case) = crash_and_recover(backend, Scenario::MergeBack).await? else {
+        return Ok(());
+    };
+    let invocation = case.tool_child.as_ref().context("no invocation id")?;
+    ensure!(
+        case.runs == ["merge_back attempt=2 mode=Execute prior=started"],
+        "the recovering hook ran {:?}",
+        case.runs
+    );
+    let record = case
+        .stores
+        .task_store
+        .effect(&EffectKey::git(invocation, "merge_back"))
+        .await?
+        .context("no git-step record")?;
+    ensure!(
+        record.state == EffectState::Completed && record.attempt == 1,
+        "the git-step record: {record:?}"
+    );
+    let completed = thread_events(&case.stores, &case.thread)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::SubagentProgress {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    ensure!(
+        completed == 1,
+        "the parent got {completed} completed results"
+    );
+    ensure!(
+        case.root.status == TaskStatus::Completed,
+        "the root turn is {:?}: {:?}",
+        case.root.status,
+        case.root.last_error
+    );
+    let live = live_rows(&case.stores, &case.thread).await?;
+    ensure!(live.is_empty(), "rows left live: {live:?}");
+    Ok(())
+}
+
 macro_rules! matrix {
     ($backend:ident, $feature:literal, [$($scenario:ident),* $(,)?], [$($gated:ident: $gate:literal),* $(,)?], [$($known:ident: $why:literal),* $(,)?]) => {
         #[cfg(feature = $feature)]
@@ -1965,7 +2086,15 @@ macro_rules! matrix {
 matrix!(
     sqlite,
     "sqlite",
-    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation, s7_hung_tool],
+    [
+        s1_unsafe_tool,
+        s2_safe_tool,
+        s5_cancel_tree,
+        s6_question,
+        s6_confirmation,
+        s7_hung_tool,
+        s9_merge_back,
+    ],
     [s4_fork: "failpoints"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
@@ -1976,7 +2105,15 @@ matrix!(
 matrix!(
     postgres,
     "postgres",
-    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation, s7_hung_tool],
+    [
+        s1_unsafe_tool,
+        s2_safe_tool,
+        s5_cancel_tree,
+        s6_question,
+        s6_confirmation,
+        s7_hung_tool,
+        s9_merge_back,
+    ],
     [s4_fork: "failpoints", s8_overlap: "postgres"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
