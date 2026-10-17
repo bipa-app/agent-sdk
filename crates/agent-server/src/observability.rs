@@ -161,9 +161,9 @@ pub mod attrs {
     pub const OUTCOME_STORE: &str = "store";
 
     /// Where a transition extension ran: `commit` / `completed_turn`.
-    pub const VIEW: &str = "view";
-    pub const VIEW_COMMIT: &str = "commit";
-    pub const VIEW_COMPLETED_TURN: &str = "completed_turn";
+    pub const EXTENSION_POINT: &str = "extension.point";
+    pub const EXTENSION_POINT_COMMIT: &str = "commit";
+    pub const EXTENSION_POINT_COMPLETED_TURN: &str = "completed_turn";
 
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
@@ -363,7 +363,30 @@ impl ServerMetrics {
         let Ok(committed) = result else {
             return;
         };
-        for document in &committed.documents {
+        self.record_documents(backend, &committed.documents);
+    }
+
+    /// Count what a transition extension did on one commit: the writes it
+    /// added, or a refusal of a write it may not add.
+    pub fn record_extension(&self, point: &'static str, added: usize, refused: bool) {
+        let attributes = [KeyValue::new(attrs::EXTENSION_POINT, point)];
+        if refused {
+            self.extension_refused.add(1, &attributes);
+        } else if added > 0 {
+            self.extension_writes
+                .add(u64::try_from(added).unwrap_or(u64::MAX), &attributes);
+        }
+    }
+
+    /// Count each committed document write on
+    /// `agent_server.journal.documents.written`, from a transition or from a
+    /// completed turn's extra writes.
+    pub fn record_documents(
+        &self,
+        backend: &'static str,
+        documents: &[crate::journal::DocumentOutcome],
+    ) {
+        for document in documents {
             let op = if document.revision.is_some() {
                 attrs::OP_PUT
             } else {
@@ -377,18 +400,6 @@ impl ServerMetrics {
                     KeyValue::new(attrs::OP, op),
                 ],
             );
-        }
-    }
-
-    /// Count what a transition extension did on one commit: the writes it
-    /// added, or a refusal of a write it may not add.
-    pub fn record_extension(&self, view: &'static str, added: usize, refused: bool) {
-        let attributes = [KeyValue::new(attrs::VIEW, view)];
-        if refused {
-            self.extension_refused.add(1, &attributes);
-        } else if added > 0 {
-            self.extension_writes
-                .add(u64::try_from(added).unwrap_or(u64::MAX), &attributes);
         }
     }
 
@@ -581,7 +592,7 @@ impl ServerMetrics {
             .build();
         let extension_writes = meter
             .u64_counter("agent_server.journal.extension.writes")
-            .with_description("Writes a transition extension added, attributed by view.")
+            .with_description("Writes a transition extension added, attributed by extension point.")
             .build();
         let extension_refused = meter
             .u64_counter("agent_server.journal.extension.refused")

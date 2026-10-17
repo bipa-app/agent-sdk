@@ -5491,13 +5491,19 @@ fn apply_extra_documents_locked(
     extra: super::transition::Transition,
     mut plans: std::vec::IntoIter<super::document::DocPlan>,
     now: OffsetDateTime,
-) -> Result<()> {
+) -> Result<Vec<super::document::DocumentOutcome>> {
+    let mut outcomes = Vec::new();
     for write in extra.writes {
         if let super::transition::Write::Document(document) = write {
-            apply_document_locked(documents, document, plans.next(), now)?;
+            outcomes.push(apply_document_locked(
+                documents,
+                document,
+                plans.next(),
+                now,
+            )?);
         }
     }
-    Ok(())
+    Ok(outcomes)
 }
 
 fn apply_document_locked(
@@ -6428,7 +6434,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         for id in &params.delivered_injection_ids {
             let _ = inner.complete_input_injection(id, params.now)?;
         }
-        apply_extra_documents_locked(&mut inner.documents, extra, document_plans, params.now)?;
+        let extra_documents =
+            apply_extra_documents_locked(&mut inner.documents, extra, document_plans, params.now)?;
         let committed_events = if params.events.is_empty() {
             Vec::new()
         } else {
@@ -6449,6 +6456,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             committed
         };
         drop(inner);
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_documents(
+            crate::observability::attrs::BACKEND_MEMORY,
+            &extra_documents,
+        );
+        #[cfg(not(feature = "otel"))]
+        drop(extra_documents);
         Ok(super::commit::CommitOutcome {
             thread,
             checkpoint,

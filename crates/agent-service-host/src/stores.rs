@@ -1128,4 +1128,131 @@ mod tests {
             "the unwound drive's entry must have been deregistered",
         );
     }
+
+    /// Adds one host document to every transition it sees.
+    struct MarkCommits;
+
+    impl agent_server::journal::TransitionExtension for MarkCommits {
+        fn extend(
+            &self,
+            _view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            let Ok(kind) = agent_server::journal::DocKind::new("registry.mark") else {
+                return Vec::new();
+            };
+            vec![agent_server::journal::Write::Document(
+                agent_server::journal::DocumentWrite::put(
+                    agent_server::journal::DocumentKey::new(
+                        agent_server::journal::DocScope::Host,
+                        kind,
+                        "",
+                    ),
+                    1,
+                    agent_server::journal::DocExpect::Any,
+                    serde_json::json!(true),
+                ),
+            )]
+        }
+    }
+
+    fn with_mark() -> StoreOptions {
+        StoreOptions {
+            transition_extension: Some(Arc::new(MarkCommits)),
+            ..StoreOptions::default()
+        }
+    }
+
+    /// The registry built with options installs the extension on the
+    /// store it shares: a commit through `task_store` carries the
+    /// extension's document, read back through `document_store`.
+    async fn assert_registry_runs_the_extension(stores: &StoreRegistry) -> anyhow::Result<()> {
+        stores.initialize().await?;
+        stores
+            .task_store
+            .commit(
+                agent_server::journal::Transition::default(),
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mark = agent_server::journal::DocumentKey::new(
+            agent_server::journal::DocScope::Host,
+            agent_server::journal::DocKind::new("registry.mark")?,
+            "",
+        );
+        anyhow::ensure!(
+            stores.document_store.get_document(&mark).await?.is_some(),
+            "the {} registry did not install the extension",
+            stores.backend_name()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_registry_installs_the_extension() -> anyhow::Result<()> {
+        assert_registry_runs_the_extension(&StoreRegistry::in_memory_with(
+            sample_registry(),
+            with_mark(),
+        ))
+        .await?;
+        let config = StorageConfig::default();
+        assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_registry_installs_the_extension() -> anyhow::Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let config = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(tmp.path().display().to_string()),
+                max_connections: None,
+            },
+            ..StorageConfig::default()
+        };
+        assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_registry_installs_the_extension() -> anyhow::Result<()> {
+        use sqlx::Connection;
+
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let schema = format!("reg_ext_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = sqlx::postgres::PgConnection::connect(&database_url).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await?;
+        let config = StorageConfig {
+            backend: StorageBackend::Postgres,
+            postgres: PostgresStorageConfig {
+                database_url: Some(database_url),
+                schema: Some(schema.clone()),
+                max_connections: 2,
+            },
+        };
+        let result = assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut admin)
+            .await?;
+        result
+    }
 }

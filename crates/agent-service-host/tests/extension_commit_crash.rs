@@ -9,10 +9,10 @@ use agent_sdk_foundation::{ThreadId, TokenUsage, llm};
 use agent_server::journal::checkpoint::CheckpointKind;
 use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
 use agent_server::journal::store::AgentTaskStore;
-use agent_server::journal::task::{AgentTask, LeaseId, WorkerId};
+use agent_server::journal::task::{AgentTask, AgentTaskId, LeaseId, WorkerId};
 use agent_server::journal::thread_store::ThreadStore;
 use agent_server::journal::turn_attempt::{
-    CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
+    CloseAttemptParams, OpenAttemptParams, TurnAttemptId, TurnAttemptOutcome,
 };
 use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 use agent_server::journal::{
@@ -70,7 +70,9 @@ async fn store(url: &str) -> Result<SqliteDurableStore> {
         .with_transition_extension(Arc::new(BookTurns)))
 }
 
-async fn first_turn(store: &SqliteDurableStore) -> Result<CompletedTurnCommit> {
+/// Submit and lease a root and open its attempt; return the task and
+/// attempt ids its first turn commits with.
+async fn start_first_turn(store: &SqliteDurableStore) -> Result<(AgentTaskId, TurnAttemptId)> {
     let thread = ThreadId::from_string(THREAD);
     let root = AgentTask::new_root_turn(thread.clone(), at(1), 3);
     let _ = store.submit_root_turn(root.clone()).await?;
@@ -88,12 +90,16 @@ async fn first_turn(store: &SqliteDurableStore) -> Result<CompletedTurnCommit> {
             otel_span_id: None,
         })
         .await?;
-    Ok(CompletedTurnCommit {
-        thread_id: thread,
-        task_id: root.id,
+    Ok((root.id, attempt.id))
+}
+
+fn first_turn(task_id: AgentTaskId, turn_attempt_id: TurnAttemptId) -> CompletedTurnCommit {
+    CompletedTurnCommit {
+        thread_id: ThreadId::from_string(THREAD),
+        task_id,
         expected_turn: 1,
         delivered_injection_ids: Vec::new(),
-        turn_attempt_id: attempt.id,
+        turn_attempt_id,
         close_attempt_params: CloseAttemptParams {
             response_blob: serde_json::json!({}),
             response_id: None,
@@ -122,7 +128,7 @@ async fn first_turn(store: &SqliteDurableStore) -> Result<CompletedTurnCommit> {
         owner_guard: None,
         extra_writes: Vec::new(),
         now: at(4),
-    })
+    }
 }
 
 /// Child-process half of the kill test: pause inside the completed turn's
@@ -137,18 +143,23 @@ async fn extension_commit_kill_child() -> Result<()> {
     let url = std::env::var(DB_ENV).context("missing crash database URL")?;
     let ready = std::env::var(READY_ENV).context("missing crash ready path")?;
     let store = store(&url).await?;
-    let params = first_turn(&store).await?;
+    let (task, attempt) = start_first_turn(&store).await?;
+    let staged = format!("{} {}", task.as_str(), attempt.as_str());
     fail::cfg_callback(FAILPOINT, move || {
-        let _ = std::fs::write(&ready, "staged");
+        let _ = std::fs::write(&ready, &staged);
         std::thread::sleep(Duration::from_mins(1));
     })
     .map_err(|error| anyhow::anyhow!("{error}"))?;
-    commit_completed_turn(params, &store).await?;
+    commit_completed_turn(first_turn(task, attempt), &store).await?;
     bail!("the child was not killed inside the completed turn's transaction")
 }
 
 /// `kill -9` while a completed turn and its extension document are staged
-/// in one `SQLite` transaction: a new process sees neither.
+/// in one `SQLite` transaction: a new process sees neither. It then commits
+/// the same turn through the extension, which books the document at
+/// revision 1: a revision past 1 would mean the killed attempt left its
+/// document behind, and a missing document that the extension's write
+/// never ran.
 #[tokio::test]
 async fn kill_nine_inside_a_completed_turn_leaves_neither_the_turn_nor_its_document() -> Result<()>
 {
@@ -167,22 +178,27 @@ async fn kill_nine_inside_a_completed_turn_leaves_neither_the_turn_nor_its_docum
         .env(READY_ENV, &ready)
         .spawn()
         .context("spawn the completed-turn child")?;
-    let mut staged = false;
+    let mut staged = None;
     for _ in 0..400 {
-        if std::fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
-            staged = true;
+        if let Ok(text) = std::fs::read_to_string(&ready)
+            && let Some((task, attempt)) = text.split_once(' ')
+        {
+            staged = Some((
+                AgentTaskId::from_string(task),
+                TurnAttemptId::from_string(attempt),
+            ));
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    if !staged {
+    let Some((task, attempt)) = staged else {
         let _ = child.kill();
         let output = child.wait_with_output()?;
         bail!(
             "the child never reached the completed turn's transaction: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
+    };
     let killed = Command::new("kill")
         .arg("-9")
         .arg(child.id().to_string())
@@ -203,6 +219,19 @@ async fn kill_nine_inside_a_completed_turn_leaves_neither_the_turn_nor_its_docum
     ensure!(
         store.get_document(&booked(&thread)?).await?.is_none(),
         "the killed turn's document committed"
+    );
+
+    let store = self::store(&url).await?;
+    let outcome = commit_completed_turn(first_turn(task, attempt), &store).await?;
+    ensure!(outcome.thread.committed_turns == 1);
+    let booked = store
+        .get_document(&booked(&thread)?)
+        .await?
+        .context("the retried turn books its document")?;
+    ensure!(
+        booked.revision == 1,
+        "the retried turn's document is at revision {}: the killed attempt left one behind",
+        booked.revision
     );
     Ok(())
 }

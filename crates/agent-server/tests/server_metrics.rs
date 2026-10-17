@@ -851,7 +851,7 @@ async fn a_transition_extension_records_its_writes_and_refusals() -> Result<()> 
     assert_eq!(added.len(), 1, "{added:?}");
     assert!(matches_all(
         &added[0].0,
-        &[(attrs::VIEW, attrs::VIEW_COMMIT)]
+        &[(attrs::EXTENSION_POINT, attrs::EXTENSION_POINT_COMMIT)]
     ));
     assert_eq!(added[0].1, 1);
     let refused = collect_u64_counter(&snapshots, "agent_server.journal.extension.refused");

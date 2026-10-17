@@ -3194,7 +3194,8 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             committed
         };
 
-        Self::apply_completed_turn_extra_writes_tx(&mut tx, &extra, params.now).await?;
+        let extra_documents =
+            Self::apply_completed_turn_extra_writes_tx(&mut tx, &extra, params.now).await?;
         // Failpoint (11 · A): simulate a crash at the true atomic-commit
         // boundary — the events and the coalesced advisory outbox row are
         // staged in `tx` but `tx.commit()` has not yet run, so the whole
@@ -3208,6 +3209,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         tx.commit()
             .await
             .context("commit sqlite completed-turn transaction")?;
+        Self::record_turn_documents(extra_documents);
 
         Ok(CommitOutcome {
             closed_attempt,
@@ -3543,18 +3545,28 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
+    /// Count the documents a committed turn wrote.
+    fn record_turn_documents(documents: Vec<agent_server::journal::DocumentOutcome>) {
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_documents(
+            agent_server::observability::attrs::BACKEND_SQLITE,
+            &documents,
+        );
+        drop(documents);
+    }
+
     /// Apply a completed turn's extra writes inside its transaction,
     /// through the same write arms as a transition.
     async fn apply_completed_turn_extra_writes_tx(
         tx: &mut Transaction<'_, Sqlite>,
         extra: &agent_server::journal::Transition,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<Vec<agent_server::journal::DocumentOutcome>> {
         let mut committed = agent_server::journal::Committed::default();
         for write in extra.writes.iter().cloned() {
             Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
         }
-        Ok(())
+        Ok(committed.documents)
     }
 
     /// Apply one write of a transition inside its transaction.
