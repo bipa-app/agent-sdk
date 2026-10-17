@@ -1932,6 +1932,43 @@ mod tests {
     /// backends also fence the direct `append_compaction` (`direct_fenced`).
     ///
     /// [`ThreadStateConflict`]: agent_server::journal::thread::ThreadStateConflict
+    /// A direct `commit_event` and `commit_event_batch` onto a purged
+    /// thread are refused with the purge fence's typed refusal.
+    async fn expect_direct_appends_refused(
+        appender: &dyn EventRepository,
+        thread: &ThreadId,
+        status: agent_server::journal::thread::ThreadStatus,
+        at: OffsetDateTime,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{ThreadOperation, ThreadStateConflict};
+
+        let single = appender
+            .commit_event(thread, AgentEvent::text("late-1", "late delta"), at)
+            .await
+            .err()
+            .with_context(|| format!("a direct event on a {status} thread is refused"))?;
+        let batch = appender
+            .commit_event_batch(
+                thread,
+                vec![
+                    AgentEvent::text("late-2", "late"),
+                    AgentEvent::text("late-3", "batch"),
+                ],
+                at,
+            )
+            .await
+            .err()
+            .with_context(|| format!("a direct batch on a {status} thread is refused"))?;
+        for error in [single, batch] {
+            let conflict = error
+                .downcast_ref::<ThreadStateConflict>()
+                .with_context(|| format!("a typed purge-fence refusal: {error:#}"))?;
+            assert_eq!(conflict.status, status);
+            assert_eq!(conflict.operation, ThreadOperation::Append);
+        }
+        Ok(())
+    }
+
     /// `refused` is the purge fence's typed refusal for `status`.
     fn expect_append_refused(
         refused: Result<agent_server::journal::Committed, agent_server::journal::Rejected>,
@@ -1958,6 +1995,7 @@ mod tests {
             &dyn EventRepository,
             &dyn OutboxStore,
         ),
+        appender: &dyn EventRepository,
         direct_fenced: bool,
     ) -> Result<()> {
         use agent_server::journal::thread::{
@@ -2027,6 +2065,7 @@ mod tests {
                 expect_append_refused(task_store.commit(transition, at).await, status)
                     .with_context(|| format!("a {what} on a {status} thread"))?;
             }
+            expect_direct_appends_refused(appender, &thread, status, at).await?;
             if direct_fenced {
                 let error = messages
                     .append_compaction(
@@ -4298,6 +4337,10 @@ mod tests {
     #[tokio::test]
     async fn conformance_in_memory_appends_to_a_purged_thread_are_refused() -> Result<()> {
         let s = fresh_in_memory_stores();
+        let appender = agent_server::journal::event_repository::PurgeFencedEventRepository::new(
+            s.event.clone(),
+            s.thread.clone(),
+        );
         test_appends_to_a_purged_thread_are_refused(
             (
                 s.task.as_ref(),
@@ -4306,6 +4349,7 @@ mod tests {
                 s.event.as_ref(),
                 s.outbox.as_ref(),
             ),
+            &appender,
             false,
         )
         .await
@@ -4754,8 +4798,12 @@ mod tests {
     #[tokio::test]
     async fn conformance_sqlite_appends_to_a_purged_thread_are_refused() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_appends_to_a_purged_thread_are_refused((&store, &store, &store, &store, &store), true)
-            .await
+        test_appends_to_a_purged_thread_are_refused(
+            (&store, &store, &store, &store, &store),
+            &store,
+            true,
+        )
+        .await
     }
 
     #[cfg(feature = "sqlite")]
@@ -5396,8 +5444,12 @@ mod tests {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_appends_to_a_purged_thread_are_refused((&store, &store, &store, &store, &store), true)
-            .await
+        test_appends_to_a_purged_thread_are_refused(
+            (&store, &store, &store, &store, &store),
+            &store,
+            true,
+        )
+        .await
     }
 
     #[cfg(feature = "postgres")]

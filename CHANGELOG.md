@@ -208,14 +208,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the thread and stopped before it recorded the key returns that thread;
     one whose thread was purged since is `FAILED_PRECONDITION`. They no
     longer answer `ABORTED`.
-- **Breaking: a transition that appends to a purged thread is refused.**
-  `DurableStore::commit` refuses a transition whose events or compaction
-  go to a `Deleting` or `Deleted` thread with a `ThreadStateConflict` for
-  the new `ThreadOperation::Append`, and writes nothing: Postgres checks
-  each thread it locks, SQLite reads the thread in the event and compaction
-  writes, and the in-memory store reads it through its event sink's thread
-  store. `append_compaction` refuses such a thread instead of putting a
-  message head back on it. A `Completed` thread still takes appends.
+- **Breaking: appends to a purged thread are refused.** A transition, a
+  direct `EventRepository::commit_event` / `commit_event_batch`, or an
+  `append_compaction` whose thread is `Deleting` or `Deleted` is refused
+  with a `ThreadStateConflict` for the new `ThreadOperation::Append`, and
+  writes nothing. A `Completed` thread still takes appends.
+  - Postgres checks each thread `commit` locks, and a direct append checks
+    the thread row it already locks to allocate sequences. SQLite reads the
+    thread in the write transaction. The in-memory task store reads it
+    through its event sink's thread store, and `StoreRegistry::in_memory`
+    wraps its event journal in the new `PurgeFencedEventRepository`.
+  - `append_compaction` refuses such a thread instead of putting a message
+    head back on it.
+  - A turn that streams while its thread is purged drops its later deltas
+    (logged at debug) and winds down when it sees its cancellation;
+    periodic subagent progress onto a purged parent stops.
+  - Still unfenced: the `MessageProjectionStore` writes other than
+    `append_compaction` (`commit_messages`, `replace_history`,
+    `append_repair`, `set_draft`, `get_or_create`), and the in-memory
+    `MessageProjectionStore::append_compaction`.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).

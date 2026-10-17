@@ -15,7 +15,9 @@ message CreateThreadRequest {
   // Caller-supplied idempotency key for the logical create operation.
   // Retries must reuse the same value on the server-minted path: the minted
   // id is derived from it, so a retry after any failure returns the same
-  // thread.
+  // thread. The derivation is deterministic and public, so the thread id is
+  // only as hard to guess as the request_id: a caller that needs unguessable
+  // thread ids must send unguessable request_ids.
   string request_id = 1;
 
   // Optional caller-minted thread identity. When non-empty, this is the

@@ -6692,6 +6692,9 @@ impl EventRepository for PostgresDurableStore {
 
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
+        if let Some(thread) = Self::lock_thread_tx(&mut tx, thread_id).await? {
+            thread.require_active(ThreadOperation::Append)?;
+        }
         let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
         tx.commit().await.context("commit event batch insert")?;
         Ok(committed)

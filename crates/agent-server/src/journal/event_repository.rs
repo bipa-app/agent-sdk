@@ -329,6 +329,103 @@ impl EventRepository for InMemoryEventRepository {
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
+/// An [`EventRepository`] that refuses appends to a purged thread, read
+/// through `threads`, and otherwise delegates to `events`.
+///
+/// The durable backends read the thread inside the append's transaction.
+/// The in-memory stores share no transaction, so the composed in-memory
+/// backend wraps its event journal in this: a purge that lands between
+/// the read and the append can still see that append.
+pub struct PurgeFencedEventRepository {
+    events: Arc<dyn EventRepository>,
+    threads: Arc<dyn super::thread_store::ThreadStore>,
+}
+
+impl PurgeFencedEventRepository {
+    #[must_use]
+    pub fn new(
+        events: Arc<dyn EventRepository>,
+        threads: Arc<dyn super::thread_store::ThreadStore>,
+    ) -> Self {
+        Self { events, threads }
+    }
+
+    async fn require_appendable(&self, thread_id: &ThreadId) -> Result<()> {
+        if let Some(thread) = self.threads.get(thread_id).await? {
+            thread.require_active(super::thread::ThreadOperation::Append)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl EventRepository for PurgeFencedEventRepository {
+    async fn commit_event(
+        &self,
+        thread_id: &ThreadId,
+        event: AgentEvent,
+        now: OffsetDateTime,
+    ) -> Result<CommittedEvent> {
+        self.require_appendable(thread_id).await?;
+        self.events.commit_event(thread_id, event, now).await
+    }
+
+    async fn commit_event_batch(
+        &self,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        self.require_appendable(thread_id).await?;
+        self.events.commit_event_batch(thread_id, events, now).await
+    }
+
+    async fn next_sequence(&self, thread_id: &ThreadId) -> Result<u64> {
+        self.events.next_sequence(thread_id).await
+    }
+
+    async fn get_events(&self, thread_id: &ThreadId) -> Result<Vec<CommittedEvent>> {
+        self.events.get_events(thread_id).await
+    }
+
+    async fn get_events_in_range(
+        &self,
+        thread_id: &ThreadId,
+        after_sequence: u64,
+        up_to_sequence: u64,
+    ) -> Result<Vec<CommittedEvent>> {
+        self.events
+            .get_events_in_range(thread_id, after_sequence, up_to_sequence)
+            .await
+    }
+
+    async fn threads_with_events_before(
+        &self,
+        cutoff: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ThreadId>> {
+        self.events.threads_with_events_before(cutoff, limit).await
+    }
+
+    async fn max_sequence_before(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.events.max_sequence_before(thread_id, cutoff).await
+    }
+
+    async fn min_sequence_at_or_after(
+        &self,
+        thread_id: &ThreadId,
+        cutoff: OffsetDateTime,
+    ) -> Result<Option<u64>> {
+        self.events
+            .min_sequence_at_or_after(thread_id, cutoff)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

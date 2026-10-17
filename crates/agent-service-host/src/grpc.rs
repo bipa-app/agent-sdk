@@ -8086,6 +8086,53 @@ mod tests {
             .await?
             .context("the purged thread's tombstone")?;
         assert_eq!(thread.status, agent_server::ThreadStatus::Deleted);
+        anonymous_fork_retry_onto_a_purged_thread_is_refused(shared, service).await
+    }
+
+    /// The fork half: the earlier attempt created the derived destination
+    /// and stopped before it recorded its key, and the destination was
+    /// purged since. The retry is `FAILED_PRECONDITION`, and the
+    /// destination stays deleted.
+    async fn anonymous_fork_retry_onto_a_purged_thread_is_refused(
+        shared: &Arc<GrpcShared>,
+        service: &GrpcControlService,
+    ) -> Result<()> {
+        let source = anonymous_create(service, "anon-purged-fork-source").await?;
+        let fork = caller_fork_request("anon-purged-fork", &source, "");
+        let purged = request_thread_id(IdempotencyKind::ForkThread, "anon-purged-fork").0;
+        service
+            .fork_thread(Request::new(caller_fork_request(
+                "anon-purged-fork-first-attempt",
+                &source,
+                &purged,
+            )))
+            .await?;
+        reserve_unrecorded(
+            shared,
+            &fork.request_id,
+            IdempotencyKind::ForkThread,
+            &fork_thread_fingerprint(&fork),
+        )
+        .await?;
+        service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: purged.clone(),
+                scope: pb::PurgeScope::Thread as i32,
+            }))
+            .await?;
+        let status = service
+            .fork_thread(Request::new(fork))
+            .await
+            .err()
+            .context("a fork retry onto a purged destination is refused")?;
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        let thread = shared
+            .stores
+            .thread_store
+            .get(&ThreadId::from_string(&purged))
+            .await?
+            .context("the purged destination's tombstone")?;
+        assert_eq!(thread.status, agent_server::ThreadStatus::Deleted);
         Ok(())
     }
 
