@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Crash-safety Phase 3: documents
+
+- **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
+  JSON document in the same transaction as the rest of its `Transition`
+  (design §6.4, `agent_server::journal::document`).
+  - A document has a scope (`DocScope::Host`, `Thread` or `Task`), an
+    owner-namespaced kind (`DocKind`, `<owner>.<name>`), a key, and the
+    owner's `schema_version`. agent-sdk never reads the value.
+  - Each write carries a `DocExpect` (`Any`, `Absent`, `Revision(n)`).
+    When it fails, the whole transition is rejected as
+    `Rejected::Guard { index }`, where `index` = number of guards + the
+    write's index, and nothing is written.
+  - A retire keeps the row, so the revision keeps rising across a retire
+    and a later put.
+- Breaking changes for code that matches these types exhaustively:
+  - `Committed.documents` reports each write's live revision.
+  - `Lock::Document` locks a host document by key, after every task row.
+    Thread and task documents are locked through their thread or task row.
+    A thread document obeys the purge fence.
+  - `Rejected::from_write_error` maps an apply-time `ExpectationFailed`
+    to that guard rejection.
+- `DocumentStore` (`get_document`, `list_documents`,
+  `list_documents_by_kind`) reads live documents. It is implemented by the
+  SQLite, Postgres and in-memory task stores, and exposed as
+  `StoreRegistry::document_store`.
+- `finish_purge` retires the purged thread's documents and its tasks'
+  documents in the same transaction. The in-memory store reads a purged
+  thread's documents as retired.
+- **Migration 0030** (Postgres and SQLite) adds `agent_sdk_documents`:
+  - primary key `(scope_kind, scope_id, kind, doc_key)`;
+  - the partial index `agent_sdk_documents_kind_idx` on live rows;
+  - no foreign key, so it takes no lock on any existing table.
+- **Locks.** Measured on Postgres 18 with 1M task rows and 100k threads, a
+  30 s read transaction open on `agent_sdk_tasks`, and a concurrent writer:
+  - `sqlx migrate` applied 0030 in 4.5 ms;
+  - it took `AccessExclusiveLock` only on the new table, its index, its
+    primary key and its TOAST relation;
+  - the writer's maximum statement latency was 34 ms (p50 29 ms).
+
+  SQLite on a 1M-task file: 1.9 ms.
+- **Rollback and rolling deploys:** an older build refuses to start against
+  a database with 0030 applied (`VersionMissing(30)`). To roll back,
+  run `DROP TABLE agent_sdk_documents; DELETE FROM _sqlx_migrations WHERE
+  version = 30;`, then start the older build.
+  - This removes every document. A host that wrote documents (bip) must
+    export them first.
+  - The rollback is valid whichever of 0027–0029 or 0035 are also applied.
+  - In a rolling deploy, an old binary never touches the table and runs
+    beside a new one.
+
 ### Added
 
 - **Session view fold** (`agent_sdk_foundation::view`, re-exported as

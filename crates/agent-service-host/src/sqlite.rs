@@ -45,7 +45,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::migrations::{
-        AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
+        AWAITING_QUESTION_MIGRATION_VERSION, DOCUMENTS_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
         HISTORY_GENERATION_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
         PURGE_SEED_MIGRATION_VERSION, TASK_AFTER_SIBLINGS_MIGRATION_VERSION,
         TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
@@ -72,6 +72,7 @@ mod tests {
             "agent_sdk_retention_cursors",
             "agent_sdk_execution_intents",
             "agent_sdk_tool_audit_events",
+            "agent_sdk_documents",
         ];
 
         for table in expected_tables {
@@ -142,6 +143,11 @@ mod tests {
             versions.contains(&TASK_AFTER_SIBLINGS_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {TASK_AFTER_SIBLINGS_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&DOCUMENTS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {DOCUMENTS_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }
@@ -445,6 +451,27 @@ mod tests {
             violations.0 == 0,
             "rebuilt schema must satisfy every foreign key: {violations:?}",
         );
+
+        sqlx::query(
+            "INSERT INTO agent_sdk_documents (
+                scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,
+                retired_at, updated_at
+             ) VALUES ('thread', 'thread-1', 'owner.kind', '', 1, 1, '{}', NULL, '2026-01-01')",
+        )
+        .execute(&pool)
+        .await?;
+        let scope_refused = sqlx::query(
+            "INSERT INTO agent_sdk_documents (
+                scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,
+                retired_at, updated_at
+             ) VALUES ('host', 'thread-1', 'owner.kind', '', 1, 1, '{}', NULL, '2026-01-01')",
+        )
+        .execute(&pool)
+        .await;
+        ensure!(
+            scope_refused.is_err(),
+            "a host document with a scope id must be refused"
+        );
         Ok(())
     }
 
@@ -474,6 +501,7 @@ mod tests {
             "agent_sdk_tool_audit_events",
             "agent_sdk_idempotency",
             "agent_sdk_applied_repairs",
+            "agent_sdk_documents",
         ]
         .into_iter()
         .map(String::from)

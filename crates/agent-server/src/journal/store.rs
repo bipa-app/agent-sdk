@@ -206,7 +206,7 @@
 //! aggregated success / failure outcomes). The counter is
 //! re-derived the next time any child reaches a terminal state.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
@@ -2826,6 +2826,8 @@ type BatchInvocationRows = (Vec<(AgentTask, AgentTask)>, Vec<AgentTaskId>);
 struct Inner {
     /// Primary key index.
     by_id: HashMap<AgentTaskId, AgentTask>,
+    /// Documents by their stored key (see [`super::document`]).
+    documents: BTreeMap<StoredDocumentKey, MemDocument>,
     /// `(thread_id)` index: every task row scoped to a thread.
     by_thread: HashMap<ThreadId, Vec<AgentTaskId>>,
     /// `(parent_id)` index: direct children of a parent task.
@@ -5230,14 +5232,17 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         let (sink, intent_store, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
-        for (index, guard) in transition.guards.iter().enumerate() {
-            guard.check(index, lock.inner.by_id.get(guard.task()))?;
-        }
-        self.require_appendable_threads(&transition).await?;
+        let mut document_plans = self.check_locked(&lock.inner, &transition).await?;
         let mut committed = Committed::default();
         for write in transition.writes.iter().cloned() {
             let inner = &mut *lock.inner;
             match write {
+                Write::Document(document) => committed.documents.push(apply_document_locked(
+                    &mut inner.documents,
+                    document,
+                    document_plans.next(),
+                    now,
+                )?),
                 Write::SettleTask { task, outcome } => {
                     let settled = self
                         .apply_settle_locked(inner, &transition, &task, outcome, now)
@@ -5319,6 +5324,251 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         }
         drop(lock);
         Ok(committed)
+    }
+}
+
+/// A document's stored key: (scope kind, scope id, kind, key).
+type StoredDocumentKey = (&'static str, String, String, String);
+
+/// One stored document row; `value` is `None` once retired.
+#[derive(Clone, Debug)]
+struct MemDocument {
+    key: super::document::DocumentKey,
+    schema_version: u32,
+    revision: u64,
+    value: Option<serde_json::Value>,
+    updated_at: OffsetDateTime,
+}
+
+fn stored_document_key(key: &super::document::DocumentKey) -> StoredDocumentKey {
+    let (scope_kind, scope_id, kind, key) = key.stored();
+    (
+        scope_kind,
+        scope_id.to_owned(),
+        kind.to_owned(),
+        key.to_owned(),
+    )
+}
+
+/// Plan every document write of `transition` against the stored rows,
+/// earlier writes of the same transition included, before the first
+/// mutation: the in-memory store cannot roll back, so a failed
+/// expectation must be found while nothing is written yet.
+fn plan_documents_locked(
+    documents: &BTreeMap<StoredDocumentKey, MemDocument>,
+    transition: &super::transition::Transition,
+) -> Result<Vec<super::document::DocPlan>, super::transition::Rejected> {
+    use super::document::StoredRevision;
+    use super::transition::{Rejected, Write};
+
+    let mut overlay: HashMap<StoredDocumentKey, StoredRevision> = HashMap::new();
+    let mut plans = Vec::new();
+    for (index, write) in transition.writes.iter().enumerate() {
+        let Write::Document(document) = write else {
+            continue;
+        };
+        let key = stored_document_key(&document.key);
+        let stored = overlay.get(&key).copied().or_else(|| {
+            documents.get(&key).map(|row| StoredRevision {
+                revision: row.revision,
+                live: row.value.is_some(),
+            })
+        });
+        let plan = document.plan(stored).map_err(|failed| {
+            Rejected::from_write_error(anyhow::Error::new(failed), transition.guards.len(), index)
+        })?;
+        match plan {
+            super::document::DocPlan::Put { revision } => {
+                overlay.insert(
+                    key,
+                    StoredRevision {
+                        revision,
+                        live: true,
+                    },
+                );
+            }
+            super::document::DocPlan::Retire { revision } => {
+                overlay.insert(
+                    key,
+                    StoredRevision {
+                        revision,
+                        live: false,
+                    },
+                );
+            }
+            super::document::DocPlan::Unchanged => {}
+        }
+        plans.push(plan);
+    }
+    Ok(plans)
+}
+
+fn apply_document_locked(
+    documents: &mut BTreeMap<StoredDocumentKey, MemDocument>,
+    document: super::document::DocumentWrite,
+    plan: Option<super::document::DocPlan>,
+    now: OffsetDateTime,
+) -> Result<super::document::DocumentOutcome> {
+    use super::document::{DocOp, DocPlan, DocumentOutcome};
+
+    let plan = plan.ok_or_else(|| anyhow!("document write {} without a plan", document.key))?;
+    let key = stored_document_key(&document.key);
+    match (plan, document.op) {
+        (DocPlan::Put { revision }, DocOp::Put(value)) => {
+            documents.insert(
+                key,
+                MemDocument {
+                    key: document.key.clone(),
+                    schema_version: document.schema_version,
+                    revision,
+                    value: Some(value),
+                    updated_at: now,
+                },
+            );
+        }
+        (DocPlan::Retire { revision }, _) => {
+            if let Some(row) = documents.get_mut(&key) {
+                row.revision = revision;
+                row.value = None;
+                row.updated_at = now;
+            }
+        }
+        (DocPlan::Put { .. } | DocPlan::Unchanged, _) => {}
+    }
+    Ok(DocumentOutcome {
+        key: document.key,
+        revision: plan.live_revision(),
+    })
+}
+
+impl InMemoryAgentTaskStore {
+    /// Every guard, the purge fence on appends, then a plan for every
+    /// document write, all under the write lock and before the first
+    /// mutation.
+    async fn check_locked(
+        &self,
+        inner: &Inner,
+        transition: &super::transition::Transition,
+    ) -> Result<std::vec::IntoIter<super::document::DocPlan>, super::transition::Rejected> {
+        for (index, guard) in transition.guards.iter().enumerate() {
+            guard.check(index, inner.by_id.get(guard.task()))?;
+        }
+        self.require_appendable_threads(transition).await?;
+        Ok(plan_documents_locked(&inner.documents, transition)?.into_iter())
+    }
+
+    /// Up to `limit` live rows `keep` selects, in key order, each with the
+    /// thread its scope belongs to. Read under the read lock, which is
+    /// released before the purge check awaits the thread store.
+    async fn document_rows(
+        &self,
+        keep: impl Fn(&StoredDocumentKey, &MemDocument) -> bool,
+        limit: usize,
+    ) -> Vec<(MemDocument, Option<ThreadId>)> {
+        use super::document::DocScope;
+
+        let inner = self.inner.read().await;
+        inner
+            .documents
+            .iter()
+            .filter(|(key, row)| row.value.is_some() && keep(key, row))
+            .take(limit)
+            .map(|(_, row)| {
+                let thread = match &row.key.scope {
+                    DocScope::Host => None,
+                    DocScope::Thread(thread) => Some(thread.clone()),
+                    DocScope::Task(task) => {
+                        inner.by_id.get(task).map(|task| task.thread_id.clone())
+                    }
+                };
+                (row.clone(), thread)
+            })
+            .collect()
+    }
+
+    /// The rows whose thread is not purged, as documents. The in-memory
+    /// purge lives in the thread store, so a purged thread's documents
+    /// read as retired from then on; a store built without a sink purges
+    /// nothing.
+    async fn live_documents(
+        &self,
+        rows: Vec<(MemDocument, Option<ThreadId>)>,
+    ) -> Result<Vec<super::document::Document>> {
+        let mut documents = Vec::with_capacity(rows.len());
+        for (row, thread) in rows {
+            if let (Some(sink), Some(thread)) = (&self.marker_sink, &thread)
+                && sink.thread_store.get(thread).await?.is_some_and(|thread| {
+                    thread.status == super::thread::ThreadStatus::Deleting
+                        || thread.status == super::thread::ThreadStatus::Deleted
+                })
+            {
+                continue;
+            }
+            let Some(value) = row.value else {
+                continue;
+            };
+            documents.push(super::document::Document {
+                key: row.key,
+                schema_version: row.schema_version,
+                revision: row.revision,
+                value,
+                updated_at: row.updated_at,
+            });
+        }
+        Ok(documents)
+    }
+}
+
+#[async_trait]
+impl super::document::DocumentStore for InMemoryAgentTaskStore {
+    async fn get_document(
+        &self,
+        key: &super::document::DocumentKey,
+    ) -> Result<Option<super::document::Document>> {
+        let wanted = stored_document_key(key);
+        let rows = self.document_rows(|stored, _| *stored == wanted, 1).await;
+        Ok(self.live_documents(rows).await?.pop())
+    }
+
+    async fn list_documents(
+        &self,
+        scope: &super::document::DocScope,
+        kind: &super::document::DocKind,
+    ) -> Result<Vec<super::document::Document>> {
+        let rows = self
+            .document_rows(
+                |_, row| &row.key.scope == scope && &row.key.kind == kind,
+                usize::MAX,
+            )
+            .await;
+        self.live_documents(rows).await
+    }
+
+    async fn list_documents_by_kind(
+        &self,
+        kind: &super::document::DocKind,
+        after: Option<&super::document::DocumentKey>,
+        limit: u32,
+    ) -> Result<Vec<super::document::Document>> {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut cursor = after.map(stored_document_key);
+        let mut documents = Vec::new();
+        while documents.len() < limit {
+            let rows = self
+                .document_rows(
+                    |key, row| {
+                        &row.key.kind == kind && cursor.as_ref().is_none_or(|after| key > after)
+                    },
+                    limit - documents.len(),
+                )
+                .await;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            cursor = Some(stored_document_key(&last.key));
+            documents.extend(self.live_documents(rows).await?);
+        }
+        Ok(documents)
     }
 }
 

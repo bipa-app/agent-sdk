@@ -25,7 +25,7 @@ mod tests {
     use anyhow::{Context, Result, ensure};
 
     use super::migrations::{
-        AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
+        AWAITING_QUESTION_MIGRATION_VERSION, DOCUMENTS_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
         HISTORY_GENERATION_MIGRATION_VERSION, HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION,
         INPUT_INJECTION_KIND_MIGRATION_VERSION, PURGE_SEED_MIGRATION_VERSION,
         TASK_AFTER_SIBLINGS_MIGRATION_VERSION, TASK_TERMINAL_REASON_MIGRATION_VERSION,
@@ -135,6 +135,11 @@ mod tests {
             versions.contains(&TASK_AFTER_SIBLINGS_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {TASK_AFTER_SIBLINGS_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&DOCUMENTS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {DOCUMENTS_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }

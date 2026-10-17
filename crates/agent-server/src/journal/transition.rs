@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
+use super::document::{DocScope, DocumentKey, DocumentOutcome, DocumentWrite, ExpectationFailed};
 use super::execution_intent::ExecutionIntent;
 use super::message::MessageProjection;
 use super::store::{MixedChildrenSpawn, SubagentBatchSpawn, SubagentInvocationSpawn};
@@ -102,6 +103,10 @@ pub enum Write {
         parent: AgentTaskId,
         spawn: Box<ChildSpawn>,
     },
+    /// Put or retire one document (see [`super::document`]). Its
+    /// [`DocExpect`](super::document::DocExpect) is checked against the
+    /// row as locked; a failed one rejects the transition like a guard.
+    Document(DocumentWrite),
 }
 
 /// What a [`Write::SpawnChildren`] spawns, one shape per spawn method of
@@ -307,6 +312,10 @@ pub enum Lock {
     },
     /// A task row.
     Task(AgentTaskId),
+    /// A [`DocScope::Host`] document row, locked after every task row in
+    /// key order. Thread and task documents need no lock of their own: the
+    /// thread or task row they belong to is locked first.
+    Document(DocumentKey),
 }
 
 /// The purge fence a thread lock checks.
@@ -429,18 +438,39 @@ pub struct Committed {
     /// Every event the transition appended, with its sequence, except a
     /// spawned child's `ThreadCreated`.
     pub events: Vec<CommittedEvent>,
+    /// For each [`Write::Document`]: the document's live revision after it.
+    pub documents: Vec<DocumentOutcome>,
 }
 
 /// Why a transition wrote nothing.
 #[derive(Debug, thiserror::Error)]
 pub enum Rejected {
-    /// The guard at `index` did not hold.
+    /// The guard at `index` did not hold. An `index` at or past the
+    /// number of guards names the write at `index - guards.len()`, whose
+    /// own expectation (a document's [`DocExpect`](super::document::DocExpect))
+    /// did not hold when the backend read its row.
     #[error("transition rejected by guard {index}: {reason}")]
     Guard { index: usize, reason: String },
     /// The transition is malformed, or the store failed; nothing was
     /// written.
     #[error("transition failed: {0:#}")]
     Store(#[from] anyhow::Error),
+}
+
+impl Rejected {
+    /// The rejection for an error the write at `write` returned: a
+    /// [`ExpectationFailed`] is a guard rejection at `guard_count + write`,
+    /// anything else a store failure.
+    #[must_use]
+    pub fn from_write_error(error: anyhow::Error, guard_count: usize, write: usize) -> Self {
+        match error.downcast::<ExpectationFailed>() {
+            Ok(failed) => Self::Guard {
+                index: guard_count + write,
+                reason: failed.reason,
+            },
+            Err(error) => Self::Store(error),
+        }
+    }
 }
 
 /// A store that applies a [`Transition`] in one transaction.
@@ -687,7 +717,8 @@ impl Transition {
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::RecordIntent(_)
-            | Write::AppendCompaction { .. } => false,
+            | Write::AppendCompaction { .. }
+            | Write::Document(_) => false,
         })
     }
 
@@ -708,19 +739,28 @@ impl Transition {
     }
 
     /// The threads whose journal a write appends to: the event threads of
-    /// non-empty event batches and the compacted threads. A purged thread
-    /// refuses all of them.
+    /// non-empty event batches, the compacted threads and the threads of
+    /// thread documents. A purged thread refuses all of them.
     pub fn appended_threads(&self) -> impl Iterator<Item = &ThreadId> {
         self.writes.iter().filter_map(|write| match write {
             Write::AppendEvents { thread, events } if !events.is_empty() => Some(thread),
-            Write::AppendCompaction { thread, .. } => Some(thread),
+            Write::AppendCompaction { thread, .. }
+            | Write::Document(DocumentWrite {
+                key:
+                    DocumentKey {
+                        scope: DocScope::Thread(thread),
+                        ..
+                    },
+                ..
+            }) => Some(thread),
             Write::AppendEvents { .. }
             | Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::RecordIntent(_)
-            | Write::SpawnChildren { .. } => None,
+            | Write::SpawnChildren { .. }
+            | Write::Document(_) => None,
         })
     }
 
@@ -780,6 +820,9 @@ impl Transition {
                         )));
                     }
                     spawn.validate_shape()?;
+                }
+                Write::Document(document) => {
+                    document.validate().map_err(Rejected::Store)?;
                 }
                 Write::RecordIntent(_)
                 | Write::AppendEvents { .. }
@@ -845,6 +888,16 @@ impl Write {
                 locks.push(Lock::Task(parent.clone()));
                 locks
             }
+            Self::Document(document) => match &document.key.scope {
+                DocScope::Host => vec![Lock::Document(document.key.clone())],
+                DocScope::Thread(thread) => vec![Lock::Thread {
+                    thread: thread.clone(),
+                    tier: ThreadTier::Own,
+                    fence: Some(Fence::APPEND),
+                    create: false,
+                }],
+                DocScope::Task(task) => vec![Lock::Task(task.clone())],
+            },
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }

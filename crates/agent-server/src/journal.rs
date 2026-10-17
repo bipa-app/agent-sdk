@@ -571,6 +571,7 @@ pub mod committed_event;
 /// Postgres backends in `agent-service-host` can run the same battery.
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
+pub mod document;
 #[cfg(test)]
 mod durability_dst_test;
 pub mod event_notifier;
@@ -624,6 +625,10 @@ pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpo
 pub use checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
+pub use document::{
+    DocExpect, DocKind, DocOp, DocScope, Document, DocumentKey, DocumentOutcome, DocumentStore,
+    DocumentWrite,
+};
 pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};

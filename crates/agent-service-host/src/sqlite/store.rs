@@ -97,6 +97,8 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
 use super::migrations::apply_durable_core_migrations;
 
+mod documents;
+
 // ─────────────────────────────────────────────────────────────────────
 // Store struct
 // ─────────────────────────────────────────────────────────────────────
@@ -3314,8 +3316,16 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
         }
         Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
-        for write in transition.writes.iter().cloned() {
-            Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed).await?;
+        for (index, write) in transition.writes.iter().cloned().enumerate() {
+            Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed)
+                .await
+                .map_err(|error| {
+                    agent_server::journal::Rejected::from_write_error(
+                        error,
+                        transition.guards.len(),
+                        index,
+                    )
+                })?;
         }
         tx.commit().await.context("commit transition")?;
         Ok(committed)
@@ -3413,6 +3423,10 @@ impl SqliteDurableStore {
                 let spawned = Self::apply_spawn_tx(tx, transition, &parent, *spawn, now).await?;
                 committed.events.extend(spawned.events.iter().cloned());
                 committed.spawned.push(spawned);
+            }
+            Write::Document(document) => {
+                let outcome = Self::apply_document_tx(tx, document, now).await?;
+                committed.documents.push(outcome);
             }
         }
         Ok(())
@@ -3524,7 +3538,7 @@ impl SqliteDurableStore {
                         fence.check(&task.thread_id, stored.as_ref())?;
                     }
                 }
-                Lock::ThreadOf { fence: None, .. } | Lock::Task(_) => {}
+                Lock::ThreadOf { fence: None, .. } | Lock::Task(_) | Lock::Document(_) => {}
             }
         }
         Ok(())
@@ -5099,6 +5113,9 @@ impl SqliteDurableStore {
         sqlx::query!("DELETE FROM agent_sdk_tool_audit_events")
             .execute(&mut *conn)
             .await?;
+        sqlx::query!("DELETE FROM agent_sdk_documents")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query!("DELETE FROM agent_sdk_tasks")
             .execute(&mut *conn)
             .await?;
@@ -5237,6 +5254,8 @@ impl ThreadStore for SqliteDurableStore {
         }
         let deleted = old.finish_purge(receipt.clone());
         Self::upsert_thread_tx(&mut tx, &deleted).await?;
+        Self::retire_thread_documents_tx(&mut tx, thread_key(thread_id), deleted.updated_at)
+            .await?;
         tx.commit().await.context("commit finish thread purge")?;
         Ok(receipt.clone())
     }

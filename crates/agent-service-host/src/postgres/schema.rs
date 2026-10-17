@@ -858,7 +858,93 @@ const DURABLE_CORE_TABLES: &[TableContract] = &[
         constraints: AGENT_SDK_TURN_CHECKPOINT_CONSTRAINTS,
         indexes: AGENT_SDK_TURN_CHECKPOINT_INDEXES,
     },
+    TableContract {
+        name: "agent_sdk_documents",
+        purpose: "Typed JSON documents a transition writes in the same transaction as its tasks and events (migration 0030).",
+        columns: AGENT_SDK_DOCUMENT_COLUMNS,
+        constraints: AGENT_SDK_DOCUMENT_CONSTRAINTS,
+        indexes: AGENT_SDK_DOCUMENT_INDEXES,
+    },
 ];
+
+const AGENT_SDK_DOCUMENT_COLUMNS: &[ColumnContract] = &[
+    ColumnContract {
+        name: "scope_kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "`host`, `thread` or `task`.",
+    },
+    ColumnContract {
+        name: "scope_id",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Thread or task id; empty for a host document.",
+    },
+    ColumnContract {
+        name: "kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Owner-namespaced kind, `<owner>.<name>`.",
+    },
+    ColumnContract {
+        name: "doc_key",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Key within the kind; empty for a singleton.",
+    },
+    ColumnContract {
+        name: "schema_version",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "The owner's schema version of `value_json`.",
+    },
+    ColumnContract {
+        name: "revision",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Raised by one on every put and retire; the CAS token.",
+    },
+    ColumnContract {
+        name: "value_json",
+        sql_type: "JSONB",
+        nullable: false,
+        notes: "Opaque to agent-sdk.",
+    },
+    ColumnContract {
+        name: "retired_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: true,
+        notes: "Set when retired; a retired row reads as absent.",
+    },
+    ColumnContract {
+        name: "updated_at",
+        sql_type: "TIMESTAMPTZ",
+        nullable: false,
+        notes: "Commit instant of the last put or retire.",
+    },
+];
+
+const AGENT_SDK_DOCUMENT_CONSTRAINTS: &[ConstraintContract] = &[
+    ConstraintContract {
+        name: "agent_sdk_documents_scope_check",
+        invariant: "A host document has an empty scope id; a thread or task document has one.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_documents_revision_check",
+        invariant: "Revisions start at 1.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_documents_schema_version_check",
+        invariant: "Schema versions are non-negative.",
+    },
+];
+
+const AGENT_SDK_DOCUMENT_INDEXES: &[IndexContract] = &[IndexContract {
+    name: "agent_sdk_documents_kind_idx",
+    key_columns: "(kind, scope_kind, scope_id, doc_key)",
+    predicate: Some("retired_at IS NULL"),
+    purpose: "Every live document of one kind across scopes, in key order.",
+}];
 
 /// All tables in the current durable-core Postgres contract.
 #[must_use]

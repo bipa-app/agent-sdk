@@ -1,0 +1,33 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT revision, retired_at IS NULL AS \"live!: bool\"\n               FROM agent_sdk_documents\n               WHERE scope_kind = ?1 AND scope_id = ?2 AND kind = ?3 AND doc_key = ?4",
+  "describe": {
+    "columns": [
+      {
+        "name": "revision",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "name": "live!: bool",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c3948b9ca68fe5625bac4d0c73a0dcdfa2f8724d14d4830b0b74169f97e0b323"
+}

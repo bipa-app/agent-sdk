@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sdk_documents\n                       SET revision = $5, retired_at = $6, updated_at = $6\n                       WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "acd20b4e1864b4b3188fcde85a7394dc8c831c463539961e25f9da21e6b40cc8"
+}

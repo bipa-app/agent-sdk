@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sdk_documents\n                   (scope_kind, scope_id, kind, doc_key, schema_version, revision,\n                    value_json, retired_at, updated_at)\n               VALUES ($1, $2, $3, $4, $5, 1, $6, NULL, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d65402678fa5fdf1fc2ec3609c9ef1518c296e3bfbfefeff5e6e78d11db18ff9"
+}

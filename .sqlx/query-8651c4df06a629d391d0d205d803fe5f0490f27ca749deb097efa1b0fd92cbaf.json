@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT revision FROM agent_sdk_documents\n                   WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4\n                   FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revision",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "revision"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "8651c4df06a629d391d0d205d803fe5f0490f27ca749deb097efa1b0fd92cbaf"
+}
