@@ -16,13 +16,11 @@ use agent_sdk_foundation::llm::{
 };
 use agent_sdk_foundation::{AgentEvent, ThreadId, ToolReplay, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
+use agent_server::journal::DurableStore;
+use agent_server::journal::effect::{EffectKey, EffectState, TOOL_INTERRUPTED_PREFIX};
 use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_context::build_root_worker_inputs;
-use agent_server::journal::execution_intent::{
-    ExecutionIntentStore, GuardedExecutionDeps, IntentStatus, OperationId, TOOL_INTERRUPTED_PREFIX,
-    classify_tool_effect, guarded_tool_execution,
-};
 use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::recovery::RecoveryAction;
 use agent_server::journal::store::AgentTaskStore;
@@ -32,7 +30,7 @@ use agent_server::worker::bootstrap::WorkerBootstrapContext;
 use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_server::worker::{
     ActivityBeacon, RootTurnDeps, RootTurnOutcome, ToolTaskOutcome, execute_root_turn,
-    resolve_tool_bootstrap,
+    resolve_tool_bootstrap, run_tool_effect,
 };
 use agent_service_host::sqlite::SqliteDurableStore;
 use anyhow::{Context, Result, bail, ensure};
@@ -256,18 +254,11 @@ async fn tool_replay_crash_child() -> Result<()> {
         .await?
         .context("tool child was not acquired")?;
     let bootstrap = resolve_tool_bootstrap(child, &store, ActivityBeacon::default()).await?;
-    let effect_class = classify_tool_effect(&bootstrap.tool_call);
     let child_id = bootstrap.task_id.clone();
-    let deps = GuardedExecutionDeps {
-        task_store: &store,
-        intent_store: &store,
-        event_repo: &store,
-    };
-    guarded_tool_execution(
+    run_tool_effect(
         bootstrap,
-        &deps,
+        &store,
         &CancellationToken::new(),
-        effect_class,
         move |_call, _collector| async move {
             std::fs::write(&ready, child_id.as_str())?;
             tokio::time::sleep(Duration::from_mins(1)).await;
@@ -347,17 +338,10 @@ async fn recover(
         .await?
         .context("boot did not reacquire the crashed tool child")?;
     let bootstrap = resolve_tool_bootstrap(child, store, ActivityBeacon::default()).await?;
-    let effect_class = classify_tool_effect(&bootstrap.tool_call);
-    let deps = GuardedExecutionDeps {
-        task_store: store,
-        intent_store: store,
-        event_repo: store,
-    };
-    guarded_tool_execution(
+    run_tool_effect(
         bootstrap,
-        &deps,
+        store,
         &CancellationToken::new(),
-        effect_class,
         |_call, _collector| async {
             runs.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::success("ran again"))
@@ -406,13 +390,13 @@ async fn kill_nine_during_an_unsafe_tool_interrupts_it_instead_of_running_it_aga
         );
 
         let intent = store
-            .get_intent(&OperationId::new(&child.id, CALL_ID))
+            .effect(&EffectKey::tool(&child.id, CALL_ID))
             .await?
-            .with_context(|| format!("{tool}: no execution intent was written before the run"))?;
+            .with_context(|| format!("{tool}: no effect record was written before the run"))?;
         ensure!(
-            intent.status == IntentStatus::Failed,
-            "{tool}: the interrupted intent is {:?}",
-            intent.status
+            matches!(intent.state, EffectState::Interrupted { .. }),
+            "{tool}: the interrupted effect is {:?}",
+            intent.state
         );
 
         let ends: Vec<ToolResult> = EventRepository::get_events(&store, &child.thread_id)

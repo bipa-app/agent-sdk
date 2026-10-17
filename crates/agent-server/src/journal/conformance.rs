@@ -216,6 +216,20 @@ mod in_memory_bundle {
         ) -> std::result::Result<crate::journal::Committed, crate::journal::Rejected> {
             self.task.commit(transition, now).await
         }
+
+        async fn effect(
+            &self,
+            key: &crate::journal::EffectKey,
+        ) -> Result<Option<crate::journal::EffectRecord>> {
+            self.task.effect(key).await
+        }
+
+        async fn effects_for_task(
+            &self,
+            owner: &AgentTaskId,
+        ) -> Result<Vec<crate::journal::EffectRecord>> {
+            self.task.effects_for_task(owner).await
+        }
     }
 
     #[async_trait]

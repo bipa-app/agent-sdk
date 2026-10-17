@@ -36,9 +36,22 @@ use std::sync::{Arc, RwLock};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::execution_intent::ToolEffectClass;
 use super::redaction::{RedactionPolicy, redact_error, redact_string, redact_value};
 use super::task::AgentTaskId;
+
+/// A tool call's replay class as the audit log and metrics label it, from
+/// the replay value the tool declares ([`agent_sdk_foundation::ToolReplay`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffectClass {
+    /// Declared [`ToolReplay::Safe`](agent_sdk_foundation::ToolReplay::Safe).
+    ReplaySafe,
+    /// Declared [`ToolReplay::Unsafe`](agent_sdk_foundation::ToolReplay::Unsafe).
+    SideEffecting,
+    /// Written by releases that told listening calls apart; no longer
+    /// produced, still read.
+    Resumable,
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Identity
@@ -48,6 +61,7 @@ use super::task::AgentTaskId;
 ///
 /// Formatted as `tae_<uuid>` to be visually distinct from task IDs
 /// (`task_<uuid>`) and attempt IDs (`attempt_<uuid>`) in logs.
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ToolAuditEventId(pub String);
 

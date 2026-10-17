@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\nINSERT INTO agent_sdk_execution_intents (\n    operation_id, effect_class, tool_call_id, child_task_id,\n    tool_name, input, status, error, created_at, updated_at, effect_kind\n) VALUES ('op_kind', 'side_effecting', 'call', 'task', 'tool', '{}', 'started', NULL, ?1, ?1, 'shell_out')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7e8f6c773a5aa2168c3d42e425d26ab9842e01fdb3bf065c31b4d7a246b685e2"
+}

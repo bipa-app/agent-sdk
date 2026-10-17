@@ -25,6 +25,8 @@ const SPLIT_WRITES: &[&str] = &[
     "reject_confirmation",
     "repark_after_steering",
     "append_compaction",
+    "persist_intent",
+    "update_intent",
 ];
 /// `(path relative to the crates directory, calls)`. Streaming
 /// `TextDelta` / `ThinkingDelta` commits and other events that record no

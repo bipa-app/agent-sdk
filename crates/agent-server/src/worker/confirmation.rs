@@ -92,12 +92,10 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::committed_event::CommittedEvent;
-use crate::journal::execution_intent::{
-    GuardedExecutionDeps, classify_tool_effect, guarded_tool_execution,
-};
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, TaskKind, TaskStatus};
 use crate::journal::transition::{Guard, Settle, Transition, Write};
+use crate::worker::tool_effect::run_tool_effect;
 use crate::worker::tool_task::{ToolTaskBootstrap, ToolTaskOutcome};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -480,9 +478,8 @@ async fn reject_with_tool_call_end(
 ///    failed with a `confirmation_policy_denied:` error prefix
 ///    and no executor callback runs.
 /// 2. **Executes** the tool through
-///    [`guarded_tool_execution`],
-///    which applies the Phase 5.2 durable intent guard on top of the
-///    Phase 5.1 executor lifecycle.
+///    [`run_tool_effect`], which commits the call's effect record before
+///    the executor runs unless the call is declared replay-safe.
 ///
 /// # Preconditions
 ///
@@ -497,11 +494,11 @@ async fn reject_with_tool_call_end(
 ///
 /// Returns an error if the policy check fails (infrastructure
 /// error), or if the underlying
-/// [`guarded_tool_execution`]
+/// [`run_tool_effect`]
 /// or store CAS operations fail.
 pub async fn resume_confirmed_tool<F, Fut>(
     bootstrap: ToolTaskBootstrap,
-    deps: &GuardedExecutionDeps<'_>,
+    task_store: &dyn AgentTaskStore,
     policy: &dyn ConfirmationPolicy,
     cancel: &CancellationToken,
     executor: F,
@@ -535,8 +532,7 @@ where
                 duration_ms: None,
             },
         );
-        let committed = deps
-            .task_store
+        let committed = task_store
             .commit(
                 Transition::settle(
                     bootstrap.task_id.clone(),
@@ -567,10 +563,8 @@ where
         });
     }
 
-    // ── Execute through the guarded path ────────────────────────
-    let effect_class = classify_tool_effect(&bootstrap.tool_call);
-    let outcome =
-        guarded_tool_execution(bootstrap, deps, cancel, effect_class, executor, now).await?;
+    // ── Execute as an effect ────────────────────────────────────
+    let outcome = run_tool_effect(bootstrap, task_store, cancel, executor, now).await?;
 
     Ok(ConfirmationResumeOutcome::Executed(outcome))
 }
