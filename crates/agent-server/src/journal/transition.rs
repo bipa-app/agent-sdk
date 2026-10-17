@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
-use super::effect::{EffectKey, EffectRecord, EffectWrite};
+use super::effect::{EffectKey, EffectKind, EffectRecord, EffectWrite};
 use super::message::MessageProjection;
 use super::store::{MixedChildrenSpawn, SubagentBatchSpawn, SubagentInvocationSpawn};
 use super::subagent_spawn_transaction::SubagentSpawnEvent;
@@ -474,6 +474,16 @@ pub trait DurableStore: Send + Sync {
     /// # Errors
     /// The store could not be read.
     async fn effects_for_task(&self, owner: &AgentTaskId) -> anyhow::Result<Vec<EffectRecord>>;
+
+    /// Every `Started` effect of `kind` whose owner is live, oldest first,
+    /// across all owners: what a boot re-drive reads. A row an earlier
+    /// release left `started` under a terminal (or missing) owner is not
+    /// returned; it reads as `Abandoned`. It scans the table (there is no
+    /// index on the kind), so call it once at start, not per task.
+    ///
+    /// # Errors
+    /// The store could not be read.
+    async fn started_effects(&self, kind: EffectKind) -> anyhow::Result<Vec<EffectRecord>>;
 }
 
 impl Transition {

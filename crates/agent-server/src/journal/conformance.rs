@@ -230,6 +230,13 @@ mod in_memory_bundle {
         ) -> Result<Vec<crate::journal::EffectRecord>> {
             self.task.effects_for_task(owner).await
         }
+
+        async fn started_effects(
+            &self,
+            kind: crate::journal::EffectKind,
+        ) -> Result<Vec<crate::journal::EffectRecord>> {
+            self.task.started_effects(kind).await
+        }
     }
 
     #[async_trait]

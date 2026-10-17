@@ -18,7 +18,8 @@ use super::tool_effect::{run_tool_effect, tool_intent};
 use super::tool_task::{ToolTaskBootstrap, ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::effect::{
-    EffectKey, EffectRecord, EffectState, EffectSubject, EffectWrite, TOOL_INTERRUPTED_PREFIX,
+    EffectKey, EffectKind, EffectRecord, EffectState, EffectSubject, EffectWrite,
+    TOOL_INTERRUPTED_PREFIX,
 };
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::InMemoryEventRepository;
@@ -134,6 +135,10 @@ impl DurableStore for FailingEffectStart<'_> {
 
     async fn effects_for_task(&self, owner: &AgentTaskId) -> Result<Vec<EffectRecord>> {
         self.inner.effects_for_task(owner).await
+    }
+
+    async fn started_effects(&self, kind: EffectKind) -> Result<Vec<EffectRecord>> {
+        self.inner.started_effects(kind).await
     }
 }
 

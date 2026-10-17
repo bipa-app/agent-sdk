@@ -59,7 +59,8 @@ mod tests {
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::committed_event::CommittedEvent;
     use agent_server::journal::effect::{
-        EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite,
+        EffectIntent, EffectKey, EffectKind, EffectRecord, EffectState, EffectSubject, EffectWrite,
+        started_effects_for_task,
     };
     use agent_server::journal::event_repository::EventRepository;
     use agent_server::journal::idempotency::{
@@ -3255,6 +3256,89 @@ mod tests {
             .count())
     }
 
+    /// Process and git effects store their subjects, and the started reads
+    /// a boot re-drive uses return exactly the `Started` effects: of one
+    /// kind across owners, or of one owner across kinds.
+    async fn test_effect_kinds_and_started_reads(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (owner, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-kinds").await?;
+        let process = |name: &str| EffectIntent {
+            key: EffectKey::process(&owner.id, name),
+            replay: ToolReplay::Unsafe,
+            owner: owner.id.clone(),
+            thread: owner.thread_id.clone(),
+            subject: EffectSubject::Process {
+                project_hash: "project".into(),
+                name: name.to_owned(),
+                argv_digest: format!("sha256:{name}"),
+            },
+            attempt: 1,
+        };
+        let git = EffectIntent {
+            key: EffectKey::git(&owner.id, "commit"),
+            replay: ToolReplay::Unsafe,
+            owner: owner.id.clone(),
+            thread: owner.thread_id.clone(),
+            subject: EffectSubject::Git {
+                repo: "/repo".into(),
+                step: "commit".into(),
+                idempotency_key: Some("Bip-Landing: l1".into()),
+            },
+            attempt: 1,
+        };
+        let starts = [
+            effect_intent(&owner, "call_1"),
+            process("dev-server"),
+            git.clone(),
+            process("watcher"),
+        ];
+        for (secs, intent) in (2..).zip(starts) {
+            task_store
+                .commit(start_effect(intent, &worker, &lease), t_plus(secs))
+                .await?;
+        }
+        task_store
+            .commit(
+                finish_effect(
+                    &EffectKey::process(&owner.id, "watcher"),
+                    &owner.id,
+                    EffectState::Completed,
+                ),
+                t_plus(10),
+            )
+            .await?;
+
+        let processes = task_store.started_effects(EffectKind::ProcessStart).await?;
+        let [dev_server] = processes.as_slice() else {
+            anyhow::bail!("expected the one started process, got {processes:?}");
+        };
+        assert_eq!(dev_server.subject, process("dev-server").subject);
+        let gits = task_store.started_effects(EffectKind::GitStep).await?;
+        let [commit] = gits.as_slice() else {
+            anyhow::bail!("expected the one started git step, got {gits:?}");
+        };
+        assert_eq!(commit.subject, git.subject);
+        assert_eq!(
+            task_store.started_effects(EffectKind::LlmRequest).await?,
+            Vec::new()
+        );
+
+        let of_owner = started_effects_for_task(task_store, &owner.id).await?;
+        let kinds: Vec<EffectKind> = of_owner.iter().map(EffectRecord::kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EffectKind::ToolCall,
+                EffectKind::ProcessStart,
+                EffectKind::GitStep
+            ]
+        );
+        Ok(())
+    }
+
     /// Design C15: every backend checks a transition's effect expectations
     /// before its first write, so when the LAST write's expectation fails
     /// nothing earlier in the transition is visible — on the in-memory
@@ -4995,6 +5079,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_effect_kinds_and_started_reads() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_effect_kinds_and_started_reads(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_effect_claim_and_finish() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_effect_claim_and_finish(s.task.as_ref(), s.thread.as_ref()).await
@@ -5487,6 +5577,13 @@ mod tests {
     async fn conformance_sqlite_effects_end_with_their_owner() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_effects_end_with_their_owner(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_effect_kinds_and_started_reads() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_effect_kinds_and_started_reads(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6408,6 +6505,15 @@ mod tests {
             return Ok(());
         };
         test_effects_end_with_their_owner(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_effect_kinds_and_started_reads() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_effect_kinds_and_started_reads(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

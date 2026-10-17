@@ -64,6 +64,20 @@ impl EffectKey {
         Self(format!("{}:{tool_call_id}", child.0))
     }
 
+    /// The key of the process `name` started under `owner`'s lease:
+    /// `process:{owner}:{name}`.
+    #[must_use]
+    pub fn process(owner: &AgentTaskId, name: &str) -> Self {
+        Self(format!("process:{}:{name}", owner.0))
+    }
+
+    /// The key of the git step `step` run under `owner`'s lease:
+    /// `git:{owner}:{step}`.
+    #[must_use]
+    pub fn git(owner: &AgentTaskId, step: &str) -> Self {
+        Self(format!("git:{}:{step}", owner.0))
+    }
+
     /// A key as a store read it back. Public because the stores live in
     /// another crate, and a host may keep a key it read to finish later.
     #[must_use]
@@ -89,6 +103,8 @@ impl std::fmt::Display for EffectKey {
 pub enum EffectKind {
     ToolCall,
     LlmRequest,
+    ProcessStart,
+    GitStep,
 }
 
 /// The kind-specific part of an effect.
@@ -104,6 +120,21 @@ pub enum EffectSubject {
         provider: String,
         model: String,
     },
+    /// A host process started for a project: `argv_digest` identifies the
+    /// command line without storing it.
+    Process {
+        project_hash: String,
+        name: String,
+        argv_digest: String,
+    },
+    /// One step of a git operation in `repo`. `idempotency_key`, when the
+    /// step has one, lets recovery check whether it already happened (a
+    /// commit trailer, a ref name).
+    Git {
+        repo: String,
+        step: String,
+        idempotency_key: Option<String>,
+    },
 }
 
 impl EffectSubject {
@@ -112,6 +143,8 @@ impl EffectSubject {
         match self {
             Self::Tool { .. } => EffectKind::ToolCall,
             Self::Llm { .. } => EffectKind::LlmRequest,
+            Self::Process { .. } => EffectKind::ProcessStart,
+            Self::Git { .. } => EffectKind::GitStep,
         }
     }
 }
@@ -376,6 +409,8 @@ pub fn kind_from_wire(kind: &str) -> Option<EffectKind> {
     match kind {
         "tool_call" => Some(EffectKind::ToolCall),
         "llm_request" => Some(EffectKind::LlmRequest),
+        "process_start" => Some(EffectKind::ProcessStart),
+        "git_step" => Some(EffectKind::GitStep),
         _ => None,
     }
 }
@@ -394,6 +429,8 @@ pub const fn kind_wire(kind: EffectKind) -> &'static str {
     match kind {
         EffectKind::ToolCall => "tool_call",
         EffectKind::LlmRequest => "llm_request",
+        EffectKind::ProcessStart => "process_start",
+        EffectKind::GitStep => "git_step",
     }
 }
 
@@ -421,6 +458,32 @@ impl EffectRecord {
                     "turn_attempt_id": turn_attempt_id,
                     "provider": provider,
                     "model": model,
+                }),
+            ),
+            EffectSubject::Process {
+                project_hash,
+                name,
+                argv_digest,
+            } => (
+                name.clone(),
+                format!("process:{name}"),
+                serde_json::json!({
+                    "project_hash": project_hash,
+                    "name": name,
+                    "argv_digest": argv_digest,
+                }),
+            ),
+            EffectSubject::Git {
+                repo,
+                step,
+                idempotency_key,
+            } => (
+                step.clone(),
+                format!("git:{step}"),
+                serde_json::json!({
+                    "repo": repo,
+                    "step": step,
+                    "idempotency_key": idempotency_key,
                 }),
             ),
         };
@@ -455,28 +518,41 @@ impl EffectRecord {
     /// A value no release writes.
     #[doc(hidden)]
     pub fn from_row(row: EffectRow) -> anyhow::Result<Self> {
+        let optional = |name: &str| {
+            row.input
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        let field = |name: &str| {
+            optional(name).with_context(|| {
+                format!(
+                    "{} effect row {} lacks {name}",
+                    row.effect_kind, row.operation_id
+                )
+            })
+        };
         let subject = match row.effect_kind.as_str() {
             "tool_call" => EffectSubject::Tool {
-                call_id: row.tool_call_id,
-                name: row.tool_name,
-                input: row.input,
+                call_id: row.tool_call_id.clone(),
+                name: row.tool_name.clone(),
+                input: row.input.clone(),
             },
-            "llm_request" => {
-                let field = |name: &str| {
-                    row.input
-                        .get(name)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .with_context(|| {
-                            format!("llm effect row {} lacks {name}", row.operation_id)
-                        })
-                };
-                EffectSubject::Llm {
-                    turn_attempt_id: field("turn_attempt_id")?,
-                    provider: field("provider")?,
-                    model: field("model")?,
-                }
-            }
+            "llm_request" => EffectSubject::Llm {
+                turn_attempt_id: field("turn_attempt_id")?,
+                provider: field("provider")?,
+                model: field("model")?,
+            },
+            "process_start" => EffectSubject::Process {
+                project_hash: field("project_hash")?,
+                name: field("name")?,
+                argv_digest: field("argv_digest")?,
+            },
+            "git_step" => EffectSubject::Git {
+                repo: field("repo")?,
+                step: field("step")?,
+                idempotency_key: optional("idempotency_key"),
+            },
             other => bail!("unknown effect kind {other:?}"),
         };
         Ok(Self {
@@ -583,6 +659,23 @@ impl Transition {
         }
         Ok(())
     }
+}
+
+/// The `Started` effects of `owner`, oldest first: what an owner that
+/// re-acquired its task recovers before it runs again.
+///
+/// # Errors
+/// The store could not be read.
+pub async fn started_effects_for_task(
+    store: &dyn DurableStore,
+    owner: &AgentTaskId,
+) -> anyhow::Result<Vec<EffectRecord>> {
+    Ok(store
+        .effects_for_task(owner)
+        .await?
+        .into_iter()
+        .filter(|record| record.state.is_started())
+        .collect())
 }
 
 /// What [`run_effect`] did.
@@ -731,6 +824,54 @@ mod tests {
         assert_eq!(row.effect_kind, "llm_request");
         assert_eq!(row.tool_name, "llm:anthropic/claude-sonnet-5-5");
         assert_eq!(EffectRecord::from_row(row)?, stored);
+        Ok(())
+    }
+
+    #[test]
+    fn process_and_git_subjects_round_trip_through_the_legacy_columns() -> anyhow::Result<()> {
+        let owner = AgentTaskId::from_string("task_1");
+        for (key, subject, tool_name) in [
+            (
+                EffectKey::process(&owner, "dev-server"),
+                EffectSubject::Process {
+                    project_hash: "p1".into(),
+                    name: "dev-server".into(),
+                    argv_digest: "sha256:abc".into(),
+                },
+                "process:dev-server",
+            ),
+            (
+                EffectKey::git(&owner, "commit"),
+                EffectSubject::Git {
+                    repo: "/repo".into(),
+                    step: "commit".into(),
+                    idempotency_key: Some("Bip-Landing: l1".into()),
+                },
+                "git:commit",
+            ),
+            (
+                EffectKey::git(&owner, "push"),
+                EffectSubject::Git {
+                    repo: "/repo".into(),
+                    step: "push".into(),
+                    idempotency_key: None,
+                },
+                "git:push",
+            ),
+        ] {
+            let mut stored = record(EffectState::Started);
+            stored.key = key;
+            stored.subject = subject;
+            let row = stored.to_row()?;
+            assert_eq!(row.tool_name, tool_name);
+            assert_eq!(row.effect_kind, kind_wire(stored.kind()));
+            assert_eq!(EffectRecord::from_row(row)?, stored);
+        }
+        assert_eq!(
+            EffectKey::process(&owner, "dev-server").as_str(),
+            "process:task_1:dev-server"
+        );
+        assert_eq!(EffectKey::git(&owner, "push").as_str(), "git:task_1:push");
         Ok(())
     }
 

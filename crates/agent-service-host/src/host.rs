@@ -10209,6 +10209,13 @@ mod tests {
         ) -> Result<Vec<agent_server::journal::EffectRecord>> {
             self.inner.effects_for_task(owner).await
         }
+
+        async fn started_effects(
+            &self,
+            kind: agent_server::journal::EffectKind,
+        ) -> Result<Vec<agent_server::journal::EffectRecord>> {
+            self.inner.started_effects(kind).await
+        }
     }
 
     #[async_trait]

@@ -5352,6 +5352,30 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         records.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
         Ok(records)
     }
+
+    async fn started_effects(
+        &self,
+        kind: super::effect::EffectKind,
+    ) -> Result<Vec<super::effect::EffectRecord>> {
+        let inner = self.inner.read().await;
+        let live = |owner: &AgentTaskId| {
+            inner
+                .by_id
+                .get(owner)
+                .is_some_and(|task| !task.status.is_terminal())
+        };
+        let mut records: Vec<_> = inner
+            .effects
+            .values()
+            .filter(|record| {
+                record.kind() == kind && record.state.is_started() && live(&record.owner)
+            })
+            .cloned()
+            .collect();
+        drop(inner);
+        records.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
+        Ok(records)
+    }
 }
 
 impl InMemoryAgentTaskStore {

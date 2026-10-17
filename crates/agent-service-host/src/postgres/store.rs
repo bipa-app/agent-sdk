@@ -37,7 +37,9 @@ use agent_server::journal::commit::{
     LostCommitOwnership, StaleTurnCommit,
 };
 use agent_server::journal::committed_event::CommittedEvent;
-use agent_server::journal::effect::{EffectKey, EffectRecord, EffectRow, EffectState, EffectWrite};
+use agent_server::journal::effect::{
+    EffectKey, EffectKind, EffectRecord, EffectRow, EffectState, EffectWrite, kind_wire,
+};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -4110,6 +4112,35 @@ ORDER BY created_at, operation_id
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("list effects of task {owner}"))?;
+        records
+            .into_iter()
+            .map(EffectRecordRow::into_record)
+            .collect()
+    }
+
+    async fn started_effects(&self, kind: EffectKind) -> Result<Vec<EffectRecord>> {
+        let records = sqlx::query_as!(
+            EffectRecordRow,
+            r"
+SELECT
+    operation_id, effect_class, tool_call_id, child_task_id,
+    tool_name, input, status, error, created_at, updated_at,
+    effect_kind, attempt, resolution, captured_output, journal_anchor, thread_id
+FROM agent_sdk_execution_intents
+WHERE effect_kind = $1
+  AND status IN ('pending', 'started')
+ AND EXISTS (
+      SELECT 1 FROM agent_sdk_tasks owner_task
+      WHERE owner_task.id = agent_sdk_execution_intents.child_task_id
+        AND owner_task.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+ORDER BY created_at, operation_id
+",
+            kind_wire(kind),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("list started {} effects", kind_wire(kind)))?;
         records
             .into_iter()
             .map(EffectRecordRow::into_record)
@@ -8601,7 +8632,7 @@ mod tests {
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::commit_completed_turn;
     use agent_server::journal::effect::{
-        EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite,
+        EffectIntent, EffectKey, EffectKind, EffectState, EffectSubject, EffectWrite,
     };
     use agent_server::journal::message_store::MessageProjectionStore;
     use agent_server::journal::recovery::FailureReason;
@@ -9721,6 +9752,11 @@ INSERT INTO agent_sdk_execution_intents (
         assert_eq!(record.thread, None);
         assert_eq!(record.journal_anchor, None);
         assert!(matches!(record.subject, EffectSubject::Tool { ref name, .. } if name == "bash"));
+        assert_eq!(
+            store.started_effects(EffectKind::ToolCall).await?,
+            Vec::new(),
+            "a started row without a live owner is not re-driven"
+        );
         Ok(())
     }
 

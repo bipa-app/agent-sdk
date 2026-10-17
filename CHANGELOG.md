@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Crash safety, Phase 2: effects
 
+- **Breaking: process and git effects** (reconciliation C7).
+  - `EffectKind` gains `ProcessStart` and `GitStep`.
+  - `EffectSubject` gains `Process { project_hash, name, argv_digest }` and
+    `Git { repo, step, idempotency_key }`.
+  - `EffectKey::process(owner, name)` and `EffectKey::git(owner, step)`
+    build their keys (`process:{owner}:{name}`, `git:{owner}:{step}`).
+
+  A host runs them through the public `run_effect`: the record commits
+  under the owner's lease before the process starts or the step runs.
+  Recovery reads are:
+  - `DurableStore::started_effects(kind)`: a new required method, every
+    `Started` effect of a kind across owners, for a boot re-drive. It scans
+    the table, so call it once at start.
+  - `started_effects_for_task(store, owner)`.
+
+  No migration: 0027's kind check already lists both kinds.
+
 - **Breaking: tool calls run as effects** (design §6.3). An effect is work
   outside the store whose record commits before it runs, under its owner
   task's lease, and whose outcome commits in the same transaction as the

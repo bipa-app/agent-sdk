@@ -8,7 +8,9 @@ use agent_sdk_foundation::llm::{
 };
 use agent_sdk_foundation::{AgentEvent, ThreadId, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
-use agent_server::journal::effect::{EffectKey, EffectRecord, EffectState, EffectWrite};
+use agent_server::journal::effect::{
+    EffectKey, EffectKind, EffectRecord, EffectState, EffectWrite,
+};
 use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_context::build_root_worker_inputs;
@@ -666,6 +668,10 @@ impl DurableStore for ClaimFails<'_> {
 
     async fn effects_for_task(&self, owner: &AgentTaskId) -> Result<Vec<EffectRecord>> {
         self.inner.effects_for_task(owner).await
+    }
+
+    async fn started_effects(&self, kind: EffectKind) -> Result<Vec<EffectRecord>> {
+        self.inner.started_effects(kind).await
     }
 }
 

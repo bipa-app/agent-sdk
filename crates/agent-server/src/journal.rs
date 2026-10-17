@@ -603,7 +603,7 @@ pub use commit::{CommitOutcome, CompletedTurnCommit, commit_completed_turn};
 pub use committed_event::CommittedEvent;
 pub use effect::{
     EffectIntent, EffectKey, EffectKind, EffectRecord, EffectRun, EffectState, EffectSubject,
-    EffectWrite, TOOL_INTERRUPTED_PREFIX, run_effect,
+    EffectWrite, TOOL_INTERRUPTED_PREFIX, run_effect, started_effects_for_task,
 };
 pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
