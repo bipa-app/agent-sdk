@@ -3575,6 +3575,7 @@ struct ApiWrappedWebsocketErrorEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "openai")]
     use crate::impls::openai::{
         MODEL_GPT6_ASTRA, MODEL_GPT6_LUNA, MODEL_GPT6_SOL, MODEL_GPT56, MODEL_GPT56_LUNA,
         MODEL_GPT56_SOL, MODEL_GPT56_TERRA, MODEL_GPT61_SOL,
@@ -3646,6 +3647,7 @@ mod tests {
         assert_eq!(MODEL_GPT52_CODEX, "gpt-5.2-codex");
     }
 
+    #[cfg(feature = "openai")]
     fn original_image_request() -> ChatRequest {
         ChatRequest::new(
             String::new(),
@@ -3658,6 +3660,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "openai")]
     #[test]
     fn historical_images_require_a_current_codex_model() {
         for model in [
@@ -3690,6 +3693,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai")]
     #[test]
     fn codex_request_conversion_downgrades_original_for_older_and_unknown_models()
     -> anyhow::Result<()> {
