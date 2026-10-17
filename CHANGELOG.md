@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Primitive 10 (S-2): the subagent completion hook
+
+- **Breaking:** `SubagentResultDeps` gains `completion_hook:
+  Option<InstalledCompletionHook>`. Code that builds it as a struct literal
+  adds `completion_hook: None`, which keeps today's settle.
+- `SubagentCompletionHook` (`agent_server::worker`): host work that a
+  subagent invocation runs after its child root is terminal and before the
+  settle that resumes the parent. Install it with
+  `ServiceHost::with_subagent_completion_hook` (or
+  `StoreRegistry::with_subagent_completion_hook`).
+  - `plan(ctx)` names a git step (`CompletionPlan { step, repo, unit }`) or
+    none. With a step, the SDK commits a `Started` `GitStep` record keyed
+    `{invocation}:git:{step}` under the invocation's lease before the hook
+    runs.
+  - `run(ctx, prior, mode)` gets the earlier attempt's `Started` record as
+    `prior`, and `RunMode::Inspect` on the invocation's last attempt.
+  - One transition then finishes the record, settles the invocation with
+    the hook's result, appends the parent's completed `SubagentProgress`
+    and applies the hook's `extra_writes` (`Document` and `AppendEvents`
+    only). The parent resumes in it.
+  - `CompletionContext::store` reads effect records and refuses `commit`.
+  - `CompletionOutput::park` is refused as `CompletionHookError::Unsupported`
+    until the durable prompt row can own a parked invocation. A refused
+    output or an `Err` from `run` fails the invocation closed, which
+    abandons the record.
+  - With no hook installed, an invocation commits exactly the settle it
+    committed before.
+- Signals: span `agent_server.subagent.completion_hook`;
+  `agent_server.effects{kind="git_step"}` with the new transition
+  `continued`; `agent_server.effect.duration{kind="git_step"}`; counter
+  `agent_server.subagent.completion_hook.refused{reason}`.
+- Failpoint `subagent.completion_hook.before_settle`: after the hook ran,
+  before the settle commits.
+
+### Primitive 10 (S-1): git-step effects and the invocation retry budget
+
+- **Breaking** (for code that matches these enums exhaustively):
+  `EffectKind::GitStep` and `EffectSubject::Git { step, repo, unit }`, a git
+  step a host runs when a subagent invocation completes.
+  `EffectKey::git(invocation, step)` is `{invocation}:git:{step}`. The row
+  keeps the unit in `tool_call_id`, `git:{step}` in `tool_name` and the
+  subject in `input`. Migration 0027 already allows `git_step` on both
+  backends, so there is no migration. An old binary that reads a `git_step`
+  row fails that read with `unknown effect kind`, as it does for any kind
+  newer than itself.
+- `AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS = 3`. Every store spawns a
+  subagent invocation with it, so an expired lease or a crash requeues the
+  invocation for attempts 2 and 3, and the expiry of attempt 3 fails it
+  closed. Invocations already stored keep the budget they were spawned with.
+  `DEFAULT_MAX_ATTEMPTS` stays 1, so tool children spawned with
+  `ChildSpawnSpec::default()` still fail closed after one attempt.
 ### Crash-safety Phase 4: the session view, folded at read time
 
 - `agent.service.v1.AgentEventService` gains `GetThreadView` (status and the

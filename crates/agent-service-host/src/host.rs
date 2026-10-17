@@ -323,6 +323,19 @@ impl ServiceHost {
         self
     }
 
+    /// Install a [`SubagentCompletionHook`](agent_server::worker::SubagentCompletionHook):
+    /// host work each subagent invocation runs, recorded as a git-step
+    /// effect, before the settle that resumes its parent. Without one an
+    /// invocation settles with its child's result, as before.
+    #[must_use]
+    pub fn with_subagent_completion_hook(
+        mut self,
+        hook: Arc<dyn agent_server::worker::SubagentCompletionHook>,
+    ) -> Self {
+        self.stores = self.stores.with_subagent_completion_hook(hook);
+        self
+    }
+
     /// Access the host runtime wiring.
     #[must_use]
     pub const fn runtime(&self) -> &Arc<ExecutionRuntime> {
@@ -7961,6 +7974,82 @@ mod tests {
         Ok((parent, invocation, child_root))
     }
 
+    /// With no completion hook installed, a subagent invocation commits
+    /// exactly the transition it committed before primitive 10: one settle
+    /// with the materialized result and the completed `SubagentProgress`,
+    /// under the invocation's lease, with no effect write. The expected
+    /// transition below is the pre-hook `execute_subagent_task_inner` body;
+    /// the two are compared as their `Debug` text.
+    #[tokio::test]
+    async fn without_a_completion_hook_the_invocation_commits_the_same_settle() -> Result<()> {
+        use agent_server::journal::{Settle, Transition};
+        use agent_server::worker::{SubagentProgressSnapshot, build_parent_progress_event};
+
+        let mut stores = StoreRegistry::in_memory(sample_registry());
+        let now = time::OffsetDateTime::now_utc();
+        let parent_thread = agent_sdk_foundation::ThreadId::from_string("t-no-hook-settle");
+        let (_parent, invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 60_000, now).await?;
+        stores.task_store.cancel_tree(&child_root.id, now).await?;
+        let recording = Arc::new(FlakyTaskStore::new(Arc::clone(&stores.task_store)));
+        stores.task_store = Arc::clone(&recording) as Arc<dyn AgentTaskStore>;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let running = stores
+            .task_store
+            .try_acquire_task(
+                &invocation.id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::minutes(10),
+                now,
+            )
+            .await?
+            .context("the woken invocation must acquire")?;
+        let bootstrap =
+            agent_server::worker::resolve_subagent_bootstrap(running, stores.task_store.as_ref())
+                .await?;
+        let expected_bootstrap = bootstrap.clone();
+        let deps = stores.subagent_result_deps(None);
+        assert!(deps.completion_hook.is_none(), "no hook is installed");
+
+        let outcome = agent_server::worker::execute_subagent_task(bootstrap, &deps, now).await?;
+
+        let expected = Transition::settle(
+            invocation.id.clone(),
+            worker,
+            lease,
+            Settle::Complete {
+                result: serde_json::to_value(&outcome.tool_result)?,
+            },
+            parent_thread.clone(),
+            vec![build_parent_progress_event(&SubagentProgressSnapshot {
+                subagent_id: &expected_bootstrap.subagent_id,
+                subagent_name: &expected_bootstrap.subagent_name,
+                spec: &expected_bootstrap.spec,
+                child_thread_id: &expected_bootstrap.child_thread_id,
+                child_root_task_id: &expected_bootstrap.child_root_task_id,
+                subagent_task_id: &expected_bootstrap.task_id,
+                completed: true,
+                success: outcome.subagent_result.summary.success,
+                current_turn: outcome.subagent_result.summary.total_turns,
+                tool_count: outcome.subagent_result.summary.tool_count,
+                usage: outcome.subagent_result.summary.total_usage.clone(),
+            })],
+        );
+        let committed = recording.committed_transitions()?;
+        assert_eq!(committed, vec![format!("{expected:?}")]);
+        assert!(
+            stores
+                .task_store
+                .effects_for_task(&invocation.id)
+                .await?
+                .is_empty(),
+            "no hook writes no effect record"
+        );
+        Ok(())
+    }
+
     /// Edge 2 (post-outage re-acquisition must not insta-reap).
     ///
     /// A child spawned long ago, then stranded by a crash/outage far longer
@@ -10050,6 +10139,8 @@ mod tests {
         artifact_store_at_completion:
             Option<Arc<std::sync::Mutex<Option<std::sync::Weak<agent_sdk::ArtifactStore>>>>>,
         artifact_store_alive_at_completion: std::sync::atomic::AtomicBool,
+        /// The `Debug` of every transition passed to `commit`, in order.
+        committed: std::sync::Mutex<Vec<String>>,
     }
 
     impl FlakyTaskStore {
@@ -10067,7 +10158,18 @@ mod tests {
                 fail_task_now: Arc::new(std::sync::Mutex::new(None)),
                 artifact_store_at_completion: None,
                 artifact_store_alive_at_completion: std::sync::atomic::AtomicBool::new(false),
+                committed: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// The `Debug` of every transition committed through this store.
+        fn committed_transitions(&self) -> Result<Vec<String>> {
+            Ok(self
+                .committed
+                .lock()
+                .ok()
+                .context("committed-transitions lock")?
+                .clone())
         }
 
         /// The instant the last `fail_task` was stamped with, if any.
@@ -10218,6 +10320,9 @@ mod tests {
                     | Write::SpawnChildren { .. }
                     | Write::Document(_) => {}
                 }
+            }
+            if let Ok(mut committed) = self.committed.lock() {
+                committed.push(format!("{transition:?}"));
             }
             self.inner.commit(transition, now).await
         }
