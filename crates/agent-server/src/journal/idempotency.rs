@@ -124,8 +124,8 @@ pub enum IdempotencyClaim {
     /// recorded one. The store cannot tell which, nor whether the effect
     /// landed. A caller may run the effect again only when running it twice
     /// converges (a guarded transition, or a create keyed by a caller-named
-    /// id), and then records the result as for `Fresh`; otherwise it must
-    /// refuse.
+    /// id or by an id derived from the key), and then records the result as
+    /// for `Fresh`; otherwise it must refuse.
     InFlight,
 }
 

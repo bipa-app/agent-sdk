@@ -102,6 +102,8 @@ pub enum ThreadOperation {
     Promote,
     Acquire,
     Commit,
+    /// Append events or a compaction to the thread's journal.
+    Append,
 }
 
 impl std::fmt::Display for ThreadOperation {
@@ -114,6 +116,7 @@ impl std::fmt::Display for ThreadOperation {
             Self::Promote => "promote",
             Self::Acquire => "acquire",
             Self::Commit => "commit",
+            Self::Append => "append",
         };
         f.write_str(operation)
     }
@@ -373,10 +376,10 @@ impl Thread {
 
     /// Return a typed error unless this row accepts `operation`.
     ///
-    /// Legacy-completed rows remain readable through create replay/recovery and
-    /// may still be forked, preserving the pre-purge contract. All other
-    /// admission requires an active row. Deleting and deleted rows reject every
-    /// operation.
+    /// Legacy-completed rows remain readable through create replay/recovery,
+    /// may still be forked, and still take appended events, preserving the
+    /// pre-purge contract. All other admission requires an active row.
+    /// Deleting and deleted rows reject every operation.
     ///
     /// # Errors
     /// Returns [`ThreadStateConflict`] with the exact durable state when the
@@ -384,7 +387,10 @@ impl Thread {
     pub fn require_active(&self, operation: ThreadOperation) -> Result<(), ThreadStateConflict> {
         let allowed = self.status.is_active()
             || (self.status.is_completed()
-                && matches!(operation, ThreadOperation::Create | ThreadOperation::Fork));
+                && matches!(
+                    operation,
+                    ThreadOperation::Create | ThreadOperation::Fork | ThreadOperation::Append
+                ));
         if allowed {
             return Ok(());
         }
@@ -605,6 +611,7 @@ mod tests {
             ThreadOperation::Promote,
             ThreadOperation::Acquire,
             ThreadOperation::Commit,
+            ThreadOperation::Append,
         ];
         let statuses = [
             ThreadStatus::Active,
@@ -622,9 +629,10 @@ mod tests {
                 thread.status = status;
                 let expected_ok = match status {
                     ThreadStatus::Active => true,
-                    ThreadStatus::Completed => {
-                        matches!(operation, ThreadOperation::Create | ThreadOperation::Fork)
-                    }
+                    ThreadStatus::Completed => matches!(
+                        operation,
+                        ThreadOperation::Create | ThreadOperation::Fork | ThreadOperation::Append
+                    ),
                     ThreadStatus::Deleting | ThreadStatus::Deleted => false,
                 };
                 match thread.require_active(operation) {

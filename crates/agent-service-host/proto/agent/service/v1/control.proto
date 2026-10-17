@@ -13,13 +13,15 @@ import "google/protobuf/timestamp.proto";
 
 message CreateThreadRequest {
   // Caller-supplied idempotency key for the logical create operation.
-  // Retries must reuse the same value on the legacy server-minted path.
+  // Retries must reuse the same value on the server-minted path: the minted
+  // id is derived from it, so a retry after any failure returns the same
+  // thread.
   string request_id = 1;
 
   // Optional caller-minted thread identity. When non-empty, this is the
   // idempotency key for thread creation: matching retries return the existing
   // thread, while reuse by a conflicting lifecycle operation is rejected.
-  // Empty preserves server-side id minting for existing callers. Either way
+  // Empty has the server mint the id from `request_id`. Either way
   // the thread is created with its `ThreadCreated` event in one write, and a
   // matching retry writes nothing.
   string thread_id = 2;
@@ -161,8 +163,8 @@ message SubmitThreadWorkResponse {
 // `thread_id`, when supplied, is the primary idempotency key. A retry with
 // the same destination, source, and fork boundary returns the existing fork;
 // conflicting reuse is `ALREADY_EXISTS`. When `thread_id` is empty, the
-// legacy `request_id` contract remains unchanged and replays the originally
-// server-minted destination.
+// server mints the destination id from `request_id`, so a retry with the same
+// `request_id` returns the same destination, even after a failure.
 //
 // # Errors
 //
@@ -190,7 +192,7 @@ message ForkThreadRequest {
   // Optional caller-minted destination identity. Matching
   // `(thread_id, source_thread_id, fork_after_committed_turns)` retries return
   // the existing fork; conflicting reuse of `thread_id` is rejected. Empty
-  // preserves server-side destination minting for existing callers.
+  // has the server mint the destination id from `request_id`.
   string thread_id = 4;
 }
 

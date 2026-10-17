@@ -510,6 +510,7 @@ ON CONFLICT (thread_id) DO NOTHING
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
         let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -3519,6 +3520,9 @@ impl SqliteDurableStore {
             Write::AppendEvents { thread, events } => {
                 if events.is_empty() {
                     return Ok(());
+                }
+                if let Some(stored) = Self::get_thread_tx(tx, &thread).await? {
+                    stored.require_active(ThreadOperation::Append)?;
                 }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;

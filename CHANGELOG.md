@@ -201,10 +201,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the destination again returns the thread the earlier attempt created.
     A host's fork that stopped between its commit and its record now
     converges on that destination instead of failing.
-  - `CreateThread` and `ForkThread` without a caller-named id answer
-    `ABORTED`, saying nothing ran and to retry with the same request_id:
-    the earlier attempt may have created a thread the caller never
-    learned, and a new request_id could create a second one.
+  - `CreateThread` and `ForkThread` without a caller-named id run it
+    again too: the new thread's id is a UUIDv5 of the method and the
+    `request_id`, so every attempt under one key claims the same thread
+    the way a caller-named one does. A retry whose earlier attempt created
+    the thread and stopped before it recorded the key returns that thread;
+    one whose thread was purged since is `FAILED_PRECONDITION`. They no
+    longer answer `ABORTED`.
+- **Breaking: a transition that appends to a purged thread is refused.**
+  `DurableStore::commit` refuses a transition whose events or compaction
+  go to a `Deleting` or `Deleted` thread with a `ThreadStateConflict` for
+  the new `ThreadOperation::Append`, and writes nothing: Postgres checks
+  each thread it locks, SQLite reads the thread in the event and compaction
+  writes, and the in-memory store reads it through its event sink's thread
+  store. `append_compaction` refuses such a thread instead of putting a
+  message head back on it. A `Completed` thread still takes appends.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).

@@ -25,7 +25,9 @@ use agent_server::journal::task_state::TaskState;
 use agent_server::journal::thread::{
     PurgeReceipt, PurgeScope, PurgeSeed, ThreadNotFound, ThreadOperation, ThreadStateConflict,
 };
-use agent_server::journal::thread_creation_transaction::{ThreadCreationCommit, ThreadNaming};
+use agent_server::journal::thread_creation_transaction::{
+    ThreadCreationCommit, ThreadCreationCommitted, ThreadNaming,
+};
 use agent_server::journal::thread_store::BeginPurge;
 use agent_server::journal::thread_store::{
     ThreadCreation, ThreadCreationOutcome, ThreadIdConflict,
@@ -747,7 +749,7 @@ impl GrpcControlService {
         naming: ThreadNaming,
         now: OffsetDateTime,
     ) -> Result<(), Status> {
-        let _committed = self
+        let committed = self
             .shared
             .stores
             .thread_store
@@ -760,7 +762,15 @@ impl GrpcControlService {
             })
             .await
             .map_err(map_thread_creation_error("thread creation"))?;
-        Ok(())
+        match committed {
+            ThreadCreationCommitted::Created(_) => Ok(()),
+            ThreadCreationCommitted::Existing => self
+                .shared
+                .require_thread(thread_id)
+                .await?
+                .require_active(ThreadOperation::Create)
+                .map_err(|error| thread_state_conflict_status(&error)),
+        }
     }
 
     fn fork_artifact_ids(
@@ -889,7 +899,14 @@ impl GrpcControlService {
 
         let (message_count, event_count) = match outcome {
             ThreadCreationOutcome::Created => (requested_message_count, requested_event_count),
-            ThreadCreationOutcome::Existing => self.fork_destination_counts(new_thread_id).await?,
+            ThreadCreationOutcome::Existing => {
+                self.shared
+                    .require_thread(new_thread_id)
+                    .await?
+                    .require_active(ThreadOperation::Fork)
+                    .map_err(|error| thread_state_conflict_status(&error))?;
+                self.fork_destination_counts(new_thread_id).await?
+            }
         };
         Ok((message_count, event_count))
     }
@@ -1476,8 +1493,10 @@ impl AgentControlService for GrpcControlService {
             }));
         }
 
-        // The legacy no-thread-id path remains request-idempotent and keeps
-        // the empty fingerprint byte-for-byte. Durable dedup survives restart.
+        // The no-thread-id path is request-idempotent and keeps the empty
+        // fingerprint byte-for-byte. Its thread id is derived from the
+        // request_id, so an attempt that stopped before it recorded its
+        // result converges like a caller-named create.
         let fingerprint: &[u8] = &[];
         match self
             .shared
@@ -1497,12 +1516,6 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
-            IdempotencyClaim::InFlight => {
-                return Err(idempotency_in_flight_status(
-                    "CreateThread",
-                    &request.request_id,
-                ));
-            }
             IdempotencyClaim::Replay(record) => {
                 let result: CreateThreadResult = decode_idempotency_result(&record.result_json)?;
                 let thread_id = ThreadId::from_string(result.thread_id);
@@ -1514,12 +1527,12 @@ impl AgentControlService for GrpcControlService {
                     thread: Some(self.shared.thread_view(&thread_id).await?),
                 }));
             }
-            IdempotencyClaim::Fresh => {}
+            IdempotencyClaim::Fresh | IdempotencyClaim::InFlight => {}
         }
 
         let now = OffsetDateTime::now_utc();
-        let thread_id = ThreadId::new();
-        self.commit_thread_creation(&thread_id, ThreadNaming::Minted, now)
+        let thread_id = request_thread_id(IdempotencyKind::CreateThread, &request.request_id);
+        self.commit_thread_creation(&thread_id, ThreadNaming::CallerNamed, now)
             .await?;
 
         let result_json = serde_json::to_value(CreateThreadResult {
@@ -1751,7 +1764,6 @@ impl AgentControlService for GrpcControlService {
         require_request_id(&request.request_id)?;
         let source_thread_id = parse_thread_id(&request.source_thread_id)?;
         let caller_thread_id = parse_caller_thread_id(&request.thread_id)?;
-        let caller_minted = caller_thread_id.is_some();
         let fork_after = request.fork_after_committed_turns;
         let fingerprint = fork_thread_fingerprint(&request);
 
@@ -1779,22 +1791,16 @@ impl AgentControlService for GrpcControlService {
                     &request.request_id,
                 ));
             }
-            // A caller-named destination converges: claiming it again
-            // returns the thread the earlier attempt created, so an attempt
-            // that stopped before it recorded its result is run again.
-            IdempotencyClaim::InFlight if caller_minted => {}
-            IdempotencyClaim::InFlight => {
-                return Err(idempotency_in_flight_status(
-                    "ForkThread",
-                    &request.request_id,
-                ));
-            }
             IdempotencyClaim::Replay(record) => {
                 let result: ForkThreadResult = decode_idempotency_result(&record.result_json)?;
                 let response = self.replay_fork_thread_response(&result).await?;
                 return Ok(Response::new(response));
             }
-            IdempotencyClaim::Fresh => {}
+            // The destination converges: a caller-named one, or one derived
+            // from the request_id, is claimed again and returns the thread
+            // the earlier attempt created, so an attempt that stopped before
+            // it recorded its result is run again.
+            IdempotencyClaim::Fresh | IdempotencyClaim::InFlight => {}
         }
 
         // The source must exist before we mint anything. NOT_FOUND
@@ -1812,8 +1818,12 @@ impl AgentControlService for GrpcControlService {
         }
 
         let now = OffsetDateTime::now_utc();
-        let (new_thread_id, creation) =
-            fork_destination(caller_thread_id, &source_thread_id, fork_after);
+        let (new_thread_id, creation) = fork_destination(
+            caller_thread_id,
+            &request.request_id,
+            &source_thread_id,
+            fork_after,
+        );
         let (message_count, event_count) = self
             .copy_thread_state(&source_thread_id, &new_thread_id, fork_after, creation, now)
             .await?;
@@ -2956,19 +2966,34 @@ fn parse_caller_thread_id(thread_id: &str) -> RpcResult<Option<ThreadId>> {
 
 fn fork_destination(
     caller_thread_id: Option<ThreadId>,
+    request_id: &str,
     source_thread_id: &ThreadId,
     fork_after_committed_turns: u32,
 ) -> (ThreadId, Option<ThreadCreation>) {
-    let Some(thread_id) = caller_thread_id else {
-        return (ThreadId::new(), None);
-    };
     (
-        thread_id,
+        caller_thread_id
+            .unwrap_or_else(|| request_thread_id(IdempotencyKind::ForkThread, request_id)),
         Some(ThreadCreation::Fork {
             source_thread_id: source_thread_id.clone(),
             fork_after_committed_turns,
         }),
     )
+}
+
+/// Namespace of the thread ids [`request_thread_id`] derives.
+const REQUEST_THREAD_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6d1f_4c3e_8a52_4b7e_9f0d_2e61_c8a4_b937);
+
+/// The id of the thread an unnamed `CreateThread` or `ForkThread` creates,
+/// derived from its `request_id` so every attempt under one key names the
+/// same thread. It has the key's own scope: the `request_id` alone, with
+/// the method, as the idempotency table keys it.
+fn request_thread_id(kind: IdempotencyKind, request_id: &str) -> ThreadId {
+    let mut name = Vec::with_capacity(kind.as_str().len() + 1 + request_id.len());
+    name.extend_from_slice(kind.as_str().as_bytes());
+    name.push(0);
+    name.extend_from_slice(request_id.as_bytes());
+    ThreadId::from_string(uuid::Uuid::new_v5(&REQUEST_THREAD_ID_NAMESPACE, &name).to_string())
 }
 
 fn parse_task_id(task_id: &str) -> RpcResult<AgentTaskId> {
@@ -3005,6 +3030,9 @@ fn map_thread_creation_error(
     move |error| {
         if let Some(conflict) = error.downcast_ref::<ThreadIdConflict>() {
             return Status::already_exists(conflict.to_string());
+        }
+        if let Some(conflict) = error.downcast_ref::<ThreadStateConflict>() {
+            return thread_state_conflict_status(conflict);
         }
         internal_status(context)(error)
     }
@@ -3058,21 +3086,6 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
 enum ApprovalFailure {
     NotApproved(anyhow::Error),
     AfterApproval(anyhow::Error),
-}
-
-/// A `request_id` whose earlier request reserved it for the same payload
-/// but never recorded a result, on a method that creates a thread the
-/// caller did not name. Nothing ran for this call. Only the same
-/// `request_id` is safe to retry: the earlier attempt may have created a
-/// thread whose id the caller never learned, and a new `request_id` would
-/// create a second one.
-fn idempotency_in_flight_status(method: &str, request_id: &str) -> Status {
-    Status::aborted(format!(
-        "request_id '{request_id}' is held by an earlier {method} request with the same \
-         payload that has not recorded a result: it is still running, or it stopped before \
-         it recorded one. Nothing ran for this call. Retry with the same request_id; a new \
-         request_id could create a second thread"
-    ))
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -6294,6 +6307,28 @@ mod tests {
         Ok(())
     }
 
+    /// An attempt whose decision landed and that stopped before it recorded
+    /// its key: every retry under that key is told the task moved on, never
+    /// `ALREADY_EXISTS`, and the key stays reserved for the same request.
+    async fn expect_landed_unrecorded_retries_moved_on(
+        control: &mut ControlClient,
+        task_store: &dyn AgentTaskStore,
+        landed: pb::DecideConfirmationRequest,
+    ) -> Result<()> {
+        ensure!(
+            decision_claim(task_store, &landed).await? == IdempotencyClaim::Fresh,
+            "the landed attempt reserved the key",
+        );
+        for _ in 0..2 {
+            expect_moved_on(control.decide_confirmation(landed.clone()).await)?;
+            ensure!(
+                decision_claim(task_store, &landed).await? == IdempotencyClaim::InFlight,
+                "the key stays reserved for the same request",
+            );
+        }
+        Ok(())
+    }
+
     async fn decision_claim(
         task_store: &dyn AgentTaskStore,
         request: &pb::DecideConfirmationRequest,
@@ -6487,7 +6522,11 @@ mod tests {
                         false,
                     ))
                     .await,
-            )
+            )?;
+
+            let landed = approval_request("decide-landed", &thread_id, &parked.task_id, false);
+            expect_landed_unrecorded_retries_moved_on(&mut control, task_store.as_ref(), landed)
+                .await
         }
         .await;
         daemon.stop().await?;
@@ -7879,54 +7918,203 @@ mod tests {
         Ok(())
     }
 
-    /// Without a caller-named destination, an unrecorded key is refused:
-    /// the earlier attempt may have created a thread whose id the caller
-    /// never learned. Nothing is created, and the answer says to retry with
-    /// the same `request_id`.
-    #[tokio::test]
-    async fn an_unrecorded_anonymous_fork_or_create_is_refused_without_a_new_thread() -> Result<()>
-    {
-        let shared = event_test_shared()?;
+    /// A `GrpcShared` over the stores `storage` names.
+    async fn shared_over(storage: &crate::config::StorageConfig) -> Result<Arc<GrpcShared>> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::from_config(storage, registry)?;
+        stores.initialize().await?;
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(Vec::new())),
+            Arc::new(NoopToolExecutor),
+        )?;
+        Ok(Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_secs(10),
+            AdmissionConfig::default(),
+        )))
+    }
+
+    async fn anonymous_create(service: &GrpcControlService, request_id: &str) -> Result<String> {
+        caller_create_direct(service, request_id, "").await
+    }
+
+    /// An unnamed `CreateThread` / `ForkThread` creates the thread its
+    /// `request_id` names, so a retry under the same key converges
+    /// whatever point the earlier attempt reached:
+    ///
+    /// - it never ran: the thread is the derived one, and a retry replays;
+    /// - it reserved the key and stopped before its commit: the retry
+    ///   creates the derived thread and records the key;
+    /// - it committed and stopped before it recorded the key: the retry
+    ///   returns that thread, with no second thread and no second
+    ///   `ThreadCreated`;
+    /// - that thread was then purged: the retry is `FAILED_PRECONDITION`
+    ///   and the thread stays deleted.
+    async fn anonymous_creates_converge(shared: Arc<GrpcShared>) -> Result<()> {
         let service = GrpcControlService {
             shared: Arc::clone(&shared),
         };
-        let source = caller_create_direct(&service, "anon-source", &caller_uuid(25)).await?;
-        let fork = caller_fork_request("anon-fork", &source, "");
+        let derived = |kind, request_id| request_thread_id(kind, request_id).0;
+        let create = IdempotencyKind::CreateThread;
+
+        let fresh = anonymous_create(&service, "anon-fresh").await?;
+        assert_eq!(fresh, derived(create, "anon-fresh"));
+        assert_eq!(anonymous_create(&service, "anon-fresh").await?, fresh);
+        assert_ne!(derived(create, "anon-other"), fresh);
+        assert_ne!(
+            derived(IdempotencyKind::ForkThread, "anon-fresh"),
+            fresh,
+            "a fork and a create under one key name different threads",
+        );
+
+        reserve_unrecorded(&shared, "anon-before", create, &[]).await?;
+        let threads_before = shared.stores.thread_store.list().await?.len();
+        let created = anonymous_create(&service, "anon-before").await?;
+        assert_eq!(created, derived(create, "anon-before"));
+        assert_eq!(
+            shared.stores.thread_store.list().await?.len(),
+            threads_before + 1
+        );
+        assert!(matches!(
+            shared
+                .stores
+                .task_store
+                .claim_idempotency("anon-before", create, &[])
+                .await?,
+            IdempotencyClaim::Replay(_)
+        ));
+
+        let landed = derived(create, "anon-after");
+        caller_create_direct(&service, "anon-after-first-attempt", &landed).await?;
+        reserve_unrecorded(&shared, "anon-after", create, &[]).await?;
+        let threads_before = shared.stores.thread_store.list().await?.len();
+        assert_eq!(anonymous_create(&service, "anon-after").await?, landed);
+        assert_eq!(
+            shared.stores.thread_store.list().await?.len(),
+            threads_before
+        );
+        assert_eq!(
+            thread_created_counts(&shared.stores, &landed).await?,
+            (1, 1)
+        );
+        anonymous_forks_converge(&shared, &service).await?;
+        anonymous_retry_onto_a_purged_thread_is_refused(&shared, &service).await
+    }
+
+    async fn anonymous_forks_converge(
+        shared: &Arc<GrpcShared>,
+        service: &GrpcControlService,
+    ) -> Result<()> {
+        let derived = |request_id| request_thread_id(IdempotencyKind::ForkThread, request_id).0;
+        let source = anonymous_create(service, "anon-source").await?;
+        let fork = caller_fork_request("anon-fork-before", &source, "");
         reserve_unrecorded(
-            &shared,
+            shared,
             &fork.request_id,
             IdempotencyKind::ForkThread,
             &fork_thread_fingerprint(&fork),
         )
         .await?;
-        reserve_unrecorded(&shared, "anon-create", IdempotencyKind::CreateThread, &[]).await?;
-        let threads_before = shared.stores.thread_store.list().await?.len();
+        let forked = service.fork_thread(Request::new(fork)).await?.into_inner();
+        assert_eq!(fork_thread_id(&forked), Some(derived("anon-fork-before")));
 
-        let forked = service
-            .fork_thread(Request::new(fork))
-            .await
-            .err()
-            .context("an unrecorded anonymous fork is refused")?;
-        let created = service
-            .create_thread(Request::new(pb::CreateThreadRequest {
-                request_id: "anon-create".into(),
-                thread_id: String::new(),
-            }))
-            .await
-            .err()
-            .context("an unrecorded anonymous create is refused")?;
-        for status in [&forked, &created] {
-            ensure!(
-                status.code() == tonic::Code::Aborted
-                    && status.message().contains("Retry with the same request_id"),
-                "{status}",
-            );
-        }
+        let fork = caller_fork_request("anon-fork-after", &source, "");
+        let landed = derived("anon-fork-after");
+        let first = service
+            .fork_thread(Request::new(caller_fork_request(
+                "anon-fork-after-first-attempt",
+                &source,
+                &landed,
+            )))
+            .await?
+            .into_inner();
+        reserve_unrecorded(
+            shared,
+            &fork.request_id,
+            IdempotencyKind::ForkThread,
+            &fork_thread_fingerprint(&fork),
+        )
+        .await?;
+        let threads_before = shared.stores.thread_store.list().await?.len();
+        let converged = service.fork_thread(Request::new(fork)).await?.into_inner();
+        assert_eq!(fork_thread_id(&converged), Some(landed.clone()));
+        assert_eq!(converged.message_count, first.message_count);
+        assert_eq!(converged.event_count, first.event_count);
         assert_eq!(
             shared.stores.thread_store.list().await?.len(),
             threads_before
         );
+        assert_eq!(
+            thread_created_counts(&shared.stores, &landed).await?,
+            (1, 1)
+        );
         Ok(())
+    }
+
+    async fn anonymous_retry_onto_a_purged_thread_is_refused(
+        shared: &Arc<GrpcShared>,
+        service: &GrpcControlService,
+    ) -> Result<()> {
+        let create = IdempotencyKind::CreateThread;
+        let purged = request_thread_id(create, "anon-purged").0;
+        caller_create_direct(service, "anon-purged-first-attempt", &purged).await?;
+        reserve_unrecorded(shared, "anon-purged", create, &[]).await?;
+        service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: purged.clone(),
+                scope: pb::PurgeScope::Thread as i32,
+            }))
+            .await?;
+        let refused = anonymous_create(service, "anon-purged")
+            .await
+            .err()
+            .context("a retry onto a purged thread is refused")?;
+        let status = refused
+            .downcast_ref::<Status>()
+            .with_context(|| format!("a gRPC status: {refused:#}"))?;
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+        let thread = shared
+            .stores
+            .thread_store
+            .get(&ThreadId::from_string(&purged))
+            .await?
+            .context("the purged thread's tombstone")?;
+        assert_eq!(thread.status, agent_server::ThreadStatus::Deleted);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anonymous_creates_converge_in_memory() -> Result<()> {
+        anonymous_creates_converge(event_test_shared()?).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn anonymous_creates_converge_on_sqlite() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Sqlite {
+                path: Some(temp.path().join("anon.db").to_string_lossy().into_owned()),
+                max_connections: None,
+            },
+            postgres: crate::config::PostgresStorageConfig::default(),
+        };
+        anonymous_creates_converge(shared_over(&storage).await?).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anonymous_creates_converge_on_postgres() -> Result<()> {
+        let Some((config, _schema)) = postgres_test_config().await? else {
+            return Ok(());
+        };
+        anonymous_creates_converge(shared_over(&config.storage).await?).await
     }
 
     /// Two concurrent calls with the same `(request_id, destination)`: one

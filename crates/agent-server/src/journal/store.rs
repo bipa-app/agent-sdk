@@ -5520,6 +5520,7 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         for (index, guard) in transition.guards.iter().enumerate() {
             guard.check(index, inner.by_id.get(guard.task()))?;
         }
+        self.require_appendable_threads(&transition).await?;
         let mut committed = Committed::default();
         for write in transition.writes.iter().cloned() {
             match write {
@@ -5601,6 +5602,24 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
 }
 
 impl InMemoryAgentTaskStore {
+    /// Refuse a transition that appends to a purged thread, read through
+    /// the event sink's thread store. A store built without a sink has no
+    /// thread projection to read, so it refuses nothing.
+    async fn require_appendable_threads(
+        &self,
+        transition: &super::transition::Transition,
+    ) -> Result<()> {
+        let Some(sink) = &self.marker_sink else {
+            return Ok(());
+        };
+        for thread_id in transition.appended_threads() {
+            if let Some(thread) = sink.thread_store.get(thread_id).await? {
+                thread.require_active(super::thread::ThreadOperation::Append)?;
+            }
+        }
+        Ok(())
+    }
+
     /// A transition's events and their advisory row, through the store's
     /// event sink.
     async fn append_transition_events(

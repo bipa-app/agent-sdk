@@ -1924,6 +1924,144 @@ mod tests {
         Ok(())
     }
 
+    /// The purge fence on appends: once a thread is `Deleting`, and after it
+    /// is `Deleted`, a transition that appends events or a compaction to it
+    /// is refused with a typed [`ThreadStateConflict`] and writes nothing:
+    /// a late compaction cannot put a message head back on a deleted thread,
+    /// and a late settle cannot add its `ToolCallEnd` to it. The durable
+    /// backends also fence the direct `append_compaction` (`direct_fenced`).
+    ///
+    /// [`ThreadStateConflict`]: agent_server::journal::thread::ThreadStateConflict
+    /// `refused` is the purge fence's typed refusal for `status`.
+    fn expect_append_refused(
+        refused: Result<agent_server::journal::Committed, agent_server::journal::Rejected>,
+        status: agent_server::journal::thread::ThreadStatus,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{ThreadOperation, ThreadStateConflict};
+
+        let Err(agent_server::journal::Rejected::Store(error)) = refused else {
+            anyhow::bail!("refused by the purge fence: {refused:?}");
+        };
+        let conflict = error
+            .downcast_ref::<ThreadStateConflict>()
+            .with_context(|| format!("a typed purge-fence refusal: {error:#}"))?;
+        assert_eq!(conflict.status, status);
+        assert_eq!(conflict.operation, ThreadOperation::Append);
+        Ok(())
+    }
+
+    async fn test_appends_to_a_purged_thread_are_refused(
+        stores: (
+            &dyn AgentTaskStore,
+            &dyn ThreadStore,
+            &dyn MessageProjectionStore,
+            &dyn EventRepository,
+            &dyn OutboxStore,
+        ),
+        direct_fenced: bool,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{
+            PurgeReceipt, PurgeScope, PurgeSeed, ThreadStateConflict, ThreadStatus,
+        };
+
+        let (task_store, thread_store, messages, events, outbox) = stores;
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-purge-fence").await?;
+        let thread = child.thread_id.clone();
+        thread_store.get_or_create(&thread, t_plus(61)).await?;
+        let history = vec![
+            agent_sdk_foundation::llm::Message::user("question"),
+            agent_sdk_foundation::llm::Message::assistant("answer"),
+        ];
+        messages
+            .commit_messages(&thread, history.clone(), t_plus(62))
+            .await?;
+        let compaction = || {
+            agent_server::journal::Transition::append_compaction(
+                thread.clone(),
+                vec![agent_sdk_foundation::llm::Message::user("[summary]")],
+                history.len(),
+                0,
+                vec![AgentEvent::ContextCompacted {
+                    original_count: history.len(),
+                    new_count: 1,
+                    original_tokens: 20,
+                    new_tokens: 2,
+                    trigger: None,
+                    engine: None,
+                    occupancy: None,
+                    threshold: None,
+                }],
+            )
+        };
+        let seed = PurgeSeed {
+            root_thread_id: thread.clone(),
+            scope: PurgeScope::Thread,
+            started_at: t_plus(63),
+        };
+        let _ = thread_store.begin_purge(&thread, seed).await?;
+        let events_before = events.get_events(&thread).await?.len();
+        let advisories_before = thread_events_rows(outbox, &thread).await?;
+
+        for (round, status) in [ThreadStatus::Deleting, ThreadStatus::Deleted]
+            .into_iter()
+            .enumerate()
+        {
+            if status == ThreadStatus::Deleted {
+                let receipt = PurgeReceipt {
+                    root_thread_id: thread.clone(),
+                    scope: PurgeScope::Thread,
+                    purged_thread_ids: vec![thread.clone()],
+                    cancelled_task_ids: Vec::new(),
+                    started_at: t_plus(63),
+                    completed_at: t_plus(64),
+                };
+                let _ = thread_store.finish_purge(&thread, &receipt).await?;
+            }
+            let at = t_plus(70 + i64::try_from(round)?);
+            let attempts = [
+                ("compaction", compaction()),
+                ("settle", settle_with_tool_call_end(&child, &worker, &lease)),
+            ];
+            for (what, transition) in attempts {
+                expect_append_refused(task_store.commit(transition, at).await, status)
+                    .with_context(|| format!("a {what} on a {status} thread"))?;
+            }
+            if direct_fenced {
+                let error = messages
+                    .append_compaction(
+                        &thread,
+                        vec![agent_sdk_foundation::llm::Message::user("[late]")],
+                        history.len(),
+                        0,
+                        at,
+                    )
+                    .await
+                    .err()
+                    .with_context(|| format!("a late compaction on a {status} thread"))?;
+                assert!(
+                    error.downcast_ref::<ThreadStateConflict>().is_some(),
+                    "{error:#}"
+                );
+            }
+
+            let row = thread_store.get(&thread).await?.context("thread row")?;
+            assert_eq!(row.status, status, "the thread stays purged");
+            let projection = messages.get(&thread).await?.context("projection")?;
+            assert!(projection.compactions.is_empty(), "no compaction lands");
+            assert_eq!(events.get_events(&thread).await?.len(), events_before);
+            assert_eq!(
+                thread_events_rows(outbox, &thread).await?,
+                advisories_before
+            );
+            let unchanged = AgentTaskStore::get(task_store, &child.id)
+                .await?
+                .context("child")?;
+            assert_eq!(unchanged.status, TaskStatus::Running, "no settle lands");
+        }
+        Ok(())
+    }
+
     /// Cancel tree cancels the root **and all its descendants** (invariant
     /// #8). The root spawns two tool children (so the parent parks on
     /// `WaitingOnChildren`) before the cancel, and the cascade must drive
@@ -4158,6 +4296,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_appends_to_a_purged_thread_are_refused() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_appends_to_a_purged_thread_are_refused(
+            (
+                s.task.as_ref(),
+                s.thread.as_ref(),
+                s.message.as_ref(),
+                s.event.as_ref(),
+                s.outbox.as_ref(),
+            ),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_compaction_transition() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_compaction_transition_is_all_or_nothing(
@@ -4594,6 +4748,14 @@ mod tests {
     async fn conformance_sqlite_repark_transition() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_appends_to_a_purged_thread_are_refused() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_appends_to_a_purged_thread_are_refused((&store, &store, &store, &store, &store), true)
+            .await
     }
 
     #[cfg(feature = "sqlite")]
@@ -5226,6 +5388,16 @@ mod tests {
             return Ok(());
         };
         test_repark_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_appends_to_a_purged_thread_are_refused() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_appends_to_a_purged_thread_are_refused((&store, &store, &store, &store, &store), true)
+            .await
     }
 
     #[cfg(feature = "postgres")]

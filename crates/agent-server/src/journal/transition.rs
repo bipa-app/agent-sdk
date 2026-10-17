@@ -365,6 +365,22 @@ impl Transition {
             .any(|write| matches!(write, Write::AppendCompaction { .. }))
     }
 
+    /// The threads whose journal a write appends to: the event threads of
+    /// non-empty event batches and the compacted threads. A purged thread
+    /// refuses all of them.
+    pub fn appended_threads(&self) -> impl Iterator<Item = &ThreadId> {
+        self.writes.iter().filter_map(|write| match write {
+            Write::AppendEvents { thread, events } if !events.is_empty() => Some(thread),
+            Write::AppendCompaction { thread, .. } => Some(thread),
+            Write::AppendEvents { .. }
+            | Write::SettleTask { .. }
+            | Write::RejectConfirmation { .. }
+            | Write::PauseOnConfirmation { .. }
+            | Write::ReparkAfterSteering { .. }
+            | Write::RecordIntent(_) => None,
+        })
+    }
+
     /// Check the shape every backend relies on before it opens a
     /// transaction: each settle has a leased guard on its task, each pause
     /// a leased guard that its task is running, each confirmation reject a
