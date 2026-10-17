@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Session view fold** (`agent_sdk_foundation::view`, re-exported as
+  `agent_server::journal::view`). `fold(status, sequence, at, event,
+  &ViewConfig)` is a pure function that turns one committed event into the
+  next `ThreadViewStatus` and the `ViewOp`s (`Put`, `AppendText`, `Patch`,
+  `SetStatus`) that change a per-thread timeline of keyed `ViewItem`s.
+  `ThreadView` is the reference applier; it numbers new items from its own
+  `next_index`, so a view built from a partial snapshot keeps unique indexes.
+  An event at or below the status's sequence is a no-op (`AppendText` is not
+  idempotent). No store writes it yet; the storage
+  and the stream follow. The match over `AgentEvent` lives in the foundation
+  crate so it stays exhaustive with no wildcard arm. Rules the clients used to
+  apply each in their own way are now in one place: a final `Text` replaces
+  the streamed deltas and closes the message; late deltas for a closed
+  message or from a superseded task are dropped; a root `Start` closes every
+  open message and tool call as interrupted; a turn is over on `Done`,
+  `BudgetExceeded`, `Cancelled`, or an `Error` with a terminal reason
+  (whatever its `recoverable` flag says); a
+  relayed `ToolRequiresConfirmation` (no `ToolCallStart`) opens its own item
+  and survives turn boundaries until its `ToolCallEnd`; a `ToolProgress` named
+  by `ViewConfig::stall_tool_name` sets `status.stalled` until the next event.
+- `ToolResult` derives `PartialEq` and `Eq`.
 - `agent_sdk_providers::impls::normalized_strict_schema` and its error,
   `StrictSchemaError` (`#[non_exhaustive]`), behind `openai`/`openai-codex`.
   They return a tool schema as `OpenAI` strict mode receives it, so callers

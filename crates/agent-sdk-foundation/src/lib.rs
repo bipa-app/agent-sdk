@@ -17,6 +17,7 @@ pub mod events;
 pub mod llm;
 pub mod privacy;
 pub mod types;
+pub mod view;
 
 // ── Flat re-exports ──────────────────────────────────────────────────
 // Downstream crates can `use agent_sdk_foundation::ThreadId` without reaching
