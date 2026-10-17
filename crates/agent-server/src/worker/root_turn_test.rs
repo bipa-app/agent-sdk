@@ -1782,7 +1782,7 @@ async fn tool_suspension_continuation_has_correct_content() -> Result<()> {
     );
 
     // No completed results yet (tools haven't run).
-    assert!(payload.completed_results.is_empty());
+    assert_eq!(payload.completed_results.len(), 0);
 
     // LLM metadata preserved.  Post-streaming-refactor the synthesized
     // response carries no provider response-id, so the continuation's

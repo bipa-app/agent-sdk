@@ -266,7 +266,7 @@ pub struct ToolResultArtifact {
 }
 
 /// Result of a tool execution
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     /// Whether the tool execution succeeded
     pub success: bool,
