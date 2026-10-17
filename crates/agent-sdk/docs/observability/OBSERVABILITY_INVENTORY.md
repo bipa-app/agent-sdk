@@ -204,6 +204,11 @@ inventory covers the whole observability surface.
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
 | event `agent_server.effect.abandoned` | Span event | `reason` (`owner_cancelled`, `lease_sweep`, `owner_terminal`), kind; span-only effect id, task id | `[agent-server]`, `[agent-service-host]` | Phase 2 |
+| `agent_server.prompts` | Counter | `owner` (`host`/`task`), `step` (`open`/`answer`/`close`/`withdraw`/`handle`), `outcome` (`committed`/`guard`/`expectation`/`store`, or for `handle` `closed`/`pending`/`error`) | `[agent-server]` instrument, recorded by `agent_service_host::prompts` | primitive 6 (prompt rows) |
+
+Prompt-row spans (`agent_service_host::prompts`): `agent_server.prompt.answer`
+and `agent_server.prompt.handle`, with `prompt.id` and `thread.id`. The ids are
+on the spans only, never on the counter.
 
 ### 4.4 Agent-service-host metrics
 

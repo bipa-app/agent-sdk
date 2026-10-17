@@ -7981,4 +7981,464 @@ mod tests {
     }
 
     mod settlement;
+
+    // ── prompt rows ──────────────────────────────────────────────────
+
+    fn host_prompt_record(surface: &ThreadId, id: &str) -> agent_server::journal::PromptRecord {
+        agent_server::journal::PromptRecord::open(
+            agent_server::journal::NewPrompt {
+                id: id.to_owned(),
+                surface_thread: surface.clone(),
+                owner: agent_server::journal::PromptOwner::Host {
+                    name: "conformance.gate".to_owned(),
+                },
+                frame: agent_server::journal::PromptFrame {
+                    name: "apply_gate".to_owned(),
+                    display_name: "Gate".to_owned(),
+                    input: serde_json::json!({ "unit": id }),
+                    description: "apply?".to_owned(),
+                },
+                close: agent_server::journal::PromptCloseFrame {
+                    name: "apply_gate".to_owned(),
+                    display_name: "Gate".to_owned(),
+                    input: serde_json::json!({ "unit": id }),
+                },
+                owner_task: None,
+                must_reach_human: false,
+                host_state: serde_json::json!({ "commit": "abc" }),
+            },
+            t_plus(64),
+        )
+    }
+
+    fn prompt_answer(request: &str) -> agent_server::journal::PromptAnswer {
+        agent_server::journal::PromptAnswer {
+            decision: agent_server::journal::PromptDecision::Approved,
+            request_id: request.to_owned(),
+            automatic: false,
+            answered_at: t_plus(70),
+        }
+    }
+
+    /// A host prompt opens in the same transaction as the task write it
+    /// belongs to: a failed guard writes neither the settle, the row nor
+    /// the frame; a committed one writes all three; and the same id cannot
+    /// open twice, which writes nothing.
+    async fn test_prompt_opens_with_its_settle(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::prompt::{get_prompt, pending_prompts};
+        use agent_server::journal::{PendingPrompt, PromptState, Rejected};
+
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-prompt-open").await?;
+        let thread = child.thread_id.clone();
+        let record = host_prompt_record(&thread, "gate-1");
+
+        let mut stale = settle_with_tool_call_end(&child, &worker, &LeaseId::new());
+        stale.writes.extend(record.open_writes(true)?);
+        let rejected = task_store.commit(stale, t_plus(65)).await;
+        assert!(
+            matches!(rejected, Err(Rejected::Guard { index: 0, .. })),
+            "{rejected:?}"
+        );
+        assert!(get_prompt(documents, &thread, "gate-1").await?.is_none());
+        assert!(events.get_events(&thread).await?.is_empty());
+
+        let mut settle = settle_with_tool_call_end(&child, &worker, &lease);
+        settle.writes.extend(record.open_writes(true)?);
+        task_store
+            .commit(settle, t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let stored = get_prompt(documents, &thread, "gate-1")
+            .await?
+            .context("the prompt row committed with the settle")?;
+        assert_eq!(stored.record.state, PromptState::Open);
+        let after_open = events.get_events(&thread).await?;
+        assert!(
+            after_open.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ToolRequiresConfirmation { id, .. } if id == "gate-1"
+            )),
+            "the frame committed with the row"
+        );
+        assert_eq!(
+            AgentTaskStore::get(task_store, &child.id)
+                .await?
+                .context("child")?
+                .status,
+            TaskStatus::Completed
+        );
+
+        let again = agent_server::journal::Transition {
+            guards: Vec::new(),
+            writes: record.open_writes(true)?,
+        };
+        let refused = task_store.commit(again, t_plus(67)).await;
+        assert!(
+            matches!(refused, Err(Rejected::Guard { index: 0, .. })),
+            "{refused:?}"
+        );
+        assert_eq!(events.get_events(&thread).await?.len(), after_open.len());
+
+        let pending = pending_prompts(task_store, documents, &thread).await?;
+        assert!(
+            matches!(pending.as_slice(), [PendingPrompt::Row(row)] if row.record.id == "gate-1"),
+            "{pending:?}"
+        );
+        Ok(())
+    }
+
+    /// A host prompt is answered once: the same request replays, another
+    /// request is refused, two answers racing on one read commit once, and
+    /// the close lands once with one start/end pair.
+    async fn test_prompt_is_answered_and_closed_once(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use crate::prompts::{AnswerError, Answered, answer_prompt};
+        use agent_server::journal::prompt::{get_prompt, pending_prompts};
+        use agent_server::journal::{PromptState, Rejected};
+
+        let (child, _, _) = leased_tool_child(task_store, "conformance-prompt-answer").await?;
+        let thread = child.thread_id.clone();
+        let record = host_prompt_record(&thread, "gate-2");
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: record.open_writes(true)?,
+                },
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        let open = get_prompt(documents, &thread, "gate-2")
+            .await?
+            .context("open row")?;
+        let racing = open.answer_write(prompt_answer("racer"))?;
+
+        let first = answer_prompt(
+            task_store,
+            documents,
+            &thread,
+            "gate-2",
+            prompt_answer("r1"),
+            t_plus(70),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+        assert!(matches!(first, Answered::Fresh(_)));
+        let lost = task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![racing],
+                },
+                t_plus(71),
+            )
+            .await;
+        assert!(
+            matches!(lost, Err(Rejected::Guard { .. })),
+            "the racing answer must lose: {lost:?}"
+        );
+        let replay = answer_prompt(
+            task_store,
+            documents,
+            &thread,
+            "gate-2",
+            prompt_answer("r1"),
+            t_plus(72),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+        assert!(matches!(replay, Answered::Replay(_)));
+        let conflict = answer_prompt(
+            task_store,
+            documents,
+            &thread,
+            "gate-2",
+            prompt_answer("r2"),
+            t_plus(73),
+        )
+        .await;
+        assert!(
+            matches!(conflict, Err(AnswerError::AlreadyAnswered { .. })),
+            "{conflict:?}"
+        );
+        let answered = get_prompt(documents, &thread, "gate-2")
+            .await?
+            .context("answered row")?;
+        assert!(matches!(
+            &answered.record.state,
+            PromptState::Answered { answer } if answer.request_id == "r1"
+        ));
+        assert!(
+            pending_prompts(task_store, documents, &thread)
+                .await?
+                .is_empty()
+        );
+
+        assert_closes_once(task_store, documents, events, &thread, &answered).await
+    }
+
+    /// Closing `answered` appends one start/end pair and retires the row;
+    /// a second close from the same read loses.
+    async fn assert_closes_once(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+        thread: &ThreadId,
+        answered: &agent_server::journal::StoredPrompt,
+    ) -> Result<()> {
+        use crate::prompts::close_prompt;
+        use agent_server::journal::prompt::get_prompt;
+
+        let before = events.get_events(thread).await?.len();
+        assert!(
+            close_prompt(
+                task_store,
+                answered,
+                agent_sdk_foundation::ToolResult::success("applied"),
+                false,
+                agent_server::journal::Transition::default(),
+                "close",
+                t_plus(74)
+            )
+            .await?
+        );
+        assert!(
+            !close_prompt(
+                task_store,
+                answered,
+                agent_sdk_foundation::ToolResult::success("applied"),
+                false,
+                agent_server::journal::Transition::default(),
+                "close",
+                t_plus(75)
+            )
+            .await?,
+            "a second close from the same read loses"
+        );
+        let closed = events.get_events(thread).await?;
+        assert_eq!(closed.len(), before + 2);
+        assert!(matches!(
+            &closed[before..],
+            [start, end] if matches!(&start.event, AgentEvent::ToolCallStart { id, .. } if id == "gate-2")
+                && matches!(&end.event, AgentEvent::ToolCallEnd { id, .. } if id == "gate-2")
+        ));
+        assert!(get_prompt(documents, thread, "gate-2").await?.is_none());
+        Ok(())
+    }
+
+    /// A task-owned prompt row is pending only while its task awaits its
+    /// confirmation, and closes once when the task resolves another way.
+    async fn test_task_owned_prompt_follows_its_task(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use crate::prompts::{default_task_prompt_result, withdraw_stale_task_prompts};
+        use agent_server::journal::prompt::pending_prompts;
+        use agent_server::journal::{PendingPrompt, PromptOwner};
+
+        let parked = awaiting_confirmation_child(task_store, "conformance-prompt-task").await?;
+        let thread = parked.thread_id.clone();
+        let mut record = host_prompt_record(&thread, "relayed-1");
+        record.owner = PromptOwner::Task {
+            task_id: parked.id.clone(),
+            thread_id: parked.thread_id.clone(),
+        };
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: vec![agent_server::journal::Guard::TaskIs {
+                        task: parked.id.clone(),
+                        status: TaskStatus::AwaitingConfirmation,
+                        lease: None,
+                    }],
+                    writes: record.open_writes(true)?,
+                },
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let pending = pending_prompts(task_store, documents, &thread).await?;
+        assert!(
+            pending.iter().any(
+                |prompt| matches!(prompt, PendingPrompt::Row(row) if row.record.id == "relayed-1")
+            ),
+            "{pending:?}"
+        );
+
+        task_store
+            .commit(reject_with_tool_call_end(&parked), t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert!(
+            pending_prompts(task_store, documents, &thread)
+                .await?
+                .is_empty(),
+            "the row stops being pending with its task, before its close lands"
+        );
+        let before = events.get_events(&thread).await?.len();
+        assert_eq!(
+            withdraw_stale_task_prompts(
+                task_store,
+                documents,
+                &default_task_prompt_result,
+                t_plus(67)
+            )
+            .await?,
+            1
+        );
+        assert_eq!(
+            withdraw_stale_task_prompts(
+                task_store,
+                documents,
+                &default_task_prompt_result,
+                t_plus(68)
+            )
+            .await?,
+            0
+        );
+        let after = events.get_events(&thread).await?;
+        assert_eq!(after.len(), before + 2);
+        assert!(matches!(
+            &after[before + 1].event,
+            AgentEvent::ToolCallEnd { id, result, .. } if id == "relayed-1" && !result.success
+        ));
+        Ok(())
+    }
+
+    /// The commit failpoint sits after the prompt row's write: a row whose
+    /// expectation fails rejects the commit before the failpoint can fire,
+    /// so the write ran first; with the failpoint armed, a valid open
+    /// leaves neither the settle, the row nor the frame. The caller holds
+    /// the `fail::FailScenario`.
+    #[cfg(feature = "failpoints")]
+    async fn test_prompt_failpoint_follows_the_row_write(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::prompt::get_prompt;
+
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-prompt-crash").await?;
+        let thread = child.thread_id.clone();
+        let record = host_prompt_record(&thread, "gate-crash");
+        let taken = host_prompt_record(&thread, "gate-taken");
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: taken.open_writes(false)?,
+                },
+                t_plus(64),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        fail::cfg("transition.before_commit", "panic")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let mut refused = settle_with_tool_call_end(&child, &worker, &lease);
+        refused.writes.extend(taken.open_writes(true)?);
+        let reached = std::panic::AssertUnwindSafe(task_store.commit(refused, t_plus(65)));
+        let reached = futures::FutureExt::catch_unwind(reached).await;
+        let mut settle = settle_with_tool_call_end(&child, &worker, &lease);
+        settle.writes.extend(record.open_writes(true)?);
+        let crashed = std::panic::AssertUnwindSafe(task_store.commit(settle, t_plus(66)));
+        let crashed = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("transition.before_commit");
+
+        assert!(
+            matches!(
+                reached,
+                Ok(Err(agent_server::journal::Rejected::Guard { .. }))
+            ),
+            "the row's expectation is checked before the failpoint"
+        );
+        assert!(crashed.is_err(), "the transition failpoint must fire");
+        assert!(
+            get_prompt(documents, &thread, "gate-crash")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            AgentTaskStore::get(task_store, &child.id)
+                .await?
+                .context("child")?
+                .status,
+            TaskStatus::Running
+        );
+        assert!(events.get_events(&thread).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_prompt_rows() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_prompt_opens_with_its_settle(s.task.as_ref(), s.documents.as_ref(), s.event.as_ref())
+            .await?;
+        let s = fresh_in_memory_stores();
+        test_prompt_is_answered_and_closed_once(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            s.event.as_ref(),
+        )
+        .await?;
+        let s = fresh_in_memory_stores();
+        test_task_owned_prompt_follows_its_task(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_prompt_rows() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_prompt_opens_with_its_settle(&store, &store, &store).await?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_prompt_is_answered_and_closed_once(&store, &store, &store).await?;
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_task_owned_prompt_follows_its_task(&store, &store, &store).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_prompt_failpoint_follows_the_row_write() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_prompt_failpoint_follows_the_row_write(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_prompt_rows() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_prompt_opens_with_its_settle(&store, &store, &store).await?;
+        test_prompt_is_answered_and_closed_once(&store, &store, &store).await?;
+        test_task_owned_prompt_follows_its_task(&store, &store, &store).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_prompt_failpoint_follows_the_row_write() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_prompt_failpoint_follows_the_row_write(&store, &store, &store).await
+    }
 }

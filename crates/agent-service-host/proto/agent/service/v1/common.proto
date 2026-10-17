@@ -216,6 +216,42 @@ message AwaitingQuestionState {
   repeated PendingQuestion questions = 1;
 }
 
+// A parked root's question batch, for ListPendingPrompts.
+message PendingQuestionBatch {
+  string task_id = 1;
+  string thread_id = 2;
+  repeated PendingQuestion questions = 3;
+}
+
+// An open prompt row: a host's own prompt, or a parked task's prompt shown
+// on another thread. Answer it with DecideConfirmation{prompt_id: id}.
+message PendingPromptRow {
+  string id = 1;
+  // The thread whose clients see it.
+  string surface_thread_id = 2;
+  // Set for a host row: the host's `<owner>.<name>` label.
+  string host_name = 3;
+  // A task-owned row: the parked task (and owner_thread_id its thread).
+  // A host row: the task that waits for it, if any.
+  string owner_task_id = 4;
+  string owner_thread_id = 5;
+  string tool_name = 6;
+  string display_name = 7;
+  google.protobuf.Value input = 8;
+  string description = 9;
+  bool must_reach_human = 10;
+  google.protobuf.Timestamp opened_at = 11;
+}
+
+// One human prompt waiting for a decision.
+message PendingPrompt {
+  oneof prompt {
+    PendingConfirmation tool_confirmation = 1;
+    PendingQuestionBatch question = 2;
+    PendingPromptRow row = 3;
+  }
+}
+
 // One durable answer, resolving exactly one parked question.
 message QuestionAnswerEntry {
   // Tool-use id of the ask_user call this answer resolves.

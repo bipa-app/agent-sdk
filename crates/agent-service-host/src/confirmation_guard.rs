@@ -11,6 +11,7 @@
 
 use agent_sdk_foundation::{PendingToolCallInfo, ThreadId};
 use agent_server::journal::AgentTask;
+use agent_server::journal::prompt::PromptRecord;
 use agent_server::worker::ConfirmationDecision;
 
 /// One decision about to be applied.
@@ -59,6 +60,46 @@ pub trait ConfirmationDecisionGuard: Send + Sync {
     ///
     /// Returns the refusal reason when the decision must not apply.
     fn check(&self, request: &ConfirmationDecisionRequest<'_>) -> Result<(), String>;
+
+    /// The same check for a decision on an open prompt row
+    /// ([`agent_server::journal::prompt`]). The default refuses nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason when the decision must not apply.
+    fn check_prompt(&self, request: &PromptDecisionRequest<'_>) -> Result<(), String> {
+        let _ = request;
+        Ok(())
+    }
+}
+
+/// One decision about to be applied to an open prompt row.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PromptDecisionRequest<'a> {
+    /// The thread the prompt row is shown on.
+    pub thread_id: &'a ThreadId,
+    pub prompt: &'a PromptRecord,
+    pub decision: &'a ConfirmationDecision,
+    /// As [`ConfirmationDecisionRequest::automatic`].
+    pub automatic: bool,
+}
+
+impl<'a> PromptDecisionRequest<'a> {
+    #[must_use]
+    pub const fn new(
+        thread_id: &'a ThreadId,
+        prompt: &'a PromptRecord,
+        decision: &'a ConfirmationDecision,
+        automatic: bool,
+    ) -> Self {
+        Self {
+            thread_id,
+            prompt,
+            decision,
+            automatic,
+        }
+    }
 }
 
 /// The call `task` itself awaits; see

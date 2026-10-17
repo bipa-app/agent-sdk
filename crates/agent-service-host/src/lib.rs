@@ -77,6 +77,7 @@ pub mod metrics;
 pub mod observability;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod prompts;
 pub mod proto;
 pub mod registry_tool_executor;
 pub mod relay;

@@ -567,6 +567,7 @@ pub mod outbox;
 pub mod outbox_message;
 #[cfg(test)]
 mod persistence_regression;
+pub mod prompt;
 pub mod recovery;
 pub mod redaction;
 pub mod relay;
@@ -623,6 +624,10 @@ pub use outbox::{
 };
 pub use outbox_message::{
     OutboxMessage, OutboxMessageKind, TaskWakeupPayload, ThreadEventsAvailablePayload,
+};
+pub use prompt::{
+    NewPrompt, PROMPT_DOC_KIND, PendingPrompt, PromptAnswer, PromptCloseFrame, PromptDecision,
+    PromptFrame, PromptOwner, PromptRecord, PromptRefusal, PromptState, StoredPrompt,
 };
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,

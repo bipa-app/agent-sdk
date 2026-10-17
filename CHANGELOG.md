@@ -31,6 +31,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `agent_server.view.folded_events` and `agent_server.view.stream`
   (`view.stream.event`: opened, resnapshot, closed, refused, not_found).
 
+### Durable prompt rows (primitive 6)
+
+- A human prompt that no task parks on is a **prompt row**: a document of the
+  SDK-owned kind `agent.prompt`, scoped to the thread whose clients see it and
+  keyed by the id they answer with (`agent_server::journal::prompt`). It is
+  written by `PromptRecord::open_writes`, `StoredPrompt::answer_write` and
+  `StoredPrompt::close_writes`, so a host opens it in the same transaction as
+  its own task write and the `ToolRequiresConfirmation` frame. A row is
+  answered once (the answer is put under the revision it read), and a close
+  appends one `ToolCallStart`/`ToolCallEnd` pair. `retain` keeps a closed row
+  as a tombstone, so the same id cannot open again.
+- A row is owned by the host (`PromptOwner::Host`, optionally naming the task
+  that waits for it in `owner_task`) or by a task parked on a confirmation
+  (`PromptOwner::Task`, the copy of its prompt on another thread). A
+  task-owned row is pending only while its task awaits, and is closed after
+  any decision through `DecideConfirmation`, at transport start, and by
+  `agent_service_host::prompts::withdraw_stale_task_prompts`.
+- `PendingPrompt` / `pending_prompts(thread)` list a thread's parked tool
+  confirmations, questions and open prompt rows.
+- **Breaking (proto, Rust literals):** `DecideConfirmationRequest.prompt_id`
+  (field 6) decides a prompt row instead of a task; the new RPC
+  `ListPendingPrompts` returns `PendingPrompt` messages. Both are additive on
+  the wire; Rust struct literals of `DecideConfirmationRequest` need the new
+  field.
+- `agent_service_host::prompts::PromptHandler`, registered with
+  `GrpcTransport::with_prompt_handler`, applies a host prompt's answer after
+  it commits; its `PromptResolution::Close` may carry the host's own guards
+  and writes, committed in the close's transaction. The transport hands every
+  answered, unclosed row to the handler again when it starts.
+  `ConfirmationDecisionGuard::check_prompt` (default: allow) checks a
+  decision on a prompt row.
+- No migration, no table, no `Write` variant: a prompt row is a document.
+- Signals: counter `agent_server.prompts{owner, step, outcome}`; spans
+  `agent_server.prompt.answer`, `agent_server.prompt.handle`.
+- Crash-matrix S6: `tests/durable_prompt_crash.rs` (SQLite, `kill -9`).
+
 ### Crash-safety Phase 3: documents
 
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
