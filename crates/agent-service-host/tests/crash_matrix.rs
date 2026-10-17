@@ -10,9 +10,12 @@
 //! schema.
 //!
 //! A scenario that fails today is `#[ignore]`d with the failure in its
-//! reason, and runs only when `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` is
-//! set: the Postgres CI job runs `--run-ignored all`, and a known failure
-//! must not turn it red.
+//! reason and runs as an expected failure: it asserts that the documented
+//! failure still reproduces, so the Postgres CI job (`--run-ignored all`)
+//! stays green while the bug exists and turns red once it is fixed, and the
+//! fix must remove the `#[ignore]` and the expected-failure branch. With
+//! `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` set it asserts the real pass
+//! condition instead.
 //!
 //! With the `otel` feature and `AGENT_SDK_CRASH_MATRIX_OBS` set, each
 //! case prints the metrics and spans of the recovering process.
@@ -1067,7 +1070,17 @@ async fn wait_for_task(
     what: &str,
     done: impl Fn(&AgentTask) -> bool,
 ) -> Result<AgentTask> {
-    let deadline = tokio::time::Instant::now() + WAIT;
+    wait_for_task_within(stores, task, what, WAIT, done).await
+}
+
+async fn wait_for_task_within(
+    stores: &StoreRegistry,
+    task: &AgentTaskId,
+    what: &str,
+    wait: Duration,
+    done: impl Fn(&AgentTask) -> bool,
+) -> Result<AgentTask> {
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         if let Some(row) = stores.task_store.get(task).await?
             && done(&row)
@@ -1413,9 +1426,6 @@ async fn s2_safe_tool(backend: Backend) -> Result<()> {
 /// S3: no duplicate assistant message, the partial text is either kept
 /// as an aborted note or gone, and every attempt row is closed.
 async fn s3_llm_stream(backend: Backend) -> Result<()> {
-    if !known_failure_enabled() {
-        return Ok(());
-    }
     let Some(case) = crash_and_recover(backend, Scenario::LlmStream).await? else {
         return Ok(());
     };
@@ -1456,6 +1466,15 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
         .filter(|attempt| attempt.outcome.is_none())
         .map(|attempt| attempt.attempt_number)
         .collect();
+    if !known_failure_enabled() {
+        ensure!(
+            !open.is_empty(),
+            "S3 no longer fails: every attempt row is closed. Remove its #[ignore] and its \
+             expected-failure branch"
+        );
+        println!("expected failure S3 {backend:?}: attempt rows left open: {open:?}");
+        return Ok(());
+    }
     ensure!(
         open.is_empty(),
         "attempt rows left open: {open:?} of {}",
@@ -1745,9 +1764,6 @@ const STALL_BUDGET: Duration = Duration::from_secs(10);
 /// parent must continue, with a typed partial result, once the child's
 /// stall budget ends (D-5). No process is killed.
 async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
-    if !known_failure_enabled() {
-        return Ok(());
-    }
     let temp = tempfile::tempdir()?;
     let dir = Arc::new(CaseDir(temp.path().to_owned()));
     let Some(db) = CaseDb::create(backend, temp.path()).await? else {
@@ -1773,11 +1789,35 @@ async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
     })
     .await?;
     let root = AgentTaskId::from_string(&root);
-    let continued = wait_for_task(&stores, &root, "continued past its hung child", |task| {
-        task.status.is_terminal()
-    })
+    // As an expected failure, the parent must still wait well past the
+    // budget; the full `WAIT` is only for the real pass condition.
+    let wait = if known_failure_enabled() {
+        WAIT
+    } else {
+        STALL_BUDGET + Duration::from_secs(5)
+    };
+    let continued = wait_for_task_within(
+        &stores,
+        &root,
+        "continued past its hung child",
+        wait,
+        |task| task.status.is_terminal(),
+    )
     .await;
     daemon.report(scenario.name());
+    if !known_failure_enabled() {
+        ensure!(
+            continued.is_err(),
+            "S7 ({}) no longer fails: the parent continued past its silent child. Remove its \
+             #[ignore] and its expected-failure branch",
+            scenario.name()
+        );
+        println!(
+            "expected failure S7 {backend:?} {}: the parent still waits {wait:?} after its child went silent",
+            scenario.name()
+        );
+        return Ok(());
+    }
     let root_row = continued.with_context(|| {
         format!("the parent is still waiting {WAIT:?} after its child went silent (budget {STALL_BUDGET:?})")
     })?;
@@ -1920,9 +1960,9 @@ matrix!(
     [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation],
     [s4_fork: "failpoints"],
     [
-        s3_llm_stream: "S3 fails: the crashed LLM attempt's turn_attempts row stays open",
-        s7_hung_tool: "S7 fails by design: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES",
-        s7_hung_subagent: "S7 fails by design: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES",
+        s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_tool: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_subagent: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
 
@@ -1932,8 +1972,8 @@ matrix!(
     [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation],
     [s4_fork: "failpoints", s8_overlap: "postgres"],
     [
-        s3_llm_stream: "S3 fails: the crashed LLM attempt's turn_attempts row stays open",
-        s7_hung_tool: "S7 fails by design: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES",
-        s7_hung_subagent: "S7 fails by design: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES",
+        s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_tool: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_subagent: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
