@@ -645,7 +645,8 @@ impl Transition {
             | Write::AppendCompaction { .. }
             | Write::AppendEvents { .. }
             | Write::SpawnChildren { .. }
-            | Write::Document(_) => None,
+            | Write::Document(_)
+            | Write::EnqueueSteeringResume { .. } => None,
         })
     }
 

@@ -10191,7 +10191,8 @@ mod tests {
                     | Write::AppendEvents { .. }
                     | Write::AppendCompaction { .. }
                     | Write::SpawnChildren { .. }
-                    | Write::Document(_) => {}
+                    | Write::Document(_)
+                    | Write::EnqueueSteeringResume { .. } => {}
                 }
             }
             self.inner.commit(transition, now).await

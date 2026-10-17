@@ -27,6 +27,7 @@ const SPLIT_WRITES: &[&str] = &[
     "append_compaction",
     "persist_intent",
     "update_intent",
+    "enqueue_steering_resume",
 ];
 /// `(path relative to the crates directory, calls)`. Streaming
 /// `TextDelta` / `ThinkingDelta` commits and other events that record no

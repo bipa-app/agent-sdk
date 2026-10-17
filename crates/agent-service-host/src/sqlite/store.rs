@@ -3525,6 +3525,27 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
+    /// Apply one effect write of a transition inside its transaction.
+    async fn apply_effect_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        effect: EffectWrite,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        match effect {
+            EffectWrite::Start(intent) => {
+                let anchor = Self::next_event_sequence_tx(tx, &intent.thread).await?;
+                let record = EffectRecord::started(intent, Some(anchor), now);
+                Self::insert_effect_tx(tx, &record).await?;
+                agent_server::fail_point!("effect.start_written");
+            }
+            EffectWrite::Finish { key, owner, state } => {
+                Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
+                agent_server::fail_point!("effect.finish_written");
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Sqlite>,
@@ -3577,16 +3598,7 @@ impl SqliteDurableStore {
                 .await?;
                 committed.reparked.push(reparked);
             }
-            Write::Effect(EffectWrite::Start(intent)) => {
-                let anchor = Self::next_event_sequence_tx(tx, &intent.thread).await?;
-                let record = EffectRecord::started(intent, Some(anchor), now);
-                Self::insert_effect_tx(tx, &record).await?;
-                agent_server::fail_point!("effect.start_written");
-            }
-            Write::Effect(EffectWrite::Finish { key, owner, state }) => {
-                Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
-                agent_server::fail_point!("effect.finish_written");
-            }
+            Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
@@ -3629,8 +3641,34 @@ impl SqliteDurableStore {
                 let outcome = Self::apply_document_tx(tx, document, now).await?;
                 committed.documents.push(outcome);
             }
+            Write::EnqueueSteeringResume { parent, steering } => {
+                let woken = Self::enqueue_steering_resume_tx(tx, &parent, steering, now).await?;
+                committed.steering_resumed.push(woken);
+            }
         }
         Ok(())
+    }
+
+    /// Wake a parent parked on its children for a steering exchange. Only
+    /// a parent still waiting on its children is woken; any other status
+    /// declines with `None`, so a concurrent fan-in never races the wake.
+    async fn enqueue_steering_resume_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        parent_id: &AgentTaskId,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let old = Self::load_task_tx(tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("steering wake rejected: task {parent_id} does not exist"))?;
+        if old.status != TaskStatus::WaitingOnChildren {
+            return Ok(None);
+        }
+        let woken = old
+            .begin_steering_resume(steering, now)
+            .context("steering wake rejected: begin_steering_resume transition failed")?;
+        Self::update_task_tx(tx, &woken).await?;
+        Ok(Some(woken))
     }
 
     /// Settle a leased task with the existing terminal-transition helper.
@@ -4851,34 +4889,16 @@ impl AgentTaskStore for SqliteDurableStore {
         steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        // A steering wake is distinguished from an ordinary fan-in only
-        // by a non-empty steering payload (both share the ReadyToResume
-        // kind). An empty payload would create a ReadyToResume whose
-        // children are still running — a broken fan-in — so reject it.
-        if steering.is_empty() {
-            return Err(anyhow!(
-                "steering wake rejected: steering content must be non-empty"
-            ));
-        }
-        let mut tx = self.begin().await?;
-        let old = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("steering wake rejected: task {parent_id} does not exist"))?;
-
-        // Idempotent CAS: decline unless the parent is still parked.
-        if old.status != TaskStatus::WaitingOnChildren {
-            return Ok(None);
-        }
-
-        let woken = old
-            .clone()
-            .begin_steering_resume(steering, now)
-            .context("steering wake rejected: begin_steering_resume transition failed")?;
-        Self::update_task_tx(&mut tx, &woken).await?;
-        tx.commit()
-            .await
-            .context("commit enqueue_steering_resume")?;
-        Ok(Some(woken))
+        let committed = agent_server::journal::DurableStore::commit(
+            self,
+            agent_server::journal::Transition::enqueue_steering_resume(parent_id.clone(), steering),
+            now,
+        )
+        .await
+        .map_err(|rejected| {
+            agent_server::journal::transition::wrapper_error("steering wake", rejected)
+        })?;
+        Ok(committed.steering_resumed.into_iter().next().flatten())
     }
 
     async fn repark_after_steering(
