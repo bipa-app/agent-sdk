@@ -172,6 +172,16 @@ pub mod attrs {
 
     /// A view stream's lifecycle step, or a refused view RPC.
     pub const VIEW_STREAM_EVENT: &str = "view.stream.event";
+    /// Prompt row owner: `host` / `task`.
+    pub const PROMPT_OWNER: &str = "owner";
+    /// Prompt row step: [`crate::journal::prompt::PromptStep::as_str`].
+    pub const PROMPT_STEP: &str = "step";
+
+    /// Prompt handler outcome: closed the prompt.
+    pub const OUTCOME_CLOSED: &str = "closed";
+    /// Prompt handler outcome: kept the prompt answered for a later retry.
+    pub const OUTCOME_PENDING: &str = "pending";
+
     pub const COMMIT_KIND_ATOMIC: &str = "atomic";
     pub const COMMIT_KIND_NON_ATOMIC: &str = "non_atomic";
 }
@@ -210,6 +220,7 @@ pub struct ServerMetrics {
     pub(crate) view_fold_duration: Histogram<f64>,
     pub(crate) view_folded_events: Histogram<f64>,
     pub(crate) view_stream: Counter<u64>,
+    pub(crate) prompts: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -353,14 +364,7 @@ impl ServerMetrics {
         result: &Result<crate::journal::Committed, crate::journal::Rejected>,
         duration_secs: f64,
     ) {
-        let outcome = match result {
-            Ok(_) => attrs::OUTCOME_COMMITTED,
-            Err(crate::journal::Rejected::Guard { index, .. }) if *index >= guard_count => {
-                attrs::OUTCOME_EXPECTATION
-            }
-            Err(crate::journal::Rejected::Guard { .. }) => attrs::OUTCOME_GUARD,
-            Err(crate::journal::Rejected::Store(_)) => attrs::OUTCOME_STORE,
-        };
+        let outcome = Self::commit_outcome(guard_count, result);
         self.transition_duration.record(
             duration_secs,
             &[
@@ -385,6 +389,44 @@ impl ServerMetrics {
                     KeyValue::new(attrs::OP, op),
                 ],
             );
+        }
+    }
+
+    /// Count one prompt row step on `agent_server.prompts`. `owner` is
+    /// [`attrs::PROMPT_OWNER`]'s value, `step` a
+    /// [`crate::journal::prompt::PromptStep`] and `outcome` a transition outcome
+    /// (`committed` / `guard` / `expectation` / `store`) or, for
+    /// `handle`, `closed` / `pending` / `error`.
+    pub fn record_prompt(
+        &self,
+        owner: &'static str,
+        step: crate::journal::prompt::PromptStep,
+        outcome: &'static str,
+    ) {
+        self.prompts.add(
+            1,
+            &[
+                KeyValue::new(attrs::PROMPT_OWNER, owner),
+                KeyValue::new(attrs::PROMPT_STEP, step.as_str()),
+                KeyValue::new(attrs::OUTCOME, outcome),
+            ],
+        );
+    }
+
+    /// The outcome label of a commit result, as
+    /// [`Self::record_transition`] attributes it.
+    #[must_use]
+    pub const fn commit_outcome(
+        guard_count: usize,
+        result: &Result<crate::journal::Committed, crate::journal::Rejected>,
+    ) -> &'static str {
+        match result {
+            Ok(_) => attrs::OUTCOME_COMMITTED,
+            Err(crate::journal::Rejected::Guard { index, .. }) if *index >= guard_count => {
+                attrs::OUTCOME_EXPECTATION
+            }
+            Err(crate::journal::Rejected::Guard { .. }) => attrs::OUTCOME_GUARD,
+            Err(crate::journal::Rejected::Store(_)) => attrs::OUTCOME_STORE,
         }
     }
 
@@ -602,6 +644,7 @@ impl ServerMetrics {
                 "Document writes committed, attributed by backend, scope and operation.",
             )
             .build();
+        let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
 
@@ -626,6 +669,7 @@ impl ServerMetrics {
             view_fold_duration,
             view_folded_events,
             view_stream,
+            prompts,
             meter,
         }
     }
@@ -684,6 +728,16 @@ fn view_instruments(
 // ─────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────
+
+fn prompts_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.prompts")
+        .with_description(
+            "Prompt row steps (answer, close, withdraw, handle, redrive), attributed by owner \
+             and outcome.",
+        )
+        .build()
+}
 
 fn read_cached() -> Option<Arc<ServerMetrics>> {
     let guard = match METRICS.read() {

@@ -57,6 +57,16 @@ message ListThreadTasksResponse {
   repeated TaskSnapshot tasks = 1;
 }
 
+message ListPendingPromptsRequest {
+  string thread_id = 1;
+}
+
+message ListPendingPromptsResponse {
+  // The thread's parked tool confirmations and questions, then its open
+  // prompt rows, in that order.
+  repeated PendingPrompt prompts = 1;
+}
+
 message GetTaskRequest {
   string task_id = 1;
 }
@@ -245,6 +255,14 @@ message DecideConfirmationRequest {
   // changes nothing on a host without one. The caller sets it, so it stops
   // honest automatic clients only; it is not an authorization boundary.
   bool automatic = 5;
+
+  // Decide the prompt row with this id on `thread_id` instead of a task.
+  // `task_id` must then be empty. A task-owned row (a parked task's prompt
+  // shown on another thread) decides its task; a host row stores the answer
+  // once and hands it to the host's prompt handler. Another request_id
+  // answering an answered row gets FAILED_PRECONDITION; an unknown id
+  // NOT_FOUND.
+  string prompt_id = 6;
 }
 
 message DecideConfirmationResponse {
@@ -428,6 +446,10 @@ service AgentControlService {
 
   // List every durable task row bound to the thread.
   rpc ListThreadTasks(ListThreadTasksRequest) returns (ListThreadTasksResponse);
+
+  // Every human prompt on the thread that waits for a decision, whichever
+  // durable row holds it: a parked task, or a prompt row.
+  rpc ListPendingPrompts(ListPendingPromptsRequest) returns (ListPendingPromptsResponse);
 
   // Inspect one durable task row by id.
   rpc GetTask(GetTaskRequest) returns (GetTaskResponse);

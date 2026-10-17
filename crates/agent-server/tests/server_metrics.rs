@@ -984,3 +984,56 @@ async fn view_signals_record_the_fold_and_stream_steps() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_prompt_step_is_counted_by_owner_step_and_outcome() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = agent_server::observability::ServerMetrics::global();
+    metrics.record_prompt(
+        "host",
+        agent_server::journal::PromptStep::Answer,
+        attrs::OUTCOME_COMMITTED,
+    );
+    metrics.record_prompt(
+        "host",
+        agent_server::journal::PromptStep::Answer,
+        attrs::OUTCOME_COMMITTED,
+    );
+    metrics.record_prompt(
+        "task",
+        agent_server::journal::PromptStep::Withdraw,
+        attrs::OUTCOME_EXPECTATION,
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counted = collect_u64_counter(&snapshots, "agent_server.prompts");
+    let count = |owner: &str, step: &str, outcome: &str| {
+        counted
+            .iter()
+            .filter(|(labels, _)| {
+                matches_all(
+                    labels,
+                    &[
+                        (attrs::PROMPT_OWNER, owner),
+                        (attrs::PROMPT_STEP, step),
+                        (attrs::OUTCOME, outcome),
+                    ],
+                )
+            })
+            .map(|(_, count)| *count)
+            .sum::<u64>()
+    };
+    assert_eq!(
+        count("host", "answer", attrs::OUTCOME_COMMITTED),
+        2,
+        "{counted:?}"
+    );
+    assert_eq!(
+        count("task", "withdraw", attrs::OUTCOME_EXPECTATION),
+        1,
+        "{counted:?}"
+    );
+    Ok(())
+}
