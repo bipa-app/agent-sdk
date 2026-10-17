@@ -149,6 +149,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    extra_writes: Vec::new(),
                     delivered_injection_ids: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
@@ -385,6 +386,7 @@ mod tests {
         // Attempt the full commit — should fail at step 1.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),
@@ -1036,6 +1038,7 @@ mod tests {
         let attempt_id = s.open_attempt(&task2, 1).await?;
         let commit_err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_id.clone(),

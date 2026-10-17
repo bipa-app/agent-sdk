@@ -717,6 +717,7 @@ mod tests {
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: tid.clone(),
@@ -814,6 +815,7 @@ mod tests {
             })
             .await?;
         let params = CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id(tid),
@@ -1045,6 +1047,7 @@ mod tests {
             })
             .await?;
         let stale = CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id("conformance-stale-typed"),
@@ -2012,6 +2015,401 @@ mod tests {
             .context("child")?;
         assert_eq!(after.status, TaskStatus::Running);
         assert!(events.get_events(&child.thread_id).await?.is_empty());
+        Ok(())
+    }
+
+    // ── transition extension ─────────────────────────────────────────
+
+    /// A pure extension for the conformance cases: on a transition it
+    /// counts each non-empty event batch into a document on the batch's
+    /// thread; on a completed turn it records the turn's input tokens in a
+    /// document keyed by the task. With `refuse`, it also asks for a write
+    /// an extension may not add.
+    struct ProbeExtension {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        refuse: bool,
+    }
+
+    impl ProbeExtension {
+        fn new(
+            refuse: bool,
+        ) -> (
+            std::sync::Arc<Self>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                std::sync::Arc::new(Self {
+                    calls: calls.clone(),
+                    refuse,
+                }),
+                calls,
+            )
+        }
+    }
+
+    fn turn_doc(
+        thread: &ThreadId,
+        task: &AgentTaskId,
+    ) -> Result<agent_server::journal::DocumentKey> {
+        Ok(agent_server::journal::DocumentKey::new(
+            agent_server::journal::DocScope::Thread(thread.clone()),
+            doc_kind("turn")?,
+            task.as_str(),
+        ))
+    }
+
+    impl agent_server::journal::TransitionExtension for ProbeExtension {
+        fn extend(
+            &self,
+            view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            use agent_server::journal::{DocExpect, TransitionView, Write};
+
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match view {
+                TransitionView::Commit(transition) => {
+                    let mut writes: Vec<Write> = transition
+                        .writes
+                        .iter()
+                        .filter_map(|write| {
+                            let Write::AppendEvents { thread, events } = write else {
+                                return None;
+                            };
+                            let key = thread_doc(thread, "events").ok()?;
+                            (!events.is_empty()).then(|| {
+                                put_doc(&key, DocExpect::Any, serde_json::json!(events.len()))
+                            })
+                        })
+                        .collect();
+                    if self.refuse
+                        && let Some(Write::AppendEvents { thread, .. }) = transition
+                            .writes
+                            .iter()
+                            .find(|write| matches!(write, Write::AppendEvents { .. }))
+                    {
+                        writes.push(Write::AppendCompaction {
+                            thread: thread.clone(),
+                            messages: Vec::new(),
+                            source_message_count: 0,
+                            retained_message_count: 0,
+                        });
+                    }
+                    writes
+                }
+                TransitionView::CompletedTurn(commit) => {
+                    let mut writes: Vec<Write> = turn_doc(&commit.thread_id, &commit.task_id)
+                        .map(|key| {
+                            vec![put_doc(
+                                &key,
+                                DocExpect::Absent,
+                                serde_json::json!(commit.turn_usage.input_tokens),
+                            )]
+                        })
+                        .unwrap_or_default();
+                    if self.refuse {
+                        writes.push(Write::AppendEvents {
+                            thread: commit.thread_id.clone(),
+                            events: vec![AgentEvent::text("refused", "refused")],
+                        });
+                    }
+                    writes
+                }
+            }
+        }
+    }
+
+    /// The extension runs once per commit, and its writes commit with the
+    /// transition or not at all; a write it may not add rejects the
+    /// transition before anything is written.
+    async fn test_extension_writes_commit_with_their_transition(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use agent_server::journal::Rejected;
+        use std::sync::atomic::Ordering;
+
+        let (child, worker, lease) = leased_tool_child(task_store, "conformance-extension").await?;
+        let counted = thread_doc(&child.thread_id, "events")?;
+        let before = calls.load(Ordering::SeqCst);
+
+        let stale = settle_with_tool_call_end(&child, &worker, &LeaseId::new());
+        let rejected = task_store.commit(stale, t_plus(64)).await;
+        assert!(
+            matches!(rejected, Err(Rejected::Guard { index: 0, .. })),
+            "{rejected:?}"
+        );
+        assert_eq!(doc_value(documents, &counted).await?, None);
+
+        task_store
+            .commit(
+                settle_with_tool_call_end(&child, &worker, &lease),
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            doc_value(documents, &counted).await?,
+            Some((1, serde_json::json!(1))),
+            "the extension's document committed with the settle and its event"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst) - before,
+            2,
+            "the extension runs exactly once per commit"
+        );
+        Ok(())
+    }
+
+    /// An extension that asks for a write it may not add rejects the
+    /// transition, and nothing of it is written.
+    async fn test_extension_refused_write_rejects_the_transition(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-extension-refused").await?;
+        let rejected = task_store
+            .commit(
+                settle_with_tool_call_end(&child, &worker, &lease),
+                t_plus(65),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(agent_server::journal::Rejected::Store(_))),
+            "{rejected:?}"
+        );
+        let after = AgentTaskStore::get(task_store, &child.id)
+            .await?
+            .context("child")?;
+        assert_eq!(after.status, TaskStatus::Running);
+        assert!(events.get_events(&child.thread_id).await?.is_empty());
+        Ok(())
+    }
+
+    /// A leased root with an open attempt, and the commit of its first
+    /// turn.
+    async fn completed_turn_fixture(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        name: &str,
+    ) -> Result<CompletedTurnCommit> {
+        let tid = thread_id(name);
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let attempt = attempt_store
+            .open_attempt(OpenAttemptParams {
+                task_id: root.id.clone(),
+                attempt_number: 1,
+                provenance: AuditProvenance::new("anthropic", "claude-sonnet-4-5-20250929"),
+                request_blob: serde_json::json!({"messages": []}),
+                now: t_plus(52),
+                otel_trace_id: None,
+                otel_span_id: None,
+            })
+            .await?;
+        Ok(CompletedTurnCommit {
+            extra_writes: Vec::new(),
+            delivered_injection_ids: Vec::new(),
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: tid,
+            task_id: root.id,
+            expected_turn: 1,
+            turn_attempt_id: attempt.id,
+            close_attempt_params: evidence_close_params(),
+            messages: vec![agent_sdk_foundation::llm::Message::assistant("response")],
+            turn_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+            agent_state_snapshot: serde_json::json!({}),
+            events: vec![],
+            outbox_max_attempts: 3,
+            owner_guard: None,
+            now: t_plus(55),
+        })
+    }
+
+    /// The extension's documents commit inside the completed turn's own
+    /// transaction, once per commit.
+    async fn test_extension_writes_commit_with_the_completed_turn(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        calls: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let params =
+            completed_turn_fixture(task_store, attempt_store, "conformance-extension-turn").await?;
+        let key = turn_doc(&params.thread_id, &params.task_id)?;
+        let before = calls.load(Ordering::SeqCst);
+        let outcome = commit_completed_turn(params, task_store).await?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(calls.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(
+            doc_value(documents, &key).await?,
+            Some((1, serde_json::json!(100)))
+        );
+        Ok(())
+    }
+
+    /// A crash after a completed turn's rows, events and extension
+    /// documents are staged, and before its transaction commits, leaves
+    /// none of them. Committing the same turn again then writes the turn
+    /// and its document at revision 1: the extension's `Absent` put would
+    /// be refused had the crashed attempt left its document, and the
+    /// document would be missing had the extension's write never run.
+    #[cfg(feature = "failpoints")]
+    async fn test_extension_completed_turn_failpoint_writes_nothing(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        thread_store: &dyn ThreadStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        let params = completed_turn_fixture(
+            task_store,
+            attempt_store,
+            "conformance-extension-turn-crash",
+        )
+        .await?;
+        let key = turn_doc(&params.thread_id, &params.task_id)?;
+        let thread = params.thread_id.clone();
+        fail::cfg("commit.before_event_commit", "panic")
+            .map_err(|error| anyhow::anyhow!("configure commit failpoint: {error}"))?;
+        let crashed =
+            std::panic::AssertUnwindSafe(commit_completed_turn(params.clone(), task_store));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("commit.before_event_commit");
+        assert!(result.is_err(), "the commit failpoint must fire");
+        assert_eq!(doc_value(documents, &key).await?, None);
+        let committed = ThreadStore::get(thread_store, &thread)
+            .await?
+            .map_or(0, |thread| thread.committed_turns);
+        assert_eq!(committed, 0, "the turn rolled back with its document");
+
+        let outcome = commit_completed_turn(params, task_store).await?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(
+            doc_value(documents, &key).await?,
+            Some((1, serde_json::json!(100))),
+            "the retried turn writes its document once"
+        );
+        Ok(())
+    }
+
+    /// An extension that adds a write a completed turn may not carry
+    /// refuses the turn: neither the turn nor the extension's document is
+    /// written.
+    async fn test_extension_refused_write_rejects_the_completed_turn(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        thread_store: &dyn ThreadStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        let params = completed_turn_fixture(
+            task_store,
+            attempt_store,
+            "conformance-extension-turn-refused",
+        )
+        .await?;
+        let key = turn_doc(&params.thread_id, &params.task_id)?;
+        let thread = params.thread_id.clone();
+        let refused = commit_completed_turn(params, task_store).await;
+        assert!(refused.is_err(), "the turn is refused");
+        assert_eq!(doc_value(documents, &key).await?, None);
+        let committed = ThreadStore::get(thread_store, &thread)
+            .await?
+            .map_or(0, |thread| thread.committed_turns);
+        assert_eq!(committed, 0, "no turn is committed");
+        Ok(())
+    }
+
+    /// A completed turn writes documents only on its own thread or task,
+    /// the rows it locks and fences first. A document on another thread
+    /// (active, or purged) or on the host refuses the turn, and nothing is
+    /// written; a document on its own task commits with it.
+    async fn test_completed_turn_documents_stay_in_its_scope(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+        thread_store: &dyn ThreadStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{PurgeReceipt, PurgeScope, PurgeSeed};
+        use agent_server::journal::{DocExpect, DocScope, DocumentKey};
+
+        let purged = thread_id("conformance-turn-scope-purged");
+        thread_store.get_or_create(&purged, t_plus(40)).await?;
+        let _ = thread_store
+            .begin_purge(
+                &purged,
+                PurgeSeed {
+                    root_thread_id: purged.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: t_plus(41),
+                },
+            )
+            .await?;
+        let _ = thread_store
+            .finish_purge(
+                &purged,
+                &PurgeReceipt {
+                    root_thread_id: purged.clone(),
+                    scope: PurgeScope::Thread,
+                    purged_thread_ids: vec![purged.clone()],
+                    cancelled_task_ids: Vec::new(),
+                    started_at: t_plus(41),
+                    completed_at: t_plus(42),
+                },
+            )
+            .await?;
+
+        let params =
+            completed_turn_fixture(task_store, attempt_store, "conformance-turn-scope").await?;
+        let elsewhere = [
+            thread_doc(&thread_id("conformance-turn-scope-other"), "context")?,
+            thread_doc(&purged, "context")?,
+            host_doc("from-a-turn")?,
+        ];
+        for key in &elsewhere {
+            let mut turn = params.clone();
+            turn.extra_writes = vec![put_doc(key, DocExpect::Absent, serde_json::json!(1))];
+            let refused = commit_completed_turn(turn, task_store).await;
+            assert!(refused.is_err(), "a turn writing {key} is refused");
+            assert_eq!(doc_value(documents, key).await?, None);
+            let committed = ThreadStore::get(thread_store, &params.thread_id)
+                .await?
+                .map_or(0, |thread| thread.committed_turns);
+            assert_eq!(
+                committed, 0,
+                "a refused turn writing {key} is not committed"
+            );
+        }
+
+        let own_task = DocumentKey::new(
+            DocScope::Task(params.task_id.clone()),
+            doc_kind("turn_task")?,
+            "",
+        );
+        let mut turn = params;
+        turn.extra_writes = vec![put_doc(&own_task, DocExpect::Absent, serde_json::json!(2))];
+        let outcome = commit_completed_turn(turn, task_store).await?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        assert_eq!(
+            doc_value(documents, &own_task).await?,
+            Some((1, serde_json::json!(2)))
+        );
         Ok(())
     }
 
@@ -5271,6 +5669,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_extension() -> Result<()> {
+        let (extension, calls) = ProbeExtension::new(false);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_extension_writes_commit_with_their_transition(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            &calls,
+        )
+        .await?;
+        test_extension_writes_commit_with_the_completed_turn(
+            s.task.as_ref(),
+            s.attempt.as_ref(),
+            s.documents.as_ref(),
+            &calls,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_extension_refused_completed_turn() -> Result<()> {
+        let (extension, _calls) = ProbeExtension::new(true);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_extension_refused_write_rejects_the_completed_turn(
+            s.task.as_ref(),
+            s.attempt.as_ref(),
+            s.thread.as_ref(),
+            s.documents.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_completed_turn_document_scope() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_completed_turn_documents_stay_in_its_scope(
+            s.task.as_ref(),
+            s.attempt.as_ref(),
+            s.thread.as_ref(),
+            s.documents.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_extension_refused_write() -> Result<()> {
+        let (extension, _calls) = ProbeExtension::new(true);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_extension_refused_write_rejects_the_transition(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_extension() -> Result<()> {
+        let (extension, calls) = ProbeExtension::new(false);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_extension_writes_commit_with_their_transition(&store, &store, &calls).await?;
+        test_extension_writes_commit_with_the_completed_turn(&store, &store, &store, &calls).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_extension_refused_completed_turn() -> Result<()> {
+        let (extension, _calls) = ProbeExtension::new(true);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_extension_refused_write_rejects_the_completed_turn(&store, &store, &store, &store)
+            .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_completed_turn_document_scope() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_completed_turn_documents_stay_in_its_scope(&store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_extension_refused_write() -> Result<()> {
+        let (extension, _calls) = ProbeExtension::new(true);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_extension_refused_write_rejects_the_transition(&store, &store).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_extension_completed_turn_failpoint_writes_nothing() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let (extension, _calls) = ProbeExtension::new(false);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_extension_completed_turn_failpoint_writes_nothing(&store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_extension() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, calls) = ProbeExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        test_extension_writes_commit_with_their_transition(&store, &store, &calls).await?;
+        test_extension_writes_commit_with_the_completed_turn(&store, &store, &store, &calls).await
+    }
+
+    /// A transition Postgres aborts for a deadlock is retried, and the
+    /// extension still runs once: it runs before the retry loop. A raw
+    /// session with a long `deadlock_timeout` holds the child's row, the
+    /// settle takes the thread row and waits on the child, and the raw
+    /// session then asks for the thread row, so Postgres aborts the
+    /// settle's attempt, which the store retries once the raw session
+    /// commits.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_lock_conflict_retry_runs_the_extension_once() -> Result<()> {
+        use agent_server::journal::DurableStore;
+        use std::sync::atomic::Ordering;
+
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, calls) = ProbeExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        let (child, worker, lease) = leased_tool_child(&store, "pg-extension-retry").await?;
+        ThreadStore::get_or_create(&store, &child.thread_id, t_plus(61)).await?;
+        let calls_before = calls.load(Ordering::SeqCst);
+        let retries_before = store.lock_conflict_retries();
+
+        let mut raw = store.pool().begin().await?;
+        sqlx::query("SET LOCAL deadlock_timeout = '30s'")
+            .execute(&mut *raw)
+            .await?;
+        sqlx::query("SELECT id FROM agent_sdk_tasks WHERE id = $1 FOR UPDATE")
+            .bind(child.id.as_str())
+            .execute(&mut *raw)
+            .await?;
+        let settle = store.commit(
+            settle_with_tool_call_end(&child, &worker, &lease),
+            t_plus(65),
+        );
+        let thread_key = child.thread_id.0.clone();
+        let raw_side = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            sqlx::query("SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+                .bind(thread_key)
+                .execute(&mut *raw)
+                .await?;
+            raw.commit().await?;
+            anyhow::Ok(())
+        };
+        let (settled, raw_done) = tokio::join!(settle, raw_side);
+        raw_done?;
+        settled.map_err(anyhow::Error::from)?;
+        anyhow::ensure!(
+            store.lock_conflict_retries() > retries_before,
+            "the settle was not retried after a lock conflict"
+        );
+        anyhow::ensure!(
+            calls.load(Ordering::SeqCst) - calls_before == 1,
+            "the extension ran {} times for one commit",
+            calls.load(Ordering::SeqCst) - calls_before
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_extension_refused_completed_turn() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, _calls) = ProbeExtension::new(true);
+        let store = store.with_transition_extension(extension);
+        test_extension_refused_write_rejects_the_completed_turn(&store, &store, &store, &store)
+            .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_completed_turn_document_scope() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_completed_turn_documents_stay_in_its_scope(&store, &store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_extension_refused_write() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, _calls) = ProbeExtension::new(true);
+        let store = store.with_transition_extension(extension);
+        test_extension_refused_write_rejects_the_transition(&store, &store).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_extension_completed_turn_failpoint_writes_nothing() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, _calls) = ProbeExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        test_extension_completed_turn_failpoint_writes_nothing(&store, &store, &store, &store).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_transition_is_all_or_nothing() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_transition_is_all_or_nothing(s.task.as_ref(), s.event.as_ref(), s.outbox.as_ref())
@@ -5537,6 +6152,12 @@ mod tests {
     }
 
     fn fresh_in_memory_stores() -> InMemoryStores {
+        fresh_in_memory_stores_with(None)
+    }
+
+    fn fresh_in_memory_stores_with(
+        extension: Option<std::sync::Arc<dyn agent_server::journal::TransitionExtension>>,
+    ) -> InMemoryStores {
         use agent_server::journal::checkpoint_store::InMemoryCheckpointStore;
         use agent_server::journal::event_repository::InMemoryEventRepository;
         use agent_server::journal::message_store::InMemoryMessageProjectionStore;
@@ -5586,6 +6207,10 @@ mod tests {
                 attempt_store: attempt.clone(),
                 checkpoint_store: checkpoint.clone(),
             });
+        let task = match extension {
+            Some(extension) => task.with_transition_extension(extension),
+            None => task,
+        };
 
         let task = std::sync::Arc::new(task);
         InMemoryStores {

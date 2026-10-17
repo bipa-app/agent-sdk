@@ -134,6 +134,11 @@ pub struct CompletedTurnCommit {
     /// turn-slot-shift retry; the first (non-shifted) commit attempt
     /// passes `None` so the normal path is unchanged.
     pub owner_guard: Option<CommitOwnerGuard>,
+    /// Further writes applied inside the completed turn's transaction,
+    /// after its own rows and events. Only [`super::Write::Document`] for
+    /// now (see [`Self::validate_extra_writes`]); a host's
+    /// [`super::extension::TransitionExtension`] adds to them.
+    pub extra_writes: Vec<super::transition::Write>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
 }
@@ -396,6 +401,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -457,6 +463,7 @@ mod tests {
         // Turn 1
         let o1 = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -480,6 +487,7 @@ mod tests {
         // Turn 2
         let o2 = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -541,6 +549,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -576,6 +585,7 @@ mod tests {
         let new_message = llm::Message::user("turn 2");
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -643,6 +653,7 @@ mod tests {
         // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -667,6 +678,7 @@ mod tests {
         // The guard rejects it before any projection advances.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -699,6 +711,7 @@ mod tests {
         // The correct expected_turn for the next turn succeeds.
         let ok = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -737,6 +750,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -759,6 +773,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_b(),
@@ -801,6 +816,7 @@ mod tests {
         let s = Stores::new();
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -854,6 +870,7 @@ mod tests {
         // Attempt to commit with the already-closed attempt.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -901,6 +918,7 @@ mod tests {
         let commit_for = |task_id: AgentTaskId,
                           attempt_id: crate::journal::turn_attempt::TurnAttemptId,
                           expected_turn: u32| CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_a(),
@@ -988,6 +1006,7 @@ mod tests {
         // Commit first turn then mark thread completed.
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1016,6 +1035,7 @@ mod tests {
         // Second commit should fail at thread aggregate step.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1081,6 +1101,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1127,6 +1148,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1186,6 +1208,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),

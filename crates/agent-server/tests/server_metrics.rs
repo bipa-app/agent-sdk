@@ -799,3 +799,63 @@ async fn effect_signals_count_each_transition_by_kind() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_transition_extension_records_its_writes_and_refusals() -> Result<()> {
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::{
+        DocExpect, DocKind, DocScope, DocumentKey, DocumentWrite, DurableStore, Transition,
+        TransitionExtension, TransitionView, Write,
+    };
+
+    struct AddsADocument {
+        refuse: bool,
+    }
+
+    impl TransitionExtension for AddsADocument {
+        fn extend(&self, _view: TransitionView<'_>) -> Vec<Write> {
+            let Ok(kind) = DocKind::new("test.extension") else {
+                return Vec::new();
+            };
+            let mut writes = vec![Write::Document(DocumentWrite::put(
+                DocumentKey::new(DocScope::Host, kind, "added"),
+                1,
+                DocExpect::Any,
+                serde_json::json!(1),
+            ))];
+            if self.refuse {
+                writes.push(Write::AppendCompaction {
+                    thread: ThreadId::from_string("t"),
+                    messages: Vec::new(),
+                    source_message_count: 0,
+                    retained_message_count: 0,
+                });
+            }
+            writes
+        }
+    }
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let now = OffsetDateTime::UNIX_EPOCH;
+    for refuse in [false, true] {
+        let store = InMemoryAgentTaskStore::new()
+            .with_transition_extension(Arc::new(AddsADocument { refuse }));
+        let result = store.commit(Transition::default(), now).await;
+        assert_eq!(result.is_err(), refuse);
+    }
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let added = collect_u64_counter(&snapshots, "agent_server.journal.extension.writes");
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert!(matches_all(
+        &added[0].0,
+        &[(attrs::EXTENSION_POINT, attrs::EXTENSION_POINT_COMMIT)]
+    ));
+    assert_eq!(added[0].1, 1);
+    let refused = collect_u64_counter(&snapshots, "agent_server.journal.extension.refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].1, 1);
+    Ok(())
+}

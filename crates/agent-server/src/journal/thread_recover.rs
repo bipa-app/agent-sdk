@@ -433,6 +433,7 @@ mod tests {
                 .saturating_add(1);
             commit_completed_turn(
                 CompletedTurnCommit {
+                    extra_writes: Vec::new(),
                     delivered_injection_ids: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     thread_id: thread_id.clone(),
