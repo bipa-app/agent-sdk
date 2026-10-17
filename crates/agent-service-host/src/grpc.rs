@@ -1834,6 +1834,9 @@ impl AgentControlService for GrpcControlService {
         let (message_count, event_count) = self
             .copy_thread_state(&source_thread_id, &new_thread_id, fork_after, creation, now)
             .await?;
+        // Crash seam: the fork is committed and its request id is not yet
+        // recorded, so a retry must converge on the committed destination.
+        agent_server::fail_point!("fork.after_commit");
 
         let result_json = serde_json::to_value(ForkThreadResult {
             source_thread_id: request.source_thread_id.clone(),
