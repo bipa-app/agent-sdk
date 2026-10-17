@@ -983,6 +983,7 @@ impl GrpcControlService {
         if fork_after == 0 {
             // Empty fork — no projection, no checkpoint, no events.
             return Ok(ForkCommitParams {
+                source_thread_id: source_thread_id.clone(),
                 new_thread_id: new_thread_id.clone(),
                 creation,
                 now,
@@ -1051,6 +1052,7 @@ impl GrpcControlService {
         );
 
         Ok(ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation,
             now,

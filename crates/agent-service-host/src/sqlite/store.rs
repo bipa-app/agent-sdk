@@ -509,8 +509,7 @@ ON CONFLICT (thread_id) DO NOTHING
         retained_message_count: usize,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
-        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
-        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
+        Self::bootstrap_appendable_thread_tx(tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -529,6 +528,23 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<()> {
         let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    async fn bootstrap_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await
+    }
+
+    async fn require_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+    ) -> Result<()> {
+        let thread = Self::get_thread_tx(tx, thread_id).await?;
+        agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref())
     }
 
     async fn claim_thread_creation_tx(
@@ -2915,6 +2931,10 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
 
         let mut tx = self.begin().await?;
 
+        let source = Self::get_thread_tx(&mut tx, &params.source_thread_id).await?;
+        agent_server::journal::Fence::FORK_SOURCE
+            .check(&params.source_thread_id, source.as_ref())?;
+
         // Claim caller-minted destinations by primary key inside the same
         // transaction as the fork copy. Matching retries are no-ops; a
         // conflicting origin is typed and rolls back without mutation.
@@ -4830,6 +4850,7 @@ impl AgentTaskStore for SqliteDurableStore {
         // pattern): it lands iff this caller still owned the row, and
         // it is durable before the row is acquirable.
         if let Some(event) = boundary {
+            Self::require_appendable_thread_tx(&mut tx, &old.thread_id).await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
             let committed =
                 Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
@@ -5002,6 +5023,7 @@ impl AgentTaskStore for SqliteDurableStore {
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::require_appendable_thread_tx(&mut tx, &paused.thread_id).await?;
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
@@ -5556,7 +5578,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_committed(messages, now)?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5571,7 +5593,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5610,7 +5632,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_repair(
             repair_messages,
@@ -5630,7 +5652,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.set_draft(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5643,14 +5665,15 @@ impl MessageProjectionStore for SqliteDurableStore {
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<Option<MessageProjection>> {
-        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+        let mut tx = self.begin().await?;
+        Self::require_appendable_thread_tx(&mut tx, thread_id).await?;
+        let Some(projection) = read_message_head(&mut *tx, thread_id).await? else {
             // No projection row exists yet — nothing to clear. The
             // commit path treats this as a no-op so first-turn
             // happy-paths don't bootstrap rows just to clear them.
             return Ok(None);
         };
         let updated = projection.clear_draft(now);
-        let mut tx = self.begin().await?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit clear_draft")?;
         Ok(Some(updated))
@@ -8816,6 +8839,7 @@ INSERT INTO agent_sdk_execution_intents (
             ),
         ];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -8903,6 +8927,7 @@ INSERT INTO agent_sdk_execution_intents (
         };
         let messages = vec![Message::user("u"), Message::assistant("a")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -9015,6 +9040,7 @@ INSERT INTO agent_sdk_execution_intents (
         // collide and the transaction rolls back.
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,

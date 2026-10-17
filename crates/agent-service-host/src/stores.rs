@@ -32,7 +32,7 @@ use agent_server::journal::event_repository::{
     EventRepository, InMemoryEventRepository, PurgeFencedEventRepository,
 };
 use agent_server::journal::message_store::{
-    InMemoryMessageProjectionStore, MessageProjectionStore,
+    InMemoryMessageProjectionStore, MessageProjectionStore, PurgeFencedMessageProjectionStore,
 };
 use agent_server::journal::outbox::{InMemoryOutboxStore, OutboxStore};
 use agent_server::journal::retention::{InMemoryRetentionStore, RetentionStore};
@@ -590,6 +590,9 @@ impl StoreRegistry {
             thread_store.clone(),
         ));
         let task_store = Arc::new(task_store);
+        let message_store: Arc<dyn MessageProjectionStore> = Arc::new(
+            PurgeFencedMessageProjectionStore::new(message_store, thread_store.clone()),
+        );
         Self {
             document_store: task_store.clone(),
             task_store,
@@ -1009,6 +1012,66 @@ mod tests {
         let deps = stores.root_turn_deps();
         let _ = deps.task_store;
         let _ = deps.thread_store;
+    }
+
+    /// The in-memory registry's message store refuses every head write to
+    /// a purged thread, as the durable backends do inside their
+    /// transactions: `StoreRegistry::in_memory` wraps the raw store in
+    /// [`PurgeFencedMessageProjectionStore`].
+    #[tokio::test]
+    async fn the_in_memory_registry_message_store_refuses_a_purged_thread() -> Result<()> {
+        use agent_sdk_foundation::{ThreadId, llm::Message};
+        use agent_server::journal::thread::{PurgeScope, PurgeSeed, ThreadStateConflict};
+
+        let stores = StoreRegistry::in_memory(sample_registry());
+        let thread = ThreadId::from_string("registry-purged-thread");
+        let now = time::OffsetDateTime::now_utc();
+        stores.thread_store.get_or_create(&thread, now).await?;
+        stores
+            .message_store
+            .commit_messages(&thread, vec![Message::user("before")], now)
+            .await?;
+        let _ = stores
+            .thread_store
+            .begin_purge(
+                &thread,
+                PurgeSeed {
+                    root_thread_id: thread.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: now,
+                },
+            )
+            .await?;
+        let messages = &stores.message_store;
+        let late = || vec![Message::user("late")];
+        let refusals = [
+            messages
+                .commit_messages(&thread, late(), now)
+                .await
+                .map(|_| ()),
+            messages
+                .replace_history(&thread, late(), now)
+                .await
+                .map(|_| ()),
+            messages.set_draft(&thread, late(), now).await.map(|_| ()),
+            messages.clear_draft(&thread, now).await.map(|_| ()),
+            messages
+                .append_compaction(&thread, late(), 1, 0, now)
+                .await
+                .map(|_| ()),
+        ];
+        for refused in refusals {
+            let error = refused
+                .err()
+                .context("a head write to a purged thread is refused")?;
+            anyhow::ensure!(
+                error.downcast_ref::<ThreadStateConflict>().is_some(),
+                "a typed purge refusal: {error:#}"
+            );
+        }
+        let head = messages.get(&thread).await?.context("the head")?;
+        assert_eq!(head.messages, vec![Message::user("before")]);
+        Ok(())
     }
 
     #[test]
