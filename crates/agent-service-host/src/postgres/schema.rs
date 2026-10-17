@@ -1319,6 +1319,42 @@ const AGENT_SDK_EXECUTION_INTENT_COLUMNS: &[ColumnContract] = &[
         nullable: false,
         notes: "When the intent last changed status.",
     },
+    ColumnContract {
+        name: "effect_kind",
+        sql_type: "TEXT",
+        nullable: false,
+        notes: "Effect kind (`tool_call`, `llm_request`, `process_start`, `git_step`); `tool_call` for rows before 0027.",
+    },
+    ColumnContract {
+        name: "attempt",
+        sql_type: "BIGINT",
+        nullable: false,
+        notes: "Attempt number of the effect, from 1.",
+    },
+    ColumnContract {
+        name: "resolution",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "How recovery ended a `failed` effect that never finished (`interrupted`, `salvaged`).",
+    },
+    ColumnContract {
+        name: "captured_output",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Output recovery captured from an interrupted or salvaged effect.",
+    },
+    ColumnContract {
+        name: "journal_anchor",
+        sql_type: "BIGINT",
+        nullable: true,
+        notes: "The owner thread's next event sequence when the effect started.",
+    },
+    ColumnContract {
+        name: "thread_id",
+        sql_type: "TEXT",
+        nullable: true,
+        notes: "Thread of the owner task; NULL for rows before 0027.",
+    },
 ];
 
 const AGENT_SDK_EXECUTION_INTENT_CONSTRAINTS: &[ConstraintContract] = &[
@@ -1333,6 +1369,18 @@ const AGENT_SDK_EXECUTION_INTENT_CONSTRAINTS: &[ConstraintContract] = &[
     ConstraintContract {
         name: "agent_sdk_execution_intents_error_check",
         invariant: "Only `failed` rows carry `error`; every `failed` row must carry one.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_kind_check",
+        invariant: "Only known effect kinds can be persisted.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_resolution_check",
+        invariant: "Only `failed` rows carry a resolution, and only a known one.",
+    },
+    ConstraintContract {
+        name: "agent_sdk_execution_intents_attempt_check",
+        invariant: "Attempts count from 1.",
     },
 ];
 
