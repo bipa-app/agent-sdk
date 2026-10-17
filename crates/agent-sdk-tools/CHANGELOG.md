@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.18.0...agent-sdk-tools-v0.19.0) - 2026-10-17
+
+### Added
+
+- *(server)* [**breaking**] tool calls run as effects; their record is claimed under the lease and finished with the settle ([#507](https://github.com/bipa-app/agent-sdk/pull/507))
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+- *(server)* durable tool-input preflight + atomic precompleted mixed-spawn (ENG-9548) ([#442](https://github.com/bipa-app/agent-sdk/pull/442))
+
+### Fixed
+
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+- *(compaction)* [**breaking**] trigger on real per-model context occupancy ([#465](https://github.com/bipa-app/agent-sdk/pull/465))
+- *(providers)* [**breaking**] unique tool-call ids, strict-safe schemas, argument-stream liveness; thread-scoped execution cache ([#467](https://github.com/bipa-app/agent-sdk/pull/467))
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+- *(ci)* repair the rust 1.98 clippy and RustSec gate breakage on main ([#452](https://github.com/bipa-app/agent-sdk/pull/452))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-tools-v0.17.0...agent-sdk-tools-v0.18.0) - 2026-08-04
 
 ### Added
