@@ -2316,6 +2316,44 @@ mod tests {
         Ok(())
     }
 
+    /// A wake on a missing parent rejects its whole transition, including
+    /// a state-changing write applied before it: an event appended earlier
+    /// in the same transition is not visible. The durable backends roll the
+    /// transaction back; the in-memory store, which cannot, checks the
+    /// parent before its first mutation (reconciliation C15).
+    async fn test_a_failing_wake_leaves_no_earlier_write(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::{Rejected, Write};
+
+        let thread = thread_id("conformance-steering-write-earlier");
+        let rejected = task_store
+            .commit(
+                doc_only(vec![
+                    Write::AppendEvents {
+                        thread: thread.clone(),
+                        events: vec![AgentEvent::text("early", "before the wake")],
+                    },
+                    Write::EnqueueSteeringResume {
+                        parent: AgentTaskId::from_string("task_missing"),
+                        steering: steering_note("lost"),
+                    },
+                ]),
+                t_plus(68),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(Rejected::Store(_))),
+            "a wake on a missing parent rejects the transition: {rejected:?}"
+        );
+        assert!(
+            events.get_events(&thread).await?.is_empty(),
+            "an earlier event of a rejected transition is not visible"
+        );
+        Ok(())
+    }
+
     /// A crash after a wake is staged and before its transition's events
     /// leaves the parent parked: the wake rolls back with the rest.
     #[cfg(feature = "failpoints")]
@@ -5423,9 +5461,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_failing_wake_leaves_no_earlier_write(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_steering_resume_write() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_steering_resume_commits_with_its_note(s.task.as_ref(), s.documents.as_ref()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -5441,6 +5492,15 @@ mod tests {
         let _scenario = fail::FailScenario::setup();
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_steering_resume_failpoint_leaves_the_parent_parked(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]
