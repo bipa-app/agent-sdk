@@ -2223,6 +2223,18 @@ async fn subagent_progress_loop(
         )
         .await
         {
+            if err
+                .downcast_ref::<agent_server::journal::thread::ThreadStateConflict>()
+                .is_some()
+            {
+                info!(
+                    task_id = %child_root_id,
+                    %thread_id,
+                    error = %err,
+                    "the parent thread was purged; periodic subagent progress stops",
+                );
+                return;
+            }
             warn!(
                 task_id = %child_root_id,
                 %thread_id,
@@ -7301,6 +7313,239 @@ mod tests {
         fn provider(&self) -> &'static str {
             "mock"
         }
+    }
+
+    /// Streams a text delta every 40 ms for `SLOW_STREAM_DELTAS` deltas
+    /// when the prompt asks for a slow answer, and answers anything else
+    /// at once.
+    struct PurgeRaceProvider;
+
+    const SLOW_STREAM_DELTAS: usize = 100;
+
+    #[async_trait]
+    impl LlmProvider for PurgeRaceProvider {
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+            bail!("PurgeRaceProvider only streams")
+        }
+
+        fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+            let slow = request_flat_text(&request).contains("answer slowly");
+            Box::pin(async_stream::stream! {
+                let deltas = if slow { SLOW_STREAM_DELTAS } else { 1 };
+                for index in 0..deltas {
+                    if slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    }
+                    yield Ok(StreamDelta::TextDelta {
+                        delta: format!("part {index} "),
+                        block_index: 0,
+                    });
+                }
+                yield Ok(StreamDelta::Usage(Usage {
+                    served_speed: None,
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    request_input_tokens: None,
+                }));
+                yield Ok(StreamDelta::Done {
+                    stop_reason: Some(StopReason::EndTurn),
+                    served_route: None,
+                    served_model: None,
+                });
+            })
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+
+        fn provider(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    async fn submit_text_root(
+        stores: &StoreRegistry,
+        thread_id: &agent_sdk_foundation::ThreadId,
+        text: &str,
+    ) -> Result<AgentTask> {
+        let now = time::OffsetDateTime::now_utc();
+        stores.thread_store.get_or_create(thread_id, now).await?;
+        let root = AgentTask::new_root_turn_with_input(
+            thread_id.clone(),
+            vec![SubmittedInputItem::Text { text: text.into() }],
+            now,
+            3,
+        );
+        stores.task_store.submit_root_turn(root.clone()).await?;
+        Ok(root)
+    }
+
+    /// Purge `thread` as `PurgeThread` does: fence it, cancel its root's
+    /// tree, finish the purge. It does not wait for the worker.
+    async fn purge_without_waiting(
+        stores: &StoreRegistry,
+        purged: &agent_sdk_foundation::ThreadId,
+        root_id: &agent_server::journal::task::AgentTaskId,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{PurgeReceipt, PurgeScope, PurgeSeed};
+
+        let started_at = time::OffsetDateTime::now_utc();
+        let _ = stores
+            .thread_store
+            .begin_purge(
+                purged,
+                PurgeSeed {
+                    root_thread_id: purged.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at,
+                },
+            )
+            .await?;
+        let cancelled = stores
+            .task_store
+            .cancel_tree(root_id, time::OffsetDateTime::now_utc())
+            .await?;
+        let _ = stores
+            .thread_store
+            .finish_purge(
+                purged,
+                &PurgeReceipt {
+                    root_thread_id: purged.clone(),
+                    scope: PurgeScope::Thread,
+                    purged_thread_ids: vec![purged.clone()],
+                    cancelled_task_ids: cancelled
+                        .transitioned
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    started_at,
+                    completed_at: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A thread purged while its turn streams: the purge runs as
+    /// `PurgeThread` does (fence, cancel the tree, finish), without
+    /// waiting for the worker. The worker's later appends — its streamed
+    /// deltas, its cancellation salvage — are refused by the purge fence,
+    /// so no event lands on the tombstone after the purge. The turn winds
+    /// down as cancelled, and the host goes on serving: a turn on another
+    /// thread completes.
+    async fn a_purge_mid_stream_winds_the_turn_down(
+        storage: crate::config::StorageConfig,
+    ) -> Result<()> {
+        use agent_server::journal::thread::ThreadStatus;
+        use anyhow::ensure;
+
+        let config = ServiceConfig {
+            storage,
+            worker: crate::config::WorkerConfig {
+                pool_size: 2,
+                heartbeat_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(PurgeRaceProvider))?;
+        let runtime = Arc::new(ExecutionRuntime::new(
+            resolver,
+            Arc::new(NoopToolExecutor),
+            Arc::new(AllowAllConfirmationPolicy),
+        ));
+        let host = ServiceHost::new(config, sample_registry(), runtime)?;
+        let stores = host.stores().clone();
+        stores.initialize().await?;
+        let token = host.shutdown_token();
+        let purged = agent_sdk_foundation::ThreadId::from_string("t-purge-mid-stream");
+        let root = submit_text_root(&stores, &purged, "answer slowly").await?;
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        let result = async {
+            let mut streamed = false;
+            for _ in 0..250 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                streamed = stores
+                    .event_repo
+                    .get_events(&purged)
+                    .await?
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            event.event,
+                            agent_sdk_foundation::AgentEvent::TextDelta { .. }
+                        )
+                    });
+                if streamed {
+                    break;
+                }
+            }
+            ensure!(streamed, "the turn streams before the purge");
+
+            purge_without_waiting(&stores, &purged, &root.id).await?;
+            let events_at_purge = stores.event_repo.get_events(&purged).await?.len();
+
+            let other = agent_sdk_foundation::ThreadId::from_string("t-after-purge");
+            let after = submit_text_root(&stores, &other, "answer at once").await?;
+            wait_for_status(&stores, &after.id, TaskStatus::Completed, 250).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+            ensure!(!host_handle.is_finished(), "the host keeps running");
+            let row = stores
+                .task_store
+                .get(&root.id)
+                .await?
+                .context("purged root")?;
+            ensure!(
+                row.status == TaskStatus::Cancelled,
+                "the purged turn ends cancelled: {:?}",
+                row.status
+            );
+            ensure!(
+                stores.event_repo.get_events(&purged).await?.len() == events_at_purge,
+                "no event lands on the purged thread after its purge",
+            );
+            let thread = stores
+                .thread_store
+                .get(&purged)
+                .await?
+                .context("tombstone")?;
+            ensure!(
+                thread.status == ThreadStatus::Deleted,
+                "{:?}",
+                thread.status
+            );
+            Ok(())
+        }
+        .await;
+        token.cancel();
+        host_handle.await??;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_purge_mid_stream_winds_the_turn_down_in_memory() -> Result<()> {
+        a_purge_mid_stream_winds_the_turn_down(crate::config::StorageConfig::default()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_purge_mid_stream_winds_the_turn_down_on_sqlite() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        a_purge_mid_stream_winds_the_turn_down(crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Sqlite {
+                path: Some(temp.path().join("purge.db").to_string_lossy().into_owned()),
+                max_connections: None,
+            },
+            postgres: crate::config::PostgresStorageConfig::default(),
+        })
+        .await
     }
 
     fn subagent_timeout_runtime(

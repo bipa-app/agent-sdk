@@ -5331,6 +5331,16 @@ async fn flush_streaming_deltas(
             // The decorator cannot be forgotten; this line could.
             deps.event_notifier.notify(&committed);
         }
+        Err(error)
+            if error
+                .downcast_ref::<crate::journal::thread::ThreadStateConflict>()
+                .is_some() =>
+        {
+            log::debug!(
+                "dropped a streaming delta batch for purged thread {thread_id} \
+                 (batch_len={batch_len}): {error:#}",
+            );
+        }
         Err(error) => {
             log::warn!(
                 "failed to commit streaming delta batch for thread {thread_id} \

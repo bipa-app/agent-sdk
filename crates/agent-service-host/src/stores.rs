@@ -27,7 +27,9 @@ use anyhow::Result;
 
 use agent_server::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
 use agent_server::journal::event_notifier::EventNotifier;
-use agent_server::journal::event_repository::{EventRepository, InMemoryEventRepository};
+use agent_server::journal::event_repository::{
+    EventRepository, InMemoryEventRepository, PurgeFencedEventRepository,
+};
 use agent_server::journal::execution_intent::{ExecutionIntentStore, InMemoryExecutionIntentStore};
 use agent_server::journal::message_store::{
     InMemoryMessageProjectionStore, MessageProjectionStore,
@@ -585,6 +587,10 @@ impl StoreRegistry {
                 attempt_store: attempt_store.clone(),
                 checkpoint_store: checkpoint_store.clone(),
             });
+        let event_repo: Arc<dyn EventRepository> = Arc::new(PurgeFencedEventRepository::new(
+            event_repo,
+            thread_store.clone(),
+        ));
         Self {
             task_store: Arc::new(task_store),
             thread_store,

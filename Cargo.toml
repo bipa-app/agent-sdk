@@ -79,7 +79,7 @@ thiserror = { version = "2.0.21", default-features = false, features = ["std"] }
 # No `perf`: short patterns, never over large haystacks.
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
 glob = { version = "0.3.4", default-features = false }
-uuid = { version = "1.26.1", default-features = false, features = ["std", "v4", "v7", "serde"] }
+uuid = { version = "1.26.1", default-features = false, features = ["std", "v4", "v5", "v7", "serde"] }
 time = { version = "0.3.55", default-features = false, features = ["serde", "std", "formatting", "parsing"] }
 # No TLS backend: the `tls-native-tls` / `tls-rustls` features add one.
 # No `system-proxy`: it only reads OS-level settings; `HTTP_PROXY` still works.

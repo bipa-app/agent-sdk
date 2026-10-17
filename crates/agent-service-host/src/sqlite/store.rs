@@ -510,6 +510,7 @@ ON CONFLICT (thread_id) DO NOTHING
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
         let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -3520,6 +3521,9 @@ impl SqliteDurableStore {
                 if events.is_empty() {
                     return Ok(());
                 }
+                if let Some(stored) = Self::get_thread_tx(tx, &thread).await? {
+                    stored.require_active(ThreadOperation::Append)?;
+                }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;
                 let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
@@ -5667,6 +5671,9 @@ impl EventRepository for SqliteDurableStore {
     ) -> Result<Vec<CommittedEvent>> {
         ensure!(!events.is_empty(), "cannot commit an empty event batch");
         let mut tx = self.begin().await?;
+        if let Some(thread) = Self::get_thread_tx(&mut tx, thread_id).await? {
+            thread.require_active(ThreadOperation::Append)?;
+        }
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
         let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
         tx.commit().await.context("commit event batch insert")?;

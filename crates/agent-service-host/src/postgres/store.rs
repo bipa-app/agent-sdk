@@ -344,6 +344,10 @@ RETURNING thread_id
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        Self::lock_thread_tx(tx, thread_id)
+            .await?
+            .context("thread missing after compaction bootstrap")?
+            .require_active(ThreadOperation::Append)?;
         let projection = Self::lock_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -4089,13 +4093,16 @@ impl PostgresDurableStore {
                 guarded.push((index, task));
             }
         }
+        let mut appended = BTreeSet::new();
         for write in &transition.writes {
             match write {
                 Write::AppendEvents { thread, events } if !events.is_empty() => {
                     threads.insert(thread_key(thread).to_owned(), thread.clone());
+                    appended.insert(thread_key(thread).to_owned());
                 }
                 Write::AppendCompaction { thread, .. } => {
                     threads.insert(thread_key(thread).to_owned(), thread.clone());
+                    appended.insert(thread_key(thread).to_owned());
                 }
                 Write::AppendEvents { .. }
                 | Write::SettleTask { .. }
@@ -4105,8 +4112,15 @@ impl PostgresDurableStore {
                 | Write::RecordIntent(_) => {}
             }
         }
-        for thread in threads.values() {
-            Self::lock_thread_tx(tx, thread).await?;
+        for (key, thread) in &threads {
+            let locked = Self::lock_thread_tx(tx, thread).await?;
+            if appended.contains(key)
+                && let Some(locked) = locked
+            {
+                locked
+                    .require_active(ThreadOperation::Append)
+                    .map_err(anyhow::Error::new)?;
+            }
         }
         guarded.sort_by(|(_, a), (_, b)| task_lock_order(a).cmp(&task_lock_order(b)));
         let mut checked = vec![false; transition.guards.len()];
@@ -6678,6 +6692,9 @@ impl EventRepository for PostgresDurableStore {
 
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
+        if let Some(thread) = Self::lock_thread_tx(&mut tx, thread_id).await? {
+            thread.require_active(ThreadOperation::Append)?;
+        }
         let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
         tx.commit().await.context("commit event batch insert")?;
         Ok(committed)
