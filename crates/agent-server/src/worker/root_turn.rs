@@ -31,7 +31,7 @@
 //!   payload — enough for Phase 5 to resume.
 //!
 //! [`ContinuationEnvelope`]: agent_sdk_foundation::ContinuationEnvelope
-//! [`spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
+//! [`spawn_tool_children`]: crate::journal::SpawnChildrenExt::spawn_tool_children
 //! [`TaskState::WaitingOnChildren`]: crate::journal::task_state::TaskState::WaitingOnChildren
 
 #[cfg(test)]
@@ -63,6 +63,7 @@ use super::definition::{
     AgentDefinition, ChildJoinPolicy, ThinkingPolicy, ToolInputPreflightContext,
     ToolInputPreflightOutcome, ToolInputSanitizer,
 };
+use crate::journal::SpawnChildrenExt;
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
 use crate::journal::commit::{
@@ -6030,7 +6031,7 @@ async fn spawn_suspended_tool_children(
 ///    pending tool calls, and LLM response metadata.
 /// 3. Creates one [`ChildSpawnSpec`] per tool call.
 /// 4. Atomically spawns children and parks the parent via
-///    [`AgentTaskStore::spawn_tool_children`].
+///    [`SpawnChildrenExt::spawn_tool_children`].
 ///
 /// No checkpoint or message-projection write occurs on this path.
 ///
@@ -6272,7 +6273,7 @@ async fn spawn_single_subagent_invocation(
 /// per entry); the worker helper
 /// [`super::subagent::spawn_subagent_batch_invocations`] then issues
 /// a single store call against
-/// [`AgentTaskStore::spawn_subagent_batch`](crate::journal::store::AgentTaskStore::spawn_subagent_batch).
+/// [`SpawnChildrenExt::spawn_subagent_batch`].
 async fn spawn_multi_subagent_invocations(
     inputs: &RootWorkerInputs,
     deps: &RootTurnDeps<'_>,
@@ -6648,7 +6649,7 @@ async fn spawn_mixed_routed_children(
 /// * [`BatchRouting::Mixed`](super::subagent_spawn_selector::BatchRouting::Mixed)
 ///   → [`spawn_mixed_batch_children`]
 /// * [`BatchRouting::AllTools`](super::subagent_spawn_selector::BatchRouting::AllTools)
-///   → [`AgentTaskStore::spawn_tool_children`](crate::journal::store::AgentTaskStore::spawn_tool_children)
+///   → [`SpawnChildrenExt::spawn_tool_children`]
 ///
 /// Returns the parked parent task plus the materialized child tasks,
 /// ordered by `spawn_index` so the batch reads back in the same order
@@ -8353,7 +8354,7 @@ fn build_resume_continuation(
 /// Children are mapped to their parent's
 /// [`AgentContinuation::pending_tool_calls`] via the positional
 /// [`AgentTask::spawn_index`] field set during
-/// [`AgentTaskStore::spawn_tool_children`]. The returned vector is
+/// [`SpawnChildrenExt::spawn_tool_children`]. The returned vector is
 /// ordered by `spawn_index` so tool-result messages appear in the
 /// same order the LLM emitted the tool-use blocks.
 ///
@@ -8366,7 +8367,6 @@ fn build_resume_continuation(
 /// - The parent has no children.
 ///
 /// [`AgentTaskStore::complete_task_with_result`]: crate::journal::store::AgentTaskStore::complete_task_with_result
-/// [`AgentTaskStore::spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
 pub async fn aggregate_child_outcomes(
     parent: &AgentTask,
     continuation: &AgentContinuation,

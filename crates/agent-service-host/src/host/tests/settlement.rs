@@ -13,6 +13,7 @@ use agent_sdk_foundation::{
     AgentContinuation, AgentState, ContinuationEnvelope, TerminalReason, ThreadId, TokenUsage, llm,
 };
 use agent_server::ChildJoinPolicy;
+use agent_server::journal::SpawnChildrenExt;
 use agent_server::journal::SubagentInvocationSpawn;
 use agent_server::journal::store::AgentTaskStore;
 use agent_server::journal::task::{

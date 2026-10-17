@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::journal::SpawnChildrenExt;
 use agent_sdk_foundation::audit::AuditProvenance;
 use agent_sdk_foundation::{
     AgentContinuation, AgentEvent, AgentState, ContinuationEnvelope, TerminalReason, ThreadId,

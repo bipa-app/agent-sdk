@@ -62,23 +62,18 @@ use agent_server::journal::sibling_order::{
 };
 use agent_server::journal::store::{
     AgentTaskStore, CancelScope, CancelTreeOutcome, ChildProbe, MixedChildrenSpawn,
-    QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SpawnedMixedChildren,
-    SubagentBatchSpawn, SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError,
-    SubmitRootTurnOutcome, SubmitRootTurnParams, ToolChildSpawn, apply_question_answer,
-    apply_question_pause, cancel_reason, has_precompleted_tool_child, is_owned_by,
-    live_mixed_child_count, mixed_child_ids_in_slot_order, new_mixed_tool_child,
-    publish_transactional_mixed_parent, release_undelivered_input, settles_undelivered_input,
-    submitted_task_disposition, validate_mixed_children_spawn,
-    validate_precompleted_boundary_events, validate_subagent_event_count,
-    validate_tool_child_specs_for_pure_spawn,
+    QuestionAnswerApplied, QuestionPause, ReattachedChild, RequeueOutcome, SubagentBatchSpawn,
+    SubagentInvocationSpawn, SubmitDisposition, SubmitRootTurnError, SubmitRootTurnOutcome,
+    SubmitRootTurnParams, ToolChildSpawn, apply_question_answer, apply_question_pause,
+    cancel_reason, has_precompleted_tool_child, is_owned_by, live_mixed_child_count,
+    mixed_child_ids_in_slot_order, new_mixed_tool_child, publish_transactional_mixed_parent,
+    release_undelivered_input, settles_undelivered_input, submitted_task_disposition,
 };
 use agent_server::journal::subagent_spawn_transaction::{
-    SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome, started_event_from_invocation,
-    subagent_started_event,
+    SubagentSpawnEvent, started_event_from_invocation, subagent_started_event,
 };
 use agent_server::journal::task::{
-    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskKind, TaskStatus,
-    WorkerId,
+    AgentTask, AgentTaskId, LeaseId, SuspensionPayload, TaskKind, TaskStatus, WorkerId,
 };
 use agent_server::journal::task_state::{SubagentInvocationState, TaskState};
 use agent_server::journal::thread::{
@@ -92,6 +87,9 @@ use agent_server::journal::thread_store::{
     creation_identity_key,
 };
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
+use agent_server::journal::transition::{
+    ChildSpawn, Lock, SpawnedChildren, SubagentSpawn, ThreadTier, ToolChildrenSpawn,
+};
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
 };
@@ -2670,147 +2668,23 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
 
     async fn insert_subagent_spawn_event_tx(
         tx: &mut Transaction<'_, Sqlite>,
-        params: SubagentSpawnCommit,
+        subagent: &SubagentSpawn,
         parent_task: &AgentTask,
-        invocation: &AgentTask,
-        child_root: &AgentTask,
+        (invocation, child_root): (&AgentTask, &AgentTask),
+        now: OffsetDateTime,
     ) -> Result<CommittedEvent> {
-        let event = subagent_started_event(params.event, &params.spawn, invocation, child_root);
+        let event = subagent_started_event(
+            subagent.event.clone(),
+            &subagent.spawn,
+            invocation,
+            child_root,
+        );
         let start_seq = Self::next_event_sequence_tx(tx, &parent_task.thread_id).await?;
-        let mut committed = Self::insert_events_tx(
-            tx,
-            &parent_task.thread_id,
-            vec![event],
-            start_seq,
-            params.now,
-        )
-        .await?;
-        Self::insert_thread_events_outbox_row_tx(
-            tx,
-            &committed,
-            params.outbox_max_attempts,
-            params.now,
-        )
-        .await?;
-        committed.pop().context("spawn event batch was empty")
-    }
-
-    async fn commit_subagent_spawn_atomic_inner(
-        &self,
-        params: SubagentSpawnCommit,
-    ) -> Result<SubagentSpawnOutcome> {
-        let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, &params.spawn.child_thread_id, params.now).await?;
-        let child_thread = Self::get_thread_tx(&mut tx, &params.spawn.child_thread_id)
-            .await?
-            .context("spawned child thread missing after bootstrap")?;
-        child_thread.require_active(ThreadOperation::Spawn)?;
-
-        let old_parent = Self::load_task_tx(&mut tx, &params.parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {} does not exist", params.parent_id))?;
-        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
+        let mut committed =
+            Self::insert_events_tx(tx, &parent_task.thread_id, vec![event], start_seq, now).await?;
+        Self::insert_thread_events_outbox_row_tx(tx, &committed, subagent.outbox_max_attempts, now)
             .await?;
-        validate_subagent_spawn_parent(
-            &old_parent,
-            &params.parent_id,
-            &params.worker,
-            &params.lease,
-        )?;
-
-        let child_thread_key = thread_key(&params.spawn.child_thread_id);
-        let existing_task = sqlx::query_scalar!(
-            "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1",
-            child_thread_key
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| {
-            format!(
-                "check existing tasks for child thread {}",
-                params.spawn.child_thread_id
-            )
-        })?
-        .flatten();
-        ensure!(
-            existing_task.is_none(),
-            "spawn rejected: child thread {} already has tasks",
-            params.spawn.child_thread_id,
-        );
-
-        let child_root = AgentTask::new_root_turn_with_optional_caller(
-            params.spawn.child_thread_id.clone(),
-            params.spawn.child_root_input.clone(),
-            params.spawn.child_caller_metadata.clone(),
-            params.now,
-            // Child roots are ROOT TURNS and take the root-turn budget —
-            // parity with the in-memory reference store, which spawns them
-            // with `RuntimePolicy::server_default().max_attempts` (== this
-            // constant, locked by a test). With `DEFAULT_MAX_ATTEMPTS` (1)
-            // a single expired lease — one heartbeat starved past the
-            // lease TTL under store contention — terminally killed a
-            // running worker tree (`lease_expired_budget_exhausted`).
-            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
-        );
-        ensure!(
-            Self::load_task_tx(&mut tx, &child_root.id).await?.is_none(),
-            "spawn rejected: child root id {} already exists",
-            child_root.id,
-        );
-        let invocation = AgentTask::new_subagent_invocation(
-            &old_parent,
-            SubagentInvocationState {
-                spec: params.spawn.spec.clone(),
-                child_thread_id: params.spawn.child_thread_id.clone(),
-                child_root_task_id: child_root.id.clone(),
-            },
-            params.spawn.spawn_index,
-            params.now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
-        )
-        .context("spawn rejected: new_subagent_invocation failed")?;
-        ensure!(
-            Self::load_task_tx(&mut tx, &invocation.id).await?.is_none(),
-            "spawn rejected: invocation id {} already exists",
-            invocation.id,
-        );
-
-        let parent_task = old_parent
-            .wait_on_children(
-                1,
-                params.spawn.payload.clone(),
-                vec![invocation.id.clone()],
-                params.now,
-            )
-            .context("spawn rejected: wait_on_children transition failed")?;
-        Self::update_task_tx(&mut tx, &parent_task).await?;
-        Self::insert_task_tx(&mut tx, &invocation).await?;
-        Self::insert_task_tx(&mut tx, &child_root).await?;
-        Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
-
-        agent_server::fail_point!("atomic_spawn.after_rows");
-
-        let spawn_now = params.now;
-        let committed_event = Self::insert_subagent_spawn_event_tx(
-            &mut tx,
-            params,
-            &parent_task,
-            &invocation,
-            &child_root,
-        )
-        .await?;
-        Self::insert_child_created_tx(&mut tx, &child_root.thread_id, spawn_now).await?;
-        tx.commit()
-            .await
-            .context("commit sqlite atomic subagent spawn")?;
-
-        Ok(SubagentSpawnOutcome {
-            parent_task,
-            invocation_task: invocation,
-            child_thread,
-            child_root_task: child_root,
-            committed_event,
-        })
+        committed.pop().context("spawn event batch was empty")
     }
 
     async fn commit_thread_creation_atomic_inner(
@@ -3260,8 +3134,8 @@ fn validate_subagent_spawn_parent(
 /// entry in a batch, validating cross-entry thread uniqueness and
 /// per-row availability inside the caller's transaction.
 ///
-/// Shared by [`AgentTaskStore::spawn_subagent_batch`] and
-/// [`AgentTaskStore::spawn_mixed_children`] so the two paths cannot
+/// Shared by [`SpawnChildrenExt::spawn_subagent_batch`](agent_server::journal::SpawnChildrenExt::spawn_subagent_batch) and
+/// [`SpawnChildrenExt::spawn_mixed_children`](agent_server::journal::SpawnChildrenExt::spawn_mixed_children) so the two paths cannot
 /// drift on invocation-row construction.
 ///
 /// Nothing is written here: the caller commits the rows only after the
@@ -3357,7 +3231,7 @@ async fn prepare_subagent_batch_rows_tx(
     Ok(prepared)
 }
 
-/// Shared by [`AgentTaskStore::spawn_mixed_children`]: builds the new
+/// Shared by [`SpawnChildrenExt::spawn_mixed_children`](agent_server::journal::SpawnChildrenExt::spawn_mixed_children): builds the new
 /// tool-runtime rows and resolves the re-attached survivors.
 ///
 /// Nothing is written here: the caller commits the rows only after the
@@ -3433,10 +3307,12 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut tx = self.begin().await?;
+        Self::check_declared_threads_tx(&mut tx, &transition, true, now).await?;
         for (index, guard) in transition.guards.iter().enumerate() {
             let stored = Self::load_task_tx(&mut tx, guard.task()).await?;
             guard.check(index, stored.as_ref())?;
         }
+        Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
         for write in transition.writes.iter().cloned() {
             Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed).await?;
@@ -3521,9 +3397,6 @@ impl SqliteDurableStore {
                 if events.is_empty() {
                     return Ok(());
                 }
-                if let Some(stored) = Self::get_thread_tx(tx, &thread).await? {
-                    stored.require_active(ThreadOperation::Append)?;
-                }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;
                 let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
@@ -3535,6 +3408,11 @@ impl SqliteDurableStore {
                 )
                 .await?;
                 committed.events.extend(batch);
+            }
+            Write::SpawnChildren { parent, spawn } => {
+                let spawned = Self::apply_spawn_tx(tx, transition, &parent, *spawn, now).await?;
+                committed.events.extend(spawned.events.iter().cloned());
+                committed.spawned.push(spawned);
             }
         }
         Ok(())
@@ -3595,15 +3473,380 @@ impl SqliteDurableStore {
     }
 }
 
-#[async_trait]
-impl AgentTaskStore for SqliteDurableStore {
-    async fn commit_subagent_spawn(
-        &self,
-        params: SubagentSpawnCommit,
-    ) -> Result<SubagentSpawnOutcome> {
-        self.commit_subagent_spawn_atomic_inner(params).await
+impl SqliteDurableStore {
+    /// Check the purge fences the transition declares for one side of its
+    /// guards, creating the thread rows it declares with `create` there.
+    /// Before the guards: a spawn's parent thread. After them: a spawn's
+    /// child threads, and every append's thread (see
+    /// [`agent_server::journal::Fence::after_guards`]). So a spawn checks
+    /// the parent's thread, the parent's lease, then each child thread, the
+    /// order the spawn methods used, and an append reports a stale lease
+    /// before a purge.
+    async fn check_declared_threads_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        transition: &agent_server::journal::Transition,
+        before_guards: bool,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let checked_now = |tier: ThreadTier, fence: Option<&agent_server::journal::Fence>| {
+            let after = fence.is_some_and(agent_server::journal::Fence::after_guards)
+                || tier == ThreadTier::Spawned;
+            after != before_guards
+        };
+        for lock in transition.locks() {
+            match lock {
+                Lock::Thread {
+                    thread,
+                    tier,
+                    fence,
+                    create,
+                } => {
+                    if !checked_now(tier, fence.as_ref()) {
+                        continue;
+                    }
+                    if create {
+                        Self::bootstrap_thread_row_tx(tx, &thread, now).await?;
+                    }
+                    if let Some(fence) = fence {
+                        let stored = Self::get_thread_tx(tx, &thread).await?;
+                        fence.check(&thread, stored.as_ref())?;
+                    }
+                }
+                Lock::ThreadOf {
+                    task,
+                    fence: Some(fence),
+                } => {
+                    if !checked_now(ThreadTier::Own, Some(&fence)) {
+                        continue;
+                    }
+                    if let Some(task) = Self::load_task_tx(tx, &task).await? {
+                        let stored = Self::get_thread_tx(tx, &task.thread_id).await?;
+                        fence.check(&task.thread_id, stored.as_ref())?;
+                    }
+                }
+                Lock::ThreadOf { fence: None, .. } | Lock::Task(_) => {}
+            }
+        }
+        Ok(())
     }
 
+    /// Apply a [`agent_server::journal::Write::SpawnChildren`]: the guard
+    /// held the parent running under its lease, and the purge fence was
+    /// checked before it.
+    async fn apply_spawn_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        transition: &agent_server::journal::Transition,
+        parent_id: &AgentTaskId,
+        spawn: ChildSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedChildren> {
+        let (worker, lease) = transition
+            .lease_for(parent_id)
+            .map(|(worker, lease)| (worker.clone(), lease.clone()))
+            .ok_or_else(|| anyhow!("spawning under {parent_id} needs a leased guard"))?;
+        let old_parent = Self::load_task_tx(tx, parent_id)
+            .await?
+            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
+        validate_subagent_spawn_parent(&old_parent, parent_id, &worker, &lease)?;
+        match spawn {
+            ChildSpawn::Tools(tools) => {
+                Self::spawn_tool_children_tx(tx, old_parent, tools, now).await
+            }
+            ChildSpawn::SubagentRows {
+                spawn,
+                delivered_injection_ids,
+            } => {
+                let batch = SubagentBatchSpawn {
+                    delivered_injection_ids,
+                    payload: spawn.payload.clone(),
+                    spawns: vec![spawn],
+                    events: Vec::new(),
+                };
+                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+            }
+            ChildSpawn::Subagent(subagent) => {
+                Self::spawn_subagent_tx(tx, old_parent, subagent, now).await
+            }
+            ChildSpawn::SubagentBatch(batch) => {
+                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+            }
+            ChildSpawn::Mixed { spawn, events } => {
+                Self::spawn_mixed_children_tx(tx, old_parent, spawn, events, now).await
+            }
+        }
+    }
+
+    async fn spawn_tool_children_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        old_parent: AgentTask,
+        ToolChildrenSpawn {
+            specs,
+            payload,
+            child_otel_traceparent,
+            delivered_injection_ids,
+        }: ToolChildrenSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedChildren> {
+        let waits = pure_spawn_waits(&specs)?;
+        let mut children = Vec::with_capacity(specs.len());
+        for (idx, spec) in specs.into_iter().enumerate() {
+            let mut child =
+                AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts)
+                    .context("spawn rejected: new_child failed")?;
+            child.spawn_index =
+                Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
+            child.otel_traceparent.clone_from(&child_otel_traceparent);
+            let existing = Self::load_task_tx(tx, &child.id).await?;
+            if existing.is_some() || children.iter().any(|e: &AgentTask| e.id == child.id) {
+                return Err(anyhow!(
+                    "spawn rejected: child id {} already exists",
+                    child.id
+                ));
+            }
+            children.push(child);
+        }
+        hold_tool_children_behind_siblings(&mut children, &[], &waits)?;
+        let child_count = u32::try_from(children.len())
+            .context("spawn rejected: child count exceeds u32::MAX")?;
+        let child_ids = children.iter().map(|c| c.id.clone()).collect();
+        let new_parent = old_parent
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(tx, &new_parent).await?;
+        for child in &children {
+            Self::insert_task_tx(tx, child).await?;
+        }
+        Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
+        Ok(SpawnedChildren {
+            parent: new_parent,
+            subagents: Vec::new(),
+            tool_children: children,
+            child_threads: Vec::new(),
+            events: Vec::new(),
+        })
+    }
+
+    async fn spawn_subagent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        old_parent: AgentTask,
+        subagent: SubagentSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedChildren> {
+        let child_thread_id = subagent.spawn.child_thread_id.clone();
+        let child_thread = Self::get_thread_tx(tx, &child_thread_id)
+            .await?
+            .context("spawned child thread missing after bootstrap")?;
+        let child_thread_key = thread_key(&child_thread_id);
+        let existing_task = sqlx::query_scalar!(
+            "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1",
+            child_thread_key
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?
+        .flatten();
+        ensure!(
+            existing_task.is_none(),
+            "spawn rejected: child thread {child_thread_id} already has tasks",
+        );
+
+        let child_root = AgentTask::new_root_turn_with_optional_caller(
+            child_thread_id.clone(),
+            subagent.spawn.child_root_input.clone(),
+            subagent.spawn.child_caller_metadata.clone(),
+            now,
+            // Child roots are ROOT TURNS and take the root-turn budget —
+            // parity with the in-memory reference store, which spawns them
+            // with `RuntimePolicy::server_default().max_attempts` (== this
+            // constant, locked by a test). With `DEFAULT_MAX_ATTEMPTS` (1)
+            // a single expired lease — one heartbeat starved past the
+            // lease TTL under store contention — terminally killed a
+            // running worker tree (`lease_expired_budget_exhausted`).
+            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
+        );
+        ensure!(
+            Self::load_task_tx(tx, &child_root.id).await?.is_none(),
+            "spawn rejected: child root id {} already exists",
+            child_root.id,
+        );
+        let invocation = AgentTask::new_subagent_invocation(
+            &old_parent,
+            SubagentInvocationState {
+                spec: subagent.spawn.spec.clone(),
+                child_thread_id: child_thread_id.clone(),
+                child_root_task_id: child_root.id.clone(),
+            },
+            subagent.spawn.spawn_index,
+            now,
+            AgentTask::DEFAULT_MAX_ATTEMPTS,
+        )
+        .context("spawn rejected: new_subagent_invocation failed")?;
+        ensure!(
+            Self::load_task_tx(tx, &invocation.id).await?.is_none(),
+            "spawn rejected: invocation id {} already exists",
+            invocation.id,
+        );
+
+        let parent_task = old_parent
+            .wait_on_children(
+                1,
+                subagent.spawn.payload.clone(),
+                vec![invocation.id.clone()],
+                now,
+            )
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(tx, &parent_task).await?;
+        Self::insert_task_tx(tx, &invocation).await?;
+        Self::insert_task_tx(tx, &child_root).await?;
+        Self::complete_injections_tx(tx, &subagent.delivered_injection_ids, now).await?;
+
+        agent_server::fail_point!("atomic_spawn.after_rows");
+
+        let committed_event = Self::insert_subagent_spawn_event_tx(
+            tx,
+            &subagent,
+            &parent_task,
+            (&invocation, &child_root),
+            now,
+        )
+        .await?;
+        Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+        Ok(SpawnedChildren {
+            parent: parent_task,
+            subagents: vec![(invocation, child_root)],
+            tool_children: Vec::new(),
+            child_threads: vec![child_thread],
+            events: vec![committed_event],
+        })
+    }
+
+    async fn spawn_subagent_batch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        old_parent: AgentTask,
+        SubagentBatchSpawn {
+            delivered_injection_ids,
+            spawns,
+            payload,
+            events,
+        }: SubagentBatchSpawn,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedChildren> {
+        // Build (invocation, child_root) per entry, validating against
+        // existing rows under the same transaction so the whole batch
+        // is rejected atomically if any single entry would conflict.
+        let prepared = prepare_subagent_batch_rows_tx(tx, &old_parent, spawns, now).await?;
+        let child_ids: Vec<AgentTaskId> = prepared
+            .iter()
+            .map(|(invocation, _)| invocation.id.clone())
+            .collect();
+        let child_count =
+            u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;
+        let new_parent = old_parent
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        Self::update_task_tx(tx, &new_parent).await?;
+        for (invocation, child_root) in &prepared {
+            Self::insert_task_tx(tx, invocation).await?;
+            Self::insert_task_tx(tx, child_root).await?;
+        }
+        let committed = if events.is_empty() {
+            Vec::new()
+        } else {
+            agent_server::fail_point!("atomic_spawn_batch.after_rows");
+            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
+                .await?
+        };
+        Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
+        Ok(SpawnedChildren {
+            parent: new_parent,
+            subagents: prepared,
+            tool_children: Vec::new(),
+            child_threads: Vec::new(),
+            events: committed,
+        })
+    }
+
+    async fn spawn_mixed_children_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        old_parent: AgentTask,
+        spawn: MixedChildrenSpawn,
+        events: Vec<SubagentSpawnEvent>,
+        now: OffsetDateTime,
+    ) -> Result<SpawnedChildren> {
+        let MixedChildrenSpawn {
+            delivered_injection_ids,
+            boundary_events,
+            trailing_events,
+            subagents,
+            tool_children,
+            reattach,
+            payload,
+            child_otel_traceparent,
+        } = spawn;
+        let has_precompleted = has_precompleted_tool_child(&tool_children);
+        let parent_id = old_parent.id.clone();
+
+        let prepared = prepare_subagent_batch_rows_tx(tx, &old_parent, subagents, now).await?;
+        let (tool_rows, reattached_rows) = prepare_mixed_tool_and_reattach_rows_tx(
+            tx,
+            &old_parent,
+            &parent_id,
+            &tool_children,
+            reattach,
+            child_otel_traceparent.as_deref(),
+            now,
+        )
+        .await?;
+        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
+        let child_count =
+            u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
+        let live_children = live_mixed_child_count(&prepared, &tool_rows, &reattached_rows)?;
+        let waiting_parent = old_parent
+            .wait_on_children(child_count, payload, child_ids, now)
+            .context("spawn rejected: wait_on_children transition failed")?;
+        let new_parent = publish_transactional_mixed_parent(
+            waiting_parent,
+            has_precompleted,
+            live_children,
+            now,
+        )?;
+
+        Self::update_task_tx(tx, &new_parent).await?;
+        for (invocation, child_root) in &prepared {
+            Self::insert_task_tx(tx, invocation).await?;
+            Self::insert_task_tx(tx, child_root).await?;
+        }
+        for child in &tool_rows {
+            Self::insert_task_tx(tx, child).await?;
+        }
+        for child in &reattached_rows {
+            Self::update_task_tx(tx, child).await?;
+        }
+
+        agent_server::fail_point!("atomic_spawn_batch.after_rows");
+
+        let mut committed =
+            Self::commit_parent_events_tx(tx, &new_parent.thread_id, boundary_events, now).await?;
+        committed.extend(
+            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
+                .await?,
+        );
+        committed.extend(
+            Self::commit_parent_events_tx(tx, &new_parent.thread_id, trailing_events, now).await?,
+        );
+        Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
+        Ok(SpawnedChildren {
+            parent: new_parent,
+            subagents: prepared,
+            tool_children: tool_rows,
+            child_threads: Vec::new(),
+            events: committed,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentTaskStore for SqliteDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
         self.commit_completed_turn_atomic_inner(params).await
     }
@@ -4541,338 +4784,6 @@ impl AgentTaskStore for SqliteDurableStore {
         Self::update_task_tx(&mut tx, &answered).await?;
         tx.commit().await.context("commit answer_question")?;
         Ok(answered)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_tool_children(
-        &self,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-        specs: Vec<ChildSpawnSpec>,
-        payload: SuspensionPayload,
-        child_otel_traceparent: Option<String>,
-        delivered_injection_ids: Vec<AgentTaskId>,
-        now: OffsetDateTime,
-    ) -> Result<(AgentTask, Vec<AgentTask>)> {
-        validate_tool_child_specs_for_pure_spawn(&specs)?;
-        let waits = pure_spawn_waits(&specs)?;
-        let mut tx = self.begin().await?;
-        let old_parent = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
-            .await?;
-        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
-
-        let mut children = Vec::with_capacity(specs.len());
-        for (idx, spec) in specs.into_iter().enumerate() {
-            let mut child =
-                AgentTask::new_child(&old_parent, TaskKind::ToolRuntime, now, spec.max_attempts)
-                    .context("spawn rejected: new_child failed")?;
-            child.spawn_index =
-                Some(u32::try_from(idx).context("spawn rejected: batch index exceeds u32::MAX")?);
-            child.otel_traceparent.clone_from(&child_otel_traceparent);
-
-            let existing = Self::load_task_tx(&mut tx, &child.id).await?;
-            if existing.is_some() || children.iter().any(|e: &AgentTask| e.id == child.id) {
-                return Err(anyhow!(
-                    "spawn rejected: child id {} already exists",
-                    child.id
-                ));
-            }
-            children.push(child);
-        }
-        hold_tool_children_behind_siblings(&mut children, &[], &waits)?;
-
-        let child_count = u32::try_from(children.len())
-            .context("spawn rejected: child count exceeds u32::MAX")?;
-        let child_ids = children.iter().map(|c| c.id.clone()).collect();
-        let new_parent = old_parent
-            .clone()
-            .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
-        Self::update_task_tx(&mut tx, &new_parent).await?;
-        for child in &children {
-            Self::insert_task_tx(&mut tx, child).await?;
-        }
-        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
-        tx.commit().await.context("commit spawn_tool_children")?;
-        Ok((new_parent, children))
-    }
-
-    async fn spawn_subagent_invocation(
-        &self,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-        spawn: SubagentInvocationSpawn,
-        delivered_injection_ids: Vec<AgentTaskId>,
-        now: OffsetDateTime,
-    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
-        let mut tx = self.begin().await?;
-        let SubagentInvocationSpawn {
-            child_thread_id,
-            spec,
-            child_root_input,
-            payload,
-            spawn_index,
-            child_caller_metadata,
-        } = spawn;
-
-        let old_parent = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
-            .await?;
-        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
-
-        Self::require_active_thread_tx(&mut tx, &child_thread_id, ThreadOperation::Spawn).await?;
-        let child_thread_key = thread_key(&child_thread_id);
-        let existing_task = sqlx::query_scalar!(
-            "SELECT id FROM agent_sdk_tasks WHERE thread_id = ?1 LIMIT 1",
-            child_thread_key
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .with_context(|| format!("check existing tasks for child thread {child_thread_id}"))?
-        .flatten();
-        if existing_task.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child thread {child_thread_id} already has tasks"
-            ));
-        }
-
-        let child_root = AgentTask::new_root_turn_with_optional_caller(
-            child_thread_id.clone(),
-            child_root_input,
-            child_caller_metadata,
-            now,
-            // Root-turn budget: see `spawn_subagent_batch_tx`'s child root.
-            AgentTask::DEFAULT_ROOT_MAX_ATTEMPTS,
-        );
-        let existing = Self::load_task_tx(&mut tx, &child_root.id).await?;
-        if existing.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: child root id {} already exists",
-                child_root.id
-            ));
-        }
-
-        let invocation = AgentTask::new_subagent_invocation(
-            &old_parent,
-            SubagentInvocationState {
-                spec,
-                child_thread_id,
-                child_root_task_id: child_root.id.clone(),
-            },
-            spawn_index,
-            now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
-        )
-        .context("spawn rejected: new_subagent_invocation failed")?;
-        let existing = Self::load_task_tx(&mut tx, &invocation.id).await?;
-        if existing.is_some() {
-            return Err(anyhow!(
-                "spawn rejected: invocation id {} already exists",
-                invocation.id
-            ));
-        }
-
-        let new_parent = old_parent
-            .clone()
-            .wait_on_children(1, payload, vec![invocation.id.clone()], now)
-            .context("spawn rejected: wait_on_children transition failed")?;
-        Self::update_task_tx(&mut tx, &new_parent).await?;
-        Self::insert_task_tx(&mut tx, &invocation).await?;
-        Self::insert_task_tx(&mut tx, &child_root).await?;
-        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
-        tx.commit()
-            .await
-            .context("commit spawn_subagent_invocation")?;
-        Ok((new_parent, invocation, child_root))
-    }
-
-    async fn spawn_subagent_batch(
-        &self,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-        batch: SubagentBatchSpawn,
-        now: OffsetDateTime,
-    ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
-        let SubagentBatchSpawn {
-            delivered_injection_ids,
-            spawns,
-            payload,
-            events,
-        } = batch;
-        if spawns.is_empty() {
-            return Err(anyhow!("spawn rejected: spawns must be non-empty"));
-        }
-        if events.len() != spawns.len() {
-            return Err(anyhow!(
-                "spawn rejected: {} events for {} spawns",
-                events.len(),
-                spawns.len()
-            ));
-        }
-        let mut tx = self.begin().await?;
-
-        let old_parent = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
-            .await?;
-        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
-        for child_thread_id in spawns.iter().map(|spawn| &spawn.child_thread_id) {
-            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
-                .await?;
-        }
-
-        // Build (invocation, child_root) per entry, validating against
-        // existing rows under the same transaction so the whole batch
-        // is rejected atomically if any single entry would conflict.
-        let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, spawns, now).await?;
-        let child_ids: Vec<AgentTaskId> = prepared
-            .iter()
-            .map(|(invocation, _)| invocation.id.clone())
-            .collect();
-
-        let child_count =
-            u32::try_from(prepared.len()).context("spawn rejected: child count exceeds u32")?;
-        let new_parent = old_parent
-            .clone()
-            .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
-
-        Self::update_task_tx(&mut tx, &new_parent).await?;
-        for (invocation, child_root) in &prepared {
-            Self::insert_task_tx(&mut tx, invocation).await?;
-            Self::insert_task_tx(&mut tx, child_root).await?;
-        }
-
-        agent_server::fail_point!("atomic_spawn_batch.after_rows");
-
-        let committed = Self::insert_spawn_started_events_tx(
-            &mut tx,
-            &new_parent.thread_id,
-            &prepared,
-            events,
-            now,
-        )
-        .await?;
-        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
-        tx.commit().await.context("commit spawn_subagent_batch")?;
-        Ok((new_parent, prepared, committed))
-    }
-
-    async fn spawn_mixed_children(
-        &self,
-        parent_id: &AgentTaskId,
-        worker: &WorkerId,
-        lease: &LeaseId,
-        spawn: MixedChildrenSpawn,
-        events: Vec<SubagentSpawnEvent>,
-        now: OffsetDateTime,
-    ) -> Result<SpawnedMixedChildren> {
-        validate_mixed_children_spawn(&spawn)?;
-        validate_precompleted_boundary_events(&spawn)?;
-        let MixedChildrenSpawn {
-            delivered_injection_ids,
-            boundary_events,
-            trailing_events,
-            subagents,
-            tool_children,
-            reattach,
-            payload,
-            child_otel_traceparent,
-        } = spawn;
-        validate_subagent_event_count(events.len(), subagents.len())?;
-        let has_precompleted = has_precompleted_tool_child(&tool_children);
-
-        // `BEGIN IMMEDIATE` serializes writers, so the parent CAS, the
-        // per-entry child-thread checks, and every insert below land in
-        // one exclusive write window.
-        let mut tx = self.begin().await?;
-
-        let old_parent = Self::load_task_tx(&mut tx, parent_id)
-            .await?
-            .ok_or_else(|| anyhow!("spawn rejected: task {parent_id} does not exist"))?;
-        Self::require_active_thread_tx(&mut tx, &old_parent.thread_id, ThreadOperation::Spawn)
-            .await?;
-        validate_subagent_spawn_parent(&old_parent, parent_id, worker, lease)?;
-        for child_thread_id in subagents.iter().map(|spawn| &spawn.child_thread_id) {
-            Self::require_active_thread_tx(&mut tx, child_thread_id, ThreadOperation::Spawn)
-                .await?;
-        }
-
-        let prepared = prepare_subagent_batch_rows_tx(&mut tx, &old_parent, subagents, now).await?;
-
-        let (tool_rows, reattached_rows) = prepare_mixed_tool_and_reattach_rows_tx(
-            &mut tx,
-            &old_parent,
-            parent_id,
-            &tool_children,
-            reattach,
-            child_otel_traceparent.as_deref(),
-            now,
-        )
-        .await?;
-        let child_ids = mixed_child_ids_in_slot_order(&prepared, &tool_rows, &reattached_rows)?;
-        let child_count =
-            u32::try_from(child_ids.len()).context("spawn rejected: child count exceeds u32")?;
-        let live_children = live_mixed_child_count(&prepared, &tool_rows, &reattached_rows)?;
-        let waiting_parent = old_parent
-            .clone()
-            .wait_on_children(child_count, payload, child_ids, now)
-            .context("spawn rejected: wait_on_children transition failed")?;
-        let new_parent = publish_transactional_mixed_parent(
-            waiting_parent,
-            has_precompleted,
-            live_children,
-            now,
-        )?;
-
-        Self::update_task_tx(&mut tx, &new_parent).await?;
-        for (invocation, child_root) in &prepared {
-            Self::insert_task_tx(&mut tx, invocation).await?;
-            Self::insert_task_tx(&mut tx, child_root).await?;
-        }
-        for child in &tool_rows {
-            Self::insert_task_tx(&mut tx, child).await?;
-        }
-        for child in &reattached_rows {
-            Self::update_task_tx(&mut tx, child).await?;
-        }
-
-        agent_server::fail_point!("atomic_spawn_batch.after_rows");
-
-        let mut committed =
-            Self::commit_parent_events_tx(&mut tx, &new_parent.thread_id, boundary_events, now)
-                .await?;
-        committed.extend(
-            Self::insert_spawn_started_events_tx(
-                &mut tx,
-                &new_parent.thread_id,
-                &prepared,
-                events,
-                now,
-            )
-            .await?,
-        );
-        committed.extend(
-            Self::commit_parent_events_tx(&mut tx, &new_parent.thread_id, trailing_events, now)
-                .await?,
-        );
-        Self::complete_injections_tx(&mut tx, &delivered_injection_ids, now).await?;
-        tx.commit().await.context("commit spawn_mixed_children")?;
-        Ok(SpawnedMixedChildren {
-            committed_events: committed,
-            parent: new_parent,
-            subagents: prepared,
-            tool_children: tool_rows,
-        })
     }
 
     async fn find_subagent_invocation_for_child_root(

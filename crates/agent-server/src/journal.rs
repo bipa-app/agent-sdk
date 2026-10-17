@@ -147,7 +147,7 @@
 //! cancellation cascade, and fully journal-driven parent resume
 //! triggers on top:
 //!
-//! - [`AgentTaskStore::spawn_tool_children`] is the single atomic
+//! - [`SpawnChildrenExt::spawn_tool_children`] is the single atomic
 //!   entry point for creating tool-runtime child tasks. A successful
 //!   call CAS-checks the parent's lease, persists one fresh
 //!   [`TaskKind::ToolRuntime`] row per [`task::ChildSpawnSpec`],
@@ -599,6 +599,7 @@ mod replay_test;
 pub mod retention;
 pub mod retention_janitor;
 pub mod sibling_order;
+pub mod spawn_children;
 pub mod staged;
 pub mod store;
 pub mod subagent_spawn_transaction;
@@ -655,6 +656,7 @@ pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use retention_janitor::{
     JanitorCycleReport, RetentionJanitorDeps, RetentionPolicy, run_janitor_cycle,
 };
+pub use spawn_children::SpawnChildrenExt;
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{
     AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, ChildProbe, CompletedTurnSink,
@@ -693,7 +695,10 @@ pub use tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventId, ToolAuditEventKind,
     ToolAuditEventParams, ToolAuditEventStore,
 };
-pub use transition::{Committed, DurableStore, Guard, Rejected, Settle, Transition, Write};
+pub use transition::{
+    ChildSpawn, Committed, DurableStore, Fence, Guard, Lock, MissingThread, Rejected, Settle,
+    SpawnedChildren, SubagentSpawn, ThreadTier, ToolChildrenSpawn, Transition, Write,
+};
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,
     TurnAttemptSchemaError,

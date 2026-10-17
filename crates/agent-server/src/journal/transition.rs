@@ -19,7 +19,12 @@ use time::OffsetDateTime;
 use super::committed_event::CommittedEvent;
 use super::execution_intent::ExecutionIntent;
 use super::message::MessageProjection;
-use super::task::{AgentTask, AgentTaskId, LeaseId, SuspensionPayload, TaskStatus, WorkerId};
+use super::store::{MixedChildrenSpawn, SubagentBatchSpawn, SubagentInvocationSpawn};
+use super::subagent_spawn_transaction::SubagentSpawnEvent;
+use super::task::{
+    AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
+};
+use super::thread::{Thread, ThreadOperation};
 
 /// Guards and writes applied in one transaction.
 #[derive(Clone, Debug, Default)]
@@ -89,6 +94,306 @@ pub enum Write {
         thread: ThreadId,
         events: Vec<AgentEvent>,
     },
+    /// Park a running parent on new children: the child rows, the parent's
+    /// `Running` → `WaitingOnChildren` transition, the delivered injections'
+    /// completion and the events the spawn reports. Needs a
+    /// [`Guard::TaskIs`] that the parent is running under its lease.
+    SpawnChildren {
+        parent: AgentTaskId,
+        spawn: Box<ChildSpawn>,
+    },
+}
+
+/// What a [`Write::SpawnChildren`] spawns, one shape per spawn method of
+/// [`super::SpawnChildrenExt`].
+#[derive(Clone, Debug)]
+pub enum ChildSpawn {
+    /// Tool-runtime children, one per pending call in input order, with no
+    /// events.
+    Tools(ToolChildrenSpawn),
+    /// One subagent on a child thread the spawn creates, with its
+    /// `SubagentProgress` start event on the parent's thread and the
+    /// child's `ThreadCreated`.
+    Subagent(SubagentSpawn),
+    /// One subagent's rows on a child thread that already exists, with no
+    /// events.
+    SubagentRows {
+        spawn: SubagentInvocationSpawn,
+        delivered_injection_ids: Vec<AgentTaskId>,
+    },
+    /// Subagents on child threads that already exist, with one start event
+    /// each.
+    SubagentBatch(SubagentBatchSpawn),
+    /// Subagents, tool children and re-attached children under one
+    /// suspension, with the suspension's events.
+    Mixed {
+        spawn: MixedChildrenSpawn,
+        events: Vec<SubagentSpawnEvent>,
+    },
+}
+
+/// The tool children of a [`ChildSpawn::Tools`].
+#[derive(Clone, Debug)]
+pub struct ToolChildrenSpawn {
+    pub specs: Vec<ChildSpawnSpec>,
+    pub payload: SuspensionPayload,
+    pub child_otel_traceparent: Option<String>,
+    /// Boundary-injection rows this turn already delivered.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
+}
+
+/// The subagent of a [`ChildSpawn::Subagent`].
+#[derive(Clone, Debug)]
+pub struct SubagentSpawn {
+    pub spawn: SubagentInvocationSpawn,
+    pub event: SubagentSpawnEvent,
+    /// Boundary-injection rows this turn already delivered.
+    pub delivered_injection_ids: Vec<AgentTaskId>,
+    /// The attempts of the start event's outbox row.
+    pub outbox_max_attempts: u32,
+}
+
+impl ChildSpawn {
+    /// The child threads of the subagents this spawn creates, in input
+    /// order.
+    #[must_use]
+    pub fn child_threads(&self) -> Vec<&ThreadId> {
+        match self {
+            Self::Tools(_) => Vec::new(),
+            Self::Subagent(SubagentSpawn { spawn, .. }) | Self::SubagentRows { spawn, .. } => {
+                vec![&spawn.child_thread_id]
+            }
+            Self::SubagentBatch(batch) => batch
+                .spawns
+                .iter()
+                .map(|spawn| &spawn.child_thread_id)
+                .collect(),
+            Self::Mixed { spawn, .. } => spawn
+                .subagents
+                .iter()
+                .map(|spawn| &spawn.child_thread_id)
+                .collect(),
+        }
+    }
+
+    /// Whether the spawn creates its child thread rows rather than
+    /// requiring them to exist.
+    #[must_use]
+    pub const fn creates_child_threads(&self) -> bool {
+        match self {
+            Self::Subagent(_) => true,
+            Self::Tools(_)
+            | Self::SubagentRows { .. }
+            | Self::SubagentBatch(_)
+            | Self::Mixed { .. } => false,
+        }
+    }
+
+    /// Refuse a malformed spawn before any backend opens a transaction, so
+    /// bad input loses to no purge fence, lease check or row lock: an empty
+    /// batch, an event count that does not match the subagents, tool
+    /// specs the pure tool spawn cannot persist, and a mixed batch that
+    /// does not cover its pending calls or whose precompleted children lack
+    /// their boundary events. A re-attached child that is missing or not
+    /// the parent's is refused later, under its row lock.
+    ///
+    /// # Errors
+    /// The same `spawn rejected: …` error the spawn method returned for
+    /// that input before it became a wrapper.
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        use super::store::{
+            validate_mixed_children_spawn, validate_precompleted_boundary_events,
+            validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
+        };
+
+        match self {
+            Self::Tools(tools) => {
+                validate_tool_child_specs_for_pure_spawn(&tools.specs)?;
+                super::sibling_order::pure_spawn_waits(&tools.specs)?;
+            }
+            Self::Subagent(_) | Self::SubagentRows { .. } => {}
+            Self::SubagentBatch(batch) => {
+                anyhow::ensure!(
+                    !batch.spawns.is_empty(),
+                    "spawn rejected: spawns must be non-empty"
+                );
+                anyhow::ensure!(
+                    batch.events.len() == batch.spawns.len(),
+                    "spawn rejected: {} events for {} spawns",
+                    batch.events.len(),
+                    batch.spawns.len()
+                );
+            }
+            Self::Mixed { spawn, events } => {
+                validate_mixed_children_spawn(spawn)?;
+                validate_precompleted_boundary_events(spawn)?;
+                validate_subagent_event_count(events.len(), spawn.subagents.len())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The boundary-injection rows the spawn completes.
+    #[must_use]
+    pub fn delivered_injection_ids(&self) -> &[AgentTaskId] {
+        match self {
+            Self::Tools(tools) => &tools.delivered_injection_ids,
+            Self::Subagent(subagent) => &subagent.delivered_injection_ids,
+            Self::SubagentRows {
+                delivered_injection_ids,
+                ..
+            } => delivered_injection_ids,
+            Self::SubagentBatch(batch) => &batch.delivered_injection_ids,
+            Self::Mixed { spawn, .. } => &spawn.delivered_injection_ids,
+        }
+    }
+
+    /// The existing children the spawn re-attaches to its parent.
+    #[must_use]
+    pub fn reattached(&self) -> Vec<&AgentTaskId> {
+        match self {
+            Self::Mixed { spawn, .. } => spawn
+                .reattach
+                .iter()
+                .map(|attached| &attached.child_id)
+                .collect(),
+            Self::Tools(_)
+            | Self::Subagent(_)
+            | Self::SubagentRows { .. }
+            | Self::SubagentBatch(_) => Vec::new(),
+        }
+    }
+}
+
+/// The rows a [`Write::SpawnChildren`] wrote, as persisted.
+#[derive(Clone, Debug)]
+pub struct SpawnedChildren {
+    /// The parent, waiting on its children.
+    pub parent: AgentTask,
+    /// `(invocation, child_root)` per subagent, in input order.
+    pub subagents: Vec<(AgentTask, AgentTask)>,
+    /// The tool-runtime children, in input order.
+    pub tool_children: Vec<AgentTask>,
+    /// The child threads the spawn created ([`ChildSpawn::Subagent`]).
+    pub child_threads: Vec<Thread>,
+    /// The events the spawn committed on the parent's thread, in sequence
+    /// order. A child's `ThreadCreated` is written but not returned.
+    pub events: Vec<CommittedEvent>,
+}
+
+/// A row a transition locks before its first write (design §6.2, step 2).
+///
+/// A backend that takes row locks takes every thread lock, ordered by
+/// [`ThreadTier`] and then by thread key, and then every task lock, a child
+/// before its parent. A cancel locks the threads of a tree parent first,
+/// discovering each subagent's thread only by walking down to it, so a
+/// transition that also locks a parent's thread and its subagents' threads
+/// locks them in that same tree order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lock {
+    /// A thread row. With `fence`, the thread must allow its operation;
+    /// with `create`, the row is created when it does not exist.
+    Thread {
+        thread: ThreadId,
+        tier: ThreadTier,
+        fence: Option<Fence>,
+        create: bool,
+    },
+    /// The thread row of `task`, at [`ThreadTier::Own`]. With `fence`, the
+    /// thread must allow its operation.
+    ThreadOf {
+        task: AgentTaskId,
+        fence: Option<Fence>,
+    },
+    /// A task row.
+    Task(AgentTaskId),
+}
+
+/// The purge fence a thread lock checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fence {
+    /// The operation the thread's status must allow.
+    pub operation: ThreadOperation,
+    /// What a thread with no row means for the operation.
+    pub missing: MissingThread,
+}
+
+/// What a [`Fence`] does with a thread that has no row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingThread {
+    /// Refuse the transition with
+    /// [`ThreadNotFound`](super::thread::ThreadNotFound): a spawn needs its
+    /// threads to exist.
+    Refuse,
+    /// Let the transition through: thread rows are created lazily, and a
+    /// purge always leaves a `Deleted` row behind, so a missing row is never
+    /// a purged thread. Appends allow it.
+    Allow,
+}
+
+impl Fence {
+    /// An append's fence: a purged thread refuses it, a missing one does
+    /// not.
+    pub const APPEND: Self = Self {
+        operation: ThreadOperation::Append,
+        missing: MissingThread::Allow,
+    };
+    /// A spawn's fence: a purged or missing thread refuses it.
+    pub const SPAWN: Self = Self {
+        operation: ThreadOperation::Spawn,
+        missing: MissingThread::Refuse,
+    };
+
+    /// Whether a backend checks this fence after the transition's guards.
+    /// Every backend checks an append's fence after the guards, so a stale
+    /// lease is reported before a purge. A spawn's fence keeps the order
+    /// each backend's spawn methods checked it in before they became
+    /// wrappers (Postgres: before the guards; SQLite: the parent's before
+    /// and the children's after; in memory: before the write lock).
+    #[must_use]
+    pub const fn after_guards(&self) -> bool {
+        match self.operation {
+            ThreadOperation::Append => true,
+            ThreadOperation::Create
+            | ThreadOperation::Fork
+            | ThreadOperation::Submit
+            | ThreadOperation::Spawn
+            | ThreadOperation::Promote
+            | ThreadOperation::Acquire
+            | ThreadOperation::Commit => false,
+        }
+    }
+
+    /// Check `thread`, the row as locked (`None` when it has none).
+    ///
+    /// # Errors
+    /// [`ThreadNotFound`](super::thread::ThreadNotFound) for a missing row
+    /// under [`MissingThread::Refuse`], and the thread's
+    /// [`ThreadStateConflict`](super::thread::ThreadStateConflict) when its
+    /// status refuses the operation.
+    pub fn check(&self, thread_id: &ThreadId, thread: Option<&Thread>) -> anyhow::Result<()> {
+        match (thread, self.missing) {
+            (Some(thread), _) => thread
+                .require_active(self.operation)
+                .map_err(anyhow::Error::new),
+            (None, MissingThread::Allow) => Ok(()),
+            (None, MissingThread::Refuse) => {
+                Err(anyhow::Error::new(super::thread::ThreadNotFound {
+                    thread_id: thread_id.clone(),
+                }))
+            }
+        }
+    }
+}
+
+/// Where a thread lock falls in a transition's thread order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThreadTier {
+    /// The threads the transition's own rows live on.
+    Own,
+    /// The threads of the subagents it spawns, locked after every thread
+    /// of its own.
+    Spawned,
 }
 
 /// How [`Write::SettleTask`] ends a task.
@@ -119,7 +424,10 @@ pub struct Committed {
     pub reparked: Vec<AgentTask>,
     /// For each [`Write::AppendCompaction`]: the compacted projection.
     pub compacted: Vec<MessageProjection>,
-    /// Every event the transition appended, with its sequence.
+    /// For each [`Write::SpawnChildren`]: the rows it wrote.
+    pub spawned: Vec<SpawnedChildren>,
+    /// Every event the transition appended, with its sequence, except a
+    /// spawned child's `ThreadCreated`.
     pub events: Vec<CommittedEvent>,
 }
 
@@ -309,6 +617,38 @@ impl Transition {
         }
     }
 
+    /// Spawn `spawn` under a running, leased parent, one transaction.
+    #[must_use]
+    pub fn spawn_children(
+        parent: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        spawn: ChildSpawn,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task: parent.clone(),
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            }],
+            writes: vec![Write::SpawnChildren {
+                parent,
+                spawn: Box::new(spawn),
+            }],
+        }
+    }
+
+    /// The rows this transition locks before its first write: each
+    /// guard's task, then each write's rows (see [`Write::locks`]).
+    #[must_use]
+    pub fn locks(&self) -> Vec<Lock> {
+        self.guards
+            .iter()
+            .map(|guard| Lock::Task(guard.task().clone()))
+            .chain(self.writes.iter().flat_map(Write::locks))
+            .collect()
+    }
+
     /// Whether a guard holds `task` in `status`.
     #[must_use]
     pub fn guards_status(&self, task: &AgentTaskId, status: TaskStatus) -> bool {
@@ -335,12 +675,14 @@ impl Transition {
         })
     }
 
-    /// Whether any write appends at least one event.
+    /// Whether any [`Write::AppendEvents`] appends at least one event. A
+    /// [`Write::SpawnChildren`] carries its events in its own shape.
     #[must_use]
     pub fn appends_events(&self) -> bool {
         self.writes.iter().any(|write| match write {
             Write::AppendEvents { events, .. } => !events.is_empty(),
-            Write::SettleTask { .. }
+            Write::SpawnChildren { .. }
+            | Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
@@ -377,7 +719,8 @@ impl Transition {
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
-            | Write::RecordIntent(_) => None,
+            | Write::RecordIntent(_)
+            | Write::SpawnChildren { .. } => None,
         })
     }
 
@@ -427,12 +770,87 @@ impl Transition {
                         )));
                     }
                 }
+                Write::SpawnChildren { parent, spawn } => {
+                    if self.lease_for(parent).is_none()
+                        || !self.guards_status(parent, TaskStatus::Running)
+                    {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "spawning children under task {parent} needs a TaskIs guard that \
+                             it is running under its lease"
+                        )));
+                    }
+                    spawn.validate_shape()?;
+                }
                 Write::RecordIntent(_)
                 | Write::AppendEvents { .. }
                 | Write::AppendCompaction { .. } => {}
             }
         }
         Ok(())
+    }
+}
+
+impl Write {
+    /// The rows this write locks before the transition's first write, so a
+    /// backend takes them in its one sorted order rather than in write
+    /// order. A settle, pause or confirmation reject locks its task through
+    /// its guard, and the rows a settle reaches after it (the parent) come
+    /// later in the same order.
+    #[must_use]
+    pub fn locks(&self) -> Vec<Lock> {
+        match self {
+            Self::AppendEvents { thread, events } if !events.is_empty() => vec![Lock::Thread {
+                thread: thread.clone(),
+                tier: ThreadTier::Own,
+                fence: Some(Fence::APPEND),
+                create: false,
+            }],
+            Self::AppendCompaction { thread, .. } => vec![Lock::Thread {
+                thread: thread.clone(),
+                tier: ThreadTier::Own,
+                fence: Some(Fence::APPEND),
+                create: false,
+            }],
+            Self::ReparkAfterSteering { task, reattach, .. } => reattach
+                .iter()
+                .chain(std::iter::once(task))
+                .cloned()
+                .map(Lock::Task)
+                .collect(),
+            Self::SpawnChildren { parent, spawn } => {
+                let mut locks = vec![Lock::ThreadOf {
+                    task: parent.clone(),
+                    fence: Some(Fence::SPAWN),
+                }];
+                let create = spawn.creates_child_threads();
+                locks.extend(
+                    spawn
+                        .child_threads()
+                        .into_iter()
+                        .map(|thread| Lock::Thread {
+                            thread: thread.clone(),
+                            tier: ThreadTier::Spawned,
+                            fence: Some(Fence::SPAWN),
+                            create,
+                        }),
+                );
+                locks.extend(spawn.reattached().into_iter().cloned().map(Lock::Task));
+                locks.extend(
+                    spawn
+                        .delivered_injection_ids()
+                        .iter()
+                        .cloned()
+                        .map(Lock::Task),
+                );
+                locks.push(Lock::Task(parent.clone()));
+                locks
+            }
+            Self::AppendEvents { .. }
+            | Self::SettleTask { .. }
+            | Self::RejectConfirmation { .. }
+            | Self::PauseOnConfirmation { .. }
+            | Self::RecordIntent(_) => Vec::new(),
+        }
     }
 }
 

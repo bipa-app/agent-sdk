@@ -4615,6 +4615,7 @@ mod tests {
     use agent_sdk_providers::LlmProvider;
     #[cfg(feature = "postgres")]
     use agent_server::AgentTaskId;
+    use agent_server::journal::SpawnChildrenExt;
     use agent_server::journal::SubagentInvocationSpawn;
     use agent_server::journal::recovery::RecoveryRecord;
     use agent_server::journal::store::{AgentTaskStore, SubmitRootTurnOutcome};
@@ -6821,12 +6822,6 @@ mod tests {
 
     #[async_trait]
     impl AgentTaskStore for CountingTaskStore {
-        async fn commit_subagent_spawn(
-            &self,
-            params: agent_server::journal::SubagentSpawnCommit,
-        ) -> Result<agent_server::journal::SubagentSpawnOutcome> {
-            self.inner.commit_subagent_spawn(params).await
-        }
         async fn commit_completed_turn(
             &self,
             params: agent_server::journal::CompletedTurnCommit,
@@ -7044,79 +7039,6 @@ mod tests {
         ) -> Result<AgentTask> {
             self.inner
                 .answer_question(task_id, receipt_id, answers, now)
-                .await
-        }
-        async fn spawn_tool_children(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            specs: Vec<ChildSpawnSpec>,
-            payload: SuspensionPayload,
-            child_otel_traceparent: Option<String>,
-            delivered_injection_ids: Vec<AgentTaskId>,
-            now: OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<AgentTask>)> {
-            self.inner
-                .spawn_tool_children(
-                    parent_id,
-                    worker,
-                    lease,
-                    specs,
-                    payload,
-                    child_otel_traceparent,
-                    delivered_injection_ids,
-                    now,
-                )
-                .await
-        }
-        async fn spawn_subagent_invocation(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            spawn: SubagentInvocationSpawn,
-            delivered_injection_ids: Vec<AgentTaskId>,
-            now: OffsetDateTime,
-        ) -> Result<(AgentTask, AgentTask, AgentTask)> {
-            self.inner
-                .spawn_subagent_invocation(
-                    parent_id,
-                    worker,
-                    lease,
-                    spawn,
-                    delivered_injection_ids,
-                    now,
-                )
-                .await
-        }
-        async fn spawn_subagent_batch(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            batch: agent_server::journal::store::SubagentBatchSpawn,
-            now: OffsetDateTime,
-        ) -> Result<(
-            AgentTask,
-            Vec<(AgentTask, AgentTask)>,
-            Vec<agent_server::CommittedEvent>,
-        )> {
-            self.inner
-                .spawn_subagent_batch(parent_id, worker, lease, batch, now)
-                .await
-        }
-        async fn spawn_mixed_children(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            spawn: agent_server::journal::MixedChildrenSpawn,
-            events: Vec<agent_server::journal::subagent_spawn_transaction::SubagentSpawnEvent>,
-            now: OffsetDateTime,
-        ) -> Result<agent_server::journal::SpawnedMixedChildren> {
-            self.inner
-                .spawn_mixed_children(parent_id, worker, lease, spawn, events, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(

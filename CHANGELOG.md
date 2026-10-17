@@ -94,6 +94,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wires both. Fixtures that compact must wire them too.
   - `Transition::validate` refuses a guard on a re-parked task: its lock
     would come before the re-attached children's.
+- **Breaking: every spawn commits through `DurableStore::commit`.**
+  `spawn_tool_children`, `spawn_subagent_invocation`, `spawn_subagent_batch`,
+  `spawn_mixed_children` and `commit_subagent_spawn` are no longer
+  `AgentTaskStore` methods: they are provided by the new `SpawnChildrenExt`
+  (implemented for every task store; `use agent_server::journal::SpawnChildrenExt`)
+  as wrappers that commit one `Write::SpawnChildren { parent, spawn: ChildSpawn }`
+  under a `Guard::TaskIs` on the running parent. Their signatures, rows,
+  events and error text are unchanged. A store that wraps another must
+  delete its spawn forwards and add any spawn behaviour to its `commit`.
+  `Committed::spawned` returns each spawn's rows (`SpawnedChildren`).
+  - Transitions declare the rows they lock (`Transition::locks`,
+    `Write::locks`, `Lock`, `ThreadTier`). Postgres locks the declared
+    threads in tree order (the transition's own threads, then the threads
+    of the subagents it spawns, each by key), the order `cancel_tree`
+    takes them in, then the declared tasks children first, so a spawn's
+    re-attached children and delivered injections lock with the parent in
+    one order.
+  - A thread lock carries its purge fence (`Fence`: the operation, and a
+    `MissingThread` policy). An append's fence allows a thread with no row
+    (rows are created lazily, and a purge always leaves a `Deleted` row);
+    a spawn's refuses one with `ThreadNotFound`. Every backend checks an
+    append's fence after the guards, so a stale lease is reported before a
+    purge (Postgres checked it before them); a spawn's fence keeps the
+    order each backend's spawn methods used (Postgres: in the lock phase,
+    before the guards; SQLite: the parent's thread, the lease, then the
+    child threads; in memory: before the write lock).
+  - A malformed spawn (an empty batch, an event count that does not match
+    its subagents, tool specs the pure tool spawn refuses, a mixed batch
+    that does not cover its pending calls) is refused by
+    `Transition::validate`, before any fence, lease check or row lock. A
+    re-attached child that is missing or not the parent's is refused under
+    its row lock, after the parent's lease check. On SQLite a single
+    subagent spawn checks the parent's purge fence and lease before the
+    child thread's fence (it checked the child's first); on Postgres a
+    spawn whose parent's thread has no row fails with `ThreadNotFound`.
+  - Postgres spawns run inside `commit`'s retry loop: a spawn Postgres
+    aborts for a deadlock or a serialization failure is retried up to
+    three times, like every other transition.
+  - The in-memory `spawn_subagent_batch` commits its start events while it
+    holds the task store's write lock, so no reader sees the children
+    before their events.
 - **Breaking: a completed turn commits through a required store method,
   and the last committer traits are gone.** `AgentTaskStore::commit_completed_turn`
   has no default, and `journal::commit::commit_completed_turn(params, task_store)`
@@ -225,8 +266,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     periodic subagent progress onto a purged parent stops.
   - Still unfenced: the `MessageProjectionStore` writes other than
     `append_compaction` (`commit_messages`, `replace_history`,
-    `append_repair`, `set_draft`, `get_or_create`), and the in-memory
-    `MessageProjectionStore::append_compaction`.
+    `append_repair`, `set_draft`, `get_or_create`), the in-memory
+    `MessageProjectionStore::append_compaction`, and the lease-guarded
+    event writers `pause_on_question` and `requeue_owned_task`, which can
+    reach a purged thread only between `begin_purge` and its `cancel_tree`,
+    the window the `commit` fence covers.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).

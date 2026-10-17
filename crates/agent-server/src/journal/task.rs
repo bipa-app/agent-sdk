@@ -226,7 +226,7 @@ pub struct SuspensionPayload {
     pub child_join_policy: ChildJoinPolicy,
 }
 
-/// Input struct for [`super::store::AgentTaskStore::spawn_tool_children`].
+/// Input struct for [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children).
 ///
 /// Phase 2.6 adds the store-level entry point that atomically
 /// persists a batch of [`TaskKind::ToolRuntime`] children under a running
@@ -237,7 +237,7 @@ pub struct SuspensionPayload {
 /// already does.
 ///
 /// `precompleted_result` is reserved for host-supplied input preflight on
-/// [`super::store::AgentTaskStore::spawn_mixed_children`], whose transaction
+/// [`SpawnChildrenExt::spawn_mixed_children`](crate::journal::SpawnChildrenExt::spawn_mixed_children), whose transaction
 /// persists both the terminal child and its boundary event. The pure
 /// `spawn_tool_children` primitive rejects specs carrying this field.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -735,7 +735,7 @@ pub struct AgentTask {
 
     // ── spawn ordering (used by 5.1) ───────────────────────
     /// Positional index within a batch spawned by
-    /// [`super::store::AgentTaskStore::spawn_tool_children`].
+    /// [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children).
     ///
     /// `None` for root tasks and any child not created through a
     /// batch spawn. The bootstrap step in the tool-runtime worker

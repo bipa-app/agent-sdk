@@ -12,6 +12,7 @@ use super::root_turn::{
     resume_from_children, resume_from_question, resume_root_turn, revert_steering_wake,
     root_turn_cancelled_at, settle_attempt_after_lost_ownership, terminal_reason_for_root_error,
 };
+use crate::journal::SpawnChildrenExt;
 use crate::journal::checkpoint::CheckpointKind;
 use std::sync::Arc;
 
