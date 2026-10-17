@@ -618,3 +618,108 @@ async fn duration_helpers_record_in_seconds_and_milliseconds() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn effect_transitions_count_each_outcome_by_kind() -> Result<()> {
+    use agent_sdk_foundation::ToolReplay;
+    use agent_server::journal::effect::{
+        EffectIntent, EffectKey, EffectRun, EffectState, EffectSubject, run_effect,
+    };
+    use agent_server::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
+    use agent_server::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
+    use agent_server::journal::{DurableStore, Guard, Settle, Transition};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let _ = ServerMetrics::global();
+
+    let store = InMemoryAgentTaskStore::new();
+    let task = AgentTask::new_root_turn(ThreadId::from_string("effect-metrics"), t0(), 3);
+    store.submit_root_turn(task.clone()).await?;
+    let (worker, lease) = (WorkerId::new(), LeaseId::new());
+    store
+        .try_acquire_task(
+            &task.id,
+            worker.clone(),
+            lease.clone(),
+            t0() + time::Duration::hours(1),
+            t0(),
+        )
+        .await?
+        .context("acquire the owner")?;
+    let intent = |call: &str| EffectIntent {
+        key: EffectKey::tool(&task.id, call),
+        replay: ToolReplay::Unsafe,
+        owner: task.id.clone(),
+        thread: task.thread_id.clone(),
+        subject: EffectSubject::Tool {
+            call_id: call.into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        },
+        attempt: 1,
+    };
+    let leased = || Transition {
+        guards: vec![Guard::TaskIs {
+            task: task.id.clone(),
+            status: TaskStatus::Running,
+            lease: Some((worker.clone(), lease.clone())),
+        }],
+        writes: Vec::new(),
+    };
+    let run = |call: &'static str| {
+        run_effect(
+            &store,
+            intent(call),
+            leased(),
+            || async {},
+            |()| anyhow::Ok((Transition::default(), EffectState::Completed)),
+            t0(),
+        )
+    };
+
+    assert!(matches!(run("call_1").await?, EffectRun::Ran { .. }));
+    assert!(matches!(run("call_1").await?, EffectRun::Refused(_)));
+    let mut start_only = leased();
+    start_only.guards.push(Guard::EffectFree {
+        key: EffectKey::tool(&task.id, "call_2"),
+    });
+    start_only.writes.push(agent_server::journal::Write::Effect(
+        agent_server::journal::EffectWrite::Start(intent("call_2")),
+    ));
+    store.commit(start_only, t0()).await?;
+    store
+        .commit(
+            Transition::settle_only(
+                task.id.clone(),
+                worker,
+                lease,
+                Settle::Fail { error: "x".into() },
+            ),
+            t0(),
+        )
+        .await?;
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.effect.transitions");
+    for (outcome, expected) in [
+        ("started", 1),
+        ("completed", 1),
+        ("refused", 1),
+        ("abandoned", 1),
+    ] {
+        let seen: u64 = counts
+            .iter()
+            .filter(|(set, _)| {
+                matches_all(
+                    set,
+                    &[(attrs::EFFECT_KIND, "tool_call"), (attrs::OUTCOME, outcome)],
+                )
+            })
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(seen, expected, "outcome {outcome}: {counts:?}");
+    }
+    Ok(())
+}

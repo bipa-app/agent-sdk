@@ -2135,7 +2135,7 @@ WHERE id = $1
         task: &AgentTask,
     ) -> Result<()> {
         let columns = EffectState::Abandoned.columns();
-        sqlx::query!(
+        let abandoned = sqlx::query!(
             r"
 UPDATE agent_sdk_execution_intents
 SET status     = $1,
@@ -2144,6 +2144,7 @@ SET status     = $1,
     updated_at = $4
 WHERE child_task_id = $5
   AND status IN ('pending', 'started')
+RETURNING effect_kind
 ",
             columns.status,
             columns.error,
@@ -2151,9 +2152,23 @@ WHERE child_task_id = $5
             task.updated_at,
             task.id.as_str(),
         )
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
         .with_context(|| format!("abandon the started effects of task {}", task.id))?;
+        if !abandoned.is_empty() {
+            tracing::info!(
+                task_id = %task.id,
+                abandoned = abandoned.len(),
+                "a task became terminal with started effects; they are abandoned, never run again"
+            );
+        }
+        #[cfg(feature = "otel")]
+        for row in &abandoned {
+            if let Some(kind) = agent_server::journal::effect::kind_from_wire(&row.effect_kind) {
+                agent_server::observability::ServerMetrics::global()
+                    .record_effect(kind, "abandoned");
+            }
+        }
         Ok(())
     }
 

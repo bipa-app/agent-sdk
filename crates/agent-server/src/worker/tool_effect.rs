@@ -186,9 +186,19 @@ async fn interrupt_unsafe_replay(
             }),
         );
     }
-    commit_failed_settle(task_store, transition, error_msg, now)
+    let outcome = commit_failed_settle(task_store, transition, error_msg, now)
         .await
-        .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))
+        .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
+    if prior.state.is_started() {
+        crate::journal::effect::record_effect(prior.kind(), "interrupted");
+    }
+    log::info!(
+        effect_key = prior.key.as_str(),
+        task_id = bootstrap.task_id.as_str(),
+        prior_state = status_words(&prior.state);
+        "an unsafe tool call that already started was settled as interrupted, not run again"
+    );
+    Ok(outcome)
 }
 
 const fn status_words(state: &EffectState) -> &'static str {

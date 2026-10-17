@@ -4048,6 +4048,7 @@ impl Inner {
             {
                 record.state = super::effect::EffectState::Abandoned;
                 record.updated_at = task.updated_at;
+                super::effect::record_effect(record.kind(), "abandoned");
             }
         }
         self.by_id.insert(id, task);

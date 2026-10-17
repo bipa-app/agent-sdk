@@ -196,6 +196,7 @@ inventory covers the whole observability surface.
 | `agent_server.wakeup.fallback_sweep` | Counter | (none) | `[agent-server]` | B4 |
 | `agent_server.thread_events_watch.lag_ms` | Histogram (ms) | `watch.kind` | `[agent-server]` | B4 |
 | `agent_server.tool_audit.outcome` | Counter | `tool.tier`, `audit.outcome` | `[agent-server]` | B4 |
+| `agent_server.effect.transitions` | Counter | `effect_kind`, `outcome` (`started`, `refused`, `completed`, `failed`, `interrupted`, `salvaged`, `abandoned`) | `[agent-server]` (abandons also from the SQL stores) | Phase 2 |
 
 ### 4.4 Agent-service-host metrics
 
