@@ -1085,6 +1085,18 @@ async fn worker_loop(params: WorkerLoopParams) {
     } = params;
     let worker_id = WorkerId::from_string(format!("worker-{index}"));
     info!(%worker_id, "worker started");
+    // Balances `agent_server.workers.active` on every exit of this loop.
+    #[cfg(feature = "otel")]
+    let _active = {
+        struct Active;
+        impl Drop for Active {
+            fn drop(&mut self) {
+                agent_server::observability::ServerMetrics::global().worker_stopped();
+            }
+        }
+        agent_server::observability::ServerMetrics::global().worker_started();
+        Active
+    };
 
     let mut ticker = tokio::time::interval(poll_interval);
     // Skip the immediate first tick.

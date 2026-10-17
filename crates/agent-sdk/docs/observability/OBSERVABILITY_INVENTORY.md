@@ -149,12 +149,12 @@ which work item resolves it, and where the fix lives.
 
 ---
 
-## 4. Metrics we owe (zero today)
+## 4. Metrics
 
-`grep`ing `crates/agent-sdk/src` for `opentelemetry::metrics`, `histogram(`,
-`counter(`, `meter(` returns no application instruments — the SDK emits **zero
-metrics** at the moment. Every row below is therefore both a new instrument
-and a new wiring site.
+The rows below were written as a wishlist when the SDK emitted no metrics.
+Most now exist; §6 records which ones a live daemon actually exports. The
+instruments are defined in `agent-sdk/src/observability/metrics.rs`,
+`agent-server/src/observability.rs` and `agent-service-host/src/observability.rs`.
 
 ### 4.1 GenAI client metrics (OTel-semconv mandatory)
 
@@ -250,6 +250,37 @@ reviewer can read this doc once and verify a change is complete by ticking
 off the rows tagged with that work item.
 
 ---
+
+## 6. Verified against a live daemon (2026-10-17)
+
+bip master ed8dea38 on agent-sdk eab97d1, sqlite backend, `--features otel`,
+exported through bip's `dev/observability/grafana` collector. The run covered
+claude-sonnet-5-5 turns with tool calls, a Bash confirmation (approve and deny),
+an explore subagent, a cancel, and a daemon SIGKILL plus restart. Prometheus
+names carry the collector's `agent_sdk_` namespace.
+
+| Status | Instruments |
+| --- | --- |
+| Arrives | `gen_ai.client.operation.duration`, `gen_ai.client.token.usage`, `agent_sdk.runs.outcome`, `agent_sdk.tools.execution.{count,duration}`, `agent_server.tasks.{acquired,execution.duration}`, `agent_server.journal.commit.duration`, `rpc.server.duration` |
+| Not on the daemon path | `agent_sdk.turns.duration`, `agent_sdk.subagent.invocations` (in-process agent loop only; the daemon runs turns through agent-server workers), `gen_ai.client.operation.time_to_first_chunk` / `time_per_output_chunk` (not recorded by the live provider path; bip records `bip.model.time_to_first_chunk`), `agent_server.thread_events_watch.lag_ms` (not reached in local mode) |
+| No production caller | `agent_server.journal.outbox_depth` (`register_outbox_depth_callback` is never called), `agent_server.tasks.lease_expired` (only the in-memory store calls `record_lease_expiry_outcomes`) |
+| Wired after the run | `agent_server.workers.active` (the host worker loop now calls `worker_started`/`worker_stopped`) |
+| Event-gated, not exercised | `agent_sdk.mcp.requests.duration`, `agent_sdk.context.compaction*`, `agent_sdk.llm.retries`, `agent_server.{relay.tick,wakeup.fallback_sweep,tool_audit.outcome}`, `db.pool.*` / `db.client.*` / `agent_service_host.amqp.*` (Postgres/AMQP only) |
+
+Other findings from the run:
+
+- `agent_server.tasks.execution.duration{kind="root"}` recorded only
+  `outcome="suspended"`. Six turns completed, and no `done` was recorded, so
+  the final root step finishes on a path that does not record it.
+- Nothing records boot recovery. After the SIGKILL the interrupted tool task
+  was failed and the root re-driven with no span, metric or log line. The
+  epoch PR (Phase 2) owns that signal.
+- Purge-fence refusals had no signal. #503 adds `agent_server.fence.refused{writer,thread_status}`
+  where a fenced write is refused. Refusals of the gRPC admission pre-checks
+  and the completed-turn commit are not counted yet.
+
+Signals the crash-safety phases owe (effects, epochs, documents, views) are
+tracked in the coordinator's phase-coordination notes, not here, until they land.
 
 ## Appendix A · Source-of-truth pointers
 
