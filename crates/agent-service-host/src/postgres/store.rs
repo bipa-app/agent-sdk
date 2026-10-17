@@ -99,6 +99,8 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
 use super::migrations::apply_durable_core_migrations;
 
+mod documents;
+
 /// `sqlx`-backed durable-core store.
 ///
 /// # Lock order
@@ -3949,6 +3951,26 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        #[cfg(feature = "otel")]
+        let (started, guard_count) = (std::time::Instant::now(), transition.guards.len());
+        let result = self.commit_transition(transition, now).await;
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_transition(
+            agent_server::observability::attrs::BACKEND_POSTGRES,
+            guard_count,
+            &result,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+}
+
+impl PostgresDurableStore {
+    async fn commit_transition(
+        &self,
+        transition: agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut attempt = 0;
         loop {
@@ -3958,6 +3980,11 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
                 {
                     attempt += 1;
                     self.lock_conflict_retries.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "otel")]
+                    agent_server::observability::ServerMetrics::global()
+                        .record_transition_lock_conflict_retry(
+                            agent_server::observability::attrs::BACKEND_POSTGRES,
+                        );
                     tracing::warn!(attempt, %error, "retrying a transition after a lock conflict");
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
@@ -4040,7 +4067,7 @@ impl PostgresDurableStore {
                         declare(ThreadTier::Own, &task.thread_id, *fence, false);
                     }
                 }
-                Lock::Task(_) => {}
+                Lock::Task(_) | Lock::Document(_) => {}
             }
         }
         let mut fenced_after_guards = Vec::new();
@@ -4062,7 +4089,7 @@ impl PostgresDurableStore {
             .iter()
             .filter_map(|lock| match lock {
                 Lock::Task(task) => read.get(task),
-                Lock::Thread { .. } | Lock::ThreadOf { .. } => None,
+                Lock::Thread { .. } | Lock::ThreadOf { .. } | Lock::Document(_) => None,
             })
             .collect();
         tasks.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
@@ -4119,9 +4146,24 @@ impl PostgresDurableStore {
         let mut tx = self.begin().await?;
         Self::lock_and_check_guards_tx(&mut tx, transition, now).await?;
         let mut committed = Committed::default();
-        for write in transition.writes.iter().cloned() {
-            Self::apply_write_tx(&mut tx, transition, write, now, &mut committed).await?;
+        let mut host_documents_locked = false;
+        for (index, write) in agent_server::journal::writes_in_apply_order(transition) {
+            if !host_documents_locked && matches!(write, agent_server::journal::Write::Document(_))
+            {
+                Self::lock_host_documents_tx(&mut tx, &transition.locks()).await?;
+                host_documents_locked = true;
+            }
+            Self::apply_write_tx(&mut tx, transition, write, now, &mut committed)
+                .await
+                .map_err(|error| {
+                    agent_server::journal::Rejected::from_write_error(
+                        error,
+                        transition.guards.len(),
+                        index,
+                    )
+                })?;
         }
+        agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
         Ok(committed)
     }
@@ -4218,6 +4260,10 @@ impl PostgresDurableStore {
                 let spawned = Self::apply_spawn_tx(tx, transition, &parent, *spawn, now).await?;
                 committed.events.extend(spawned.events.iter().cloned());
                 committed.spawned.push(spawned);
+            }
+            Write::Document(document) => {
+                let outcome = Self::apply_document_tx(tx, document, now).await?;
+                committed.documents.push(outcome);
             }
         }
         Ok(())
@@ -6073,6 +6119,7 @@ TRUNCATE TABLE
     agent_sdk_message_heads,
     agent_sdk_execution_intents,
     agent_sdk_tool_audit_events,
+    agent_sdk_documents,
     agent_sdk_tasks,
     agent_sdk_threads
 CASCADE
@@ -6209,6 +6256,8 @@ impl ThreadStore for PostgresDurableStore {
         }
         let deleted = old.finish_purge(receipt.clone());
         Self::upsert_thread_tx(&mut tx, &deleted).await?;
+        Self::retire_thread_documents_tx(&mut tx, thread_key(thread_id), deleted.updated_at)
+            .await?;
         tx.commit().await.context("commit finish thread purge")?;
         Ok(receipt.clone())
     }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_documents\n                           (scope_kind, scope_id, kind, doc_key, schema_version, revision,\n                            value_json, retired_at, updated_at)\n                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)\n                       ON CONFLICT (scope_kind, scope_id, kind, doc_key) DO UPDATE SET\n                           schema_version = excluded.schema_version,\n                           revision = excluded.revision,\n                           value_json = excluded.value_json,\n                           retired_at = NULL,\n                           updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "385f9e22030f528249517a5d74c011a2d1f76ecb49985ab1dd972fbd16b39e0a"
+}

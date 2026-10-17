@@ -26,6 +26,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 use agent_server::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpointStore};
+use agent_server::journal::document::DocumentStore;
 use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::{
     EventRepository, InMemoryEventRepository, PurgeFencedEventRepository,
@@ -74,7 +75,7 @@ pub struct StorageSurfaceStatus {
     pub note: &'static str,
 }
 
-const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
+const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 11] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "in_memory",
@@ -113,6 +114,12 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
+        backend: "in_memory",
+        persists_restart: false,
+        note: "all state is process-local",
+    },
+    StorageSurfaceStatus {
+        surface: "document_store",
         backend: "in_memory",
         persists_restart: false,
         note: "all state is process-local",
@@ -138,7 +145,7 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
 ];
 
 #[cfg(feature = "postgres")]
-const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
+const POSTGRES_SURFACES: [StorageSurfaceStatus; 11] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "postgres",
@@ -177,6 +184,12 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
+        backend: "postgres",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "document_store",
         backend: "postgres",
         persists_restart: true,
         note: "",
@@ -202,7 +215,7 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
 ];
 
 #[cfg(feature = "sqlite")]
-const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
+const SQLITE_SURFACES: [StorageSurfaceStatus; 11] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "sqlite",
@@ -241,6 +254,12 @@ const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
     },
     StorageSurfaceStatus {
         surface: "execution_intent_store",
+        backend: "sqlite",
+        persists_restart: true,
+        note: "",
+    },
+    StorageSurfaceStatus {
+        surface: "document_store",
         backend: "sqlite",
         persists_restart: true,
         note: "",
@@ -326,6 +345,9 @@ pub struct StoreRegistry {
     pub event_repo: Arc<dyn EventRepository>,
     /// Execution-intent records for fail-closed guard.
     pub execution_intent_store: Arc<dyn ExecutionIntentStore>,
+    /// Reads of the documents transitions write; the same store as
+    /// `task_store`, whose `commit` writes them.
+    pub document_store: Arc<dyn DocumentStore>,
     /// Tool audit events.
     pub tool_audit_store: Arc<dyn ToolAuditEventStore>,
     /// Transactional outbox for durable event relay.
@@ -591,8 +613,10 @@ impl StoreRegistry {
             event_repo,
             thread_store.clone(),
         ));
+        let task_store = Arc::new(task_store);
         Self {
-            task_store: Arc::new(task_store),
+            document_store: task_store.clone(),
+            task_store,
             thread_store,
             message_store,
             attempt_store,
@@ -627,6 +651,7 @@ impl StoreRegistry {
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
             execution_intent_store: durable_store.clone(),
+            document_store: durable_store.clone(),
             tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
@@ -659,6 +684,7 @@ impl StoreRegistry {
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
             execution_intent_store: durable_store.clone(),
+            document_store: durable_store.clone(),
             tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
@@ -884,6 +910,7 @@ mod tests {
         let _ckpt = &stores.checkpoint_store;
         let _event = &stores.event_repo;
         let _intent = &stores.execution_intent_store;
+        let _documents = &stores.document_store;
         let _audit = &stores.tool_audit_store;
         let _outbox = &stores.outbox_store;
         let _retention = &stores.retention_store;

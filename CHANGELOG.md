@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Crash-safety Phase 3: documents
+
+- **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
+  JSON document in the same transaction as the rest of its `Transition`
+  (design §6.4, `agent_server::journal::document`).
+  - A document has a scope (`DocScope::Host`, `Thread` or `Task`), an
+    owner-namespaced kind (`DocKind`, `<owner>.<name>`), a key, and the
+    owner's `schema_version`. agent-sdk never reads the value.
+  - Each write carries a `DocExpect` (`Any`, `Absent`, `Revision(n)`).
+    When it fails, the whole transition is rejected as
+    `Rejected::Guard { index }`, where `index` = number of guards + the
+    write's index, and nothing is written.
+  - A retire keeps the row, so the revision keeps rising across a retire
+    and a later put.
+- Breaking changes for code that matches these types exhaustively:
+  - `Committed.documents` reports each write's live revision.
+  - `Lock::Document` locks a host document by key.
+  - Every backend applies a transition's document writes after its other
+    writes, so a document row is the last row a transition locks, after a
+    settle's parent row too.
+  - Thread documents are locked through their thread row, and task
+    documents through their task's thread row and their task row. Both
+    obey the purge fence: no document can be written on a thread that is
+    being purged or was purged.
+  - A task document needs its task to exist.
+  - `Rejected::from_write_error` maps an apply-time `ExpectationFailed`
+    to that guard rejection.
+- `DocumentStore` (`get_document`, `list_documents`,
+  `list_documents_by_kind`) reads live documents. It is implemented by the
+  SQLite, Postgres and in-memory task stores, and exposed as
+  `StoreRegistry::document_store`.
+- `finish_purge` retires the purged thread's documents and its tasks'
+  documents in the same transaction.
+  - The in-memory store reads a purged thread's documents as retired.
+  - The fence keeps every later write away from them, so all three backends
+    give the same answers.
+  - In-memory caveat: it still cannot roll back a document if a later
+    non-document write fails at apply time. Documents are applied last,
+    which narrows this to a failing document write after an earlier one.
+- Behaviour every backend shares:
+  - a value holding a NUL character, in any string or object key, is
+    refused before the transaction opens, because Postgres `jsonb` cannot
+    store one;
+  - keys list in byte order;
+  - two racing first writes of a key under `Any` both commit, at revisions
+    1 and 2. Under `Absent` the loser is a guard rejection.
+- **Signals** (feature `otel`). Every store's `commit` records
+  `agent_server.journal.transition.duration`, by `backend` and `outcome`
+  (`committed`, `guard`, `expectation`, `store`), and
+  `agent_server.journal.documents.written`, by `backend`, `scope` and `op`.
+  Postgres counts its lock-conflict retries on
+  `agent_server.journal.transition.lock_conflict_retries`. Attribute values
+  are fixed names; no key or value of a document is recorded.
+- **Migration 0030** (Postgres and SQLite) adds `agent_sdk_documents`:
+  - primary key `(scope_kind, scope_id, kind, doc_key)`;
+  - on Postgres, the key columns declared `COLLATE "C"`;
+  - a scope CHECK that names no kinds (host ⇔ empty id), because SQLite
+    could not widen a kind list without a rebuild;
+  - the partial index `agent_sdk_documents_kind_idx` on live rows;
+  - no foreign key, so it takes no lock on any existing table.
+- **Locks.** Measured on Postgres 18 with 1M task rows and 100k threads, a
+  30 s read transaction open on `agent_sdk_tasks`, and a concurrent writer:
+  - `sqlx migrate` applied 0030 in 4.5 ms;
+  - it took `AccessExclusiveLock` only on the new table, its index, its
+    primary key and its TOAST relation;
+  - the writer's maximum statement latency was 34 ms (p50 29 ms).
+
+  SQLite on a 1M-task file: 1.9 ms.
+- **Rollback and rolling deploys:** an older build refuses to start against
+  a database with 0030 applied (`VersionMissing(30)`). To roll back,
+  run `DROP TABLE agent_sdk_documents; DELETE FROM _sqlx_migrations WHERE
+  version = 30;`, then start the older build.
+  - This removes every document. A host that wrote documents (bip) must
+    export them first.
+  - The rollback is valid whichever of 0027–0029 or 0035 are also applied.
+  - In a rolling deploy, an old binary never touches the table and runs
+    beside a new one.
+  - **Compile impact for downstream stores and decorators:** an exhaustive
+    match on `Write` or `Lock`, or a struct literal of `Committed` or
+    `StoreRegistry`, needs the new variants or fields. satoshi itself
+    writes no documents.
+
 ### Added
 
 - **Session view fold** (`agent_sdk_foundation::view`, re-exported as

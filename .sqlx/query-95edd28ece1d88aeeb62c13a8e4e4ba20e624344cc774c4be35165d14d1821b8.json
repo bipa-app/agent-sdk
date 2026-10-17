@@ -1,0 +1,115 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,\n                      updated_at\n               FROM agent_sdk_documents\n               WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4\n                 AND retired_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "scope_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "scope_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "scope_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "scope_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "doc_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "doc_key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "schema_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "schema_version"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "revision",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "value_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "value_json"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "95edd28ece1d88aeeb62c13a8e4e4ba20e624344cc774c4be35165d14d1821b8"
+}

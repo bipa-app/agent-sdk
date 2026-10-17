@@ -196,6 +196,9 @@ inventory covers the whole observability surface.
 | `agent_server.wakeup.fallback_sweep` | Counter | (none) | `[agent-server]` | B4 |
 | `agent_server.thread_events_watch.lag_ms` | Histogram (ms) | `watch.kind` | `[agent-server]` | B4 |
 | `agent_server.tool_audit.outcome` | Counter | `tool.tier`, `audit.outcome` | `[agent-server]` | B4 |
+| `agent_server.journal.transition.duration` | Histogram (s) | `backend` (`memory`/`sqlite`/`postgres`), `outcome` (`committed`/`guard`/`expectation`/`store`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
+| `agent_server.journal.transition.lock_conflict_retries` | Counter | `backend` | `[agent-service-host]` Postgres `commit` | crash-safety Phase 3 |
+| `agent_server.journal.documents.written` | Counter | `backend`, `scope` (`host`/`thread`/`task`), `op` (`put`/`retire`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
 
 ### 4.4 Agent-service-host metrics
 

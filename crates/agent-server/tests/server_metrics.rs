@@ -618,3 +618,65 @@ async fn duration_helpers_record_in_seconds_and_milliseconds() -> Result<()> {
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// transitions and documents, recorded by the store's commit
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_commit_records_its_outcome_and_its_documents() -> Result<()> {
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::{
+        DocExpect, DocKind, DocScope, DocumentKey, DocumentWrite, DurableStore, Transition, Write,
+    };
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new();
+    let key = DocumentKey::new(DocScope::Host, DocKind::new("test.note")?, "k");
+    let put = |expect| Transition {
+        guards: Vec::new(),
+        writes: vec![Write::Document(DocumentWrite::put(
+            key.clone(),
+            1,
+            expect,
+            serde_json::json!(1),
+        ))],
+    };
+    let now = OffsetDateTime::UNIX_EPOCH;
+    store
+        .commit(put(DocExpect::Absent), now)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let rejected = store.commit(put(DocExpect::Absent), now).await;
+    assert!(rejected.is_err(), "a second Absent put is rejected");
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let points = collect_histogram_attrs(&snapshots, "agent_server.journal.transition.duration");
+    for outcome in [attrs::OUTCOME_COMMITTED, attrs::OUTCOME_EXPECTATION] {
+        assert!(
+            points.iter().any(|p| matches_all(
+                p,
+                &[
+                    (attrs::BACKEND, attrs::BACKEND_MEMORY),
+                    (attrs::OUTCOME, outcome)
+                ]
+            )),
+            "a {outcome} transition is recorded: {points:?}"
+        );
+    }
+    let written = collect_u64_counter(&snapshots, "agent_server.journal.documents.written");
+    assert_eq!(written.len(), 1, "{written:?}");
+    let (labels, count) = &written[0];
+    assert_eq!(*count, 1);
+    assert!(matches_all(
+        labels,
+        &[
+            (attrs::BACKEND, attrs::BACKEND_MEMORY),
+            (attrs::SCOPE, "host"),
+            (attrs::OP, attrs::OP_PUT),
+        ]
+    ));
+    Ok(())
+}

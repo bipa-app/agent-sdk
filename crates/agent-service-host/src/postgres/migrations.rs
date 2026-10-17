@@ -136,11 +136,15 @@ const TASK_AFTER_SIBLINGS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0026_task_after_siblings.sql"
 ));
+const DOCUMENTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0030_documents.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 24] = [
+const MIGRATIONS: [PostgresMigration; 25] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -261,6 +265,11 @@ const MIGRATIONS: [PostgresMigration; 24] = [
         summary: "earlier batch siblings a pending tool child waits for",
         sql: TASK_AFTER_SIBLINGS_SQL,
     },
+    PostgresMigration {
+        version: "0030",
+        summary: "typed JSON documents written in the same transaction as their transition",
+        sql: DOCUMENTS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -304,6 +313,10 @@ pub(crate) const HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION: i64 = 23;
 /// pending tool child waits for.
 #[cfg(test)]
 pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
+
+/// Version of the migration that adds the document table.
+#[cfg(test)]
+pub(crate) const DOCUMENTS_MIGRATION_VERSION: i64 = 30;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]

@@ -10198,7 +10198,8 @@ mod tests {
                     | Write::RecordIntent(_)
                     | Write::AppendEvents { .. }
                     | Write::AppendCompaction { .. }
-                    | Write::SpawnChildren { .. } => {}
+                    | Write::SpawnChildren { .. }
+                    | Write::Document(_) => {}
                 }
             }
             self.inner.commit(transition, now).await

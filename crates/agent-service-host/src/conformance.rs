@@ -1541,6 +1541,478 @@ mod tests {
         Ok(())
     }
 
+    // ── documents ────────────────────────────────────────────────────
+
+    fn doc_kind(name: &str) -> Result<agent_server::journal::DocKind> {
+        agent_server::journal::DocKind::new(format!("conformance.{name}"))
+    }
+
+    fn thread_doc(thread: &ThreadId, name: &str) -> Result<agent_server::journal::DocumentKey> {
+        Ok(agent_server::journal::DocumentKey::new(
+            agent_server::journal::DocScope::Thread(thread.clone()),
+            doc_kind(name)?,
+            "",
+        ))
+    }
+
+    fn host_doc(key: &str) -> Result<agent_server::journal::DocumentKey> {
+        Ok(agent_server::journal::DocumentKey::new(
+            agent_server::journal::DocScope::Host,
+            doc_kind("host")?,
+            key,
+        ))
+    }
+
+    fn put_doc(
+        key: &agent_server::journal::DocumentKey,
+        expect: agent_server::journal::DocExpect,
+        value: serde_json::Value,
+    ) -> agent_server::journal::Write {
+        agent_server::journal::Write::Document(agent_server::journal::DocumentWrite::put(
+            key.clone(),
+            1,
+            expect,
+            value,
+        ))
+    }
+
+    fn doc_only(writes: Vec<agent_server::journal::Write>) -> agent_server::journal::Transition {
+        agent_server::journal::Transition {
+            guards: Vec::new(),
+            writes,
+        }
+    }
+
+    async fn doc_value(
+        documents: &dyn agent_server::journal::DocumentStore,
+        key: &agent_server::journal::DocumentKey,
+    ) -> Result<Option<(u64, serde_json::Value)>> {
+        Ok(documents
+            .get_document(key)
+            .await?
+            .map(|document| (document.revision, document.value)))
+    }
+
+    /// I1, I4 and the document CAS: a document commits or rolls back with
+    /// its transition's task and events; a failed guard or a failed
+    /// expectation writes nothing, including the writes before it in the
+    /// same transition (the in-memory store checks every expectation before
+    /// its first mutation); a retire reads as absent and keeps the
+    /// revision rising.
+    async fn test_document_transition_is_all_or_nothing(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::{DocExpect, Rejected};
+
+        let (child, worker, lease) = leased_tool_child(task_store, "conformance-document").await?;
+        let thread = child.thread_id.clone();
+        let context = thread_doc(&thread, "context")?;
+        let marker = host_doc("conformance-document")?;
+
+        let mut stale = settle_with_tool_call_end(&child, &worker, &LeaseId::new());
+        stale
+            .writes
+            .push(put_doc(&context, DocExpect::Absent, serde_json::json!(1)));
+        let rejected = task_store.commit(stale, t_plus(64)).await;
+        assert!(
+            matches!(rejected, Err(Rejected::Guard { index: 0, .. })),
+            "{rejected:?}"
+        );
+        assert_eq!(doc_value(documents, &context).await?, None);
+
+        let mut settle = settle_with_tool_call_end(&child, &worker, &lease);
+        settle.writes.insert(
+            0,
+            put_doc(&context, DocExpect::Absent, serde_json::json!({"turn": 1})),
+        );
+        settle.writes.push(put_doc(
+            &marker,
+            DocExpect::Absent,
+            serde_json::json!("done"),
+        ));
+        let committed = task_store
+            .commit(settle, t_plus(65))
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(committed.settled.len(), 1);
+        assert_eq!(committed.events.len(), 1);
+        let revisions: Vec<_> = committed
+            .documents
+            .iter()
+            .map(|outcome| outcome.revision)
+            .collect();
+        assert_eq!(revisions, vec![Some(1), Some(1)]);
+        assert_eq!(
+            doc_value(documents, &context).await?,
+            Some((1, serde_json::json!({"turn": 1})))
+        );
+        assert_eq!(
+            doc_value(documents, &marker).await?,
+            Some((1, serde_json::json!("done")))
+        );
+
+        task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    &context,
+                    DocExpect::Revision(1),
+                    serde_json::json!({"turn": 2}),
+                )]),
+                t_plus(66),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        for (expect, what) in [
+            (DocExpect::Revision(1), "a stale revision"),
+            (DocExpect::Absent, "absent over a live document"),
+        ] {
+            let rejected = task_store
+                .commit(
+                    doc_only(vec![put_doc(&context, expect, serde_json::json!("lost"))]),
+                    t_plus(67),
+                )
+                .await;
+            assert!(
+                matches!(rejected, Err(Rejected::Guard { index: 0, .. })),
+                "{what} is rejected at the write's index: {rejected:?}"
+            );
+        }
+        assert_eq!(
+            doc_value(documents, &context).await?,
+            Some((2, serde_json::json!({"turn": 2})))
+        );
+
+        test_document_last_expectation_writes_nothing(task_store, documents, events, &thread)
+            .await?;
+        test_document_retire_and_list(task_store, documents, &context).await
+    }
+
+    /// A transition whose last write's expectation fails leaves its earlier
+    /// document write and its events invisible: the in-memory store checks
+    /// every expectation before its first mutation.
+    async fn test_document_last_expectation_writes_nothing(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+        thread: &ThreadId,
+    ) -> Result<()> {
+        use agent_server::journal::{DocExpect, Rejected, Write};
+
+        let context = thread_doc(thread, "context")?;
+        let events_before = events.get_events(thread).await?.len();
+        let other = thread_doc(thread, "other")?;
+        let rejected = task_store
+            .commit(
+                doc_only(vec![
+                    put_doc(&other, DocExpect::Any, serde_json::json!("early")),
+                    Write::AppendEvents {
+                        thread: thread.clone(),
+                        events: vec![AgentEvent::text("doc-late", "late")],
+                    },
+                    put_doc(&context, DocExpect::Revision(99), serde_json::json!("late")),
+                ]),
+                t_plus(68),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(Rejected::Guard { index: 2, .. })),
+            "the last write's expectation names its index: {rejected:?}"
+        );
+        assert_eq!(
+            doc_value(documents, &other).await?,
+            None,
+            "an earlier document write of a rejected transition is not visible"
+        );
+        assert_eq!(events.get_events(thread).await?.len(), events_before);
+        Ok(())
+    }
+
+    /// A retire reads as absent and keeps the revision rising; host
+    /// documents list in key order, page by page. `context` is a live
+    /// document at revision 2.
+    async fn test_document_retire_and_list(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        context: &agent_server::journal::DocumentKey,
+    ) -> Result<()> {
+        use agent_server::journal::{DocExpect, Write};
+
+        let retired = task_store
+            .commit(
+                doc_only(vec![Write::Document(
+                    agent_server::journal::DocumentWrite::retire(
+                        (*context).clone(),
+                        DocExpect::Revision(2),
+                    ),
+                )]),
+                t_plus(69),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(retired.documents[0].revision, None);
+        assert_eq!(doc_value(documents, context).await?, None);
+        task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    context,
+                    DocExpect::Absent,
+                    serde_json::json!("again"),
+                )]),
+                t_plus(70),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            doc_value(documents, context).await?,
+            Some((4, serde_json::json!("again"))),
+            "a retired document is absent, and its revision keeps rising"
+        );
+
+        let kind = doc_kind("host")?;
+        for key in ["b", "a", "c"] {
+            task_store
+                .commit(
+                    doc_only(vec![put_doc(
+                        &host_doc(key)?,
+                        DocExpect::Any,
+                        serde_json::json!(key),
+                    )]),
+                    t_plus(71),
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        let first = documents.list_documents_by_kind(&kind, None, 2).await?;
+        let first_keys: Vec<_> = first.iter().map(|d| d.key.key.as_str()).collect();
+        assert_eq!(first_keys, ["a", "b"]);
+        let rest = documents
+            .list_documents_by_kind(&kind, Some(&first[1].key), 10)
+            .await?;
+        let rest_keys: Vec<_> = rest.iter().map(|d| d.key.key.as_str()).collect();
+        assert_eq!(rest_keys, ["c", "conformance-document"]);
+        let scoped = documents
+            .list_documents(&agent_server::journal::DocScope::Host, &kind)
+            .await?;
+        assert_eq!(scoped.len(), 4);
+        Ok(())
+    }
+
+    /// The purge fence covers documents: a thread or task document cannot
+    /// be written once its thread is being purged, nor after the purge
+    /// finished, and finishing the purge retires the thread's documents and
+    /// its tasks' documents. A task document needs its task. Every backend
+    /// gives the same answers.
+    async fn test_document_purge(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{PurgeReceipt, PurgeScope, PurgeSeed};
+        use agent_server::journal::{DocExpect, DocScope, DocumentKey};
+
+        let (child, _worker, _lease) =
+            leased_tool_child(task_store, "conformance-document-purge").await?;
+        let thread = child.thread_id.clone();
+        thread_store.get_or_create(&thread, t_plus(61)).await?;
+        let on_thread = thread_doc(&thread, "context")?;
+        let on_task = DocumentKey::new(DocScope::Task(child.id.clone()), doc_kind("task")?, "");
+        let on_host = host_doc("survives-purge")?;
+        task_store
+            .commit(
+                doc_only(vec![
+                    put_doc(&on_thread, DocExpect::Absent, serde_json::json!(1)),
+                    put_doc(&on_task, DocExpect::Absent, serde_json::json!(2)),
+                    put_doc(&on_host, DocExpect::Absent, serde_json::json!(3)),
+                ]),
+                t_plus(62),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let ghost = DocumentKey::new(
+            DocScope::Task(AgentTaskId::from_string("task_missing")),
+            doc_kind("task")?,
+            "",
+        );
+        let refused = task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    &ghost,
+                    DocExpect::Absent,
+                    serde_json::json!(0),
+                )]),
+                t_plus(62),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a document on a missing task is refused: {refused:?}"
+        );
+        assert_eq!(doc_value(documents, &ghost).await?, None);
+
+        let seed = PurgeSeed {
+            root_thread_id: thread.clone(),
+            scope: PurgeScope::Thread,
+            started_at: t_plus(63),
+        };
+        let _ = thread_store.begin_purge(&thread, seed).await?;
+        for (key, what) in [(&on_thread, "thread"), (&on_task, "task")] {
+            let refused = task_store
+                .commit(
+                    doc_only(vec![put_doc(
+                        key,
+                        DocExpect::Any,
+                        serde_json::json!("late"),
+                    )]),
+                    t_plus(64),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "a {what} document on a purging thread is refused: {refused:?}"
+            );
+        }
+        let receipt = PurgeReceipt {
+            root_thread_id: thread.clone(),
+            scope: PurgeScope::Thread,
+            purged_thread_ids: vec![thread.clone()],
+            cancelled_task_ids: Vec::new(),
+            started_at: t_plus(63),
+            completed_at: t_plus(65),
+        };
+        let _ = thread_store.finish_purge(&thread, &receipt).await?;
+        assert_eq!(doc_value(documents, &on_thread).await?, None);
+        assert_eq!(doc_value(documents, &on_task).await?, None);
+        for (key, what) in [(&on_thread, "thread"), (&on_task, "task")] {
+            let refused = task_store
+                .commit(
+                    doc_only(vec![put_doc(
+                        key,
+                        DocExpect::Absent,
+                        serde_json::json!("after"),
+                    )]),
+                    t_plus(66),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "a {what} document on a purged thread is refused: {refused:?}"
+            );
+            assert_eq!(doc_value(documents, key).await?, None);
+        }
+        assert_eq!(
+            doc_value(documents, &on_host).await?,
+            Some((1, serde_json::json!(3))),
+            "a host document belongs to no thread"
+        );
+        Ok(())
+    }
+
+    /// Every backend refuses a value holding a NUL character before it
+    /// writes anything (Postgres `jsonb` cannot store one), and lists keys
+    /// in byte order whatever its collation.
+    async fn test_document_values_and_order(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        use agent_server::journal::{DocExpect, DocScope, Rejected};
+
+        let nul = host_doc("nul")?;
+        for value in [
+            serde_json::json!("a\u{0}b"),
+            serde_json::json!({"k\u{0}": 1}),
+        ] {
+            let rejected = task_store
+                .commit(
+                    doc_only(vec![put_doc(&nul, DocExpect::Any, value)]),
+                    t_plus(68),
+                )
+                .await;
+            assert!(
+                matches!(rejected, Err(Rejected::Store(_))),
+                "a NUL in a value is refused: {rejected:?}"
+            );
+        }
+        assert_eq!(doc_value(documents, &nul).await?, None);
+
+        let kind = doc_kind("order")?;
+        for key in ["B", "a", "_z", "A", "b", "a.b", "a-b"] {
+            let write = put_doc(
+                &agent_server::journal::DocumentKey::new(DocScope::Host, kind.clone(), key),
+                DocExpect::Any,
+                serde_json::json!(key),
+            );
+            task_store
+                .commit(doc_only(vec![write]), t_plus(69))
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        let listed: Vec<String> = documents
+            .list_documents(&DocScope::Host, &kind)
+            .await?
+            .into_iter()
+            .map(|document| document.key.key)
+            .collect();
+        assert_eq!(
+            listed,
+            ["A", "B", "_z", "a", "a-b", "a.b", "b"],
+            "byte order"
+        );
+        let first = documents.list_documents_by_kind(&kind, None, 3).await?;
+        let rest = documents
+            .list_documents_by_kind(&kind, first.last().map(|document| &document.key), 10)
+            .await?;
+        let paged: Vec<String> = first
+            .into_iter()
+            .chain(rest)
+            .map(|document| document.key.key)
+            .collect();
+        assert_eq!(paged, listed, "paging follows the same order");
+        Ok(())
+    }
+
+    /// A crash after every write of a transition is applied, its document
+    /// included (documents apply last), and before its transaction
+    /// commits leaves none of them: not the document, not the settle, not
+    /// its event.
+    #[cfg(feature = "failpoints")]
+    async fn test_document_failpoint_writes_neither_half(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        let (child, worker, lease) =
+            leased_tool_child(task_store, "conformance-document-crash").await?;
+        let context = thread_doc(&child.thread_id, "context")?;
+        let mut settle = settle_with_tool_call_end(&child, &worker, &lease);
+        settle.writes.insert(
+            0,
+            put_doc(
+                &context,
+                agent_server::journal::DocExpect::Absent,
+                serde_json::json!(1),
+            ),
+        );
+        fail::cfg("transition.before_commit", "panic")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(task_store.commit(settle, t_plus(65)));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("transition.before_commit");
+        assert!(result.is_err(), "the transition failpoint must fire");
+        assert_eq!(
+            doc_value(documents, &context).await?,
+            None,
+            "the document rolled back with the settle and its event"
+        );
+        let after = AgentTaskStore::get(task_store, &child.id)
+            .await?
+            .context("child")?;
+        assert_eq!(after.status, TaskStatus::Running);
+        assert!(events.get_events(&child.thread_id).await?.is_empty());
+        Ok(())
+    }
+
     /// Durable subagent spawn hands the child ROOT the root-turn retry
     /// budget on every backend.
     ///
@@ -4453,6 +4925,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_document_transition() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_document_transition_is_all_or_nothing(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_document_values_and_order() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_document_values_and_order(s.task.as_ref(), s.documents.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_document_purge() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_document_purge(s.task.as_ref(), s.thread.as_ref(), s.documents.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_transition_is_all_or_nothing() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_transition_is_all_or_nothing(s.task.as_ref(), s.event.as_ref(), s.outbox.as_ref())
@@ -4679,6 +5174,7 @@ mod tests {
         checkpoint: std::sync::Arc<dyn CheckpointStore>,
         event: std::sync::Arc<dyn EventRepository>,
         outbox: std::sync::Arc<dyn OutboxStore>,
+        documents: std::sync::Arc<dyn agent_server::journal::DocumentStore>,
     }
 
     impl InMemoryStores {
@@ -4745,8 +5241,10 @@ mod tests {
                 checkpoint_store: checkpoint.clone(),
             });
 
+        let task = std::sync::Arc::new(task);
         InMemoryStores {
-            task: std::sync::Arc::new(task),
+            documents: task.clone(),
+            task,
             thread,
             message,
             attempt,
@@ -4902,6 +5400,35 @@ mod tests {
     async fn conformance_sqlite_transition_is_all_or_nothing() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_document_transition() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_document_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_document_values_and_order() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_document_values_and_order(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_document_purge() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_document_purge(&store, &store, &store).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_document_failpoint_writes_neither_half() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_document_failpoint_writes_neither_half(&store, &store, &store).await
     }
 
     #[cfg(all(feature = "sqlite", feature = "failpoints"))]
@@ -5556,6 +6083,131 @@ mod tests {
             return Ok(());
         };
         test_reject_confirmation_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_document_transition() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_document_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_document_values_and_order() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_document_values_and_order(&store, &store).await
+    }
+
+    /// Two first writes of the same host document under `Any` both commit,
+    /// whichever reaches the key first: the later one writes over the
+    /// earlier, at revision 2, as it would after the first committed.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_racing_first_host_document_writes_any_both_commit() -> Result<()> {
+        use agent_server::journal::{DocExpect, DocumentStore, DurableStore};
+
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        for round in 0..32 {
+            let key = host_doc(&format!("any-race-{round}"))?;
+            let write = |value: &str| {
+                doc_only(vec![put_doc(
+                    &key,
+                    DocExpect::Any,
+                    serde_json::json!(value),
+                )])
+            };
+            let outcomes: [_; 2] = tokio::join!(
+                store.commit(write("first"), t_plus(70)),
+                store.commit(write("second"), t_plus(70)),
+            )
+            .into();
+            let mut revisions = Vec::new();
+            for outcome in outcomes {
+                let committed = outcome.map_err(anyhow::Error::from)?;
+                revisions.extend(
+                    committed
+                        .documents
+                        .into_iter()
+                        .map(|outcome| outcome.revision),
+                );
+            }
+            revisions.sort_unstable();
+            anyhow::ensure!(
+                revisions == vec![Some(1), Some(2)],
+                "round {round}: both commit at revisions 1 and 2, got {revisions:?}",
+            );
+            let stored = store.get_document(&key).await?.context("raced document")?;
+            anyhow::ensure!(
+                stored.revision == 2,
+                "round {round}: final revision {}",
+                stored.revision
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_document_purge() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_document_purge(&store, &store, &store).await
+    }
+
+    /// Two first writes of the same host document race on its key, which
+    /// has no row to lock yet: exactly one commits, and the other's
+    /// `Absent` expectation is a guard rejection, not a store error.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_racing_first_host_document_writes_reject_one() -> Result<()> {
+        use agent_server::journal::{DocExpect, DurableStore, Rejected};
+
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        for round in 0..16 {
+            let key = host_doc(&format!("race-{round}"))?;
+            let write = |value: &str| {
+                doc_only(vec![put_doc(
+                    &key,
+                    DocExpect::Absent,
+                    serde_json::json!(value),
+                )])
+            };
+            let outcomes: [_; 2] = tokio::join!(
+                store.commit(write("first"), t_plus(70)),
+                store.commit(write("second"), t_plus(70)),
+            )
+            .into();
+            let committed = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+            let guarded = outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Err(Rejected::Guard { index: 0, .. })))
+                .count();
+            anyhow::ensure!(
+                committed == 1 && guarded == 1,
+                "round {round}: one commit and one guard rejection, got {outcomes:?}",
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_document_failpoint_writes_neither_half() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_document_failpoint_writes_neither_half(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]

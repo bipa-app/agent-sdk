@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT revision, retired_at IS NULL AS \"live!\"\n               FROM agent_sdk_documents\n               WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4\n               FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revision",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "revision"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "6e5504340b2464cdb5d04c58b8e0fa48e7a5fc1443508d18dc4beb78d2c010a1"
+}

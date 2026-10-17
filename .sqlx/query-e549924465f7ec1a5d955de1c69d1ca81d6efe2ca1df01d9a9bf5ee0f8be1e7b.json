@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sdk_documents\n                       SET revision = ?5, retired_at = ?6, updated_at = ?6\n                       WHERE scope_kind = ?1 AND scope_id = ?2 AND kind = ?3 AND doc_key = ?4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "e549924465f7ec1a5d955de1c69d1ca81d6efe2ca1df01d9a9bf5ee0f8be1e7b"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sdk_documents\n               SET revision = revision + 1, retired_at = $2, updated_at = $2\n               WHERE retired_at IS NULL\n                 AND ((scope_kind = 'thread' AND scope_id = $1)\n                      OR (scope_kind = 'task'\n                          AND scope_id IN (SELECT id FROM agent_sdk_tasks WHERE thread_id = $1)))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c6c5b7ab8866c56020608340c692b1daa69c66ef5997bc65c002d0f0bd03720b"
+}

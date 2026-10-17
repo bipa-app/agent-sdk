@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_documents",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "e26db36937171eba9b614d95d7d3be6f44335e64ba1c719cd0ca406b832c8c69"
+}
