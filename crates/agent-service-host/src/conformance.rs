@@ -1972,8 +1972,10 @@ mod tests {
         Ok(())
     }
 
-    /// A crash after a transition's document write and before its events
-    /// leaves neither: the backend's transaction drops both.
+    /// A crash after every write of a transition is applied, its document
+    /// included (documents apply last), and before its transaction
+    /// commits leaves none of them: not the document, not the settle, not
+    /// its event.
     #[cfg(feature = "failpoints")]
     async fn test_document_failpoint_writes_neither_half(
         task_store: &dyn AgentTaskStore,
@@ -1992,11 +1994,11 @@ mod tests {
                 serde_json::json!(1),
             ),
         );
-        fail::cfg("transition.before_events", "panic")
+        fail::cfg("transition.before_commit", "panic")
             .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
         let crashed = std::panic::AssertUnwindSafe(task_store.commit(settle, t_plus(65)));
         let result = futures::FutureExt::catch_unwind(crashed).await;
-        fail::remove("transition.before_events");
+        fail::remove("transition.before_commit");
         assert!(result.is_err(), "the transition failpoint must fire");
         assert_eq!(
             doc_value(documents, &context).await?,

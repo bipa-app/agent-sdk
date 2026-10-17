@@ -4163,6 +4163,7 @@ impl PostgresDurableStore {
                     )
                 })?;
         }
+        agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
         Ok(committed)
     }
