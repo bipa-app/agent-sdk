@@ -84,6 +84,7 @@ pub mod runtime;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod stores;
+mod tx_ctx;
 pub mod wakeup;
 pub mod watch;
 

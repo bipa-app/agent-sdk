@@ -12,11 +12,13 @@
 //! thread aggregate advance, message head/raw-batch write, and
 //! checkpoint insert into one SQL transaction.
 
+use crate::tx_ctx::TxCtx;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
     ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, TerminalReason, ThreadId,
     TokenUsage, llm,
 };
+use agent_server::journal::view::ViewConfig;
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -148,6 +150,7 @@ pub struct PostgresDurableStore {
     pool: PgPool,
     held_probe: HeldProbe<HeldKey>,
     lock_conflict_retries: Arc<AtomicU64>,
+    view: ViewConfig,
 }
 
 impl PostgresDurableStore {
@@ -187,7 +190,12 @@ impl PostgresDurableStore {
             pool,
             held_probe: HeldProbe::default(),
             lock_conflict_retries: Arc::default(),
+            view: ViewConfig::default(),
         }
+    }
+
+    const fn tx_ctx(&self) -> TxCtx<'_> {
+        TxCtx { view: &self.view }
     }
 
     /// Build a lazily connecting Postgres pool.
@@ -540,7 +548,8 @@ FOR UPDATE
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
-        let (outcome, _top) = Self::cancel_scoped_tx(&mut tx, root_id, scope, owner, now).await?;
+        let (outcome, _top) =
+            Self::cancel_scoped_tx(&self.tx_ctx(), &mut tx, root_id, scope, owner, now).await?;
         tx.commit().await.context("commit cancel_tree")?;
         Ok(outcome)
     }
@@ -549,6 +558,7 @@ FOR UPDATE
     /// returns `root_id`'s row as read under its lock, before any
     /// transition.
     async fn cancel_scoped_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         root_id: &AgentTaskId,
         scope: CancelScope,
@@ -677,7 +687,7 @@ FOR UPDATE
         // nothing. The thread rows were locked in phase 1, so the
         // sequence allocation here re-locks held rows (no new lock
         // edges). Emitted in BFS order.
-        let markers = commit_cancel_markers_tx(tx, &all_tasks, marker_candidates, now).await?;
+        let markers = commit_cancel_markers_tx(ctx, tx, &all_tasks, marker_candidates, now).await?;
 
         // Phase 7.6: wake linked SubagentInvocation tasks that were
         // WaitingOnChildren on a now-cancelled child root. This
@@ -1917,8 +1927,15 @@ WHERE id = ANY($1::text[])
                     .await?;
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
-                        .await?;
+                    Self::fail_closed_tx(
+                        &self.tx_ctx(),
+                        &mut tx,
+                        &old,
+                        reason,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -2456,6 +2473,7 @@ WHERE parent_id = $1
     /// lock (thread → task) and pass it as `root_thread`; otherwise use
     /// [`Self::fail_closed_root_thread_first`].
     async fn fail_closed_with_thread_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         old: &AgentTask,
         reason: FailureReason,
@@ -2471,7 +2489,8 @@ WHERE parent_id = $1
         if let Some(event) = reason.terminal_event(old) {
             let start_seq = Self::next_event_sequence_tx(tx, &old.thread_id).await?;
             let committed =
-                Self::insert_events_tx(tx, &old.thread_id, vec![event], start_seq, now).await?;
+                Self::insert_events_tx(ctx, tx, &old.thread_id, vec![event], start_seq, now)
+                    .await?;
             Self::insert_thread_events_outbox_row_tx(
                 tx,
                 &committed,
@@ -2487,13 +2506,14 @@ WHERE parent_id = $1
     /// turn, which needs no thread lock: a root fails closed under its
     /// thread's lock, through [`Self::fail_closed_root_thread_first`].
     async fn fail_closed_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         old: &AgentTask,
         reason: FailureReason,
         now: OffsetDateTime,
         error_prefix: &str,
     ) -> Result<()> {
-        Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix).await
+        Self::fail_closed_with_thread_tx(ctx, tx, old, reason, None, now, error_prefix).await
     }
 
     /// Fail closed, each in its own transaction, the roots whose last
@@ -2561,8 +2581,15 @@ WHERE parent_id = $1
             return Ok(None);
         };
         Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
-        let (settled, locked) =
-            Self::cancel_scoped_tx(&mut tx, id, CancelScope::Descendants, None, now).await?;
+        let (settled, locked) = Self::cancel_scoped_tx(
+            &self.tx_ctx(),
+            &mut tx,
+            id,
+            CancelScope::Descendants,
+            None,
+            now,
+        )
+        .await?;
         let Some(old) = locked else {
             tx.rollback()
                 .await
@@ -2595,6 +2622,7 @@ WHERE parent_id = $1
         match action {
             RecoveryAction::FailClosed(reason) => {
                 Self::fail_closed_with_thread_tx(
+                    &self.tx_ctx(),
                     &mut tx,
                     &old,
                     reason,
@@ -3264,6 +3292,7 @@ FOR UPDATE
 
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
         let mut committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.thread_id,
             vec![params.event],
@@ -3388,6 +3417,7 @@ FOR UPDATE
         //    above, which is the point of this committer.
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
         let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.new_thread_id,
             params.events,
@@ -3530,6 +3560,7 @@ FOR UPDATE
         } else {
             let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
             let committed = Self::insert_events_tx(
+                &self.tx_ctx(),
                 &mut tx,
                 &params.thread_id,
                 params.events,
@@ -3806,6 +3837,7 @@ async fn prepare_subagent_batch_rows_tx(
 }
 
 async fn commit_cancel_markers_tx(
+    ctx: &TxCtx<'_>,
     tx: &mut Transaction<'_, Postgres>,
     all_tasks: &[AgentTask],
     mut candidates: std::collections::BTreeMap<
@@ -3821,6 +3853,7 @@ async fn commit_cancel_markers_tx(
         };
         markers.push(
             PostgresDurableStore::insert_cancelled_marker_tx(
+                ctx,
                 tx,
                 &thread_id,
                 &row.id,
@@ -4173,15 +4206,22 @@ impl PostgresDurableStore {
                 Self::lock_host_documents_tx(&mut tx, &transition.locks()).await?;
                 host_documents_locked = true;
             }
-            Self::apply_write_tx(&mut tx, transition, write, now, &mut committed)
-                .await
-                .map_err(|error| {
-                    agent_server::journal::Rejected::from_write_error(
-                        error,
-                        transition.guards.len(),
-                        index,
-                    )
-                })?;
+            Self::apply_write_tx(
+                &self.tx_ctx(),
+                &mut tx,
+                transition,
+                write,
+                now,
+                &mut committed,
+            )
+            .await
+            .map_err(|error| {
+                agent_server::journal::Rejected::from_write_error(
+                    error,
+                    transition.guards.len(),
+                    index,
+                )
+            })?;
         }
         agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
@@ -4192,6 +4232,7 @@ impl PostgresDurableStore {
 impl PostgresDurableStore {
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         transition: &agent_server::journal::Transition,
         write: agent_server::journal::Write,
@@ -4266,7 +4307,7 @@ impl PostgresDurableStore {
                 }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;
-                let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
+                let batch = Self::insert_events_tx(ctx, tx, &thread, events, start, now).await?;
                 Self::insert_thread_events_outbox_row_tx(
                     tx,
                     &batch,
@@ -4277,7 +4318,8 @@ impl PostgresDurableStore {
                 committed.events.extend(batch);
             }
             Write::SpawnChildren { parent, spawn } => {
-                let spawned = Self::apply_spawn_tx(tx, transition, &parent, *spawn, now).await?;
+                let spawned =
+                    Self::apply_spawn_tx(ctx, tx, transition, &parent, *spawn, now).await?;
                 committed.events.extend(spawned.events.iter().cloned());
                 committed.spawned.push(spawned);
             }
@@ -4357,6 +4399,7 @@ impl PostgresDurableStore {
     /// [`ChildSpawn::Subagent`]), each re-attached child and the parent,
     /// in the store's order, and checked the purge fence on every thread.
     async fn apply_spawn_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         transition: &agent_server::journal::Transition,
         parent_id: &AgentTaskId,
@@ -4400,16 +4443,17 @@ impl PostgresDurableStore {
                     spawns: vec![spawn],
                     events: Vec::new(),
                 };
-                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+                Self::spawn_subagent_batch_tx(ctx, tx, old_parent, batch, now).await
             }
             ChildSpawn::Subagent(subagent) => {
-                Self::spawn_subagent_tx(tx, old_parent, subagent, now).await
+                Self::spawn_subagent_tx(ctx, tx, old_parent, subagent, now).await
             }
             ChildSpawn::SubagentBatch(batch) => {
-                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+                Self::spawn_subagent_batch_tx(ctx, tx, old_parent, batch, now).await
             }
             ChildSpawn::Mixed { spawn, events } => {
-                Self::spawn_mixed_children_tx(tx, old_parent, reattached, spawn, events, now).await
+                Self::spawn_mixed_children_tx(ctx, tx, old_parent, reattached, spawn, events, now)
+                    .await
             }
         }
     }
@@ -4471,6 +4515,7 @@ impl PostgresDurableStore {
     }
 
     async fn spawn_subagent_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         old_parent: AgentTask,
         subagent: SubagentSpawn,
@@ -4527,10 +4572,11 @@ impl PostgresDurableStore {
         let event = subagent_started_event(event, &spawn, &invocation, &child_root);
         let start_seq = Self::next_event_sequence_tx(tx, &parent_task.thread_id).await?;
         let mut committed =
-            Self::insert_events_tx(tx, &parent_task.thread_id, vec![event], start_seq, now).await?;
+            Self::insert_events_tx(ctx, tx, &parent_task.thread_id, vec![event], start_seq, now)
+                .await?;
         Self::insert_thread_events_outbox_row_tx(tx, &committed, outbox_max_attempts, now).await?;
         let committed_event = committed.pop().context("spawn event batch was empty")?;
-        Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+        Self::insert_child_created_tx(ctx, tx, &child_root.thread_id, now).await?;
         Ok(SpawnedChildren {
             parent: parent_task,
             subagents: vec![(invocation, child_root)],
@@ -4541,6 +4587,7 @@ impl PostgresDurableStore {
     }
 
     async fn spawn_subagent_batch_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         old_parent: AgentTask,
         SubagentBatchSpawn {
@@ -4570,8 +4617,15 @@ impl PostgresDurableStore {
             Vec::new()
         } else {
             agent_server::fail_point!("atomic_spawn_batch.after_rows");
-            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
-                .await?
+            Self::insert_spawn_started_events_tx(
+                ctx,
+                tx,
+                &new_parent.thread_id,
+                &prepared,
+                events,
+                now,
+            )
+            .await?
         };
         Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
         Ok(SpawnedChildren {
@@ -4584,6 +4638,7 @@ impl PostgresDurableStore {
     }
 
     async fn spawn_mixed_children_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         old_parent: AgentTask,
         locked_reattach: BTreeMap<AgentTaskId, AgentTask>,
@@ -4645,14 +4700,21 @@ impl PostgresDurableStore {
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
 
         let mut committed =
-            Self::commit_boundary_events_tx(tx, &new_parent.thread_id, boundary_events, now)
+            Self::commit_boundary_events_tx(ctx, tx, &new_parent.thread_id, boundary_events, now)
                 .await?;
         committed.extend(
-            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
-                .await?,
+            Self::insert_spawn_started_events_tx(
+                ctx,
+                tx,
+                &new_parent.thread_id,
+                &prepared,
+                events,
+                now,
+            )
+            .await?,
         );
         committed.extend(
-            Self::commit_boundary_events_tx(tx, &new_parent.thread_id, trailing_events, now)
+            Self::commit_boundary_events_tx(ctx, tx, &new_parent.thread_id, trailing_events, now)
                 .await?,
         );
         Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
@@ -5297,7 +5359,15 @@ ORDER BY created_at, id
                 return Ok(None);
             }
             RecoveryAction::FailClosed(reason) => {
-                Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
+                Self::fail_closed_tx(
+                    &self.tx_ctx(),
+                    &mut tx,
+                    &old,
+                    reason,
+                    now,
+                    "try_acquire_task",
+                )
+                .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -5532,8 +5602,15 @@ FOR UPDATE SKIP LOCKED
                     continue;
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
-                        .await?;
+                    Self::fail_closed_tx(
+                        &self.tx_ctx(),
+                        &mut tx,
+                        &old,
+                        reason,
+                        now,
+                        "release_expired_leases",
+                    )
+                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason)
                 }
                 RecoveryAction::NoAction => {
@@ -5602,9 +5679,15 @@ FOR UPDATE SKIP LOCKED
         if let Some(event) = boundary {
             Self::require_appendable_thread_tx(&mut tx, &old.thread_id).await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
-            let committed =
-                Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
-                    .await?;
+            let committed = Self::insert_events_tx(
+                &self.tx_ctx(),
+                &mut tx,
+                &old.thread_id,
+                vec![event],
+                start_seq,
+                now,
+            )
+            .await?;
             Self::insert_thread_events_outbox_row_tx(
                 &mut tx,
                 &committed,
@@ -5778,8 +5861,15 @@ FOR UPDATE SKIP LOCKED
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
-        let committed =
-            Self::insert_events_tx(&mut tx, &paused.thread_id, events, start_seq, now).await?;
+        let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
+            &mut tx,
+            &paused.thread_id,
+            events,
+            start_seq,
+            now,
+        )
+        .await?;
         Self::insert_thread_events_outbox_row_tx(
             &mut tx,
             &committed,
@@ -6730,7 +6820,9 @@ impl EventRepository for PostgresDurableStore {
         if let Some(thread) = Self::lock_thread_tx(&mut tx, thread_id).await? {
             thread.require_active(ThreadOperation::Append)?;
         }
-        let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
+        let committed =
+            Self::insert_events_tx(&self.tx_ctx(), &mut tx, thread_id, events, start_seq, now)
+                .await?;
         tx.commit().await.context("commit event batch insert")?;
         Ok(committed)
     }
@@ -6944,12 +7036,14 @@ impl PostgresDurableStore {
     /// Insert a spawned child thread's `ThreadCreated` and its
     /// events-available advisory inside the caller's transaction.
     async fn insert_child_created_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         child_thread: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<()> {
         let seq = Self::next_event_sequence_tx(tx, child_thread).await?;
         let committed = Self::insert_events_tx(
+            ctx,
             tx,
             child_thread,
             vec![AgentEvent::thread_created(child_thread.clone(), None, None)],
@@ -6971,6 +7065,7 @@ impl PostgresDurableStore {
     /// `thread_events_available` advisory inside the caller's spawn
     /// transaction. Empty batches commit nothing.
     async fn commit_boundary_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         boundary_events: Vec<agent_sdk_foundation::events::AgentEvent>,
@@ -6981,7 +7076,7 @@ impl PostgresDurableStore {
         }
         let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
         let committed =
-            Self::insert_events_tx(tx, thread_id, boundary_events, start_seq, now).await?;
+            Self::insert_events_tx(ctx, tx, thread_id, boundary_events, start_seq, now).await?;
         Self::insert_thread_events_outbox_row_tx(
             tx,
             &committed,
@@ -6997,6 +7092,7 @@ impl PostgresDurableStore {
     /// inside the caller's spawn transaction. Attached tool-only batches
     /// have neither and therefore commit no event batch or advisory.
     async fn insert_spawn_started_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         parent_thread: &ThreadId,
         prepared: &[(AgentTask, AgentTask)],
@@ -7014,7 +7110,7 @@ impl PostgresDurableStore {
         } else {
             let start_seq = Self::next_event_sequence_tx(tx, parent_thread).await?;
             let committed =
-                Self::insert_events_tx(tx, parent_thread, started, start_seq, now).await?;
+                Self::insert_events_tx(ctx, tx, parent_thread, started, start_seq, now).await?;
             Self::insert_thread_events_outbox_row_tx(
                 tx,
                 &committed,
@@ -7025,18 +7121,23 @@ impl PostgresDurableStore {
             committed
         };
         for (_, child_root) in prepared {
-            Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+            Self::insert_child_created_tx(ctx, tx, &child_root.thread_id, now).await?;
         }
         Ok(committed)
     }
 
     async fn insert_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         events: Vec<AgentEvent>,
         start_seq: u64,
         now: OffsetDateTime,
     ) -> Result<Vec<CommittedEvent>> {
+        ensure!(
+            !ctx.view.enabled,
+            "thread views are enabled, but this build does not maintain them"
+        );
         let mut committed = Vec::with_capacity(events.len());
         for (idx, event) in events.into_iter().enumerate() {
             let seq = start_seq + idx as u64;
@@ -7209,6 +7310,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
     /// root's parked continuation before the cancel clears its typed
     /// state; when absent the thread aggregate is reported instead.
     async fn insert_cancelled_marker_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
         task_id: &AgentTaskId,
@@ -7228,6 +7330,7 @@ VALUES ($1, 'task_wakeup', $2, NULL, NULL, 'pending', $3, $4, $4, 0, $5)
         let turn = usize::try_from(thread.committed_turns).unwrap_or(0);
         let usage = continuation_usage.unwrap_or(thread.total_usage);
         let mut committed = Self::insert_events_tx(
+            ctx,
             tx,
             thread_id,
             vec![
@@ -7266,6 +7369,7 @@ impl PostgresDurableStore {
 
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
         let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.thread_id,
             params.events,
