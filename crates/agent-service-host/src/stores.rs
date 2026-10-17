@@ -346,6 +346,15 @@ pub struct StoreRegistry {
     backend: RegistryBackend,
 }
 
+/// What a host sets on its concrete stores before [`StoreRegistry`] shares
+/// them.
+#[derive(Clone, Default)]
+pub struct StoreOptions {
+    /// Runs inside every transition and completed-turn commit (see
+    /// [`agent_server::journal::TransitionExtension`]).
+    pub transition_extension: Option<Arc<dyn agent_server::journal::TransitionExtension>>,
+}
+
 /// Registry of live cancellation tokens for detached
 /// approved-confirmation drives, keyed by the Confirm-tier tool task
 /// id.
@@ -471,11 +480,26 @@ impl StoreRegistry {
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
+        Self::from_config_with(config, definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::from_config`] with host options applied to the concrete
+    /// store before it is shared: a decorating store wraps the `Arc`s
+    /// afterwards and cannot reach inside the store's transactions.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::from_config`].
+    pub fn from_config_with(
+        config: &StorageConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Result<Self> {
         match config.backend {
-            StorageBackend::InMemory => Ok(Self::in_memory(definition_registry)),
+            StorageBackend::InMemory => Ok(Self::in_memory_with(definition_registry, options)),
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres => {
-                Self::postgres(config.postgres_settings()?, definition_registry)
+                Self::postgres(config.postgres_settings()?, definition_registry, options)
             }
             #[cfg(not(feature = "postgres"))]
             StorageBackend::Postgres => {
@@ -484,7 +508,7 @@ impl StoreRegistry {
             StorageBackend::Sqlite { .. } => {
                 #[cfg(feature = "sqlite")]
                 {
-                    Self::sqlite(config, definition_registry)
+                    Self::sqlite(config, definition_registry, options)
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -551,6 +575,15 @@ impl StoreRegistry {
     /// empty instance.
     #[must_use]
     pub fn in_memory(definition_registry: Arc<dyn AgentDefinitionRegistry>) -> Self {
+        Self::in_memory_with(definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::in_memory`] with host options.
+    #[must_use]
+    pub fn in_memory_with(
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Self {
         // The task store's `cancel_tree` commits terminal `Cancelled`
         // markers (+ outbox advisories) through these shared stores —
         // the in-memory analogue of the durable backends committing
@@ -585,6 +618,10 @@ impl StoreRegistry {
                 attempt_store: attempt_store.clone(),
                 checkpoint_store: checkpoint_store.clone(),
             });
+        let task_store = match options.transition_extension {
+            Some(extension) => task_store.with_transition_extension(extension),
+            None => task_store,
+        };
         let event_repo: Arc<dyn EventRepository> = Arc::new(PurgeFencedEventRepository::new(
             event_repo,
             thread_store.clone(),
@@ -612,8 +649,9 @@ impl StoreRegistry {
     fn postgres(
         config: &PostgresStorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
     ) -> Result<Self> {
-        let durable_store = build_postgres_store(config)?;
+        let durable_store = build_postgres_store(config, options)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -643,9 +681,11 @@ impl StoreRegistry {
     fn sqlite(
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
     ) -> Result<Self> {
         let database_url = config.sqlite_database_url()?;
-        let durable_store = build_sqlite_store(&database_url, config.sqlite_max_connections()?)?;
+        let durable_store =
+            build_sqlite_store(&database_url, config.sqlite_max_connections()?, options)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -792,12 +832,19 @@ impl StoreRegistry {
 }
 
 #[cfg(feature = "postgres")]
-fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDurableStore>> {
+fn build_postgres_store(
+    config: &PostgresStorageConfig,
+    options: StoreOptions,
+) -> Result<Arc<PostgresDurableStore>> {
     let database_url = config.resolved_database_url()?;
     let max_connections = config.max_connections;
     let schema = config.schema.clone();
     let build = || {
         PostgresDurableStore::connect_lazy(&database_url, max_connections, schema.as_deref())
+            .map(|store| match options.transition_extension {
+                Some(extension) => store.with_transition_extension(extension),
+                None => store,
+            })
             .map(Arc::new)
     };
 
@@ -816,6 +863,7 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
 fn build_sqlite_store(
     database_url: &str,
     max_connections: Option<u32>,
+    options: StoreOptions,
 ) -> Result<Arc<SqliteDurableStore>> {
     // SqliteDurableStore::connect is async (runs PRAGMAs and
     // migrations), but `from_config` is a sync constructor.  We
@@ -835,6 +883,10 @@ fn build_sqlite_store(
             .block_on(async {
                 SqliteDurableStore::connect_with_max_connections(&url, max_connections)
                     .await
+                    .map(|store| match options.transition_extension {
+                        Some(extension) => store.with_transition_extension(extension),
+                        None => store,
+                    })
                     .map(Arc::new)
                     .context("connect sqlite durable store")
             })

@@ -3006,6 +3006,7 @@ async fn commit_one_turn<S: JournalStore>(
 
     let outcome = commit_completed_turn(
         CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             delivered_injection_ids: Vec::new(),
             thread_id: thread.clone(),

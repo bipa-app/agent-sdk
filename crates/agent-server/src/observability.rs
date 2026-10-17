@@ -160,6 +160,11 @@ pub mod attrs {
     /// Transition outcome: malformed, refused, or the store failed.
     pub const OUTCOME_STORE: &str = "store";
 
+    /// Where a transition extension ran: `commit` / `completed_turn`.
+    pub const VIEW: &str = "view";
+    pub const VIEW_COMMIT: &str = "commit";
+    pub const VIEW_COMPLETED_TURN: &str = "completed_turn";
+
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
 
@@ -195,6 +200,8 @@ pub struct ServerMetrics {
     /// `agent_server.effect.duration`: started to finished, by kind and
     /// the state it finished in.
     pub(crate) effect_duration: Histogram<f64>,
+    pub(crate) extension_writes: Counter<u64>,
+    pub(crate) extension_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -370,6 +377,18 @@ impl ServerMetrics {
                     KeyValue::new(attrs::OP, op),
                 ],
             );
+        }
+    }
+
+    /// Count what a transition extension did on one commit: the writes it
+    /// added, or a refusal of a write it may not add.
+    pub fn record_extension(&self, view: &'static str, added: usize, refused: bool) {
+        let attributes = [KeyValue::new(attrs::VIEW, view)];
+        if refused {
+            self.extension_refused.add(1, &attributes);
+        } else if added > 0 {
+            self.extension_writes
+                .add(u64::try_from(added).unwrap_or(u64::MAX), &attributes);
         }
     }
 
@@ -560,6 +579,16 @@ impl ServerMetrics {
                 "Transitions the store retried after a deadlock or serialization failure.",
             )
             .build();
+        let extension_writes = meter
+            .u64_counter("agent_server.journal.extension.writes")
+            .with_description("Writes a transition extension added, attributed by view.")
+            .build();
+        let extension_refused = meter
+            .u64_counter("agent_server.journal.extension.refused")
+            .with_description(
+                "Commits refused because the transition extension returned a write it may not add.",
+            )
+            .build();
         let documents_written = meter
             .u64_counter("agent_server.journal.documents.written")
             .with_description(
@@ -596,6 +625,8 @@ impl ServerMetrics {
             documents_written,
             effects,
             effect_duration,
+            extension_writes,
+            extension_refused,
             meter,
         }
     }

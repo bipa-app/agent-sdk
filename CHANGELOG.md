@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Crash-safety Phase 3: documents
 
+- **Breaking:** the transition extension hook (design §6.4).
+  - A host installs one `TransitionExtension` on its concrete store:
+    `with_transition_extension` on the SQLite, Postgres and in-memory task
+    stores, or `StoreRegistry::from_config_with(.., StoreOptions {
+    transition_extension, .. })`.
+  - The store calls it once per `DurableStore::commit`, before validating
+    the transition. On Postgres this is outside the lock-conflict retry
+    loop, so a retry never calls it again. The store also calls it once per
+    `commit_completed_turn`.
+  - The writes it returns apply in the same transaction:
+    - on a transition, `Document` and `AppendEvents`;
+    - on a completed turn, `Document` only.
+  - Any other write rejects the commit before anything is written.
+  - The extension is a pure function of what is committed: it reads
+    nothing and does no I/O.
+- **Breaking:** `CompletedTurnCommit` gains `extra_writes`: writes applied
+  inside the completed turn's transaction, through the same write arms as a
+  transition. For now these are documents only
+  (`CompletedTurnCommit::validate_extra_writes`). `StoreRegistry::in_memory_with`
+  takes the same options.
+
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
   JSON document in the same transaction as the rest of its `Transition`
   (design §6.4, `agent_server::journal::document`).

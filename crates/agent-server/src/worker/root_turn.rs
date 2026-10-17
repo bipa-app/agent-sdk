@@ -1344,6 +1344,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
 
     let commit_result = commit_completed_turn(
         CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::CancelSalvage,
             delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
@@ -2271,6 +2272,7 @@ async fn commit_text_only_turn(
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),
@@ -8034,6 +8036,7 @@ async fn commit_resumed_turn(
 
     let commit = commit_completed_turn_shifting_slot(
         CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
             task_id: task_id.clone(),

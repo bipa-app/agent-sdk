@@ -2907,6 +2907,8 @@ pub struct InMemoryAgentTaskStore {
     turn_sink: Option<Arc<CompletedTurnSink>>,
     /// Where the backstop probe over held rows resumes.
     held_probe: super::sibling_order::HeldProbe<(OffsetDateTime, AgentTaskId)>,
+    /// The host's transition extension, if any.
+    extension: Option<Arc<dyn super::extension::TransitionExtension>>,
 }
 
 #[cfg(test)]
@@ -3212,6 +3214,18 @@ impl InMemoryAgentTaskStore {
     #[must_use]
     pub fn with_completed_turns(mut self, sink: CompletedTurnSink) -> Self {
         self.turn_sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Install the host's transition extension: it runs once per
+    /// [`super::transition::DurableStore::commit`] and per completed turn,
+    /// and its writes apply under the same write lock.
+    #[must_use]
+    pub fn with_transition_extension(
+        mut self,
+        extension: Arc<dyn super::extension::TransitionExtension>,
+    ) -> Self {
+        self.extension = Some(extension);
         self
     }
 
@@ -5273,6 +5287,7 @@ impl InMemoryAgentTaskStore {
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
+        let transition = transition.extended(self.extension.as_deref())?;
         self.require_spawn_event_sink(&transition)?;
         transition.validate()?;
         let (sink, message_store) = self.transition_handles(&transition)?;
@@ -5445,6 +5460,46 @@ fn plan_documents_locked(
         plans.push(plan);
     }
     Ok(plans)
+}
+
+/// Refuse a completed turn whose thread is purged or whose expected turn
+/// is not the next one.
+async fn require_expected_turn(
+    marker_sink: &CancellationMarkerSink,
+    params: &super::commit::CompletedTurnCommit,
+) -> Result<()> {
+    let committed_turns = match marker_sink.thread_store.get(&params.thread_id).await? {
+        Some(thread) => {
+            thread
+                .require_active(super::thread::ThreadOperation::Commit)
+                .context("commit: advance thread aggregate")?;
+            thread.committed_turns
+        }
+        None => 0,
+    };
+    if committed_turns.saturating_add(1) != params.expected_turn {
+        return Err(anyhow::Error::new(super::commit::StaleTurnCommit {
+            expected_turn: params.expected_turn,
+            committed_turns,
+        }));
+    }
+    Ok(())
+}
+
+/// Apply a completed turn's extra documents with the plans made for them
+/// before its first mutation.
+fn apply_extra_documents_locked(
+    documents: &mut BTreeMap<StoredDocumentKey, MemDocument>,
+    extra: super::transition::Transition,
+    mut plans: std::vec::IntoIter<super::document::DocPlan>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    for write in extra.writes {
+        if let super::transition::Write::Document(document) = write {
+            apply_document_locked(documents, document, plans.next(), now)?;
+        }
+    }
+    Ok(())
 }
 
 fn apply_document_locked(
@@ -6297,6 +6352,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         &self,
         params: super::commit::CompletedTurnCommit,
     ) -> Result<super::commit::CommitOutcome> {
+        let params = params.extended(self.extension.as_deref())?;
+        params.validate_extra_writes()?;
         let (Some(marker_sink), Some(message_store), Some(turn_sink)) =
             (&self.marker_sink, &self.message_store, &self.turn_sink)
         else {
@@ -6308,21 +6365,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         };
         let mut inner = self.inner.write().await;
         inner.enforce_commit_owner_guard(&params.task_id, params.owner_guard.as_ref())?;
-        let committed_turns = match marker_sink.thread_store.get(&params.thread_id).await? {
-            Some(thread) => {
-                thread
-                    .require_active(super::thread::ThreadOperation::Commit)
-                    .context("commit: advance thread aggregate")?;
-                thread.committed_turns
-            }
-            None => 0,
-        };
-        if committed_turns.saturating_add(1) != params.expected_turn {
-            return Err(anyhow::Error::new(super::commit::StaleTurnCommit {
-                expected_turn: params.expected_turn,
-                committed_turns,
-            }));
-        }
+        require_expected_turn(marker_sink, &params).await?;
+        let extra = params.extra_transition();
+        let document_plans = plan_documents_locked(&inner.documents, &extra)
+            .map_err(anyhow::Error::from)?
+            .into_iter();
 
         let closed_attempt = turn_sink
             .attempt_store
@@ -6371,6 +6418,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         for id in &params.delivered_injection_ids {
             let _ = inner.complete_input_injection(id, params.now)?;
         }
+        apply_extra_documents_locked(&mut inner.documents, extra, document_plans, params.now)?;
         let committed_events = if params.events.is_empty() {
             Vec::new()
         } else {

@@ -148,6 +148,7 @@ pub struct PostgresDurableStore {
     pool: PgPool,
     held_probe: HeldProbe<HeldKey>,
     lock_conflict_retries: Arc<AtomicU64>,
+    extension: Option<Arc<dyn agent_server::journal::TransitionExtension>>,
 }
 
 impl PostgresDurableStore {
@@ -187,6 +188,7 @@ impl PostgresDurableStore {
             pool,
             held_probe: HeldProbe::default(),
             lock_conflict_retries: Arc::default(),
+            extension: None,
         }
     }
 
@@ -307,6 +309,18 @@ impl PostgresDurableStore {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Install the host's transition extension: it runs once per
+    /// [`commit`](agent_server::journal::DurableStore::commit) and per
+    /// completed turn, and its writes commit in the same transaction.
+    #[must_use]
+    pub fn with_transition_extension(
+        mut self,
+        extension: Arc<dyn agent_server::journal::TransitionExtension>,
+    ) -> Self {
+        self.extension = Some(extension);
+        self
     }
 
     async fn begin(&self) -> Result<Transaction<'_, Postgres>> {
@@ -3544,6 +3558,8 @@ FOR UPDATE
         params: CompletedTurnCommit,
         fail_after: Option<InjectedCommitFailure>,
     ) -> Result<CommitOutcome> {
+        params.validate_extra_writes()?;
+        let extra = params.extra_transition();
         let mut tx = self.begin().await?;
 
         Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
@@ -3657,6 +3673,7 @@ FOR UPDATE
         };
         maybe_inject_failure(fail_after, InjectedCommitFailure::EventCommit)?;
 
+        Self::apply_completed_turn_extra_writes_tx(&mut tx, &extra, params.now).await?;
         // Failpoint (11 · A): simulate a crash at the true atomic-commit
         // boundary — the events and the coalesced advisory outbox row are
         // staged in `tx` but `tx.commit()` has not yet run, so the whole
@@ -4125,6 +4142,7 @@ impl PostgresDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        let transition = transition.extended(self.extension.as_deref())?;
         transition.validate()?;
         let mut attempt = 0;
         loop {
@@ -4344,6 +4362,20 @@ impl PostgresDurableStore {
 }
 
 impl PostgresDurableStore {
+    /// Apply a completed turn's extra writes inside its transaction,
+    /// through the same write arms as a transition.
+    async fn apply_completed_turn_extra_writes_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        extra: &agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut committed = agent_server::journal::Committed::default();
+        for write in extra.writes.iter().cloned() {
+            Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
+        }
+        Ok(())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -4832,6 +4864,7 @@ impl PostgresDurableStore {
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        let params = params.extended(self.extension.as_deref())?;
         self.commit_completed_turn_atomic_inner(params, None).await
     }
 
@@ -9425,6 +9458,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let err = store
             .commit_completed_turn_atomic_with_failure(
                 CompletedTurnCommit {
+                    extra_writes: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     delivered_injection_ids: Vec::new(),
                     thread_id: running.thread_id.clone(),
@@ -9505,6 +9539,7 @@ INSERT INTO agent_sdk_turn_attempts (
 
         let thread_id = running.thread_id.clone();
         let commit_params = |now| CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
@@ -9590,6 +9625,7 @@ INSERT INTO agent_sdk_turn_attempts (
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: running.thread_id.clone(),

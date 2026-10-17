@@ -320,6 +320,7 @@ mod tests {
             .context("open attempt for committed turn")?;
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread.clone(),
@@ -936,6 +937,7 @@ mod tests {
             .context("open attempt for delivering commit")?;
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: vec![injection_id.clone(), task_id.clone()],
                 thread_id: thread.clone(),

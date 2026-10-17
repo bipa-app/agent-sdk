@@ -112,6 +112,7 @@ mod documents;
 pub struct SqliteDurableStore {
     pool: SqlitePool,
     held_probe: HeldProbe<HeldKey>,
+    extension: Option<std::sync::Arc<dyn agent_server::journal::TransitionExtension>>,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -136,6 +137,7 @@ impl SqliteDurableStore {
         Self {
             pool,
             held_probe: HeldProbe::default(),
+            extension: None,
         }
     }
 
@@ -272,6 +274,18 @@ impl SqliteDurableStore {
     #[must_use]
     pub const fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Install the host's transition extension: it runs once per
+    /// [`commit`](agent_server::journal::DurableStore::commit) and per
+    /// completed turn, and its writes commit in the same transaction.
+    #[must_use]
+    pub fn with_transition_extension(
+        mut self,
+        extension: std::sync::Arc<dyn agent_server::journal::TransitionExtension>,
+    ) -> Self {
+        self.extension = Some(extension);
+        self
     }
 }
 
@@ -3078,6 +3092,8 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         &self,
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
+        params.validate_extra_writes()?;
+        let extra = params.extra_transition();
         let mut tx = self.begin().await?;
 
         Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
@@ -3178,6 +3194,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             committed
         };
 
+        Self::apply_completed_turn_extra_writes_tx(&mut tx, &extra, params.now).await?;
         // Failpoint (11 · A): simulate a crash at the true atomic-commit
         // boundary — the events and the coalesced advisory outbox row are
         // staged in `tx` but `tx.commit()` has not yet run, so the whole
@@ -3495,6 +3512,7 @@ impl SqliteDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        let transition = transition.extended(self.extension.as_deref())?;
         transition.validate()?;
         let mut tx = self.begin().await?;
         Self::check_declared_threads_tx(&mut tx, &transition, true, now).await?;
@@ -3525,6 +3543,20 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
+    /// Apply a completed turn's extra writes inside its transaction,
+    /// through the same write arms as a transition.
+    async fn apply_completed_turn_extra_writes_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        extra: &agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut committed = agent_server::journal::Committed::default();
+        for write in extra.writes.iter().cloned() {
+            Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
+        }
+        Ok(())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Sqlite>,
@@ -4063,6 +4095,7 @@ impl SqliteDurableStore {
 #[async_trait]
 impl AgentTaskStore for SqliteDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        let params = params.extended(self.extension.as_deref())?;
         self.commit_completed_turn_atomic_inner(params).await
     }
 
@@ -8420,6 +8453,7 @@ INSERT INTO agent_sdk_execution_intents (
         let commit = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread_id.clone(),
@@ -8550,6 +8584,7 @@ INSERT INTO agent_sdk_execution_intents (
         let outcome = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread_id.clone(),
