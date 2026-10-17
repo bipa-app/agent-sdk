@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context as _;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Histogram, ObservableGauge};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, ObservableGauge};
 
 // ─────────────────────────────────────────────────────────────────────
 // Bucket boundaries
@@ -68,6 +68,19 @@ pub mod attrs {
     pub const AMQP_OUTCOME_NACK: &str = "nack";
     pub const AMQP_OUTCOME_OK: &str = "ok";
     pub const AMQP_OUTCOME_ERROR: &str = "error";
+
+    /// The idempotent operation a request id was claimed for
+    /// (`IdempotencyKind::as_str`).
+    pub const IDEMPOTENCY_KIND: &str = "kind";
+    /// What the claim found: `fresh`, `replay`, `in_flight` or `conflict`.
+    pub const IDEMPOTENCY_CLAIM: &str = "claim";
+    /// Host-loop outcome or source labels, from the logging recorder's
+    /// own vocabulary (`crate::metrics`).
+    pub const OUTCOME: &str = "outcome";
+    pub const SOURCE: &str = "source";
+    /// What a janitor cycle removed or advanced: `events_purged`,
+    /// `checkpoints_pruned` or `floors_advanced`.
+    pub const JANITOR_ROWS: &str = "rows";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -83,6 +96,15 @@ pub struct HostMetrics {
     pub(crate) db_client_connection_create_time: Histogram<f64>,
     pub(crate) amqp_publish_duration: Histogram<f64>,
     pub(crate) amqp_consume_duration: Histogram<f64>,
+    pub(crate) idempotency_claims: Counter<u64>,
+    pub(crate) orphans_settled: Counter<u64>,
+    pub(crate) orphans_failed: Counter<u64>,
+    pub(crate) relay_reclaimed: Counter<u64>,
+    pub(crate) relay_backlog: Gauge<u64>,
+    pub(crate) wakeup_nudges: Counter<u64>,
+    pub(crate) watch_advisories: Counter<u64>,
+    pub(crate) janitor_cycles: Counter<u64>,
+    pub(crate) janitor_rows: Counter<u64>,
     /// Shared meter handle reused by callback-based gauge
     /// registrations so they bind to the same `MeterProvider` as
     /// every other instrument on this struct.
@@ -206,6 +228,43 @@ impl HostMetrics {
         );
     }
 
+    /// Count one idempotency claim on `agent_service_host.idempotency.claims`.
+    /// A retry after a crash shows here as `replay` (or `in_flight` when the
+    /// first attempt died between its commit and its recorded result).
+    pub fn record_idempotency_claim(
+        &self,
+        kind: agent_server::journal::idempotency::IdempotencyKind,
+        claim: &agent_server::journal::idempotency::IdempotencyClaim,
+    ) {
+        use agent_server::journal::idempotency::IdempotencyClaim;
+        let claim = match claim {
+            IdempotencyClaim::Fresh => "fresh",
+            IdempotencyClaim::Replay(_) => "replay",
+            IdempotencyClaim::InFlight => "in_flight",
+            IdempotencyClaim::Conflict => "conflict",
+        };
+        self.idempotency_claims.add(
+            1,
+            &[
+                KeyValue::new(attrs::IDEMPOTENCY_KIND, kind.as_str()),
+                KeyValue::new(attrs::IDEMPOTENCY_CLAIM, claim),
+            ],
+        );
+    }
+
+    /// Count one orphan-settlement pass: `settled` descendants and `failed`
+    /// roots.
+    pub fn record_orphan_settlement(&self, settled: usize, failed: usize) {
+        if settled > 0 {
+            self.orphans_settled
+                .add(u64::try_from(settled).unwrap_or(u64::MAX), &[]);
+        }
+        if failed > 0 {
+            self.orphans_failed
+                .add(u64::try_from(failed).unwrap_or(u64::MAX), &[]);
+        }
+    }
+
     /// Register `(active, idle)` gauges for a sqlx Postgres pool.
     ///
     /// Returns the gauge handles; dropping them deregisters the
@@ -326,13 +385,141 @@ impl HostMetrics {
             .with_boundaries(SHORT_DURATION_BUCKETS_S.to_vec())
             .build();
 
+        let idempotency_claims = meter
+            .u64_counter("agent_service_host.idempotency.claims")
+            .with_description("Idempotent requests claimed, by operation and what the claim found.")
+            .build();
+        let orphans_settled = meter
+            .u64_counter("agent_service_host.orphans.settled")
+            .with_description(
+                "Live descendants of terminal roots settled by the startup or sweep pass.",
+            )
+            .build();
+        let orphans_failed = meter
+            .u64_counter("agent_service_host.orphans.failed")
+            .with_description("Terminal roots whose orphan settlement failed (retried next pass).")
+            .build();
+        let relay_reclaimed = meter
+            .u64_counter("agent_service_host.relay.reclaimed")
+            .with_description("Outbox rows the relay reclaimed from an expired claim.")
+            .build();
+        let relay_backlog = meter
+            .u64_gauge("agent_service_host.relay.backlog")
+            .with_description("Pending outbox rows at the relay's last backlog check.")
+            .build();
+        let wakeup_nudges = meter
+            .u64_counter("agent_service_host.wakeup.nudges")
+            .with_description("Worker wakeup nudges, by source and outcome.")
+            .build();
+        let watch_advisories = meter
+            .u64_counter("agent_service_host.watch.advisories")
+            .with_description("Thread-events watch advisories, by outcome.")
+            .build();
+        let janitor_cycles = meter
+            .u64_counter("agent_service_host.janitor.cycles")
+            .with_description("Retention janitor cycles run.")
+            .build();
+        let janitor_rows = meter
+            .u64_counter("agent_service_host.janitor.rows")
+            .with_description("Rows a retention janitor cycle purged, pruned or advanced.")
+            .build();
+
         Self {
             rpc_server_duration,
             db_client_connection_create_time,
             amqp_publish_duration,
             amqp_consume_duration,
+            idempotency_claims,
+            orphans_settled,
+            orphans_failed,
+            relay_reclaimed,
+            relay_backlog,
+            wakeup_nudges,
+            watch_advisories,
+            janitor_cycles,
+            janitor_rows,
             meter,
         }
+    }
+}
+
+/// The [`crate::metrics::MetricsRecorder`] a host gets with the `otel` feature.
+///
+/// Every call is logged as [`crate::metrics::LoggingMetricsRecorder`] logs
+/// it, and the host-loop signals that no other instrument carries are also
+/// recorded on [`HostMetrics`]. The relay tick is not, because
+/// `agent_server.relay.tick` already counts it. The lease sweep is not either,
+/// because its releases are counted per task as `agent_server.tasks.lease_expired`.
+#[derive(Debug, Default)]
+pub struct OtelMetricsRecorder {
+    logging: crate::metrics::LoggingMetricsRecorder,
+}
+
+impl crate::metrics::MetricsRecorder for OtelMetricsRecorder {
+    fn record_relay_tick(&self, tick: &agent_server::journal::relay::RelayTick, duration_ms: u64) {
+        self.logging.record_relay_tick(tick, duration_ms);
+    }
+
+    fn record_relay_reclaim(&self, reclaimed: u64) {
+        self.logging.record_relay_reclaim(reclaimed);
+        if reclaimed > 0 {
+            HostMetrics::global().relay_reclaimed.add(reclaimed, &[]);
+        }
+    }
+
+    fn record_relay_backlog(&self, pending: u64, soft_threshold: Option<u64>) {
+        self.logging.record_relay_backlog(pending, soft_threshold);
+        HostMetrics::global().relay_backlog.record(pending, &[]);
+    }
+
+    fn record_wakeup_nudge(
+        &self,
+        source: crate::metrics::WakeupSource,
+        outcome: &agent_server::journal::TaskWakeupOutcome,
+    ) {
+        self.logging.record_wakeup_nudge(source, outcome);
+        HostMetrics::global().wakeup_nudges.add(
+            1,
+            &[
+                KeyValue::new(attrs::SOURCE, crate::metrics::wakeup_source_label(source)),
+                KeyValue::new(
+                    attrs::OUTCOME,
+                    crate::metrics::wakeup_outcome_label(outcome),
+                ),
+            ],
+        );
+    }
+
+    fn record_watch_advisory(&self, outcome: &agent_server::journal::ThreadEventsWatchOutcome) {
+        self.logging.record_watch_advisory(outcome);
+        HostMetrics::global().watch_advisories.add(
+            1,
+            &[KeyValue::new(
+                attrs::OUTCOME,
+                crate::metrics::watch_outcome_label(outcome),
+            )],
+        );
+    }
+
+    fn record_janitor_cycle(&self, report: &agent_server::journal::JanitorCycleReport) {
+        self.logging.record_janitor_cycle(report);
+        let metrics = HostMetrics::global();
+        metrics.janitor_cycles.add(1, &[]);
+        for (rows, count) in [
+            ("events_purged", report.events_purged),
+            ("checkpoints_pruned", report.checkpoints_pruned),
+            ("floors_advanced", u64::from(report.floors_advanced)),
+        ] {
+            if count > 0 {
+                metrics
+                    .janitor_rows
+                    .add(count, &[KeyValue::new(attrs::JANITOR_ROWS, rows)]);
+            }
+        }
+    }
+
+    fn record_lease_sweep(&self, released: usize) {
+        self.logging.record_lease_sweep(released);
     }
 }
 

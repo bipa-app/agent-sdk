@@ -78,7 +78,7 @@ use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
 use super::config::{BrokerConfig, ServiceConfig};
 use super::health::{HealthSurface, LatencyLayerHealth};
 use super::http_health::HttpHealthHandle;
-use super::metrics::{LoggingMetricsRecorder, MetricsRecorder};
+use super::metrics::MetricsRecorder;
 use super::relay::{RelayScheduler, RelaySchedulerConfig};
 use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
@@ -147,7 +147,7 @@ impl ServiceHost {
             stores,
             runtime,
             health: HealthSurface::shared(),
-            metrics: Arc::new(LoggingMetricsRecorder),
+            metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
@@ -173,7 +173,7 @@ impl ServiceHost {
             stores,
             runtime,
             health: HealthSurface::shared(),
-            metrics: Arc::new(LoggingMetricsRecorder),
+            metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
@@ -313,8 +313,8 @@ impl ServiceHost {
         &self.metrics
     }
 
-    /// Replace the default [`LoggingMetricsRecorder`] with a caller
-    /// provided implementation — typically an
+    /// Replace the default recorder (logging, plus `OTel` with the `otel`
+    /// feature) with a caller provided implementation — typically an
     /// [`InMemoryMetricsRecorder`](crate::metrics::InMemoryMetricsRecorder)
     /// for tests or a Prometheus/OTel-backed recorder for production.
     #[must_use]
@@ -864,6 +864,7 @@ async fn settle_orphaned_descendants(
 
     let deps = stores.root_turn_deps();
     let mut settled = 0usize;
+    let mut failed = 0usize;
     for root_id in roots {
         match settle_live_descendants(&root_id, &deps, now).await {
             Ok(transitioned) => {
@@ -880,6 +881,7 @@ async fn settle_orphaned_descendants(
                 settled = settled.saturating_add(transitioned.len());
             }
             Err(err) => {
+                failed = failed.saturating_add(1);
                 warn!(
                     root = %root_id,
                     error = %err,
@@ -888,7 +890,22 @@ async fn settle_orphaned_descendants(
             }
         }
     }
+    #[cfg(feature = "otel")]
+    super::observability::HostMetrics::global().record_orphan_settlement(settled, failed);
+    #[cfg(not(feature = "otel"))]
+    let _ = failed;
     Ok(settled)
+}
+
+/// The recorder a host starts with: with the `otel` feature it also exports
+/// the host-loop signals ([`super::observability::OtelMetricsRecorder`]),
+/// otherwise it only logs them. [`ServiceHost::with_metrics`] replaces it.
+fn default_metrics_recorder() -> Arc<dyn MetricsRecorder> {
+    #[cfg(feature = "otel")]
+    let recorder = super::observability::OtelMetricsRecorder::default();
+    #[cfg(not(feature = "otel"))]
+    let recorder = super::metrics::LoggingMetricsRecorder;
+    Arc::new(recorder)
 }
 
 /// Wake same-process followers of the child threads a settlement closed,

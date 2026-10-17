@@ -1513,6 +1513,7 @@ impl AgentControlService for GrpcControlService {
                 fingerprint,
             )
             .await
+            .inspect(|claim| observe_idempotency_claim(IdempotencyKind::CreateThread, claim))
             .map_err(internal_status("create-thread idempotency lookup"))?
         {
             IdempotencyClaim::Conflict => {
@@ -1788,6 +1789,7 @@ impl AgentControlService for GrpcControlService {
                 &fingerprint,
             )
             .await
+            .inspect(|claim| observe_idempotency_claim(IdempotencyKind::ForkThread, claim))
             .map_err(internal_status("fork-thread idempotency lookup"))?
         {
             IdempotencyClaim::Conflict => {
@@ -3149,6 +3151,16 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
 enum ApprovalFailure {
     NotApproved(anyhow::Error),
     AfterApproval(anyhow::Error),
+}
+
+/// Counts a claim on `agent_service_host.idempotency.claims`, so a retried
+/// request shows whether it replayed, found its first attempt in flight, or
+/// ran fresh.
+fn observe_idempotency_claim(kind: IdempotencyKind, claim: &IdempotencyClaim) {
+    #[cfg(feature = "otel")]
+    crate::observability::HostMetrics::global().record_idempotency_claim(kind, claim);
+    #[cfg(not(feature = "otel"))]
+    let _ = (kind, claim);
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -8662,6 +8674,90 @@ mod tests {
                 )
         ));
         Ok(compacted.messages)
+    }
+
+    /// A retried fork records its claim kind on
+    /// `agent_service_host.idempotency.claims`: the first `fresh`, the retry
+    /// `replay`. Assertions are lower bounds: other tests in this binary may
+    /// record into the same global meter.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_retried_fork_records_a_replay_claim() -> Result<()> {
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+        crate::observability::HostMetrics::reset_for_testing();
+
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_claim",
+                "claim",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+            let source = create_thread(&mut control, "claim-src").await?;
+            submit_text_work(&mut control, "claim-submit", &source, "first").await?;
+            let mut stream =
+                open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
+            let _ = collect_until_closed(&mut stream).await?;
+            fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
+            fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result?;
+
+        provider.force_flush()?;
+        let count = |claim: &str| -> u64 {
+            let mut total = 0;
+            for resource in exporter
+                .get_finished_metrics()
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .take(1)
+            {
+                for scope in resource.scope_metrics() {
+                    for metric in scope
+                        .metrics()
+                        .filter(|m| m.name() == "agent_service_host.idempotency.claims")
+                    {
+                        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                            total += sum
+                                .data_points()
+                                .filter(|point| {
+                                    let labels: Vec<(String, String)> = point
+                                        .attributes()
+                                        .map(|kv| (kv.key.to_string(), kv.value.to_string()))
+                                        .collect();
+                                    labels.contains(&("kind".into(), "fork_thread".into()))
+                                        && labels.contains(&("claim".into(), claim.into()))
+                                })
+                                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                                .sum::<u64>();
+                        }
+                    }
+                }
+            }
+            total
+        };
+        assert!(count("fresh") >= 1, "the first fork claims fresh");
+        assert!(count("replay") >= 1, "the retry replays the recorded fork");
+        Ok(())
     }
 
     /// AC3: fork is idempotent under the same `request_id`. A retry
