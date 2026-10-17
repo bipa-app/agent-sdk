@@ -6545,7 +6545,10 @@ async fn steering_wake_restart_between_wake_and_repark_resumes_cleanly() -> Resu
     // ... the daemon crashes before re-park. The lease expires and the
     // recovery sweep requeues the row — SteeringResume is preserved so
     // the durable continuation stays authoritative.
-    let recovered = stores.tasks.release_expired_leases(t_plus(200)).await?;
+    let recovered = stores
+        .tasks
+        .release_expired_leases(t_plus(200), crate::journal::LeaseRecoveryScope::Expired)
+        .await?;
     assert_eq!(recovered.len(), 1, "the wedged steering row must requeue");
     let requeued = stores.tasks.get(&parent.id).await?.context("requeued")?;
     assert_eq!(requeued.status, TaskStatus::Pending);
@@ -9100,7 +9103,10 @@ async fn expire_wake_until_failed_closed(
             )
             .await?
             .context("acquire the woken parent")?;
-        stores.tasks.release_expired_leases(t_plus(at + 2)).await?;
+        stores
+            .tasks
+            .release_expired_leases(t_plus(at + 2), crate::journal::LeaseRecoveryScope::Expired)
+            .await?;
         let row = stores.tasks.get(parent_id).await?.context("parent")?;
         if row.status == TaskStatus::Failed {
             return Ok(());

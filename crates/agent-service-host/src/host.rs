@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use agent_sdk_foundation::{TerminalReason, ToolTier};
 use agent_server::journal::commit::StaleTurnCommit;
@@ -75,7 +75,7 @@ use agent_server::worker::{
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
-use super::config::{BrokerConfig, ServiceConfig};
+use super::config::{BrokerConfig, EpochRecovery, ServiceConfig};
 use super::health::{HealthSurface, LatencyLayerHealth};
 use super::http_health::HttpHealthHandle;
 use super::metrics::{LoggingMetricsRecorder, MetricsRecorder};
@@ -86,8 +86,9 @@ use super::wakeup::WakeupScheduler;
 use super::watch::ThreadEventsWatchScheduler;
 use agent_server::journal::relay::RetryBackoff;
 use agent_server::journal::{
-    JournalTaskWakeupHandler, NotifierThreadEventsWatchHandler, TaskWakeupHandler,
-    ThreadEventsWatchHandler, WakeupSignal,
+    EpochId, EpochRecord, JournalTaskWakeupHandler, LeaseRecoveryScope,
+    NotifierThreadEventsWatchHandler, TaskWakeupHandler, ThreadEventsWatchHandler, Transition,
+    WakeupSignal, Write,
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -373,6 +374,13 @@ impl ServiceHost {
             use tokio::signal::unix::{SignalKind, signal};
             signal(SignalKind::terminate()).context("registering SIGTERM handler")?
         };
+
+        begin_epoch_and_reclaim(
+            &self.stores,
+            self.config.worker.epoch_recovery,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
 
         // Before any worker can pick up a task a previous process left
         // under a terminal root.
@@ -785,7 +793,9 @@ async fn lease_sweep_loop(
             }
             _ = ticker.tick() => {
                 let now = time::OffsetDateTime::now_utc();
-                match drain_expired_leases(&stores, Some(&wakeup_signal), now).await {
+                match drain_expired_leases(&stores, Some(&wakeup_signal), now, &LeaseRecoveryScope::Expired)
+                    .await
+                {
                     Ok(count) if count > 0 => {
                         info!(count, "released expired leases");
                         metrics.record_lease_sweep(count);
@@ -906,6 +916,88 @@ fn forward_settlement(
     }
 }
 
+/// Begin this process's epoch on the store, in one transaction. Every
+/// lease the store grants from then on records it.
+///
+/// # Errors
+/// The store refused or failed the commit.
+async fn begin_epoch(stores: &StoreRegistry, now: time::OffsetDateTime) -> Result<EpochId> {
+    let record = EpochRecord::begin(now, Some(format!("pid {}", std::process::id())));
+    let epoch = record.id.clone();
+    stores
+        .task_store
+        .commit(
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::BeginEpoch(record)],
+            },
+            now,
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("begin the process epoch")?;
+    info!(epoch = %epoch, "began the process epoch");
+    Ok(epoch)
+}
+
+/// Begin this process's epoch and, under [`EpochRecovery::SingleHost`],
+/// reclaim every lease an earlier process granted, before any worker of
+/// this process runs. Returns the new epoch.
+///
+/// # Errors
+/// The epoch could not be begun. A failed reclaim is only logged: the
+/// leases then expire as they would without epochs.
+async fn begin_epoch_and_reclaim(
+    stores: &StoreRegistry,
+    recovery: EpochRecovery,
+    now: time::OffsetDateTime,
+) -> Result<EpochId> {
+    let span = tracing::info_span!(
+        "agent_server.epoch.begin",
+        agent_server.epoch.id = tracing::field::Empty,
+        agent_server.epoch.recovery = recovery.as_str(),
+        agent_server.epoch.requeued = tracing::field::Empty,
+        agent_server.epoch.failed_interrupted = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+    let epoch = begin_epoch(stores, now).instrument(span.clone()).await?;
+    span.record("agent_server.epoch.id", epoch.as_str());
+    match recovery {
+        EpochRecovery::LeaseExpiry => {
+            span.record("outcome", "ok");
+        }
+        EpochRecovery::SingleHost => {
+            let scope = LeaseRecoveryScope::ForeignEpoch(epoch.clone());
+            match drain_leases(stores, None, now, &scope)
+                .instrument(span.clone())
+                .await
+            {
+                Ok(tally) => {
+                    span.record("agent_server.epoch.requeued", tally.requeued);
+                    span.record("agent_server.epoch.failed_interrupted", tally.failed_closed);
+                    span.record("outcome", "ok");
+                    if tally.total() > 0 {
+                        info!(
+                            requeued = tally.requeued,
+                            failed_closed = tally.failed_closed,
+                            epoch = %epoch,
+                            "reclaimed the leases of earlier processes at startup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    span.record("outcome", "error");
+                    warn!(
+                        error = %e,
+                        "startup reclaim of earlier leases failed; they expire as usual"
+                    );
+                }
+            }
+        }
+    }
+    Ok(epoch)
+}
+
 /// Rounds of [`AgentTaskStore::release_expired_leases`] one sweep tick
 /// may run while draining a backlog — a guard against a pathological
 /// store that keeps reporting full batches (the remainder defers to
@@ -931,29 +1023,67 @@ async fn drain_expired_leases(
     stores: &StoreRegistry,
     signal: Option<&WakeupSignal>,
     now: time::OffsetDateTime,
+    scope: &LeaseRecoveryScope,
 ) -> Result<usize> {
-    let mut total = 0usize;
+    drain_leases(stores, signal, now, scope)
+        .await
+        .map(ReclaimTally::total)
+}
+
+/// The rows one drain reclaimed, by what recovery did with them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ReclaimTally {
+    requeued: usize,
+    failed_closed: usize,
+}
+
+impl ReclaimTally {
+    const fn total(self) -> usize {
+        self.requeued.saturating_add(self.failed_closed)
+    }
+
+    fn add(&mut self, records: &[agent_server::journal::RecoveryRecord]) {
+        for record in records {
+            match record.action {
+                agent_server::journal::RecoveryAction::Requeue => self.requeued += 1,
+                agent_server::journal::RecoveryAction::FailClosed(_) => self.failed_closed += 1,
+                agent_server::journal::RecoveryAction::NoAction => {}
+            }
+        }
+    }
+}
+
+/// [`drain_expired_leases`], reporting the reclaimed rows by action.
+async fn drain_leases(
+    stores: &StoreRegistry,
+    signal: Option<&WakeupSignal>,
+    now: time::OffsetDateTime,
+    scope: &LeaseRecoveryScope,
+) -> Result<ReclaimTally> {
+    let mut tally = ReclaimTally::default();
     for _ in 0..MAX_LEASE_SWEEP_ROUNDS {
         let records = stores
             .task_store
-            .release_expired_leases(now)
+            .release_expired_leases(now, scope.clone())
             .await
             .context("release expired leases")?;
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_lease_reclaim(&records, scope);
         for record in &records {
             forward_settlement(stores, &record.settled);
             settle_failed_closed_tool_child(stores, signal, record).await;
         }
-        total = total.saturating_add(records.len());
+        tally.add(&records);
         if records.len() < agent_server::journal::store::LEASE_RELEASE_BATCH {
-            return Ok(total);
+            return Ok(tally);
         }
     }
     warn!(
         rounds = MAX_LEASE_SWEEP_ROUNDS,
-        reclaimed = total,
+        reclaimed = tally.total(),
         "expired-lease drain hit its round guard; remaining backlog defers to the next tick",
     );
-    Ok(total)
+    Ok(tally)
 }
 
 /// Settle a tool child the lease sweep failed closed (see
@@ -8657,7 +8787,13 @@ mod tests {
             .await?
             .context("the first child must acquire")?;
 
-        drain_expired_leases(&stores, Some(&signal), time::OffsetDateTime::now_utc()).await?;
+        drain_expired_leases(
+            &stores,
+            Some(&signal),
+            time::OffsetDateTime::now_utc(),
+            &LeaseRecoveryScope::Expired,
+        )
+        .await?;
 
         let row = stores
             .task_store
@@ -9207,7 +9343,10 @@ mod tests {
         // Well past the short acquisition lease but far short of the renewed
         // one: the row must not be sweepable, proving the beat ran first.
         let swept = flaky
-            .release_expired_leases(start + time::Duration::seconds(5))
+            .release_expired_leases(
+                start + time::Duration::seconds(5),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
             .await?;
         assert!(
             !swept.iter().any(|record| record.id == child_root.id),
@@ -10200,6 +10339,7 @@ mod tests {
                     | Write::PauseOnConfirmation { .. }
                     | Write::ReparkAfterSteering { .. }
                     | Write::Effect(_)
+                    | Write::BeginEpoch(_)
                     | Write::AppendEvents { .. }
                     | Write::AppendCompaction { .. }
                     | Write::SpawnChildren { .. }
@@ -10363,8 +10503,9 @@ mod tests {
         async fn release_expired_leases(
             &self,
             now: time::OffsetDateTime,
+            scope: agent_server::journal::LeaseRecoveryScope,
         ) -> Result<Vec<RecoveryRecord>> {
-            self.inner.release_expired_leases(now).await
+            self.inner.release_expired_leases(now, scope).await
         }
         async fn pause_on_children(
             &self,
@@ -11429,7 +11570,8 @@ mod tests {
             task_ids.push(task_id);
         }
 
-        let drained = drain_expired_leases(&stores, None, now).await?;
+        let drained =
+            drain_expired_leases(&stores, None, now, &LeaseRecoveryScope::Expired).await?;
         assert_eq!(
             drained, backlog,
             "one sweep tick must drain the whole backlog, not one batch",
@@ -11581,7 +11723,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let swept = stores
             .task_store
-            .release_expired_leases(time::OffsetDateTime::now_utc())
+            .release_expired_leases(
+                time::OffsetDateTime::now_utc(),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
             .await?;
         assert!(
             swept.iter().any(|record| record.id == child_root.id),

@@ -354,6 +354,42 @@ pub struct WorkerConfig {
     /// interval reduces latency to first pick-up but increases
     /// polling load on the store.
     pub acquisition_interval_secs: u64,
+    /// How the host reclaims the leases an earlier process left behind
+    /// when it starts.
+    pub epoch_recovery: EpochRecovery,
+}
+
+/// How a starting host reclaims the leases of earlier processes.
+///
+/// Every host begins a new epoch at start and stamps it on each lease it
+/// grants (see [`agent_server::journal::epoch`]). The backend cannot tell
+/// whether the host is the only process on its store: several processes
+/// can open one `SQLite` file, and several pods share one Postgres
+/// database, so the embedder chooses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpochRecovery {
+    /// Wait for each earlier lease to expire, as before epochs. Safe for
+    /// any number of hosts on one store, and for a rolling deploy.
+    #[default]
+    LeaseExpiry,
+    /// Requeue (or fail closed at its budget) every lease of an earlier
+    /// epoch before the first worker starts. Only for an embedder that
+    /// guarantees this host is the sole process on its store, for example
+    /// with a single-instance lock.
+    SingleHost,
+}
+
+impl EpochRecovery {
+    /// The mode's stable label, as in spans: `lease_expiry` or
+    /// `single_host`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseExpiry => "lease_expiry",
+            Self::SingleHost => "single_host",
+        }
+    }
 }
 
 impl Default for WorkerConfig {
@@ -365,6 +401,7 @@ impl Default for WorkerConfig {
             sweep_interval_secs: 5,
             subagent_progress_interval_secs: 30,
             acquisition_interval_secs: 1,
+            epoch_recovery: EpochRecovery::LeaseExpiry,
         }
     }
 }

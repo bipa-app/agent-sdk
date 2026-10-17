@@ -29,6 +29,8 @@ use crate::host::{
     settle_orphaned_descendants,
 };
 use crate::stores::StoreRegistry;
+#[cfg(feature = "sqlite")]
+use crate::{config::EpochRecovery, host::begin_epoch_and_reclaim};
 
 use super::FlakyTaskStore;
 
@@ -587,7 +589,13 @@ async fn the_lease_sweep_forwards_what_its_fail_close_settled() -> Result<()> {
     let child_thread = task(&stores, &tool).await?.thread_id;
     let mut follower = stores.event_notifier.subscribe(&child_thread);
 
-    drain_expired_leases(&stores, None, OffsetDateTime::now_utc()).await?;
+    drain_expired_leases(
+        &stores,
+        None,
+        OffsetDateTime::now_utc(),
+        &agent_server::journal::LeaseRecoveryScope::Expired,
+    )
+    .await?;
 
     assert_eq!(task(&stores, &root).await?.status, TaskStatus::Failed);
     let cancelled = task(&stores, &tool).await?;
@@ -808,5 +816,62 @@ async fn a_failed_subagent_completion_surfaces_and_writes_neither_half() -> Resu
         "a failed completion wrote half: invocation {:?}, {completed_progress} completed progress",
         after.status,
     );
+    Ok(())
+}
+
+/// A previous process on an `SQLite` file leased a root for an hour and
+/// died. The next process begins its epoch at start; with
+/// [`EpochRecovery::SingleHost`] it requeues the dead lease before any
+/// worker runs, and with [`EpochRecovery::LeaseExpiry`] it leaves the
+/// lease to expire.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_new_process_reclaims_a_dead_processs_lease_only_as_the_single_host() -> Result<()> {
+    for (recovery, reclaimed) in [
+        (EpochRecovery::SingleHost, true),
+        (EpochRecovery::LeaseExpiry, false),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(dir.path().join("epoch.db").display().to_string()),
+                max_connections: None,
+            },
+            ..StorageConfig::default()
+        };
+        let now = OffsetDateTime::now_utc();
+        let (root, lease) = {
+            let previous = StoreRegistry::from_config(&storage, super::sample_registry())?;
+            previous.initialize().await?;
+            begin_epoch_and_reclaim(&previous, recovery, now).await?;
+            let root = AgentTask::new_root_turn(ThreadId::from_string("t-epoch"), now, 3);
+            previous.task_store.submit_root_turn(root.clone()).await?;
+            let lease = LeaseId::new();
+            previous
+                .task_store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("worker-0"),
+                    lease.clone(),
+                    now + time::Duration::hours(1),
+                    now,
+                )
+                .await?
+                .context("the previous process leases the root")?;
+            (root, lease)
+        };
+
+        let next = StoreRegistry::from_config(&storage, super::sample_registry())?;
+        next.initialize().await?;
+        begin_epoch_and_reclaim(&next, recovery, now + time::Duration::seconds(1)).await?;
+        let row = task(&next, &root.id).await?;
+        if reclaimed {
+            assert_eq!(row.status, TaskStatus::Pending, "{recovery:?}");
+            assert!(row.lease_id.is_none(), "{recovery:?}");
+        } else {
+            assert_eq!(row.status, TaskStatus::Running, "{recovery:?}");
+            assert_eq!(row.lease_id, Some(lease), "{recovery:?}");
+        }
+    }
     Ok(())
 }
