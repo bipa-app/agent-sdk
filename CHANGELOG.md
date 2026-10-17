@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `AgentTaskStore::enqueue_steering_resume` is now a wrapper over
     `commit`, with unchanged behaviour and error text.
   - The architecture test counts calls to it.
+  - Each wake is counted on `agent_server.journal.steering_resumes`, by
+    `backend` and `outcome` (`woken` / `declined`, feature `otel`).
 
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
   JSON document in the same transaction as the rest of its `Transition`

@@ -799,3 +799,44 @@ async fn effect_signals_count_each_transition_by_kind() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::task::AgentTask;
+    use agent_server::journal::{AgentTaskStore, DurableStore, Transition};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new();
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let root = AgentTask::new_root_turn(ThreadId::from_string("steer"), now, 3);
+    let _ = store.submit_root_turn(root.clone()).await?;
+    let note = vec![agent_sdk_foundation::llm::ContentBlock::Text {
+        text: "status?".into(),
+    }];
+    let committed = store
+        .commit(
+            Transition::enqueue_steering_resume(root.id.clone(), note),
+            now,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    assert!(
+        matches!(committed.steering_resumed.as_slice(), [None]),
+        "a parent that is not parked declines"
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let resumes = collect_u64_counter(&snapshots, "agent_server.journal.steering_resumes");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert!(matches_all(
+        &resumes[0].0,
+        &[
+            (attrs::BACKEND, attrs::BACKEND_MEMORY),
+            (attrs::OUTCOME, attrs::OUTCOME_DECLINED),
+        ]
+    ));
+    Ok(())
+}

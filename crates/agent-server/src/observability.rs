@@ -160,6 +160,11 @@ pub mod attrs {
     /// Transition outcome: malformed, refused, or the store failed.
     pub const OUTCOME_STORE: &str = "store";
 
+    /// Steering wake outcome: `woken` / `declined` (the parent was no
+    /// longer parked).
+    pub const OUTCOME_WOKEN: &str = "woken";
+    pub const OUTCOME_DECLINED: &str = "declined";
+
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
 
@@ -195,6 +200,7 @@ pub struct ServerMetrics {
     /// `agent_server.effect.duration`: started to finished, by kind and
     /// the state it finished in.
     pub(crate) effect_duration: Histogram<f64>,
+    pub(crate) steering_resumes: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -356,6 +362,20 @@ impl ServerMetrics {
         let Ok(committed) = result else {
             return;
         };
+        for resumed in &committed.steering_resumed {
+            let outcome = if resumed.is_some() {
+                attrs::OUTCOME_WOKEN
+            } else {
+                attrs::OUTCOME_DECLINED
+            };
+            self.steering_resumes.add(
+                1,
+                &[
+                    KeyValue::new(attrs::BACKEND, backend),
+                    KeyValue::new(attrs::OUTCOME, outcome),
+                ],
+            );
+        }
         for document in &committed.documents {
             let op = if document.revision.is_some() {
                 attrs::OP_PUT
@@ -560,6 +580,12 @@ impl ServerMetrics {
                 "Transitions the store retried after a deadlock or serialization failure.",
             )
             .build();
+        let steering_resumes = meter
+            .u64_counter("agent_server.journal.steering_resumes")
+            .with_description(
+                "Steering wakes committed, attributed by backend and outcome (woken or declined).",
+            )
+            .build();
         let documents_written = meter
             .u64_counter("agent_server.journal.documents.written")
             .with_description(
@@ -596,6 +622,7 @@ impl ServerMetrics {
             documents_written,
             effects,
             effect_duration,
+            steering_resumes,
             meter,
         }
     }
