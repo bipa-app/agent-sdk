@@ -1076,7 +1076,20 @@ async fn wait_for_task(
         }
         if tokio::time::Instant::now() >= deadline {
             let row = stores.task_store.get(task).await?;
-            bail!("timed out waiting for task {task} to be {what}: {row:?}");
+            let rows = all_rows(stores).await?;
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} {:?} {:?} attempt {} parent {:?} error {:?}",
+                        row.id, row.kind, row.status, row.attempt, row.parent_id, row.last_error
+                    )
+                })
+                .collect();
+            bail!(
+                "timed out waiting for task {task} to be {what}: {row:?}\nall rows:\n{}",
+                rows.join("\n")
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
