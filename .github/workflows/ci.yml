@@ -224,6 +224,10 @@ jobs:
   # consumer who picks a single provider (or none) still compiles. Keep
   # the feature list in sync with the `[features]` sections of
   # `crates/agent-sdk/Cargo.toml` and `crates/agent-sdk-providers/Cargo.toml`.
+  #
+  # agent-sdk-providers is checked with `--all-targets`, so a unit or
+  # integration test that reaches into a provider its row leaves off fails
+  # here instead of only in the nightly jobs that build its default features.
   feature-matrix:
     name: Feature matrix (${{ matrix.crate }} ${{ matrix.features }})
     runs-on: ubuntu-latest
@@ -233,6 +237,7 @@ jobs:
         crate: [agent-sdk, agent-sdk-providers]
         features:
           - "--no-default-features"
+          - "--features default"
           - "--no-default-features --features anthropic"
           - "--no-default-features --features openai"
           - "--no-default-features --features openai-codex"
@@ -247,7 +252,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p ${{ matrix.crate }} ${{ matrix.features }}
+      - run: cargo check -p ${{ matrix.crate }} ${{ matrix.crate == 'agent-sdk-providers' && '--all-targets' || '' }} ${{ matrix.features }}
 
   # ───────────────────────────────────────────────────────────────────
   # Host feature matrix — agent-service-host backend combos.

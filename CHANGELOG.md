@@ -489,6 +489,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `agent-sdk-providers` test targets compile with any single provider
+  feature. Tests that build an `OpenAIProvider` or use its model constants
+  need `openai`, and `tests/provider_tiers.rs` needs `anthropic`; with the
+  default features the unit tests failed to compile, which broke the nightly
+  live and tool-call smoke jobs. The CI feature matrix now checks this
+  crate with `--all-targets`.
 - Gemini and Vertex Gemini count thinking tokens as output. Google reports
   them in `thoughtsTokenCount`, outside `candidatesTokenCount`, and bills
   them at the output rate, but the usage parser read only the candidate

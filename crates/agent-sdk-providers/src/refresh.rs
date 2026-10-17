@@ -643,6 +643,7 @@ mod tests {
         assert!(wrapped.validate_thinking_config(None).is_ok());
     }
 
+    #[cfg(feature = "openai")]
     #[test]
     fn wrapper_reports_the_wrapped_provider_route() {
         let gateway = crate::impls::openai::OpenAIProvider::with_base_url(

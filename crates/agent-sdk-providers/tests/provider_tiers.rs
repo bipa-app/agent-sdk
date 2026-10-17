@@ -25,6 +25,8 @@
 //! the `cassettes/` SSE fixtures are recorded-shape, secret-free, and
 //! replayed deterministically.
 
+#![cfg(feature = "anthropic")]
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
