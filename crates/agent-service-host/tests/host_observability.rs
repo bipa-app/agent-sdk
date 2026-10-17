@@ -272,3 +272,111 @@ async fn service_host_counts_its_running_workers_and_returns_to_zero() -> Result
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 4. A host's default recorder exports its host-loop signals
+// ─────────────────────────────────────────────────────────────────────
+
+/// Sum of every point of the u64 counter `name` in the newest snapshot.
+fn counter_total(snapshots: &[ResourceMetrics], name: &str) -> u64 {
+    let mut total = 0;
+    for resource in snapshots.iter().rev().take(1) {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics().filter(|m| m.name() == name) {
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    total += sum
+                        .data_points()
+                        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                        .sum::<u64>();
+                }
+            }
+        }
+    }
+    total
+}
+
+#[tokio::test]
+async fn a_host_exports_its_janitor_cycles_without_a_custom_recorder() -> Result<()> {
+    let _guard = acquire_lock().await;
+    let (provider, exporter) = install_in_memory_meter();
+
+    let mut config = ServiceConfig::default();
+    config.transport.grpc_enabled = false;
+    config.transport.http_enabled = false;
+    config.retention.janitor_enabled = true;
+    config.retention.janitor_interval_secs = 1;
+    let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(sample_definition()));
+    let host = ServiceHost::new(config, registry, sample_runtime()).context("construct host")?;
+    let token = host.shutdown_token();
+    let running = tokio::spawn(async move { host.run().await });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let cycles = loop {
+        flush(&provider)?;
+        let cycles = counter_total(&collected(&exporter)?, "agent_service_host.janitor.cycles");
+        if cycles > 0 || std::time::Instant::now() > deadline {
+            break cycles;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    token.cancel();
+    running.await.context("join host")??;
+    assert!(
+        cycles >= 1,
+        "the default recorder must export janitor cycles"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_otel_recorder_exports_relay_and_janitor_signals() -> Result<()> {
+    use agent_service_host::metrics::MetricsRecorder;
+    use agent_service_host::observability::OtelMetricsRecorder;
+
+    let _guard = acquire_lock().await;
+    let (provider, exporter) = install_in_memory_meter();
+
+    let recorder = OtelMetricsRecorder::default();
+    recorder.record_relay_reclaim(2);
+    recorder.record_relay_reclaim(0);
+    recorder.record_relay_backlog(7, Some(5));
+    recorder.record_janitor_cycle(&agent_server::journal::JanitorCycleReport {
+        events_purged: 3,
+        ..Default::default()
+    });
+    recorder.record_lease_sweep(4);
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+
+    assert_eq!(
+        counter_total(&snapshots, "agent_service_host.relay.reclaimed"),
+        2
+    );
+    assert_eq!(
+        counter_total(&snapshots, "agent_service_host.janitor.cycles"),
+        1
+    );
+    assert_eq!(
+        counter_total(&snapshots, "agent_service_host.janitor.rows"),
+        3
+    );
+    let backlog = snapshots.iter().rev().take(1).find_map(|resource| {
+        resource
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "agent_service_host.relay.backlog")
+            .and_then(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => gauge
+                    .data_points()
+                    .next()
+                    .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value),
+                _ => None,
+            })
+    });
+    assert_eq!(
+        backlog,
+        Some(7),
+        "the backlog gauge holds the last pending count"
+    );
+    Ok(())
+}

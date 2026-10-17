@@ -1513,6 +1513,7 @@ impl AgentControlService for GrpcControlService {
                 fingerprint,
             )
             .await
+            .inspect(|claim| observe_idempotency_claim(IdempotencyKind::CreateThread, claim))
             .map_err(internal_status("create-thread idempotency lookup"))?
         {
             IdempotencyClaim::Conflict => {
@@ -1788,6 +1789,7 @@ impl AgentControlService for GrpcControlService {
                 &fingerprint,
             )
             .await
+            .inspect(|claim| observe_idempotency_claim(IdempotencyKind::ForkThread, claim))
             .map_err(internal_status("fork-thread idempotency lookup"))?
         {
             IdempotencyClaim::Conflict => {
@@ -1961,6 +1963,7 @@ impl AgentControlService for GrpcControlService {
             )
             .await
             .map_err(internal_status("answer-question idempotency lookup"))?;
+        observe_idempotency_claim(IdempotencyKind::AnswerQuestion, &claim);
         match &claim {
             IdempotencyClaim::Conflict => {
                 return Err(idempotency_conflict_status(
@@ -3149,6 +3152,16 @@ fn map_purge_receipt(receipt: &PurgeReceipt) -> Result<pb::PurgeReceipt, Status>
 enum ApprovalFailure {
     NotApproved(anyhow::Error),
     AfterApproval(anyhow::Error),
+}
+
+/// Counts a claim on `agent_service_host.idempotency.claims`, so a retried
+/// request shows whether it replayed, found its first attempt in flight, or
+/// ran fresh.
+fn observe_idempotency_claim(kind: IdempotencyKind, claim: &IdempotencyClaim) {
+    #[cfg(feature = "otel")]
+    crate::observability::HostMetrics::global().record_idempotency_claim(kind, claim);
+    #[cfg(not(feature = "otel"))]
+    let _ = (kind, claim);
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -8662,6 +8675,99 @@ mod tests {
                 )
         ));
         Ok(compacted.messages)
+    }
+
+    /// Retried creates and forks record their claim kind on
+    /// `agent_service_host.idempotency.claims`: the first `fresh`, the retry
+    /// `replay`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn retried_creates_and_forks_record_a_replay_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_claim",
+                "claim",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+        let result = async {
+            let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
+            let source = create_thread(&mut control, "claim-src").await?;
+            let again = create_thread(&mut control, "claim-src").await?;
+            anyhow::ensure!(again == source, "a replayed create returns the same thread");
+            submit_text_work(&mut control, "claim-submit", &source, "first").await?;
+            let mut stream =
+                open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
+            let _ = collect_until_closed(&mut stream).await?;
+            fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
+            fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result?;
+
+        // Lower bounds: under plain `cargo test` other tests in this binary
+        // record into the same global meter (nextest runs one per process).
+        let claims = |kind: &str, claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", kind), ("claim", claim)],
+            )
+        };
+        assert!(
+            claims("create_thread", "fresh") >= 1,
+            "create_thread, fresh"
+        );
+        assert!(
+            claims("create_thread", "replay") >= 1,
+            "create_thread, replay"
+        );
+        assert!(claims("fork_thread", "fresh") >= 1, "fork_thread, fresh");
+        assert!(claims("fork_thread", "replay") >= 1, "fork_thread, replay");
+        Ok(())
+    }
+
+    /// A re-sent answer (the crash matrix's S6 retry after a restart) records
+    /// `replay` for `answer_question`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_resent_answer_records_a_replay_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let (thread_id, task_id) = seed_pending_root(&service, "answer-claim").await?;
+        park_rpc_question(&shared, &thread_id, &task_id).await?;
+        let request = pb::AnswerQuestionRequest {
+            request_id: "answer-claim-1".into(),
+            thread_id,
+            task_id,
+            answers: vec![pb::QuestionAnswerEntry {
+                tool_call_id: "question-call-rpc".into(),
+                answer: "A".into(),
+            }],
+        };
+        service
+            .answer_question(Request::new(request.clone()))
+            .await?;
+        service.answer_question(Request::new(request)).await?;
+
+        let claims = |claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", "answer_question"), ("claim", claim)],
+            )
+        };
+        assert!(claims("fresh") >= 1, "fresh");
+        assert!(claims("replay") >= 1, "replay");
+        Ok(())
     }
 
     /// AC3: fork is idempotent under the same `request_id`. A retry

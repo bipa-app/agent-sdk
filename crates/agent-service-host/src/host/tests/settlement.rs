@@ -293,6 +293,52 @@ async fn sweep_tick_settles_children_of_a_root_failed_closed_on_lease_expiry() -
     assert_children_settled(&stores, &tree).await
 }
 
+/// The startup orphan settlement is exported as
+/// `agent_service_host.orphans.settled`.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn startup_exports_the_orphans_it_settled() -> Result<()> {
+    let meter = crate::observability::test_meter::TestMeter::install().await;
+    let config = ServiceConfig {
+        worker: WorkerConfig {
+            sweep_interval_secs: 3_600,
+            acquisition_interval_secs: 3_600,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let host = ServiceHost::new(config, super::sample_registry(), super::sample_runtime()?)?;
+    let stores = host.stores().clone();
+    let token = host.shutdown_token();
+    // A failed root over live children, as a dead process leaves it: the
+    // startup pass settles them.
+    let tree =
+        seed_failed_root_with_live_children(&stores, &ThreadId::from_string("t-orphan-metric"))
+            .await?;
+
+    let host_handle = tokio::spawn(async move { host.run().await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !all_children_terminal(&stores, &tree).await? {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "startup never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    token.cancel();
+    host_handle.await??;
+
+    let settled = meter.counter("agent_service_host.orphans.settled", &[]);
+    drop(meter);
+    // A lower bound: under plain `cargo test` other tests record into the same
+    // global meter (nextest runs one per process).
+    assert!(
+        settled >= u64::try_from(tree.children.len())?,
+        "each settled child is counted"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn host_startup_settles_orphans_left_by_a_previous_process() -> Result<()> {

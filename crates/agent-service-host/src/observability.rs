@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context as _;
 use opentelemetry::KeyValue;
 use opentelemetry::global;
-use opentelemetry::metrics::{Histogram, ObservableGauge};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, ObservableGauge};
 
 // ─────────────────────────────────────────────────────────────────────
 // Bucket boundaries
@@ -68,6 +68,15 @@ pub mod attrs {
     pub const AMQP_OUTCOME_NACK: &str = "nack";
     pub const AMQP_OUTCOME_OK: &str = "ok";
     pub const AMQP_OUTCOME_ERROR: &str = "error";
+
+    /// The idempotent operation a request id was claimed for
+    /// (`IdempotencyKind::as_str`).
+    pub const IDEMPOTENCY_KIND: &str = "kind";
+    /// What the claim found: `fresh`, `replay`, `in_flight` or `conflict`.
+    pub const IDEMPOTENCY_CLAIM: &str = "claim";
+    /// What a janitor cycle removed or advanced: `events_purged`,
+    /// `checkpoints_pruned` or `floors_advanced`.
+    pub const JANITOR_ROWS: &str = "rows";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -83,6 +92,12 @@ pub struct HostMetrics {
     pub(crate) db_client_connection_create_time: Histogram<f64>,
     pub(crate) amqp_publish_duration: Histogram<f64>,
     pub(crate) amqp_consume_duration: Histogram<f64>,
+    pub(crate) idempotency_claims: Counter<u64>,
+    pub(crate) orphans_settled: Counter<u64>,
+    pub(crate) relay_reclaimed: Counter<u64>,
+    pub(crate) relay_backlog: Gauge<u64>,
+    pub(crate) janitor_cycles: Counter<u64>,
+    pub(crate) janitor_rows: Counter<u64>,
     /// Shared meter handle reused by callback-based gauge
     /// registrations so they bind to the same `MeterProvider` as
     /// every other instrument on this struct.
@@ -206,6 +221,39 @@ impl HostMetrics {
         );
     }
 
+    /// Count one idempotency claim on `agent_service_host.idempotency.claims`.
+    /// A retry after a crash shows here as `replay` (or `in_flight` when the
+    /// first attempt died between its commit and its recorded result).
+    pub fn record_idempotency_claim(
+        &self,
+        kind: agent_server::journal::idempotency::IdempotencyKind,
+        claim: &agent_server::journal::idempotency::IdempotencyClaim,
+    ) {
+        use agent_server::journal::idempotency::IdempotencyClaim;
+        let claim = match claim {
+            IdempotencyClaim::Fresh => "fresh",
+            IdempotencyClaim::Replay(_) => "replay",
+            IdempotencyClaim::InFlight => "in_flight",
+            IdempotencyClaim::Conflict => "conflict",
+        };
+        self.idempotency_claims.add(
+            1,
+            &[
+                KeyValue::new(attrs::IDEMPOTENCY_KIND, kind.as_str()),
+                KeyValue::new(attrs::IDEMPOTENCY_CLAIM, claim),
+            ],
+        );
+    }
+
+    /// Count the descendants one orphan-settlement pass settled. A pass that
+    /// settled nothing adds nothing.
+    pub fn record_orphan_settlement(&self, settled: usize) {
+        if settled > 0 {
+            self.orphans_settled
+                .add(u64::try_from(settled).unwrap_or(u64::MAX), &[]);
+        }
+    }
+
     /// Register `(active, idle)` gauges for a sqlx Postgres pool.
     ///
     /// Returns the gauge handles; dropping them deregisters the
@@ -326,12 +374,176 @@ impl HostMetrics {
             .with_boundaries(SHORT_DURATION_BUCKETS_S.to_vec())
             .build();
 
+        let idempotency_claims = meter
+            .u64_counter("agent_service_host.idempotency.claims")
+            .with_description("Idempotent requests claimed, by operation and what the claim found.")
+            .build();
+        let orphans_settled = meter
+            .u64_counter("agent_service_host.orphans.settled")
+            .with_description(
+                "Live descendants of terminal roots settled by the startup or sweep pass.",
+            )
+            .build();
+        let relay_reclaimed = meter
+            .u64_counter("agent_service_host.relay.reclaimed")
+            .with_description("Outbox rows the relay reclaimed from an expired claim.")
+            .build();
+        let relay_backlog = meter
+            .u64_gauge("agent_service_host.relay.backlog")
+            .with_description("Pending outbox rows at the relay's last backlog check.")
+            .build();
+        let janitor_cycles = meter
+            .u64_counter("agent_service_host.janitor.cycles")
+            .with_description("Retention janitor cycles run.")
+            .build();
+        let janitor_rows = meter
+            .u64_counter("agent_service_host.janitor.rows")
+            .with_description("Rows a retention janitor cycle purged, pruned or advanced.")
+            .build();
+
         Self {
             rpc_server_duration,
             db_client_connection_create_time,
             amqp_publish_duration,
             amqp_consume_duration,
+            idempotency_claims,
+            orphans_settled,
+            relay_reclaimed,
+            relay_backlog,
+            janitor_cycles,
+            janitor_rows,
             meter,
+        }
+    }
+}
+
+/// The [`crate::metrics::MetricsRecorder`] a host gets with the `otel` feature.
+///
+/// Every call is logged as [`crate::metrics::LoggingMetricsRecorder`] logs
+/// it, and the host-loop signals that no other instrument carries are also
+/// recorded on [`HostMetrics`]. Wakeup nudges and watch advisories have no
+/// production caller yet and stay log-only. The relay tick is not exported,
+/// because `agent_server.relay.tick` already counts it. The lease sweep is not
+/// either, because its releases are counted per task as
+/// `agent_server.tasks.lease_expired`.
+#[derive(Debug, Default)]
+pub struct OtelMetricsRecorder {
+    logging: crate::metrics::LoggingMetricsRecorder,
+}
+
+impl crate::metrics::MetricsRecorder for OtelMetricsRecorder {
+    fn record_relay_tick(&self, tick: &agent_server::journal::relay::RelayTick, duration_ms: u64) {
+        self.logging.record_relay_tick(tick, duration_ms);
+    }
+
+    fn record_relay_reclaim(&self, reclaimed: u64) {
+        self.logging.record_relay_reclaim(reclaimed);
+        if reclaimed > 0 {
+            HostMetrics::global().relay_reclaimed.add(reclaimed, &[]);
+        }
+    }
+
+    fn record_relay_backlog(&self, pending: u64, soft_threshold: Option<u64>) {
+        self.logging.record_relay_backlog(pending, soft_threshold);
+        HostMetrics::global().relay_backlog.record(pending, &[]);
+    }
+
+    // No production caller reaches these two yet, so they stay log-only;
+    // export them when a host loop calls them.
+    fn record_wakeup_nudge(
+        &self,
+        source: crate::metrics::WakeupSource,
+        outcome: &agent_server::journal::TaskWakeupOutcome,
+    ) {
+        self.logging.record_wakeup_nudge(source, outcome);
+    }
+
+    fn record_watch_advisory(&self, outcome: &agent_server::journal::ThreadEventsWatchOutcome) {
+        self.logging.record_watch_advisory(outcome);
+    }
+
+    fn record_janitor_cycle(&self, report: &agent_server::journal::JanitorCycleReport) {
+        self.logging.record_janitor_cycle(report);
+        let metrics = HostMetrics::global();
+        metrics.janitor_cycles.add(1, &[]);
+        for (rows, count) in [
+            ("events_purged", report.events_purged),
+            ("checkpoints_pruned", report.checkpoints_pruned),
+            ("floors_advanced", u64::from(report.floors_advanced)),
+        ] {
+            if count > 0 {
+                metrics
+                    .janitor_rows
+                    .add(count, &[KeyValue::new(attrs::JANITOR_ROWS, rows)]);
+            }
+        }
+    }
+
+    fn record_lease_sweep(&self, released: usize) {
+        self.logging.record_lease_sweep(released);
+    }
+}
+
+/// An in-memory meter for this crate's own tests that assert a recording
+/// site. The global meter provider and [`HostMetrics`] are process-wide, so a
+/// test holds [`test_meter::TestMeter`] (and its lock) for its whole run.
+#[cfg(test)]
+pub(crate) mod test_meter {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use tokio::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub struct TestMeter {
+        provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl TestMeter {
+        /// Installs a fresh global meter provider and rebinds [`super::HostMetrics`].
+        pub async fn install() -> Self {
+            let guard = LOCK.lock().await;
+            let exporter = InMemoryMetricExporter::default();
+            let provider = SdkMeterProvider::builder()
+                .with_reader(PeriodicReader::builder(exporter.clone()).build())
+                .build();
+            opentelemetry::global::set_meter_provider(provider.clone());
+            super::HostMetrics::reset_for_testing();
+            Self {
+                provider,
+                exporter,
+                _guard: guard,
+            }
+        }
+
+        /// The sum of the `u64` counter `name` over the points carrying every
+        /// `(key, value)` in `labels`, from a fresh flush.
+        pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+            self.exporter.reset();
+            let _ = self.provider.force_flush();
+            let mut total = 0;
+            for resource in self.exporter.get_finished_metrics().unwrap_or_default() {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                            total += sum
+                                .data_points()
+                                .filter(|point| {
+                                    labels.iter().all(|(key, value)| {
+                                        point.attributes().any(|kv| {
+                                            kv.key.as_str() == *key && kv.value.as_str() == *value
+                                        })
+                                    })
+                                })
+                                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                                .sum::<u64>();
+                        }
+                    }
+                }
+            }
+            total
         }
     }
 }
