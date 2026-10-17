@@ -7,9 +7,19 @@
 //! applies the answer and says how to close the prompt; the close commits
 //! under the revision the answer left, so it lands once however often the
 //! handler runs. An answered prompt that never closed (the process died, or
-//! the handler asked to wait) is handed to the handler again by
-//! [`redrive_answered_prompts`] when the transport starts. An open prompt
-//! needs nothing running: it is a row, and the answer arrives as an RPC.
+//! the handler asked to wait) is handed to the handler again when the
+//! transport starts, before it serves. An open prompt needs nothing
+//! running: it is a row, and the answer arrives as an RPC.
+//!
+//! **How often the handler runs.** Within one transport, the handler runs
+//! at most once at a time for one prompt: a retried or replayed answer, and
+//! the start-up re-drive, are skipped while a run for that prompt is in
+//! flight. It runs again for the same answer after a crash, after a
+//! [`PromptResolution::Pending`], after an error, and when another process
+//! sharing the store (a second host, or the old process of a rolling
+//! deploy) re-drives it at its own start; such runs can overlap. A handler
+//! must therefore be idempotent and safe to run concurrently with itself
+//! across processes. The close commits once.
 //!
 //! A task-owned prompt is closed when its task stops awaiting its
 //! confirmation: right after a decision through the control plane, and by
@@ -20,8 +30,8 @@ use std::sync::Arc;
 
 use agent_sdk_foundation::{ThreadId, ToolResult};
 use agent_server::journal::prompt::{
-    PromptAnswer, PromptOwner, PromptRecord, PromptRefusal, PromptState, StoredPrompt, all_prompts,
-    get_prompt, owner_task_awaits, step,
+    PromptAnswer, PromptOwner, PromptRecord, PromptRefusal, PromptState, PromptStep, StoredPrompt,
+    all_prompts, get_prompt, owner_task_awaits,
 };
 use agent_server::journal::{
     AgentTask, AgentTaskId, AgentTaskStore, Committed, DocumentStore, Rejected, Transition,
@@ -51,8 +61,9 @@ pub enum PromptResolution {
 /// Applies the answers to a host's own prompts.
 #[async_trait]
 pub trait PromptHandler: Send + Sync {
-    /// Apply `prompt`'s answer. It may run more than once for one answer
-    /// (a crash before the close, a restart), so it must be idempotent.
+    /// Apply `prompt`'s answer. It may run more than once for one answer,
+    /// and concurrently with itself from another process (see the module
+    /// docs), so it must be idempotent.
     ///
     /// # Errors
     /// The answer could not be applied; the prompt stays answered.
@@ -141,7 +152,7 @@ pub async fn commit_prompt_step(
     store: &dyn AgentTaskStore,
     transition: Transition,
     owner: &PromptOwner,
-    step: &'static str,
+    step: PromptStep,
     now: OffsetDateTime,
 ) -> Result<Committed, Rejected> {
     #[cfg(feature = "otel")]
@@ -217,7 +228,7 @@ pub async fn answer_prompt(
             writes: vec![write],
         };
         let owner = prompt.record.owner.clone();
-        match commit_prompt_step(store, transition, &owner, step::ANSWER, now).await {
+        match commit_prompt_step(store, transition, &owner, PromptStep::Answer, now).await {
             Ok(committed) => {
                 let revision = committed
                     .documents
@@ -267,7 +278,7 @@ pub async fn close_prompt(
     result: ToolResult,
     retain: bool,
     extra: Transition,
-    step: &'static str,
+    step: PromptStep,
     now: OffsetDateTime,
 ) -> anyhow::Result<bool> {
     let mut transition = extra;
@@ -281,8 +292,13 @@ pub async fn close_prompt(
     }
 }
 
-/// Hand an answered host prompt to `handler` and commit the close it asks
-/// for. `true` once the prompt is closed.
+/// Hand an answered host prompt to `handler` and commit its close.
+///
+/// `trigger` is [`PromptStep::Handle`] for a live answer and
+/// [`PromptStep::Redrive`] for one found unclosed at start. `true` once the
+/// prompt is closed; `false` when the handler asked to wait, or the close
+/// was refused (a host guard in `extra` failed, or another writer moved
+/// the prompt first).
 ///
 /// # Errors
 /// The handler or the store failed; the prompt stays answered.
@@ -290,19 +306,21 @@ pub async fn resolve_answered(
     store: &dyn AgentTaskStore,
     prompt: &StoredPrompt,
     handler: &dyn PromptHandler,
+    trigger: PromptStep,
     now: OffsetDateTime,
 ) -> anyhow::Result<bool> {
     let span = info_span!(
         "agent_server.prompt.handle",
         prompt.id = %prompt.record.id,
         thread.id = %prompt.record.surface_thread,
+        prompt.trigger = trigger.as_str(),
     );
     async move {
         let resolution = handler.on_answered(prompt).await;
         #[cfg(feature = "otel")]
         agent_server::observability::ServerMetrics::global().record_prompt(
             prompt.record.owner.label(),
-            step::HANDLE,
+            trigger,
             match &resolution {
                 Ok(PromptResolution::Close { .. }) => {
                     agent_server::observability::attrs::OUTCOME_CLOSED
@@ -318,7 +336,7 @@ pub async fn resolve_answered(
                 result,
                 retain,
                 extra,
-            } => close_prompt(store, prompt, result, retain, extra, step::CLOSE, now).await,
+            } => close_prompt(store, prompt, result, retain, extra, PromptStep::Close, now).await,
             PromptResolution::Pending => Ok(false),
         }
     }
@@ -326,8 +344,27 @@ pub async fn resolve_answered(
     .await
 }
 
-/// Hand every answered, unclosed host prompt to `handler`, oldest first.
-/// One failing prompt does not stop the others. Returns how many closed.
+/// Every answered, unclosed host prompt, oldest first.
+///
+/// # Errors
+/// The prompt rows could not be read.
+pub async fn answered_host_prompts(
+    documents: &dyn DocumentStore,
+) -> anyhow::Result<Vec<StoredPrompt>> {
+    let mut answered = all_prompts(documents, |record| {
+        matches!(record.owner, PromptOwner::Host { .. })
+            && matches!(record.state, PromptState::Answered { .. })
+    })
+    .await?;
+    answered.sort_by_key(|prompt| prompt.record.opened_at);
+    Ok(answered)
+}
+
+/// Hand every answered, unclosed host prompt to `handler` in turn.
+///
+/// Oldest first, as [`PromptStep::Redrive`]. One failing prompt does not stop the
+/// others. Returns how many closed. The transport does this itself at
+/// start (one run per prompt at a time); this is for a host without one.
 ///
 /// # Errors
 /// The prompt rows could not be read.
@@ -337,15 +374,9 @@ pub async fn redrive_answered_prompts(
     handler: &dyn PromptHandler,
     now: OffsetDateTime,
 ) -> anyhow::Result<usize> {
-    let mut answered = all_prompts(documents, |record| {
-        matches!(record.owner, PromptOwner::Host { .. })
-            && matches!(record.state, PromptState::Answered { .. })
-    })
-    .await?;
-    answered.sort_by_key(|prompt| prompt.record.opened_at);
     let mut closed = 0;
-    for prompt in &answered {
-        match resolve_answered(store, prompt, handler, now).await {
+    for prompt in &answered_host_prompts(documents).await? {
+        match resolve_answered(store, prompt, handler, PromptStep::Redrive, now).await {
             Ok(true) => closed += 1,
             Ok(false) => {}
             Err(error) => warn!(
@@ -367,13 +398,19 @@ pub type TaskPromptResult = dyn Fn(&PromptRecord, Option<&AgentTask>) -> ToolRes
 /// or finish, an error naming the task's state otherwise.
 #[must_use]
 pub fn default_task_prompt_result(_: &PromptRecord, task: Option<&AgentTask>) -> ToolResult {
+    use agent_server::journal::TaskStatus;
     match task.map(|task| task.status) {
+        Some(TaskStatus::Pending | TaskStatus::Running | TaskStatus::Completed) => {
+            ToolResult::success("No longer awaiting")
+        }
         Some(
-            agent_server::journal::TaskStatus::Pending
-            | agent_server::journal::TaskStatus::Running
-            | agent_server::journal::TaskStatus::Completed,
-        ) => ToolResult::success("No longer awaiting"),
-        Some(status) => ToolResult::error(format!("withdrawn: the task is {status:?}")),
+            status @ (TaskStatus::Queued
+            | TaskStatus::WaitingOnChildren
+            | TaskStatus::AwaitingConfirmation
+            | TaskStatus::AwaitingQuestion
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled),
+        ) => ToolResult::error(format!("withdrawn: the task is {status:?}")),
         None => ToolResult::error("withdrawn: the task is gone"),
     }
 }
@@ -407,7 +444,7 @@ async fn close_stale_task_prompts(
             result(&prompt.record, task.as_ref()),
             false,
             Transition::default(),
-            step::WITHDRAW,
+            PromptStep::Withdraw,
             now,
         )
         .await?

@@ -627,7 +627,7 @@ pub use outbox_message::{
 };
 pub use prompt::{
     NewPrompt, PROMPT_DOC_KIND, PendingPrompt, PromptAnswer, PromptCloseFrame, PromptDecision,
-    PromptFrame, PromptOwner, PromptRecord, PromptRefusal, PromptState, StoredPrompt,
+    PromptFrame, PromptOwner, PromptRecord, PromptRefusal, PromptState, PromptStep, StoredPrompt,
 };
 pub use recovery::{
     FailureReason, RecoveryAction, RecoveryContext, RecoveryRecord, classify_recovery,

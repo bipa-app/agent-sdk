@@ -204,11 +204,14 @@ inventory covers the whole observability surface.
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
 | event `agent_server.effect.abandoned` | Span event | `reason` (`owner_cancelled`, `lease_sweep`, `owner_terminal`), kind; span-only effect id, task id | `[agent-server]`, `[agent-service-host]` | Phase 2 |
-| `agent_server.prompts` | Counter | `owner` (`host`/`task`), `step` (`open`/`answer`/`close`/`withdraw`/`handle`), `outcome` (`committed`/`guard`/`expectation`/`store`, or for `handle` `closed`/`pending`/`error`) | `[agent-server]` instrument, recorded by `agent_service_host::prompts` | primitive 6 (prompt rows) |
+| `agent_server.prompts` | Counter | `owner` (`host`/`task`), `step` (`answer`/`close`/`withdraw` with the commit outcome `committed`/`guard`/`expectation`/`store`; `handle` for a live answer and `redrive` for one found unclosed at start, with `closed`/`pending`/`error`) | `[agent-server]` instrument, recorded by `agent_service_host::prompts` | primitive 6 (prompt rows) |
 
-Prompt-row spans (`agent_service_host::prompts`): `agent_server.prompt.answer`
-and `agent_server.prompt.handle`, with `prompt.id` and `thread.id`. The ids are
-on the spans only, never on the counter.
+Prompt-row spans (`agent_service_host::prompts`, `grpc::prompt_rpc`):
+- `agent_server.prompt.answer` (`prompt.id`, `thread.id`);
+- `agent_server.prompt.handle` (`prompt.id`, `thread.id`, `prompt.trigger` = `handle`/`redrive`);
+- `agent_server.prompt.redrive`, once per transport start, with the counts `prompt.withdrawn`, `prompt.redriven`, `prompt.skipped` (already in flight).
+
+Ids are on spans only, never on the counter. A host opens a row inside its own transition, so it counts its own opens.
 
 ### 4.4 Agent-service-host metrics
 

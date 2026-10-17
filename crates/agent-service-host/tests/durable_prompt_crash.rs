@@ -1,7 +1,8 @@
 //! Crash-matrix S6: a human prompt survives `kill -9`. A question, a tool
 //! confirmation and a host prompt row are parked by a child process that is
-//! then killed; after the restart all three are pending, and the host
-//! prompt is answered once. A second child answers the host prompt and is
+//! then killed; after the restart all three are pending, and each is
+//! answered once: the question's batch and the tool's decision apply once
+//! and a second, different answer is refused. A second child answers the host prompt and is
 //! killed before its close; the restart hands the answer to the handler
 //! once and closes it once.
 #![cfg(feature = "sqlite")]
@@ -334,6 +335,97 @@ async fn run_then_kill(
     )
 }
 
+/// After the restart, the parked question and tool confirmation each take
+/// one answer: the first applies, the same answer replays, and a different
+/// one is refused without changing the task.
+async fn answer_parked_prompts_once(boot: &SqliteDurableStore) -> Result<()> {
+    let pending = pending_prompts(boot, boot, &ThreadId::from_string(QUESTION_THREAD)).await?;
+    let [
+        PendingPrompt::Question {
+            task_id: question, ..
+        },
+    ] = pending.as_slice()
+    else {
+        bail!("one parked question, got {}", kinds(&pending).join(","));
+    };
+    let staging = || {
+        vec![agent_sdk_foundation::QuestionAnswer {
+            tool_call_id: "question-call".into(),
+            answer: "Staging".into(),
+        }]
+    };
+    let answered = boot
+        .answer_question(question, "first-answer", staging(), at(7))
+        .await?;
+    ensure!(
+        answered.status == TaskStatus::Pending,
+        "the answer makes the root runnable"
+    );
+    let replay = boot
+        .answer_question(question, "first-answer", staging(), at(8))
+        .await?;
+    ensure!(
+        replay.status == TaskStatus::Pending,
+        "the same answer replays"
+    );
+    let other = boot
+        .answer_question(
+            question,
+            "second-answer",
+            vec![agent_sdk_foundation::QuestionAnswer {
+                tool_call_id: "question-call".into(),
+                answer: "Production".into(),
+            }],
+            at(9),
+        )
+        .await;
+    ensure!(other.is_err(), "a second, different answer is refused");
+    let root = AgentTaskStore::get(boot, question)
+        .await?
+        .context("question root")?;
+    ensure!(
+        matches!(&root.state, agent_server::journal::task_state::TaskState::AnsweredQuestion { receipt_id, .. } if receipt_id == "first-answer"),
+        "the first answer is the one kept: {:?}",
+        root.state
+    );
+
+    let pending = pending_prompts(boot, boot, &ThreadId::from_string(TOOL_THREAD)).await?;
+    let [PendingPrompt::ToolConfirmation { task_id: tool, .. }] = pending.as_slice() else {
+        bail!(
+            "one parked tool confirmation, got {}",
+            kinds(&pending).join(",")
+        );
+    };
+    let reject = || agent_server::worker::ConfirmationDecision::Rejected {
+        reason: "not after a crash".into(),
+    };
+    agent_server::worker::apply_confirmation_decision(tool, reject(), boot, at(7)).await?;
+    let again =
+        agent_server::worker::apply_confirmation_decision(tool, reject(), boot, at(8)).await;
+    ensure!(again.is_err(), "a second decision is refused");
+    let child = AgentTaskStore::get(boot, tool)
+        .await?
+        .context("tool child")?;
+    ensure!(
+        child.status == TaskStatus::Failed,
+        "the tool was decided once: {:?}",
+        child.status
+    );
+    let ends = boot
+        .get_events(&ThreadId::from_string(TOOL_THREAD))
+        .await?
+        .iter()
+        .filter(
+            |event| matches!(&event.event, AgentEvent::ToolCallEnd { id, .. } if id == "tool-call"),
+        )
+        .count();
+    ensure!(
+        ends == 1,
+        "one ToolCallEnd for the decided call, got {ends}"
+    );
+    Ok(())
+}
+
 struct CountingHandler {
     calls: AtomicUsize,
 }
@@ -394,6 +486,7 @@ async fn kill_nine_keeps_every_prompt_and_applies_an_answer_once() -> Result<()>
         kinds(&pending_prompts(&boot, &boot, &ThreadId::from_string(HOST_THREAD)).await?),
         [format!("row:{HOST_PROMPT}")]
     );
+    answer_parked_prompts_once(&boot).await?;
     drop(boot);
 
     run_then_kill(

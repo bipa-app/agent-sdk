@@ -161,6 +161,7 @@ struct GrpcShared {
     view: agent_server::journal::view::ViewConfig,
     view_cache: Arc<thread_view::ViewCache>,
     prompt_handler: Option<crate::prompts::SharedPromptHandler>,
+    prompts_in_flight: prompt_rpc::PromptsInFlight,
 }
 
 impl GrpcShared {
@@ -189,6 +190,7 @@ impl GrpcShared {
             },
             view_cache: Arc::new(thread_view::ViewCache::default()),
             prompt_handler: None,
+            prompts_in_flight: prompt_rpc::PromptsInFlight::default(),
         }
     }
 
@@ -2796,8 +2798,7 @@ impl GrpcTransport {
         let event_service = GrpcEventService {
             shared: Arc::clone(&self.shared),
         };
-        let recovery = Arc::clone(&self.shared);
-        tokio::spawn(async move { recovery.recover_prompts().await });
+        self.shared.recover_prompts().await;
 
         let shutdown = self.shared.shutdown.clone();
         let health = Arc::clone(&self.shared.health);
@@ -12040,7 +12041,7 @@ mod tests {
     }
 
     fn prompt_service(
-        handler: Arc<CountingPromptHandler>,
+        handler: crate::prompts::SharedPromptHandler,
     ) -> Result<(GrpcControlService, Arc<GrpcShared>)> {
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
             Vec::new(),
@@ -12196,7 +12197,8 @@ mod tests {
         let handler = Arc::new(CountingPromptHandler {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let (control, shared) = prompt_service(Arc::clone(&handler))?;
+        let (control, shared) =
+            prompt_service(Arc::clone(&handler) as crate::prompts::SharedPromptHandler)?;
         let thread_owned = uuid::Uuid::new_v4().to_string();
         let thread = thread_owned.as_str();
         create_prompt_thread(&control, "create-prompt-thread", thread).await?;
@@ -12286,7 +12288,8 @@ mod tests {
         let handler = Arc::new(CountingPromptHandler {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let (control, shared) = prompt_service(Arc::clone(&handler))?;
+        let (control, shared) =
+            prompt_service(Arc::clone(&handler) as crate::prompts::SharedPromptHandler)?;
         let thread_owned = uuid::Uuid::new_v4().to_string();
         let thread = thread_owned.as_str();
         create_prompt_thread(&control, "create-redrive-thread", thread).await?;
@@ -12302,7 +12305,9 @@ mod tests {
         open_gate(&shared, &answered, false).await?;
 
         shared.recover_prompts().await;
+        wait_until_retired(&shared, thread, "gate-r").await?;
         shared.recover_prompts().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(handler.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(
             agent_server::journal::prompt::get_prompt(
@@ -12313,6 +12318,312 @@ mod tests {
             .await?
             .is_none()
         );
+        Ok(())
+    }
+
+    /// A handler that waits until released, so a test can hold a run in
+    /// flight.
+    struct GatedPromptHandler {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[tonic::async_trait]
+    impl crate::prompts::PromptHandler for GatedPromptHandler {
+        async fn on_answered(
+            &self,
+            _: &agent_server::journal::StoredPrompt,
+        ) -> Result<crate::prompts::PromptResolution> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.notified().await;
+            Ok(crate::prompts::PromptResolution::Close {
+                result: ToolResult::success("applied"),
+                retain: false,
+                extra: agent_server::journal::Transition::default(),
+            })
+        }
+    }
+
+    /// While a handler run for a prompt is in flight, a replayed answer and
+    /// the start-up re-drive dispatch nothing more for it.
+    #[tokio::test]
+    async fn one_prompt_runs_one_handler_at_a_time() -> Result<()> {
+        let gated = Arc::new(GatedPromptHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        let (control, shared) =
+            prompt_service(Arc::clone(&gated) as crate::prompts::SharedPromptHandler)?;
+        let thread_owned = uuid::Uuid::new_v4().to_string();
+        let thread = thread_owned.as_str();
+        create_prompt_thread(&control, "create-single-flight", thread).await?;
+        open_gate(&shared, &gate_prompt(thread, "gate-s", false), true).await?;
+
+        control
+            .decide_confirmation(Request::new(prompt_decision(
+                "once", thread, "gate-s", false,
+            )))
+            .await?;
+        for _ in 0..200 {
+            if gated.calls.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let answered = agent_server::journal::prompt::get_prompt(
+            shared.stores.document_store.as_ref(),
+            &ThreadId::from_string(thread),
+            "gate-s",
+        )
+        .await?
+        .context("answered row")?;
+        assert!(
+            !shared.dispatch_answered(answered.clone(), agent_server::journal::PromptStep::Handle),
+            "a second live dispatch is skipped while the first runs"
+        );
+        shared.recover_prompts().await;
+        gated.release.notify_one();
+        wait_until_retired(&shared, thread, "gate-s").await?;
+        assert_eq!(gated.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            shared.dispatch_answered(answered, agent_server::journal::PromptStep::Handle),
+            "the slot is free once the run ends"
+        );
+        Ok(())
+    }
+
+    /// A tool child of a root on `thread`, parked on the confirmation of
+    /// `call_id`.
+    async fn parked_tool_child(
+        shared: &GrpcShared,
+        thread: &str,
+        call_id: &str,
+    ) -> Result<AgentTask> {
+        let store = shared.stores.task_store.as_ref();
+        let thread_id = ThreadId::from_string(thread);
+        let now = OffsetDateTime::now_utc();
+        let root = AgentTask::new_root_turn(thread_id.clone(), now, 3);
+        store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                now + time::Duration::minutes(5),
+                now,
+            )
+            .await?
+            .context("acquire the root")?;
+        let call = PendingToolCallInfo {
+            id: call_id.into(),
+            name: "deploy".into(),
+            display_name: "Deploy".into(),
+            tier: ToolTier::Confirm,
+            concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+            replay: agent_sdk_foundation::ToolReplay::Unsafe,
+            input: serde_json::json!({}),
+            effective_input: serde_json::json!({}),
+            listen_context: None,
+        };
+        let continuation = agent_sdk_foundation::ContinuationEnvelope::wrap(
+            agent_sdk_foundation::AgentContinuation {
+                thread_id: thread_id.clone(),
+                turn: 1,
+                total_usage: agent_sdk_foundation::TokenUsage::default(),
+                turn_usage: agent_sdk_foundation::TokenUsage::default(),
+                pending_tool_calls: vec![call],
+                awaiting_index: 0,
+                completed_results: Vec::new(),
+                state: agent_sdk_foundation::AgentState::new(thread_id.clone()),
+                response_id: None,
+                stop_reason: None,
+                response_content: Vec::new(),
+            },
+        );
+        let (_, children) = store
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(3)],
+                SuspensionPayload {
+                    continuation: continuation.clone(),
+                    suspended_messages: Vec::new(),
+                    child_join_policy: agent_server::ChildJoinPolicy::default(),
+                },
+                None,
+                Vec::new(),
+                now,
+            )
+            .await?;
+        let child = children.into_iter().next().context("one tool child")?;
+        let (child_worker, child_lease) = (WorkerId::new(), LeaseId::new());
+        store
+            .try_acquire_task(
+                &child.id,
+                child_worker.clone(),
+                child_lease.clone(),
+                now + time::Duration::minutes(5),
+                now,
+            )
+            .await?
+            .context("acquire the tool child")?;
+        store
+            .pause_on_confirmation(
+                &child.id,
+                &child_worker,
+                &child_lease,
+                continuation,
+                None,
+                now,
+            )
+            .await
+    }
+
+    /// Open a task-owned row for `task` on the session thread.
+    async fn relay_row(
+        shared: &GrpcShared,
+        session: &str,
+        id: &str,
+        task: &AgentTask,
+    ) -> Result<()> {
+        let mut record = gate_prompt(session, id, true);
+        record.owner = agent_server::journal::PromptOwner::Task {
+            task_id: task.id.clone(),
+            thread_id: task.thread_id.clone(),
+        };
+        open_gate(shared, &record, true).await
+    }
+
+    fn reject_by_prompt(
+        request_id: &str,
+        session: &str,
+        prompt: &str,
+    ) -> pb::DecideConfirmationRequest {
+        pb::DecideConfirmationRequest {
+            decision: Some(pb::ConfirmationDecision {
+                decision: Some(pb::confirmation_decision::Decision::Rejected(
+                    pb::RejectedConfirmation {
+                        reason: "not now".into(),
+                    },
+                )),
+            }),
+            ..prompt_decision(request_id, session, prompt, false)
+        }
+    }
+
+    async fn status_of(
+        shared: &GrpcShared,
+        task: &AgentTask,
+    ) -> Result<agent_server::journal::TaskStatus> {
+        Ok(shared
+            .stores
+            .task_store
+            .get(&task.id)
+            .await?
+            .context("task row")?
+            .status)
+    }
+
+    async fn closes_on(shared: &GrpcShared, thread: &str, id: &str) -> Result<usize> {
+        Ok(shared
+            .stores
+            .event_repo
+            .get_events(&ThreadId::from_string(thread))
+            .await?
+            .iter()
+            .filter(|event| matches!(&event.event, AgentEvent::ToolCallEnd { id: end, .. } if end == id))
+            .count())
+    }
+
+    /// A task-owned row decides its task: by `prompt_id` the owner task is
+    /// rejected once and the row closes with one pair, a replay returns the
+    /// stored response, and a decision by the child's own `task_id` closes
+    /// its row too, after which a racer by `prompt_id` changes nothing.
+    #[tokio::test]
+    async fn a_task_owned_row_decides_its_task_once() -> Result<()> {
+        let (control, shared) = prompt_service(Arc::new(CountingPromptHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }))?;
+        let session_owned = uuid::Uuid::new_v4().to_string();
+        let child_owned = uuid::Uuid::new_v4().to_string();
+        let (session, child_thread) = (session_owned.as_str(), child_owned.as_str());
+        create_prompt_thread(&control, "create-session", session).await?;
+        create_prompt_thread(&control, "create-child", child_thread).await?;
+
+        let by_row = parked_tool_child(&shared, child_thread, "call-row").await?;
+        relay_row(&shared, session, "relayed-row", &by_row).await?;
+        assert_eq!(listed_rows(&control, session).await?, ["relayed-row"]);
+        let decided = control
+            .decide_confirmation(Request::new(reject_by_prompt(
+                "by-row",
+                session,
+                "relayed-row",
+            )))
+            .await?
+            .into_inner();
+        assert_eq!(
+            decided.task.as_ref().map(|task| task.task_id.as_str()),
+            Some(by_row.id.as_str())
+        );
+        assert_eq!(
+            status_of(&shared, &by_row).await?,
+            agent_server::journal::TaskStatus::Failed
+        );
+        assert_eq!(closes_on(&shared, session, "relayed-row").await?, 1);
+        assert_eq!(listed_rows(&control, session).await?, Vec::<String>::new());
+        let replay = control
+            .decide_confirmation(Request::new(reject_by_prompt(
+                "by-row",
+                session,
+                "relayed-row",
+            )))
+            .await?
+            .into_inner();
+        assert_eq!(
+            replay.task.map(|task| task.task_id),
+            Some(by_row.id.to_string())
+        );
+
+        let second_owned = uuid::Uuid::new_v4().to_string();
+        let second_thread = second_owned.as_str();
+        create_prompt_thread(&control, "create-second-child", second_thread).await?;
+        let by_task = parked_tool_child(&shared, second_thread, "call-task").await?;
+        relay_row(&shared, session, "relayed-task", &by_task).await?;
+        control
+            .decide_confirmation(Request::new(pb::DecideConfirmationRequest {
+                task_id: by_task.id.to_string(),
+                thread_id: second_thread.into(),
+                prompt_id: String::new(),
+                ..reject_by_prompt("by-task", session, "")
+            }))
+            .await?;
+        assert_eq!(
+            status_of(&shared, &by_task).await?,
+            agent_server::journal::TaskStatus::Failed
+        );
+        assert_eq!(
+            closes_on(&shared, session, "relayed-task").await?,
+            1,
+            "a decision by the child's task id closes its relayed row"
+        );
+        let racer = control
+            .decide_confirmation(Request::new(reject_by_prompt(
+                "racer",
+                session,
+                "relayed-task",
+            )))
+            .await;
+        assert!(
+            matches!(&racer, Err(status) if matches!(status.code(), tonic::Code::FailedPrecondition | tonic::Code::NotFound)),
+            "{racer:?}"
+        );
+        assert_eq!(
+            status_of(&shared, &by_task).await?,
+            agent_server::journal::TaskStatus::Failed
+        );
+        assert_eq!(closes_on(&shared, session, "relayed-task").await?, 1);
         Ok(())
     }
 }

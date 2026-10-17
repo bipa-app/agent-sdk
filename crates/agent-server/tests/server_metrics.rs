@@ -992,17 +992,17 @@ async fn a_prompt_step_is_counted_by_owner_step_and_outcome() -> Result<()> {
     let metrics = agent_server::observability::ServerMetrics::global();
     metrics.record_prompt(
         "host",
-        agent_server::journal::prompt::step::ANSWER,
+        agent_server::journal::PromptStep::Answer,
         attrs::OUTCOME_COMMITTED,
     );
     metrics.record_prompt(
         "host",
-        agent_server::journal::prompt::step::ANSWER,
+        agent_server::journal::PromptStep::Answer,
         attrs::OUTCOME_COMMITTED,
     );
     metrics.record_prompt(
         "task",
-        agent_server::journal::prompt::step::WITHDRAW,
+        agent_server::journal::PromptStep::Withdraw,
         attrs::OUTCOME_EXPECTATION,
     );
 

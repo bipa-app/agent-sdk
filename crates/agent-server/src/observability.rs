@@ -174,7 +174,7 @@ pub mod attrs {
     pub const VIEW_STREAM_EVENT: &str = "view.stream.event";
     /// Prompt row owner: `host` / `task`.
     pub const PROMPT_OWNER: &str = "owner";
-    /// Prompt row step: one of [`crate::journal::prompt::step`].
+    /// Prompt row step: [`crate::journal::prompt::PromptStep::as_str`].
     pub const PROMPT_STEP: &str = "step";
 
     /// Prompt handler outcome: closed the prompt.
@@ -393,16 +393,21 @@ impl ServerMetrics {
     }
 
     /// Count one prompt row step on `agent_server.prompts`. `owner` is
-    /// [`attrs::PROMPT_OWNER`]'s value, `step` one of
-    /// [`crate::journal::prompt::step`] and `outcome` a transition outcome
+    /// [`attrs::PROMPT_OWNER`]'s value, `step` a
+    /// [`crate::journal::prompt::PromptStep`] and `outcome` a transition outcome
     /// (`committed` / `guard` / `expectation` / `store`) or, for
     /// `handle`, `closed` / `pending` / `error`.
-    pub fn record_prompt(&self, owner: &'static str, step: &'static str, outcome: &'static str) {
+    pub fn record_prompt(
+        &self,
+        owner: &'static str,
+        step: crate::journal::prompt::PromptStep,
+        outcome: &'static str,
+    ) {
         self.prompts.add(
             1,
             &[
                 KeyValue::new(attrs::PROMPT_OWNER, owner),
-                KeyValue::new(attrs::PROMPT_STEP, step),
+                KeyValue::new(attrs::PROMPT_STEP, step.as_str()),
                 KeyValue::new(attrs::OUTCOME, outcome),
             ],
         );
@@ -728,7 +733,7 @@ fn prompts_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
     meter
         .u64_counter("agent_server.prompts")
         .with_description(
-            "Prompt row steps (open, answer, close, withdraw, handle), attributed by owner \
+            "Prompt row steps (answer, close, withdraw, handle, redrive), attributed by owner \
              and outcome.",
         )
         .build()

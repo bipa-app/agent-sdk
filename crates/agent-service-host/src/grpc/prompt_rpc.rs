@@ -1,15 +1,17 @@
 //! `DecideConfirmation{prompt_id}` and `ListPendingPrompts`: the control
 //! plane's side of [`crate::prompts`].
+use std::collections::HashSet;
+
 use agent_sdk_foundation::{ThreadId, ToolResult};
 use agent_server::journal::prompt::{
     PendingPrompt, PromptAnswer, PromptDecision, PromptOwner, PromptRecord, PromptState,
-    StoredPrompt, get_prompt, pending_prompts,
+    PromptStep, StoredPrompt, get_prompt, pending_prompts,
 };
 use agent_server::journal::{AgentTask, AgentTaskId};
 use agent_server::worker::ConfirmationDecision;
 use time::OffsetDateTime;
 use tonic::{Response, Status};
-use tracing::warn;
+use tracing::{Instrument, info_span, warn};
 
 use super::{
     DecideConfirmationResult, GrpcControlService, GrpcShared, RpcResult,
@@ -40,6 +42,40 @@ fn answer_status(error: AnswerError) -> Status {
         | AnswerError::Closed { .. }
         | AnswerError::TaskOwned { .. } => Status::failed_precondition(error.to_string()),
         AnswerError::Store(error) => internal_status("answering prompt")(error),
+    }
+}
+
+/// The prompts whose handler runs in this transport now, by row key.
+pub(super) type PromptsInFlight = std::sync::Arc<std::sync::Mutex<HashSet<(String, String)>>>;
+
+/// One prompt's in-flight slot; dropping it frees the slot.
+struct InFlight {
+    set: PromptsInFlight,
+    key: (String, String),
+}
+
+impl InFlight {
+    fn claim(set: &PromptsInFlight, prompt: &StoredPrompt) -> Option<Self> {
+        let key = (
+            prompt.record.surface_thread.0.clone(),
+            prompt.record.id.clone(),
+        );
+        let mut held = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.insert(key.clone()).then(|| Self {
+            set: std::sync::Arc::clone(set),
+            key,
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
     }
 }
 
@@ -76,59 +112,111 @@ impl GrpcShared {
         }
     }
 
-    /// Withdraw stale task-owned prompts, then hand every answered host
-    /// prompt to the handler again. Runs once when the transport starts.
+    /// Withdraw stale task-owned prompts, then dispatch every answered,
+    /// unclosed host prompt to the handler. The transport awaits this
+    /// before it serves, so each re-driven prompt holds its in-flight slot
+    /// before any RPC can dispatch it again.
     pub(super) async fn recover_prompts(&self) {
-        let handler = self.prompt_handler.clone();
-        let result = {
-            let handler = handler.clone();
-            move |record: &PromptRecord, owner: Option<&AgentTask>| {
-                task_prompt_result(handler.as_ref(), record, owner)
+        let span = info_span!(
+            "agent_server.prompt.redrive",
+            prompt.withdrawn = tracing::field::Empty,
+            prompt.redriven = tracing::field::Empty,
+            prompt.skipped = tracing::field::Empty,
+        );
+        async {
+            let handler = self.prompt_handler.clone();
+            let result = {
+                let handler = handler.clone();
+                move |record: &PromptRecord, owner: Option<&AgentTask>| {
+                    task_prompt_result(handler.as_ref(), record, owner)
+                }
+            };
+            let documents = self.stores.document_store.as_ref();
+            match prompts::withdraw_stale_task_prompts(
+                self.stores.task_store.as_ref(),
+                documents,
+                &result,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            {
+                Ok(withdrawn) => {
+                    tracing::Span::current().record("prompt.withdrawn", withdrawn);
+                }
+                Err(error) => warn!(
+                    error = %format!("{error:#}"),
+                    "withdrawing stale prompt rows at start failed"
+                ),
             }
-        };
-        let now = OffsetDateTime::now_utc();
-        let tasks = self.stores.task_store.as_ref();
-        let documents = self.stores.document_store.as_ref();
-        if let Err(error) =
-            prompts::withdraw_stale_task_prompts(tasks, documents, &result, now).await
-        {
-            warn!(error = %format!("{error:#}"), "withdrawing stale prompt rows at start failed");
+            if handler.is_none() {
+                return;
+            }
+            let answered = match prompts::answered_host_prompts(documents).await {
+                Ok(answered) => answered,
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "listing answered prompts at start failed");
+                    return;
+                }
+            };
+            let (mut redriven, mut skipped) = (0_usize, 0_usize);
+            for prompt in answered {
+                if self.dispatch_answered(prompt, PromptStep::Redrive) {
+                    redriven += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            tracing::Span::current().record("prompt.redriven", redriven);
+            tracing::Span::current().record("prompt.skipped", skipped);
         }
-        let Some(handler) = handler else {
-            return;
-        };
-        if let Err(error) =
-            prompts::redrive_answered_prompts(tasks, documents, handler.as_ref(), now).await
-        {
-            warn!(error = %format!("{error:#}"), "re-driving answered prompts at start failed");
-        }
+        .instrument(span)
+        .await;
     }
 
-    fn dispatch_answered(&self, prompt: agent_server::journal::StoredPrompt) {
+    /// Run the handler on `prompt` in the background, unless a run for the
+    /// same prompt is already in flight in this transport. `false` when it
+    /// was skipped for that reason, or no handler is registered.
+    pub(super) fn dispatch_answered(&self, prompt: StoredPrompt, trigger: PromptStep) -> bool {
         let Some(handler) = self.prompt_handler.clone() else {
             warn!(
                 prompt.id = %prompt.record.id,
                 "a host prompt was answered but no prompt handler is registered"
             );
-            return;
+            return false;
+        };
+        let Some(slot) = InFlight::claim(&self.prompts_in_flight, &prompt) else {
+            return false;
         };
         let store = std::sync::Arc::clone(&self.stores.task_store);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            if let Err(error) = prompts::resolve_answered(
+            let _slot = slot;
+            if shutdown.is_cancelled() {
+                return;
+            }
+            match prompts::resolve_answered(
                 store.as_ref(),
                 &prompt,
                 handler.as_ref(),
+                trigger,
                 OffsetDateTime::now_utc(),
             )
             .await
             {
-                warn!(
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    prompt.id = %prompt.record.id,
+                    "answered prompt stays unclosed (the handler waits, or its close was \
+                     refused); the next start hands it over again"
+                ),
+                Err(error) => warn!(
                     prompt.id = %prompt.record.id,
                     error = %format!("{error:#}"),
                     "answered prompt could not be applied; the next start retries it"
-                );
+                ),
             }
         });
+        true
     }
 
     async fn pending_prompt_pb(&self, prompt: &PendingPrompt) -> RpcResult<pb::PendingPrompt> {
@@ -358,7 +446,7 @@ impl GrpcControlService {
                 if let Answered::Fresh(answered) | Answered::Replay(answered) = answered
                     && matches!(answered.record.state, PromptState::Answered { .. })
                 {
-                    self.shared.dispatch_answered(answered);
+                    self.shared.dispatch_answered(answered, PromptStep::Handle);
                 }
                 DecideConfirmationResult {
                     task_id: String::new(),

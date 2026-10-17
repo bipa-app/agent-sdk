@@ -58,14 +58,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `agent_service_host::prompts::PromptHandler`, registered with
   `GrpcTransport::with_prompt_handler`, applies a host prompt's answer after
   it commits; its `PromptResolution::Close` may carry the host's own guards
-  and writes, committed in the close's transaction. The transport hands every
-  answered, unclosed row to the handler again when it starts.
+  and writes, committed in the close's transaction. Before it serves, the
+  transport withdraws stale task-owned rows and hands every answered,
+  unclosed row to the handler again.
   `ConfirmationDecisionGuard::check_prompt` (default: allow) checks a
-  decision on a prompt row.
+  decision on a prompt row; it is the only check on that path, so the owner
+  task's `check` does not run for a task-owned row.
+- **How often a handler runs.** Within one transport it runs at most once
+  at a time for one prompt: a retried or replayed answer and the start-up
+  re-drive are skipped while a run is in flight. It runs again after a
+  crash, a `Pending`, or an error, and another process sharing the store (a
+  second host, or the old pod of a rolling deploy) can run it concurrently.
+  A handler must be idempotent and safe under that; the close commits once.
 - No migration, no table, no `Write` variant: a prompt row is a document.
-- Signals: counter `agent_server.prompts{owner, step, outcome}`; spans
-  `agent_server.prompt.answer`, `agent_server.prompt.handle`.
-- Crash-matrix S6: `tests/durable_prompt_crash.rs` (SQLite, `kill -9`).
+- Signals: counter `agent_server.prompts{owner, step, outcome}` with steps
+  `answer`, `close`, `withdraw`, `handle` (live) and `redrive` (at start);
+  spans `agent_server.prompt.answer`, `agent_server.prompt.handle`
+  (`prompt.trigger`) and `agent_server.prompt.redrive` (counts per start).
+- Crash-matrix S6: `tests/durable_prompt_crash.rs` (SQLite, real `kill -9`):
+  a parked question, tool confirmation and host prompt are all pending after
+  the restart, each is answered once (a second, different answer is
+  refused), and a host answer committed before the kill is applied and
+  closed once.
 
 ### Crash-safety Phase 3: documents
 

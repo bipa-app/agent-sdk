@@ -8207,7 +8207,7 @@ mod tests {
                 agent_sdk_foundation::ToolResult::success("applied"),
                 false,
                 agent_server::journal::Transition::default(),
-                "close",
+                agent_server::journal::PromptStep::Close,
                 t_plus(74)
             )
             .await?
@@ -8219,7 +8219,7 @@ mod tests {
                 agent_sdk_foundation::ToolResult::success("applied"),
                 false,
                 agent_server::journal::Transition::default(),
-                "close",
+                agent_server::journal::PromptStep::Close,
                 t_plus(75)
             )
             .await?,

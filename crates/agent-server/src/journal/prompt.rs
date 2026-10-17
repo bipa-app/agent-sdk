@@ -39,14 +39,32 @@ pub const PROMPT_DOC_KIND: &str = "agent.prompt";
 /// The schema version of [`PromptRecord`] as stored.
 pub const PROMPT_SCHEMA_VERSION: u32 = 1;
 
-/// The steps of a prompt row's life, as `agent_server.prompts` counts them.
-pub mod step {
-    pub const OPEN: &str = "open";
-    pub const ANSWER: &str = "answer";
-    pub const CLOSE: &str = "close";
-    pub const WITHDRAW: &str = "withdraw";
-    /// The host's prompt handler ran on an answered prompt.
-    pub const HANDLE: &str = "handle";
+/// One step of a prompt row's life, as `agent_server.prompts` counts it.
+/// A host opens a row inside its own transition, so it counts its own
+/// opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PromptStep {
+    Answer,
+    Close,
+    Withdraw,
+    /// The host's handler ran on a live answer.
+    Handle,
+    /// The host's handler ran on an answer found unclosed at start.
+    Redrive,
+}
+
+impl PromptStep {
+    /// The bounded metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Close => "close",
+            Self::Withdraw => "withdraw",
+            Self::Handle => "handle",
+            Self::Redrive => "redrive",
+        }
+    }
 }
 
 /// Rows read per page when a read walks every prompt row.
@@ -597,8 +615,8 @@ pub async fn pending_prompts(
 ) -> anyhow::Result<Vec<PendingPrompt>> {
     let mut pending = Vec::new();
     for task in tasks.list_by_thread(thread).await? {
-        match (&task.status, &task.state) {
-            (TaskStatus::AwaitingConfirmation, TaskState::AwaitingConfirmation { .. }) => {
+        match &task.state {
+            TaskState::AwaitingConfirmation { .. } => {
                 if let Some(call) = awaited_call(&task) {
                     pending.push(PendingPrompt::ToolConfirmation {
                         task_id: task.id.clone(),
@@ -607,14 +625,18 @@ pub async fn pending_prompts(
                     });
                 }
             }
-            (TaskStatus::AwaitingQuestion, TaskState::AwaitingQuestion { questions, .. }) => {
+            TaskState::AwaitingQuestion { questions, .. } => {
                 pending.push(PendingPrompt::Question {
                     task_id: task.id.clone(),
                     thread_id: task.thread_id.clone(),
                     questions: questions.clone(),
                 });
             }
-            _ => {}
+            TaskState::None
+            | TaskState::WaitingOnChildren { .. }
+            | TaskState::AnsweredQuestion { .. }
+            | TaskState::SubagentInvocation { .. }
+            | TaskState::ReadyToResume { .. } => {}
         }
     }
     for prompt in thread_prompts(documents, thread).await? {
