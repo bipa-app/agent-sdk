@@ -1445,6 +1445,42 @@ mod tests {
         Ok(())
     }
 
+    /// A failed settle that carries a result keeps it on the row, for the
+    /// parent to read in place of the error (a stalled tool's report); one
+    /// without keeps none.
+    async fn test_failed_settle_keeps_its_result(task_store: &dyn AgentTaskStore) -> Result<()> {
+        let result = serde_json::json!({"success": false, "output": "stalled"});
+        for (name, kept) in [
+            ("conformance-failed-result", Some(result)),
+            ("conformance-failed-no-result", None),
+        ] {
+            let (child, worker, lease) = leased_tool_child(task_store, name).await?;
+            task_store
+                .commit(
+                    Transition::settle_only(
+                        child.id.clone(),
+                        worker,
+                        lease,
+                        Settle::FailWithReason {
+                            error: "stalled".into(),
+                            reason: TerminalReason::WatchdogStall,
+                            result: kept.clone(),
+                        },
+                    ),
+                    t_plus(65),
+                )
+                .await?;
+            let failed = AgentTaskStore::get(task_store, &child.id)
+                .await?
+                .context("child")?;
+            assert_eq!(failed.status, TaskStatus::Failed);
+            assert_eq!(failed.terminal_reason, Some(TerminalReason::WatchdogStall));
+            assert_eq!(failed.last_error.as_deref(), Some("stalled"));
+            assert_eq!(failed.result_payload, kept, "{name}");
+        }
+        Ok(())
+    }
+
     /// A leased tool child parked on a confirmation.
     async fn awaiting_confirmation_child(
         task_store: &dyn AgentTaskStore,
@@ -5397,6 +5433,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_failed_settle_keeps_its_result() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_failed_settle_keeps_its_result(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_transition_is_all_or_nothing() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_transition_is_all_or_nothing(s.task.as_ref(), s.event.as_ref(), s.outbox.as_ref())
@@ -5872,6 +5914,13 @@ mod tests {
     async fn conformance_sqlite_reject_confirmation_transition() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_reject_confirmation_transition_is_all_or_nothing(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_failed_settle_keeps_its_result() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_failed_settle_keeps_its_result(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6717,6 +6766,15 @@ mod tests {
             return Ok(());
         };
         test_document_failpoint_writes_neither_half(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_failed_settle_keeps_its_result() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_failed_settle_keeps_its_result(&store).await
     }
 
     #[cfg(feature = "postgres")]

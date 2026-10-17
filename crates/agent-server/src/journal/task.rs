@@ -2306,6 +2306,18 @@ impl AgentTask {
         self.fail_with_terminal_reason(error, TerminalReason::ConfirmationRejected, now)
     }
 
+    /// Keep `result` on a failed task as the result its parent reads in
+    /// place of the error. `None` changes nothing.
+    #[must_use]
+    pub fn with_failure_result(mut self, result: Option<serde_json::Value>) -> Self {
+        if self.status == TaskStatus::Failed
+            && let Some(result) = result
+        {
+            self.result_payload = Some(result);
+        }
+        self
+    }
+
     /// Mark the task [`TaskStatus::Failed`] with an explicit typed reason.
     ///
     /// # Errors

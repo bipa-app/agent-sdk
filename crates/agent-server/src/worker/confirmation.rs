@@ -541,6 +541,7 @@ where
                     Settle::FailWithReason {
                         error,
                         reason: TerminalReason::ConfirmationRejected,
+                        result: None,
                     },
                     bootstrap.thread_id.clone(),
                     vec![end_event],

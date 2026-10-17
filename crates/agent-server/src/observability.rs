@@ -122,6 +122,16 @@ pub mod attrs {
     pub const SPAN_EFFECT_ID: &str = "agent_server.effect.id";
     /// Span-only: the owner task of an effect.
     pub const SPAN_TASK_ID: &str = "agent_server.task.id";
+    /// The tool a stalled call ran (span-only: tool names are unbounded).
+    pub const SPAN_TOOL_NAME: &str = "agent_server.tool.name";
+    /// `outcome` of `agent_server.tool.stalls`: the heartbeat found the tool
+    /// silent for its budget and stopped it.
+    pub const STALL_TRIPPED: &str = "tripped";
+    /// `outcome` of `agent_server.tool.stalls`: the tool's run ignored the
+    /// stop, so the heartbeat settled the call.
+    pub const STALL_FALLBACK_SETTLED: &str = "fallback_settled";
+    pub const SPAN_STALL_BUDGET_MS: &str = "agent_server.tool.stall_budget_ms";
+    pub const SPAN_STALL_SILENT_FOR_MS: &str = "agent_server.tool.silent_for_ms";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -186,6 +196,47 @@ pub mod attrs {
     pub const COMMIT_KIND_NON_ATOMIC: &str = "non_atomic";
 }
 
+/// The ids a tool-stall signal carries on its span (never on a metric).
+#[derive(Clone, Copy, Debug)]
+pub struct ToolStallSignal<'a> {
+    pub tool_name: &'a str,
+    pub task_id: &'a str,
+    /// The task's stored W3C `traceparent`, which the span nests under.
+    pub traceparent: Option<&'a str>,
+    pub budget_ms: u64,
+    pub silent_for_ms: u64,
+}
+
+impl ToolStallSignal<'_> {
+    fn emit(&self, event: &'static str, mut attributes: Vec<KeyValue>) {
+        use opentelemetry::trace::{Span, Tracer};
+
+        let parent = self
+            .traceparent
+            .map_or_else(opentelemetry::Context::new, |traceparent| {
+                let carrier = std::collections::HashMap::from([(
+                    "traceparent".to_owned(),
+                    traceparent.to_owned(),
+                )]);
+                global::get_text_map_propagator(|propagator| propagator.extract(&carrier))
+            });
+        let mut span =
+            global::tracer("agent-server").start_with_context("agent_server.tool.stall", &parent);
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TOOL_NAME,
+            self.tool_name.to_owned(),
+        ));
+        span.set_attribute(KeyValue::new(attrs::SPAN_TASK_ID, self.task_id.to_owned()));
+        attributes.push(KeyValue::new(
+            attrs::SPAN_TOOL_NAME,
+            self.tool_name.to_owned(),
+        ));
+        attributes.push(KeyValue::new(attrs::SPAN_TASK_ID, self.task_id.to_owned()));
+        span.add_event(event, attributes);
+        span.end();
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // ServerMetrics
 // ─────────────────────────────────────────────────────────────────────
@@ -221,6 +272,12 @@ pub struct ServerMetrics {
     pub(crate) view_folded_events: Histogram<f64>,
     pub(crate) view_stream: Counter<u64>,
     pub(crate) prompts: Counter<u64>,
+    /// `agent_server.tool.stalls`: tool calls stopped for silence, by
+    /// outcome.
+    pub(crate) tool_stalls: Counter<u64>,
+    /// `agent_server.tool.stall_budget.unbounded`: tool calls that run
+    /// with no stall budget.
+    pub(crate) tool_stall_unbounded: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -545,6 +602,39 @@ impl ServerMetrics {
         });
     }
 
+    /// Count a tool call stopped for silence with `outcome`
+    /// ([`attrs::STALL_TRIPPED`] or [`attrs::STALL_FALLBACK_SETTLED`]), and
+    /// record the `agent_server.tool.stalled` event, which alone carries the
+    /// tool and task, on a short `agent_server.tool.stall` span. The tool
+    /// child's heartbeat runs under no span of its own, so the span is
+    /// parented on the task's stored `traceparent` when it has one.
+    pub fn record_tool_stall(&self, outcome: &'static str, stall: &ToolStallSignal<'_>) {
+        self.tool_stalls
+            .add(1, &[KeyValue::new(attrs::OUTCOME, outcome)]);
+        stall.emit(
+            "agent_server.tool.stalled",
+            vec![
+                KeyValue::new(attrs::OUTCOME, outcome),
+                KeyValue::new(
+                    attrs::SPAN_STALL_BUDGET_MS,
+                    i64::try_from(stall.budget_ms).unwrap_or(i64::MAX),
+                ),
+                KeyValue::new(
+                    attrs::SPAN_STALL_SILENT_FOR_MS,
+                    i64::try_from(stall.silent_for_ms).unwrap_or(i64::MAX),
+                ),
+            ],
+        );
+    }
+
+    /// Count a tool call that starts with no stall budget, and record the
+    /// `agent_server.tool.stall_budget_unbounded` event on a short
+    /// `agent_server.tool.stall` span.
+    pub fn record_tool_stall_unbounded(&self, stall: &ToolStallSignal<'_>) {
+        self.tool_stall_unbounded.add(1, &[]);
+        stall.emit("agent_server.tool.stall_budget_unbounded", Vec::new());
+    }
+
     pub fn record_tool_audit(&self, event: &ToolAuditEvent) {
         let attrs = [
             KeyValue::new(attrs::AUDIT_OUTCOME, event.kind.as_str()),
@@ -647,6 +737,7 @@ impl ServerMetrics {
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
+        let (tool_stalls, tool_stall_unbounded) = Self::build_tool_stall_instruments(&meter);
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
 
@@ -670,8 +761,28 @@ impl ServerMetrics {
             view_folded_events,
             view_stream,
             prompts,
+            tool_stalls,
+            tool_stall_unbounded,
             meter,
         }
+    }
+
+    fn build_tool_stall_instruments(
+        meter: &opentelemetry::metrics::Meter,
+    ) -> (Counter<u64>, Counter<u64>) {
+        let tool_stalls = meter
+            .u64_counter("agent_server.tool.stalls")
+            .with_description(
+                "Tool calls stopped because the tool showed no progress for its stall budget, \
+                 by outcome: tripped (the heartbeat stopped it), fallback_settled (the tool \
+                 ignored the stop and the heartbeat settled the call).",
+            )
+            .build();
+        let tool_stall_unbounded = meter
+            .u64_counter("agent_server.tool.stall_budget.unbounded")
+            .with_description("Tool calls started with no stall budget.")
+            .build();
+        (tool_stalls, tool_stall_unbounded)
     }
 }
 

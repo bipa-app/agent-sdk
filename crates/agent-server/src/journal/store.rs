@@ -5860,13 +5860,21 @@ impl InMemoryAgentTaskStore {
                 "commit",
                 move |child| child.complete(now),
             ),
-            Settle::FailWithReason { error, reason } => inner.apply_task_terminal_transition(
+            Settle::FailWithReason {
+                error,
+                reason,
+                result,
+            } => inner.apply_task_terminal_transition(
                 task,
                 (&worker, &lease),
                 thread,
                 now,
                 "commit",
-                move |child| child.fail_with_terminal_reason(error, reason, now),
+                move |child| {
+                    child
+                        .fail_with_terminal_reason(error, reason, now)
+                        .map(|failed| failed.with_failure_result(result))
+                },
             ),
         }
     }
@@ -7461,7 +7469,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 child_id.clone(),
                 worker.clone(),
                 lease.clone(),
-                super::transition::Settle::FailWithReason { error, reason },
+                super::transition::Settle::FailWithReason {
+                    error,
+                    reason,
+                    result: None,
+                },
             ),
             now,
         )

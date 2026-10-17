@@ -203,6 +203,11 @@ inventory covers the whole observability surface.
 | `agent_server.effects` | Counter | `kind`, `transition` (`started`, `refused`, `finished`, `reclaimed`, `abandoned`) | `[agent-server]` (abandons also from the SQL stores) | Phase 2 |
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
+| `agent_server.tool.stalls` | Counter | `outcome` (`tripped`, `fallback_settled`) | `[agent-service-host]` (tool child heartbeat) | prim-wait W1 |
+| `agent_server.tool.stall_budget.unbounded` | Counter | — | `[agent-service-host]` | prim-wait W1 |
+| span `agent_server.tool.stall` | Span | span-only `agent_server.tool.name`, `agent_server.task.id`; parented on the tool child's stored `traceparent` when it has one (the heartbeat runs under no span) | `[agent-server]`, recorded from the `[agent-service-host]` tool child heartbeat and dispatch | prim-wait W1 |
+| event `agent_server.tool.stalled` | Span event on `agent_server.tool.stall` | `outcome`; span-only `agent_server.tool.name`, `agent_server.task.id`, `agent_server.tool.stall_budget_ms`, `agent_server.tool.silent_for_ms` | `[agent-service-host]` (tool child heartbeat) | prim-wait W1 |
+| event `agent_server.tool.stall_budget_unbounded` | Span event on `agent_server.tool.stall` | span-only `agent_server.tool.name`, `agent_server.task.id` | `[agent-service-host]` (dispatch) | prim-wait W1 |
 | event `agent_server.effect.abandoned` | Span event | `reason` (`owner_cancelled`, `lease_sweep`, `owner_terminal`), kind; span-only effect id, task id | `[agent-server]`, `[agent-service-host]` | Phase 2 |
 | `agent_server.prompts` | Counter | `owner` (`host`/`task`), `step` (`answer`/`close`/`withdraw` with the commit outcome `committed`/`guard`/`expectation`/`store`; `handle` for a live answer and `redrive` for one found unclosed at start, with `closed`/`pending`/`error`) | `[agent-server]` instrument, recorded by `agent_service_host::prompts` | primitive 6 (prompt rows) |
 

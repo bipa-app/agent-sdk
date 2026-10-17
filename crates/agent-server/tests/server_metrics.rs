@@ -32,7 +32,7 @@ use agent_server::journal::tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventKind, ToolAuditEventParams,
     ToolAuditEventStore,
 };
-use agent_server::observability::{ServerMetrics, attrs};
+use agent_server::observability::{ServerMetrics, ToolStallSignal, attrs};
 
 // ─────────────────────────────────────────────────────────────────────
 // Test helpers
@@ -1035,5 +1035,45 @@ async fn a_prompt_step_is_counted_by_owner_step_and_outcome() -> Result<()> {
         1,
         "{counted:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_stall_signals_count_by_outcome_without_the_tool_name() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+
+    let stall = |tool_name: &'static str, task_id: &'static str| ToolStallSignal {
+        tool_name,
+        task_id,
+        traceparent: None,
+        budget_ms: 900_000,
+        silent_for_ms: 901_000,
+    };
+    metrics.record_tool_stall(attrs::STALL_TRIPPED, &stall("mcp__any__tool", "task-1"));
+    metrics.record_tool_stall(attrs::STALL_TRIPPED, &stall("bash", "task-2"));
+    metrics.record_tool_stall(attrs::STALL_FALLBACK_SETTLED, &stall("bash", "task-2"));
+    metrics.record_tool_stall_unbounded(&stall("watch_logs", "task-3"));
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let stalls = collect_u64_counter(&snapshots, "agent_server.tool.stalls");
+    let by_outcome = |outcome: &str| -> u64 {
+        stalls
+            .iter()
+            .filter(|(set, _)| matches_all(set, &[(attrs::OUTCOME, outcome)]))
+            .map(|(_, count)| count)
+            .sum()
+    };
+    assert_eq!(by_outcome(attrs::STALL_TRIPPED), 2);
+    assert_eq!(by_outcome(attrs::STALL_FALLBACK_SETTLED), 1);
+    assert!(
+        stalls.iter().all(|(set, _)| set.len() == 1),
+        "the counter carries only its bounded outcome: {stalls:?}"
+    );
+    let unbounded = collect_u64_counter(&snapshots, "agent_server.tool.stall_budget.unbounded");
+    assert_eq!(unbounded.iter().map(|(_, count)| count).sum::<u64>(), 1);
+    assert!(unbounded.iter().all(|(set, _)| set.is_empty()));
     Ok(())
 }

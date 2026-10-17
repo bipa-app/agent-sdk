@@ -151,7 +151,8 @@ pub enum EffectState {
     Failed {
         error: String,
     },
-    /// Recovery found it `Started` and ended it without running it again.
+    /// Recovery found it `Started` and ended it without running it again,
+    /// or its run was dropped mid-flight because it stalled.
     Interrupted {
         captured_output: Option<String>,
     },
