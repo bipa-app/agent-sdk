@@ -734,6 +734,35 @@ impl Transition {
         })
     }
 
+    /// Refuse an effect write that comes after the write ending its owner:
+    /// ending an owner abandons its still-`Started` effects, so the effect
+    /// would meet an abandoned record (or, in memory, overwrite one).
+    fn validate_effect_order(&self) -> Result<(), Rejected> {
+        let mut ended = std::collections::BTreeSet::new();
+        for write in &self.writes {
+            match write {
+                Write::SettleTask { task, .. } | Write::RejectConfirmation { task, .. } => {
+                    ended.insert(task);
+                }
+                Write::Effect(effect) if ended.contains(effect.owner()) => {
+                    return Err(Rejected::Store(anyhow::anyhow!(
+                        "effect {} must be written before the write that ends its owner {}, \
+                     which abandons its started effects",
+                        effect.key(),
+                        effect.owner()
+                    )));
+                }
+                Write::Effect(_)
+                | Write::PauseOnConfirmation { .. }
+                | Write::ReparkAfterSteering { .. }
+                | Write::AppendCompaction { .. }
+                | Write::AppendEvents { .. }
+                | Write::SpawnChildren { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Check the shape every backend relies on before it opens a
     /// transaction: each settle has a leased guard on its task, each pause
     /// a leased guard that its task is running, each confirmation reject a
@@ -814,6 +843,7 @@ impl Transition {
                 Write::AppendEvents { .. } | Write::AppendCompaction { .. } => {}
             }
         }
+        self.validate_effect_order()?;
         let mut keys = std::collections::BTreeSet::new();
         for effect in self.effect_writes() {
             if !keys.insert(effect.key()) {

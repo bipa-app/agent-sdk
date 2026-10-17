@@ -18,7 +18,7 @@ ALTER TABLE agent_sdk_execution_intents
         CONSTRAINT agent_sdk_execution_intents_resolution_check
         CHECK (
             resolution IS NULL
-            OR (status = 'failed' AND resolution IN ('interrupted', 'salvaged'))
+            OR (status = 'failed' AND resolution IN ('interrupted', 'salvaged', 'abandoned'))
         );
 
 ALTER TABLE agent_sdk_execution_intents

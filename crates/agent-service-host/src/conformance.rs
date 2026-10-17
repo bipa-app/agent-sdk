@@ -3100,10 +3100,167 @@ mod tests {
         Ok(())
     }
 
+    /// A `Started` record's owner is live: every write that makes the owner
+    /// terminal ends its still-`Started` records as `Abandoned` in the same
+    /// transaction — a settle without the finish, a cancel of its tree, the
+    /// lease sweep failing it closed — while a transition that finishes the
+    /// effect first keeps its outcome, and one that finishes it after
+    /// ending the owner is refused.
+    async fn test_effects_end_with_their_owner(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let started = |owner: &AgentTask, worker: &WorkerId, lease: &LeaseId| {
+            start_effect(effect_intent(owner, "call_1"), worker, lease)
+        };
+        let key = |owner: &AgentTask| EffectKey::tool(&owner.id, "call_1");
+        let state = |owner: AgentTask| async move {
+            anyhow::Ok(
+                task_store
+                    .effect(&EffectKey::tool(&owner.id, "call_1"))
+                    .await?
+                    .context("the record")?
+                    .state,
+            )
+        };
+
+        let (settled, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-owner-settle").await?;
+        task_store
+            .commit(started(&settled, &worker, &lease), t_plus(2))
+            .await?;
+        task_store
+            .commit(
+                Transition::settle_only(
+                    settled.id.clone(),
+                    worker,
+                    lease,
+                    Settle::Fail {
+                        error: "boom".into(),
+                    },
+                ),
+                t_plus(3),
+            )
+            .await?;
+        assert_eq!(state(settled.clone()).await?, EffectState::Abandoned);
+        let abandoned = task_store.effect(&key(&settled)).await?.context("record")?;
+        assert_eq!(abandoned.updated_at, t_plus(3));
+
+        let (finished, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-owner-finish").await?;
+        task_store
+            .commit(started(&finished, &worker, &lease), t_plus(2))
+            .await?;
+        let finish = Write::Effect(EffectWrite::Finish {
+            key: key(&finished),
+            owner: finished.id.clone(),
+            state: EffectState::Completed,
+        });
+        let mut late = Transition::settle_only(
+            finished.id.clone(),
+            worker.clone(),
+            lease.clone(),
+            Settle::Complete {
+                result: serde_json::json!("done"),
+            },
+        );
+        late.writes.push(finish.clone());
+        let refused = task_store.commit(late, t_plus(3)).await;
+        assert!(
+            matches!(refused, Err(Rejected::Store(_))),
+            "a finish after the write that ends its owner is refused: {refused:?}"
+        );
+        assert_eq!(state(finished.clone()).await?, EffectState::Started);
+        let mut first = Transition::settle_only(
+            finished.id.clone(),
+            worker,
+            lease,
+            Settle::Complete {
+                result: serde_json::json!("done"),
+            },
+        );
+        first.writes.insert(0, finish);
+        task_store.commit(first, t_plus(4)).await?;
+        assert_eq!(state(finished.clone()).await?, EffectState::Completed);
+
+        let (cancelled, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-owner-cancel").await?;
+        task_store
+            .commit(started(&cancelled, &worker, &lease), t_plus(2))
+            .await?;
+        task_store.cancel_tree(&cancelled.id, t_plus(3)).await?;
+        let cancelled_row = task_store.get(&cancelled.id).await?.context("owner")?;
+        assert_eq!(cancelled_row.status, TaskStatus::Cancelled);
+        assert_eq!(state(cancelled.clone()).await?, EffectState::Abandoned);
+
+        for owner in [&settled, &finished, &cancelled] {
+            assert_eq!(
+                started_records(task_store, owner).await?,
+                0,
+                "a terminal owner keeps no started record"
+            );
+        }
+        Ok(())
+    }
+
+    /// The lease sweep failing an owner closed at its budget abandons the
+    /// owner's still-`Started` records in the same transaction.
+    async fn test_a_failed_closed_owner_abandons_its_effects(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let thread = thread_id("effect-owner-sweep");
+        thread_store.get_or_create(&thread, t0()).await?;
+        let swept = AgentTask::new_root_turn(thread, t0(), 1);
+        task_store.submit_root_turn(swept.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let swept = task_store
+            .try_acquire_task(
+                &swept.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(10),
+                t_plus(1),
+            )
+            .await?
+            .context("the swept owner must acquire")?;
+        task_store
+            .commit(
+                start_effect(effect_intent(&swept, "call_1"), &worker, &lease),
+                t_plus(2),
+            )
+            .await?;
+        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        assert!(
+            records.iter().any(|record| record.id == swept.id
+                && matches!(record.action, RecoveryAction::FailClosed(_))),
+            "the sweep fails the owner closed at its budget: {records:?}"
+        );
+        let record = task_store
+            .effect(&EffectKey::tool(&swept.id, "call_1"))
+            .await?
+            .context("the record")?;
+        assert_eq!(record.state, EffectState::Abandoned);
+        assert_eq!(started_records(task_store, &swept).await?, 0);
+
+        Ok(())
+    }
+
+    async fn started_records(task_store: &dyn AgentTaskStore, owner: &AgentTask) -> Result<usize> {
+        Ok(task_store
+            .effects_for_task(&owner.id)
+            .await?
+            .iter()
+            .filter(|record| record.state == EffectState::Started)
+            .count())
+    }
+
     /// Design C15: every backend checks a transition's effect expectations
     /// before its first write, so when the LAST write's expectation fails
     /// nothing earlier in the transition is visible — on the in-memory
-    /// store, which cannot roll back, too.
+    /// store, which cannot roll back, too. (A finish after a settle of its
+    /// owner is refused earlier still, by `validate`; see
+    /// `test_effects_end_with_their_owner`.)
     async fn test_effect_expectation_failure_writes_nothing(
         task_store: &dyn AgentTaskStore,
         thread_store: &dyn ThreadStore,
@@ -3115,24 +3272,16 @@ mod tests {
         let key = intent.key.clone();
         let events_before = event_repo.get_events(&owner.thread_id).await?.len();
 
-        let mut transition = Transition::settle(
-            owner.id.clone(),
-            worker.clone(),
-            lease.clone(),
-            Settle::Complete {
-                result: serde_json::json!("done"),
+        // Events, then a start, then the last write: a finish whose record
+        // does not exist. The two earlier writes must not land.
+        let mut transition = start_effect(effect_intent(&owner, "call_0"), &worker, &lease);
+        transition.writes.insert(
+            0,
+            Write::AppendEvents {
+                thread: owner.thread_id.clone(),
+                events: vec![AgentEvent::text("m1", "reported")],
             },
-            owner.thread_id.clone(),
-            vec![AgentEvent::text("m1", "reported")],
         );
-        transition.guards.push(Guard::EffectFree {
-            key: EffectKey::tool(&owner.id, "call_0"),
-        });
-        transition
-            .writes
-            .push(Write::Effect(EffectWrite::Start(effect_intent(
-                &owner, "call_0",
-            ))));
         transition.writes.push(Write::Effect(EffectWrite::Finish {
             key: key.clone(),
             owner: owner.id.clone(),
@@ -3144,8 +3293,6 @@ mod tests {
             "finishing an effect with no record is refused by a guard: {refused:?}"
         );
 
-        let task = task_store.get(&owner.id).await?.context("owner")?;
-        assert_eq!(task.status, TaskStatus::Running, "the settle did not land");
         assert_eq!(
             event_repo.get_events(&owner.thread_id).await?.len(),
             events_before,
@@ -4836,6 +4983,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_failed_closed_owner_abandons_its_effects() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_failed_closed_owner_abandons_its_effects(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_effects_end_with_their_owner() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_effects_end_with_their_owner(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_effect_claim_and_finish() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_effect_claim_and_finish(s.task.as_ref(), s.thread.as_ref()).await
@@ -5314,6 +5473,20 @@ mod tests {
     async fn conformance_sqlite_two_concurrent_claims_one_fresh() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_two_concurrent_claims_one_fresh(store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_failed_closed_owner_abandons_its_effects() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_failed_closed_owner_abandons_its_effects(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_effects_end_with_their_owner() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_effects_end_with_their_owner(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6217,6 +6390,24 @@ mod tests {
             return Ok(());
         };
         test_two_concurrent_claims_one_fresh(store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_failed_closed_owner_abandons_its_effects() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_failed_closed_owner_abandons_its_effects(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_effects_end_with_their_owner() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_effects_end_with_their_owner(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

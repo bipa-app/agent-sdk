@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `interrupted:` without running it, and `Completed` refuses a duplicate.
     An interrupted record is now stored as `failed` with
     `resolution = 'interrupted'`.
+  - **A `Started` record's owner is live.** Every store write that makes a
+    task terminal also ends that task's still-`Started` records as
+    `Abandoned` (`failed`, `resolution = 'abandoned'`), in the same
+    transaction, on all three backends. This covers a settle without the
+    finish, `cancel_tree` / `cancel_descendants_of_owned` while the call
+    runs, and the lease sweep failing the owner closed.
+    - The SQL backends do it where they write every task status
+      (`update_task_tx`); the in-memory store does it in the one place it
+      stores a task row.
+    - A transition that finishes an effect and ends its owner must write
+      the `Finish` first. `validate` refuses the other order, and
+      `run_effect` puts the finish ahead of the caller's end writes.
+    - Readers treat a `Started` record whose owner is already terminal (a
+      row an earlier release left behind) as `Abandoned`, and never run
+      it again.
 - **Breaking: the write and guard types.**
   - `Write::Effect(EffectWrite::{Start, Finish})` and `Guard::EffectFree`
     replace `Write::RecordIntent`.
@@ -63,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `tool_call`, `llm_request`, `process_start` and `git_step`. All four are
     listed now because SQLite cannot widen the check later.
   - `attempt`: `NOT NULL DEFAULT 1`, with a check that it is `>= 1`.
-  - `resolution`: `interrupted` or `salvaged`, only on `failed` rows.
+  - `resolution`: `interrupted`, `salvaged` or `abandoned`, only on
+    `failed` rows.
   - `captured_output`, `journal_anchor` (the owner thread's next event
     sequence at start) and `thread_id`, all nullable.
 

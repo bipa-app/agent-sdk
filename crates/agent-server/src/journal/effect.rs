@@ -5,8 +5,18 @@
 //! step. [`run_effect`] is the one way to run one: it commits the effect's
 //! `Started` row with the owner task's change in one transition, runs the
 //! effect, then commits the outcome, the owner's change and the event that
-//! reports it in another. The row and the owner's state always agree, so
-//! recovery reads committed state only and never infers from age.
+//! reports it in another.
+//!
+//! A `Started` record's owner is live: every store write that makes a task
+//! terminal (its settle, a cancel of its tree, a fail-closed lease sweep)
+//! also ends the task's still-`Started` records as `Abandoned`, in the same
+//! transaction. A transition that ends an owner and finishes its effect
+//! therefore writes the [`EffectWrite::Finish`] first. So recovery reads
+//! committed state only and never infers from age: a `Started` record is an
+//! effect whose live owner may run it again, an `Abandoned` one ended
+//! without an outcome and is never run again. A row an earlier release left
+//! `started` under a task that is already terminal reads the same way:
+//! readers treat a `Started` record whose owner is terminal as `Abandoned`.
 //!
 //! Recovery of a `Started` effect depends on its [`ToolReplay`]: a `Safe`
 //! effect runs again, an `Unsafe` one never does. A `Safe` tool call writes
@@ -28,6 +38,7 @@
 //! | `Failed` | `failed` | the error | NULL |
 //! | `Interrupted` | `failed` | `interrupted` | `interrupted` |
 //! | `Salvaged` | `failed` | `salvaged: aborted response` | `salvaged` |
+//! | `Abandoned` | `failed` | `abandoned: its owner ended first` | `abandoned` |
 
 use agent_sdk_foundation::{ThreadId, ToolReplay};
 use anyhow::{Context, bail};
@@ -53,7 +64,8 @@ impl EffectKey {
         Self(format!("{}:{tool_call_id}", child.0))
     }
 
-    /// A key as a store read it back.
+    /// A key as a store read it back. Public because the stores live in
+    /// another crate, and a host may keep a key it read to finish later.
     #[must_use]
     pub fn from_stored(key: impl Into<String>) -> Self {
         Self(key.into())
@@ -122,6 +134,9 @@ pub enum EffectState {
     Salvaged {
         captured_output: Option<String>,
     },
+    /// Its owner became terminal while it was `Started`, so it ended with
+    /// no outcome. It is never run again.
+    Abandoned,
 }
 
 impl EffectState {
@@ -260,6 +275,7 @@ pub struct EffectStateColumns {
 }
 
 const SALVAGED_ERROR: &str = "salvaged: aborted response";
+const ABANDONED_ERROR: &str = "abandoned: its owner ended first";
 const INTERRUPTED_ERROR: &str = "interrupted";
 
 impl EffectState {
@@ -281,6 +297,12 @@ impl EffectState {
                 Some(SALVAGED_ERROR.to_owned()),
                 Some("salvaged"),
                 captured_output.clone(),
+            ),
+            Self::Abandoned => (
+                "failed",
+                Some(ABANDONED_ERROR.to_owned()),
+                Some("abandoned"),
+                None,
             ),
         };
         EffectStateColumns {
@@ -305,6 +327,7 @@ impl EffectState {
             },
             ("failed", Some("interrupted")) => Self::Interrupted { captured_output },
             ("failed", Some("salvaged")) => Self::Salvaged { captured_output },
+            ("failed", Some("abandoned")) => Self::Abandoned,
             (status, resolution) => {
                 bail!("unknown effect status {status:?} with resolution {resolution:?}")
             }
@@ -544,8 +567,9 @@ pub enum EffectRun<T> {
 /// `start` carries the owner's leased [`Guard::TaskIs`]. `end` turns the
 /// effect's output into the transition that records its outcome and the
 /// state to finish it with. The [`EffectWrite::Finish`] is added to that
-/// transition, so the outcome, the owner's change and its events commit
-/// together.
+/// transition, ahead of its writes (a write that ends the owner abandons
+/// whatever is still `Started`), so the outcome, the owner's change and its
+/// events commit together.
 ///
 /// Each transition is committed once: the store retries its own lock
 /// conflicts, and a second commit of `start` would only meet its own row.
@@ -580,7 +604,7 @@ where
     let (mut end_transition, state) = end(&value)?;
     end_transition
         .writes
-        .push(Write::Effect(EffectWrite::Finish { key, owner, state }));
+        .insert(0, Write::Effect(EffectWrite::Finish { key, owner, state }));
     crate::fail_point!("effect.before_finish");
     let committed = store
         .commit(end_transition, OffsetDateTime::now_utc())
@@ -632,6 +656,7 @@ mod tests {
             EffectState::Salvaged {
                 captured_output: None,
             },
+            EffectState::Abandoned,
         ] {
             let stored = record(state);
             let row = stored.to_row()?;

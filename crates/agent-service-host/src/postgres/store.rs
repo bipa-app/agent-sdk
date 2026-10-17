@@ -2120,6 +2120,40 @@ WHERE id = $1
             result.rows_affected(),
             task.id
         );
+        if task.status.is_terminal() {
+            Self::abandon_started_effects_tx(tx, task).await?;
+        }
+        Ok(())
+    }
+
+    /// End the still-`Started` effects of a task that just became
+    /// terminal as `Abandoned`, in the same transaction: a `Started`
+    /// record's owner is live. Every write of a task's status goes through
+    /// [`Self::update_task_tx`], so no path that ends an owner skips this.
+    async fn abandon_started_effects_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTask,
+    ) -> Result<()> {
+        let columns = EffectState::Abandoned.columns();
+        sqlx::query!(
+            r"
+UPDATE agent_sdk_execution_intents
+SET status     = $1,
+    error      = $2,
+    resolution = $3,
+    updated_at = $4
+WHERE child_task_id = $5
+  AND status IN ('pending', 'started')
+",
+            columns.status,
+            columns.error,
+            columns.resolution,
+            task.updated_at,
+            task.id.as_str(),
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("abandon the started effects of task {}", task.id))?;
         Ok(())
     }
 
@@ -4195,23 +4229,6 @@ impl PostgresDurableStore {
         Ok(())
     }
 
-    /// One attempt at a transition, in the store's lock order (see
-    /// [`PostgresDurableStore`]):
-    ///
-    /// 1. read each task the transition declares (`Transition::locks`)
-    ///    without a lock, to learn its thread and depth;
-    /// 2. lock the threads it needs (its event threads, its compacted
-    ///    threads, its guarded root turns' threads and a spawn's parent
-    ///    thread, then a spawn's child threads), in tree order then by
-    ///    thread key, checking a spawn's purge fence;
-    /// 3. lock every declared task in `task_lock_order`, a re-attached child
-    ///    before its parent, check the guards, then each append's purge
-    ///    fence on the thread row it locked in step 2;
-    /// 4. apply the writes, whose own task locks (a settled child, then its
-    ///    parent) follow the same order.
-    ///
-    /// The guards are read under their row locks, so a lease stolen after
-    /// the guard read cannot reach a write: it is a `Rejected::Guard`.
     /// Check the transition's effect expectations against the rows as this
     /// transaction sees them, after the task rows that own them are locked.
     async fn check_effects_tx(
@@ -4227,6 +4244,25 @@ impl PostgresDurableStore {
         transition.check_effects(|key| effects.get(key))
     }
 
+    /// One attempt at a transition, in the store's lock order (see
+    /// [`PostgresDurableStore`]):
+    ///
+    /// 1. read each task the transition declares (`Transition::locks`)
+    ///    without a lock, to learn its thread and depth;
+    /// 2. lock the threads it needs (its event threads, its compacted
+    ///    threads, its guarded root turns' threads and a spawn's parent
+    ///    thread, then a spawn's child threads), in tree order then by
+    ///    thread key, checking a spawn's purge fence;
+    /// 3. lock every declared task in `task_lock_order`, a re-attached child
+    ///    before its parent, check the guards, then each append's purge
+    ///    fence on the thread row it locked in step 2;
+    ///    3b. read the effect rows the transition expects to be free or
+    ///    `Started` (each owned by a task locked in step 3) and check them;
+    /// 4. apply the writes, whose own task locks (a settled child, then its
+    ///    parent) follow the same order.
+    ///
+    /// The guards are read under their row locks, so a lease stolen after
+    /// the guard read cannot reach a write: it is a `Rejected::Guard`.
     async fn commit_once(
         &self,
         transition: &agent_server::journal::Transition,

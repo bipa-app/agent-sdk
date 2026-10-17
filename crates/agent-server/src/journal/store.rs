@@ -3111,7 +3111,7 @@ impl InMemoryAgentTaskStore {
         // spawn_index is not an indexed field, so a plain primary-key
         // overwrite keeps every secondary index consistent.
         for child in updated_children {
-            inner.by_id.insert(child.id.clone(), child);
+            inner.put_row(child.id.clone(), child);
         }
 
         // A re-attach child that finished during the LLM call is already
@@ -3121,7 +3121,7 @@ impl InMemoryAgentTaskStore {
             .repark_after_steering(live, payload, reattach, now)
             .context("repark rejected: repark_after_steering transition failed")?;
         inner.rebalance_after_row_change(&old, &reparked);
-        inner.by_id.insert(reparked.id.clone(), reparked.clone());
+        inner.put_row(reparked.id.clone(), reparked.clone());
         Ok(reparked)
     }
 
@@ -3144,7 +3144,7 @@ impl InMemoryAgentTaskStore {
             .await_confirmation(continuation, prepared_operation, now)
             .context("pause rejected: await_confirmation transition failed")?;
         inner.rebalance_after_row_change(&old, &paused);
-        inner.by_id.insert(paused.id.clone(), paused.clone());
+        inner.put_row(paused.id.clone(), paused.clone());
         Ok(paused)
     }
 
@@ -3173,7 +3173,7 @@ impl InMemoryAgentTaskStore {
             .reject_confirmation(error, now)
             .context("reject_confirmation: fail transition failed")?;
         inner.rebalance_after_row_change(&old, &failed);
-        inner.by_id.insert(failed.id.clone(), failed.clone());
+        inner.put_row(failed.id.clone(), failed.clone());
 
         // Recompute the parent's pending_child_count the same way
         // `apply_task_terminal_transition` does in complete_task /
@@ -3430,7 +3430,7 @@ impl InMemoryAgentTaskStore {
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
                     inner.rebalance_after_row_change(&old, &claimed);
-                    inner.by_id.insert(claimed.id.clone(), claimed.clone());
+                    inner.put_row(claimed.id.clone(), claimed.clone());
                     result = Some(claimed);
                     break;
                 }
@@ -4035,6 +4035,24 @@ impl InMemoryAgentTaskStore {
 }
 
 impl Inner {
+    /// Store `task` as its row. A task stored terminal ends its
+    /// still-`Started` effects as `Abandoned` in the same locked step, as
+    /// the SQL backends do in `update_task_tx`: a `Started` record's owner
+    /// is live.
+    fn put_row(&mut self, id: AgentTaskId, task: AgentTask) {
+        if task.status.is_terminal() {
+            for record in self
+                .effects
+                .values_mut()
+                .filter(|record| record.owner == id && record.state.is_started())
+            {
+                record.state = super::effect::EffectState::Abandoned;
+                record.updated_at = task.updated_at;
+            }
+        }
+        self.by_id.insert(id, task);
+    }
+
     /// Complete one queued input-injection row; any other row is left
     /// alone and yields `None`.
     fn complete_input_injection(
@@ -4053,7 +4071,7 @@ impl Inner {
             .complete_input_injection(now)
             .context("complete input injection transition failed")?;
         self.rebalance_after_row_change(&old, &completed);
-        self.by_id.insert(completed.id.clone(), completed.clone());
+        self.put_row(completed.id.clone(), completed.clone());
         Ok(Some(completed))
     }
 
@@ -4295,7 +4313,7 @@ impl Inner {
             .context("promote rejected: promotion transition failed")?;
 
         self.rebalance_after_row_change(&queued_row, &promoted);
-        self.by_id.insert(id, promoted.clone());
+        self.put_row(id, promoted.clone());
         Ok(Some(promoted))
     }
 
@@ -4372,7 +4390,7 @@ impl Inner {
         now: OffsetDateTime,
     ) -> Result<()> {
         self.rebalance_after_row_change(old, failed);
-        self.by_id.insert(failed.id.clone(), failed.clone());
+        self.put_row(failed.id.clone(), failed.clone());
         let _ = self.propagate_terminal_child_transition(
             failed,
             thread,
@@ -4489,7 +4507,7 @@ impl Inner {
             .cancel_with_reason(reason, now)
             .context("cancel_tree: cancel transition failed")?;
         self.rebalance_after_row_change(&old, &cancelled);
-        self.by_id.insert(cancelled.id.clone(), cancelled.clone());
+        self.put_row(cancelled.id.clone(), cancelled.clone());
         let _ = self.propagate_terminal_child_transition(
             &cancelled,
             ThreadAdmission::Fenced,
@@ -4516,7 +4534,7 @@ impl Inner {
                 .complete_input_injection(now)
                 .context("complete input injection transition failed")?;
             self.rebalance_after_row_change(&old, &completed);
-            self.by_id.insert(completed.id.clone(), completed.clone());
+            self.put_row(completed.id.clone(), completed.clone());
         }
         Ok(())
     }
@@ -4590,7 +4608,7 @@ impl Inner {
         let new_child = transition(old_child.clone())
             .with_context(|| format!("{error_prefix}: terminal transition failed"))?;
         self.rebalance_after_row_change(&old_child, &new_child);
-        self.by_id.insert(new_child.id.clone(), new_child.clone());
+        self.put_row(new_child.id.clone(), new_child.clone());
 
         let parent =
             self.propagate_terminal_child_transition(&new_child, thread, now, error_prefix, false)?;
@@ -4640,7 +4658,7 @@ impl Inner {
                         format!("{error_prefix}: recompute_pending_children transition failed")
                     })?;
                 self.rebalance_after_row_change(&old_parent, &new_parent);
-                self.by_id.insert(new_parent.id.clone(), new_parent.clone());
+                self.put_row(new_parent.id.clone(), new_parent.clone());
                 Ok(Some(new_parent))
             } else {
                 Ok(Some(old_parent))
@@ -4720,7 +4738,7 @@ impl Inner {
                 .insert(released.injection.id.clone(), released.injection);
             if let Some(next_turn) = released.next_turn {
                 self.add_to_indexes(&next_turn);
-                self.by_id.insert(next_turn.id.clone(), next_turn);
+                self.put_row(next_turn.id.clone(), next_turn);
             }
         }
         Ok(())
@@ -5142,19 +5160,19 @@ impl Inner {
     ) -> Result<()> {
         let (old_parent, new_parent) = parent_transition;
         self.rebalance_after_row_change(old_parent, new_parent);
-        self.by_id.insert(new_parent.id.clone(), new_parent.clone());
+        self.put_row(new_parent.id.clone(), new_parent.clone());
         for (invocation, child_root) in subagents {
             for child in [invocation, child_root] {
                 self.add_to_indexes(child);
-                self.by_id.insert(child.id.clone(), child.clone());
+                self.put_row(child.id.clone(), child.clone());
             }
         }
         for child in tool_children {
             self.add_to_indexes(child);
-            self.by_id.insert(child.id.clone(), child.clone());
+            self.put_row(child.id.clone(), child.clone());
         }
         for child in reattached {
-            self.by_id.insert(child.id.clone(), child);
+            self.put_row(child.id.clone(), child);
         }
         self.complete_injection_rows(delivered_injection_ids, now)
     }
@@ -5180,7 +5198,7 @@ impl Inner {
             } else {
                 self.add_to_indexes(original);
             }
-            self.by_id.insert(original.id.clone(), original.clone());
+            self.put_row(original.id.clone(), original.clone());
         }
     }
 }
@@ -5224,6 +5242,7 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
             }
         }
         transition.check_effects(|key| lock.inner.effects.get(key))?;
+        let anchors = self.effect_anchors(&transition).await?;
         self.require_appendable_threads(&transition).await?;
         let mut committed = Committed::default();
         for write in transition.writes.iter().cloned() {
@@ -5271,12 +5290,7 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                     committed.reparked.push(reparked);
                 }
                 Write::Effect(effect) => {
-                    let anchor = match (&effect, &self.marker_sink) {
-                        (super::effect::EffectWrite::Start(intent), Some(sink)) => {
-                            Some(sink.event_repo.next_sequence(&intent.thread).await?)
-                        }
-                        _ => None,
-                    };
+                    let anchor = anchors.get(effect.key()).copied();
                     Self::apply_effect_locked(inner, effect, anchor, now);
                 }
                 Write::AppendCompaction {
@@ -5340,6 +5354,47 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
 }
 
 impl InMemoryAgentTaskStore {
+    /// The journal anchor of each effect the transition starts, read before
+    /// its first write so the effect writes cannot fail after an earlier
+    /// write landed: the thread's next sequence plus the events the
+    /// transition's earlier `AppendEvents` writes add to it, which is what
+    /// the SQL backends read inside their transaction. A store without an
+    /// event sink anchors nothing.
+    async fn effect_anchors(
+        &self,
+        transition: &super::transition::Transition,
+    ) -> Result<HashMap<super::effect::EffectKey, u64>> {
+        use super::effect::EffectWrite;
+        use super::transition::Write;
+
+        let mut anchors = HashMap::new();
+        let Some(sink) = &self.marker_sink else {
+            return Ok(anchors);
+        };
+        let mut appended: HashMap<&ThreadId, u64> = HashMap::new();
+        for write in &transition.writes {
+            match write {
+                Write::AppendEvents { thread, events } => {
+                    *appended.entry(thread).or_default() +=
+                        u64::try_from(events.len()).unwrap_or(u64::MAX);
+                }
+                Write::Effect(EffectWrite::Start(intent)) => {
+                    let next = sink.event_repo.next_sequence(&intent.thread).await?;
+                    let earlier = appended.get(&intent.thread).copied().unwrap_or_default();
+                    anchors.insert(intent.key.clone(), next + earlier);
+                }
+                Write::Effect(EffectWrite::Finish { .. })
+                | Write::SettleTask { .. }
+                | Write::RejectConfirmation { .. }
+                | Write::PauseOnConfirmation { .. }
+                | Write::ReparkAfterSteering { .. }
+                | Write::AppendCompaction { .. }
+                | Write::SpawnChildren { .. } => {}
+            }
+        }
+        Ok(anchors)
+    }
+
     /// Apply an effect write whose expectation
     /// [`super::transition::Transition::check_effects`] already checked, so
     /// it cannot fail after an earlier write of the transition landed.
@@ -5656,7 +5711,7 @@ impl InMemoryAgentTaskStore {
             .insert(new_parent.id.clone(), new_parent.clone());
         for child in &children {
             inner.add_to_indexes(child);
-            inner.by_id.insert(child.id.clone(), child.clone());
+            inner.put_row(child.id.clone(), child.clone());
         }
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
         Ok(SpawnedChildren {
@@ -6068,7 +6123,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         inner.check_insert_root_admission(&task)?;
 
         inner.add_to_indexes(&task);
-        inner.by_id.insert(task.id.clone(), task);
+        inner.put_row(task.id.clone(), task);
         drop(inner);
         Ok(())
     }
@@ -6104,7 +6159,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // helper so that Phase 2.3's acquire / heartbeat / sweep call
         // sites can share the same logic with `update()`.
         inner.rebalance_after_row_change(&old, &task);
-        inner.by_id.insert(task.id.clone(), task);
+        inner.put_row(task.id.clone(), task);
         drop(inner);
         Ok(())
     }
@@ -6218,7 +6273,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         };
 
         inner.add_to_indexes(&admitted);
-        inner.by_id.insert(admitted.id.clone(), admitted.clone());
+        inner.put_row(admitted.id.clone(), admitted.clone());
         drop(inner);
         Ok(admitted)
     }
@@ -6288,7 +6343,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         };
 
         inner.add_to_indexes(&admitted);
-        inner.by_id.insert(admitted.id.clone(), admitted.clone());
+        inner.put_row(admitted.id.clone(), admitted.clone());
 
         // 3. Claim the idempotency key in the same critical section.
         if let Some(claim) = idempotency {
@@ -6465,7 +6520,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
-        inner.by_id.insert(claimed.id.clone(), claimed.clone());
+        inner.put_row(claimed.id.clone(), claimed.clone());
         drop(inner);
         Ok(Some(claimed))
     }
@@ -6541,7 +6596,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .context("heartbeat rejected")?;
 
         inner.rebalance_after_row_change(&old, &refreshed);
-        inner.by_id.insert(refreshed.id.clone(), refreshed.clone());
+        inner.put_row(refreshed.id.clone(), refreshed.clone());
         drop(inner);
         Ok(refreshed)
     }
@@ -6595,7 +6650,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                         .release_lease(now)
                         .context("release_expired_leases: release transition failed")?;
                     inner.rebalance_after_row_change(&old, &released_row);
-                    inner.by_id.insert(id.clone(), released_row);
+                    inner.put_row(id.clone(), released_row);
                     RecoveryRecord::requeued(id)
                 }
                 RecoveryAction::FailClosed(reason) => {
@@ -6692,7 +6747,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .release_lease(now)
             .context("requeue_owned_task: release transition failed")?;
         inner.rebalance_after_row_change(&old, &released_row);
-        inner.by_id.insert(id.clone(), released_row.clone());
+        inner.put_row(id.clone(), released_row.clone());
         drop(inner);
         Ok(RequeueOutcome::Requeued(Box::new(released_row)))
     }
@@ -6736,7 +6791,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .wait_on_children(child_count, payload, Vec::new(), now)
             .context("pause rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old, &paused);
-        inner.by_id.insert(paused.id.clone(), paused.clone());
+        inner.put_row(paused.id.clone(), paused.clone());
         drop(inner);
         Ok(paused)
     }
@@ -6777,7 +6832,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .begin_steering_resume(steering, now)
             .context("steering wake rejected: begin_steering_resume transition failed")?;
         inner.rebalance_after_row_change(&old, &woken);
-        inner.by_id.insert(woken.id.clone(), woken.clone());
+        inner.put_row(woken.id.clone(), woken.clone());
         drop(inner);
         Ok(Some(woken))
     }
@@ -6865,7 +6920,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
         inner.rebalance_after_row_change(&old, &paused);
-        inner.by_id.insert(paused.id.clone(), paused.clone());
+        inner.put_row(paused.id.clone(), paused.clone());
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
         drop(inner);
         events.push(AgentEvent::question_asked(id.as_str(), questions));
@@ -6901,7 +6956,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             QuestionAnswerApplied::Answered(task) => task,
         };
         inner.rebalance_after_row_change(&old, &answered);
-        inner.by_id.insert(answered.id.clone(), answered.clone());
+        inner.put_row(answered.id.clone(), answered.clone());
         drop(inner);
         Ok(answered)
     }
@@ -7116,7 +7171,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .approve_confirmation_for_pickup(now)
             .context("resume rejected: approve_confirmation_for_pickup transition failed")?;
         inner.rebalance_after_row_change(&old, &resumed);
-        inner.by_id.insert(resumed.id.clone(), resumed.clone());
+        inner.put_row(resumed.id.clone(), resumed.clone());
         drop(inner);
         Ok((resumed, prepared_operation))
     }
@@ -7148,7 +7203,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .approve_confirmation(worker, lease, expires_at, now)
             .context("approve rejected: approve_confirmation transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
-        inner.by_id.insert(claimed.id.clone(), claimed.clone());
+        inner.put_row(claimed.id.clone(), claimed.clone());
         drop(inner);
         Ok((claimed, prepared_operation))
     }
