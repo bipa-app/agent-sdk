@@ -60,6 +60,8 @@ use crate::confirmation_guard::{
 use crate::health::HealthSurface;
 use crate::host::ServiceHost;
 use crate::proto::agent::service::v1 as pb;
+
+mod thread_view;
 use crate::proto::agent::service::v1::agent_control_service_server::{
     AgentControlService, AgentControlServiceServer,
 };
@@ -149,10 +151,13 @@ struct GrpcShared {
     heartbeat_interval: std::time::Duration,
     admission: AdmissionConfig,
     confirmation_guard: Option<Arc<dyn ConfirmationDecisionGuard>>,
+    /// Whether and how the view RPCs fold a thread's events.
+    view: agent_server::journal::view::ViewConfig,
+    view_cache: Arc<thread_view::ViewCache>,
 }
 
 impl GrpcShared {
-    const fn new(
+    fn new(
         stores: StoreRegistry,
         runtime: Arc<ExecutionRuntime>,
         health: Arc<HealthSurface>,
@@ -170,6 +175,12 @@ impl GrpcShared {
             heartbeat_interval,
             admission,
             confirmation_guard: None,
+            view: agent_server::journal::view::ViewConfig {
+                enabled: false,
+                stall_tool_name: None,
+                visible_document_kinds: Vec::new(),
+            },
+            view_cache: Arc::new(thread_view::ViewCache::default()),
         }
     }
 
@@ -2383,9 +2394,58 @@ fn follow_live_events(
     }
 }
 
+type ViewStream = Pin<Box<dyn Stream<Item = Result<pb::StreamThreadViewResponse, Status>> + Send>>;
+
 #[tonic::async_trait]
 impl AgentEventService for GrpcEventService {
     type StreamThreadEventsStream = EventStream;
+    type StreamThreadViewStream = ViewStream;
+
+    async fn get_thread_view(
+        &self,
+        request: Request<pb::GetThreadViewRequest>,
+    ) -> Result<Response<pb::ThreadViewSnapshot>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        thread_view::admit(&self.shared, &thread_id).await?;
+        let view = thread_view::fold_thread(&self.shared, &thread_id).await?;
+        Ok(Response::new(thread_view::snapshot_proto(
+            &thread_id,
+            &view,
+            thread_view::item_limit(request.item_limit),
+        )?))
+    }
+
+    async fn get_thread_view_items(
+        &self,
+        request: Request<pb::GetThreadViewItemsRequest>,
+    ) -> Result<Response<pb::GetThreadViewItemsResponse>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        thread_view::admit(&self.shared, &thread_id).await?;
+        let view = thread_view::fold_thread(&self.shared, &thread_id).await?;
+        Ok(Response::new(pb::GetThreadViewItemsResponse {
+            items: thread_view::items_proto(
+                &view,
+                request.before_index,
+                thread_view::item_limit(request.limit),
+            )?,
+        }))
+    }
+
+    async fn stream_thread_view(
+        &self,
+        request: Request<pb::StreamThreadViewRequest>,
+    ) -> Result<Response<Self::StreamThreadViewStream>, Status> {
+        let request = request.into_inner();
+        let thread_id = parse_thread_id(&request.thread_id)?;
+        thread_view::admit(&self.shared, &thread_id).await?;
+        Ok(Response::new(Box::pin(thread_view::view_stream(
+            Arc::clone(&self.shared),
+            thread_id,
+            thread_view::item_limit(request.item_limit),
+        ))))
+    }
 
     async fn stream_thread_events(
         &self,
@@ -2663,6 +2723,15 @@ impl GrpcTransport {
         guard: Arc<dyn ConfirmationDecisionGuard>,
     ) -> Self {
         Arc::make_mut(&mut self.shared).confirmation_guard = Some(guard);
+        self
+    }
+
+    /// Serve `GetThreadView`, `GetThreadViewItems` and `StreamThreadView`,
+    /// folding each thread's events with `view`. Off by default: without
+    /// `view.enabled` they answer `FAILED_PRECONDITION`.
+    #[must_use]
+    pub fn with_view_config(mut self, view: agent_server::journal::view::ViewConfig) -> Self {
+        Arc::make_mut(&mut self.shared).view = view;
         self
     }
 
@@ -4487,6 +4556,8 @@ async fn emitter_was_cancelled(
 
 #[cfg(test)]
 mod tests {
+    mod thread_view_test;
+
     use std::collections::VecDeque;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};

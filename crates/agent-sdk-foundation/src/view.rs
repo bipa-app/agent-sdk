@@ -470,8 +470,25 @@ pub fn fold(
     if status.sequence.is_some_and(|folded| sequence <= folded) {
         return (status.clone(), Vec::new());
     }
+    let (status, mut ops) = fold_owned(status.clone(), sequence, at, event, config);
+    ops.push(ViewOp::SetStatus {
+        status: Box::new(status.clone()),
+    });
+    (status, ops)
+}
+
+/// [`fold`] on a status the caller gives up, returning the next status and
+/// the item ops alone, with no closing [`ViewOp::SetStatus`]. Assumes the
+/// event is past `status.sequence`.
+fn fold_owned(
+    status: ThreadViewStatus,
+    sequence: u64,
+    at: OffsetDateTime,
+    event: &AgentEvent,
+    config: &ViewConfig,
+) -> (ThreadViewStatus, Vec<ViewOp>) {
     let mut step = Step {
-        status: status.clone(),
+        status,
         ops: Vec::new(),
         sequence,
     };
@@ -479,12 +496,7 @@ pub fn fold(
     step.status.sequence = Some(sequence);
     step.status.stalled = false;
     step.apply(at, event, config);
-    let status = step.status;
-    let mut ops = step.ops;
-    ops.push(ViewOp::SetStatus {
-        status: Box::new(status.clone()),
-    });
-    (status, ops)
+    (step.status, step.ops)
 }
 
 struct Step {
@@ -1219,9 +1231,33 @@ impl ThreadView {
     ) -> Self {
         let mut view = Self::default();
         for (sequence, at, event) in events {
-            view.fold(sequence, at, event, config);
+            view.fold_in(sequence, at, event, config);
         }
         view
+    }
+
+    /// Fold one event and apply its ops by value, keeping none of them: the
+    /// read-time fold, which has no subscriber to send them to.
+    pub fn fold_in(
+        &mut self,
+        sequence: u64,
+        at: OffsetDateTime,
+        event: &AgentEvent,
+        config: &ViewConfig,
+    ) {
+        if self
+            .status
+            .sequence
+            .is_some_and(|folded| sequence <= folded)
+        {
+            return;
+        }
+        let status = std::mem::take(&mut self.status);
+        let (status, ops) = fold_owned(status, sequence, at, event, config);
+        for op in ops {
+            self.apply_owned(op);
+        }
+        self.status = status;
     }
 
     /// Fold one event and apply its ops. Returns the ops.
@@ -1237,6 +1273,33 @@ impl ThreadView {
             self.apply(op);
         }
         ops
+    }
+
+    /// [`Self::apply`] for an op the caller no longer needs: moves its
+    /// status and item instead of cloning them.
+    pub fn apply_owned(&mut self, op: ViewOp) -> bool {
+        match op {
+            ViewOp::SetStatus { status } => {
+                self.status = *status;
+                true
+            }
+            ViewOp::Put { key, item } => {
+                if let Some(existing) = self.items.get_mut(&key) {
+                    existing.item = item;
+                } else {
+                    self.items.insert(
+                        key,
+                        IndexedItem {
+                            index: self.next_index,
+                            item,
+                        },
+                    );
+                    self.next_index += 1;
+                }
+                true
+            }
+            ViewOp::AppendText { .. } | ViewOp::Patch { .. } => self.apply(&op),
+        }
     }
 
     /// Apply one op. Returns false, and changes nothing, for a patch or text

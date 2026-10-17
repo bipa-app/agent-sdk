@@ -608,6 +608,81 @@ message StreamThreadEventsResponse {
   }
 }
 
+// ── Session view ─────────────────────────────────────────────────
+//
+// A thread's session view is the fold of its committed events
+// (agent_sdk_foundation::view::fold), computed when it is read. Its status,
+// items and ops travel as the serde JSON of those Rust types; the item keys
+// and the op shapes are documented on that module and change only with
+// VIEW_SCHEMA. Every view RPC answers FAILED_PRECONDITION on a host that does
+// not serve views, and NOT_FOUND for a thread being purged.
+
+message GetThreadViewRequest {
+  string thread_id = 1;
+  // How many of the newest items to return. Default 200, at most 5000.
+  optional uint32 item_limit = 2;
+}
+
+message ThreadViewItem {
+  string key = 1;
+  uint64 index = 2;
+  // JSON of agent_sdk_foundation::view::ViewItem.
+  string body_json = 3;
+}
+
+// The view's status and its newest items, at the status's sequence.
+message ThreadViewSnapshot {
+  string thread_id = 1;
+  // JSON of agent_sdk_foundation::view::ThreadViewStatus.
+  string status_json = 2;
+  // The last folded event's sequence; absent before the first event.
+  optional uint64 sequence = 3;
+  uint64 next_index = 4;
+  // In timeline order.
+  repeated ThreadViewItem items = 5;
+  // Whether older items exist; page with GetThreadViewItems.
+  bool has_older = 6;
+}
+
+message GetThreadViewItemsRequest {
+  string thread_id = 1;
+  // Items with an index below this one.
+  uint64 before_index = 2;
+  // Default 200, at most 5000.
+  optional uint32 limit = 3;
+}
+
+message GetThreadViewItemsResponse {
+  // In timeline order.
+  repeated ThreadViewItem items = 1;
+}
+
+// The ops that one committed event makes to the view.
+message ThreadViewChange {
+  string thread_id = 1;
+  uint64 sequence = 2;
+  // JSON array of agent_sdk_foundation::view::ViewOp, applied in order; the
+  // last op sets the status.
+  string ops_json = 3;
+}
+
+message StreamThreadViewRequest {
+  string thread_id = 1;
+  // Items in each snapshot. Default 200, at most 5000.
+  optional uint32 item_limit = 2;
+}
+
+// The stream opens with a snapshot, then sends one change per committed
+// event after it. A later snapshot replaces the client's view (sent when the
+// server lost its place); every change after a snapshot applies to it.
+message StreamThreadViewResponse {
+  oneof item {
+    ThreadViewSnapshot snapshot = 1;
+    ThreadViewChange change = 2;
+    EventStreamClosed closed = 3;
+  }
+}
+
 service AgentEventService {
   // Replay committed events after `after_sequence`, optionally followed by the
   // live committed tail for the same thread.
@@ -621,4 +696,14 @@ service AgentEventService {
   // 5. otherwise zero or more live `event` frames until `replay_required`,
   //    `closed`, transport error, or client cancellation
   rpc StreamThreadEvents(StreamThreadEventsRequest) returns (stream StreamThreadEventsResponse);
+
+  // The thread's session view: status and newest items.
+  rpc GetThreadView(GetThreadViewRequest) returns (ThreadViewSnapshot);
+
+  // Older items of the thread's session view, for paging back.
+  rpc GetThreadViewItems(GetThreadViewItemsRequest) returns (GetThreadViewItemsResponse);
+
+  // A snapshot of the thread's session view, then a change for each
+  // committed event, until the client cancels or the server shuts down.
+  rpc StreamThreadView(StreamThreadViewRequest) returns (stream StreamThreadViewResponse);
 }
