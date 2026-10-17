@@ -680,3 +680,47 @@ async fn a_commit_records_its_outcome_and_its_documents() -> Result<()> {
     ));
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// thread_fence.refused counts each refusal by operation and status
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_thread_fence_refusal_is_counted_by_operation_and_status() -> Result<()> {
+    use agent_server::journal::Fence;
+    use agent_server::journal::thread::{PurgeScope, PurgeSeed, Thread};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let thread_id = ThreadId::from_string("fenced-thread");
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let deleting = Thread::new(thread_id.clone(), now).begin_purge(PurgeSeed {
+        root_thread_id: thread_id.clone(),
+        scope: PurgeScope::Thread,
+        started_at: now,
+    });
+
+    assert!(Fence::APPEND.check(&thread_id, Some(&deleting)).is_err());
+    assert!(
+        Fence::FORK_SOURCE
+            .check(&thread_id, Some(&deleting))
+            .is_err()
+    );
+    assert!(Fence::APPEND.check(&thread_id, None).is_ok());
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.journal.thread_fence.refused");
+    let total: u64 = counts.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, 2, "{counts:?}");
+    for operation in ["append", "fork"] {
+        assert!(
+            counts
+                .iter()
+                .any(|(s, _)| has_label(s, attrs::OPERATION, operation)
+                    && has_label(s, attrs::THREAD_STATUS, "deleting")),
+            "{operation}: {counts:?}"
+        );
+    }
+    Ok(())
+}

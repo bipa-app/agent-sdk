@@ -351,10 +351,8 @@ impl PurgeFencedEventRepository {
     }
 
     async fn require_appendable(&self, thread_id: &ThreadId) -> Result<()> {
-        if let Some(thread) = self.threads.get(thread_id).await? {
-            thread.require_active(super::thread::ThreadOperation::Append)?;
-        }
-        Ok(())
+        let thread = self.threads.get(thread_id).await?;
+        super::transition::Fence::APPEND.check(thread_id, thread.as_ref())
     }
 }
 

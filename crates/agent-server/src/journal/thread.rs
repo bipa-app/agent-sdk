@@ -59,15 +59,22 @@ pub enum ThreadStatus {
     Deleted,
 }
 
-impl std::fmt::Display for ThreadStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = match self {
+impl ThreadStatus {
+    /// The status's stable label, as in logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Deleting => "deleting",
             Self::Deleted => "deleted",
-        };
-        f.write_str(status)
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -106,9 +113,11 @@ pub enum ThreadOperation {
     Append,
 }
 
-impl std::fmt::Display for ThreadOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let operation = match self {
+impl ThreadOperation {
+    /// The operation's stable label, as in logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Create => "create",
             Self::Fork => "fork",
             Self::Submit => "submit",
@@ -117,8 +126,13 @@ impl std::fmt::Display for ThreadOperation {
             Self::Acquire => "acquire",
             Self::Commit => "commit",
             Self::Append => "append",
-        };
-        f.write_str(operation)
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -133,6 +147,25 @@ pub struct ThreadStateConflict {
     pub thread_id: ThreadId,
     pub status: ThreadStatus,
     pub operation: ThreadOperation,
+}
+
+impl ThreadStateConflict {
+    /// Report this refusal: one `agent_server.journal.thread_fence.refused`
+    /// count by operation and status, and a debug log naming the thread.
+    /// A backend calls it where the fence refuses a write, not where it
+    /// only probes a thread's status.
+    pub fn record(&self) {
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_thread_fence_refusal(self);
+        log::debug!(
+            thread_id = self.thread_id.0.as_str(),
+            operation = self.operation.as_str(),
+            thread_status = self.status.as_str();
+            "the thread fence refused {} on a {} thread",
+            self.operation,
+            self.status,
+        );
+    }
 }
 
 /// Purge reach: only the named thread, or its durable subagent invocation

@@ -105,6 +105,10 @@ pub mod attrs {
     pub const AUDIT_OUTCOME: &str = "outcome";
     /// Tool effect class on audit events.
     pub const EFFECT_CLASS: &str = "effect_class";
+    /// Thread-fenced store operation: the label of a [`ThreadOperation`](crate::journal::thread::ThreadOperation).
+    pub const OPERATION: &str = "operation";
+    /// Thread lifecycle status: the label of a [`ThreadStatus`](crate::journal::thread::ThreadStatus).
+    pub const THREAD_STATUS: &str = "thread_status";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -180,6 +184,7 @@ pub struct ServerMetrics {
     pub(crate) transition_duration: Histogram<f64>,
     pub(crate) transition_lock_conflict_retries: Counter<u64>,
     pub(crate) documents_written: Counter<u64>,
+    pub(crate) thread_fence_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -299,6 +304,22 @@ impl ServerMetrics {
             self.tasks_lease_expired
                 .add(1, &[KeyValue::new(attrs::REASON, reason)]);
         }
+    }
+
+    /// Record one `agent_server.journal.thread_fence.refused` increment
+    /// for `conflict`, by operation and thread status. The thread id is
+    /// not a label (unbounded cardinality).
+    pub fn record_thread_fence_refusal(
+        &self,
+        conflict: &crate::journal::thread::ThreadStateConflict,
+    ) {
+        self.thread_fence_refused.add(
+            1,
+            &[
+                KeyValue::new(attrs::OPERATION, conflict.operation.as_str()),
+                KeyValue::new(attrs::THREAD_STATUS, conflict.status.as_str()),
+            ],
+        );
     }
 
     /// Record a single `agent_server.journal.commit.duration` sample
@@ -497,6 +518,13 @@ impl ServerMetrics {
                 "Document writes committed, attributed by backend, scope and operation.",
             )
             .build();
+        let thread_fence_refused = meter
+            .u64_counter("agent_server.journal.thread_fence.refused")
+            .with_description(
+                "Writes the thread lifecycle fence refused (a purged or closed thread), \
+                 attributed by operation and thread status.",
+            )
+            .build();
 
         Self {
             workers_active,
@@ -511,6 +539,7 @@ impl ServerMetrics {
             transition_duration,
             transition_lock_conflict_retries,
             documents_written,
+            thread_fence_refused,
             meter,
         }
     }

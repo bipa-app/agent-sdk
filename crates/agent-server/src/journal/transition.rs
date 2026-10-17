@@ -352,6 +352,12 @@ impl Fence {
         operation: ThreadOperation::Append,
         missing: MissingThread::Allow,
     };
+    /// A fork source's fence: a purged source refuses the fork, a missing
+    /// one does not.
+    pub const FORK_SOURCE: Self = Self {
+        operation: ThreadOperation::Fork,
+        missing: MissingThread::Allow,
+    };
     /// A spawn's fence: a purged or missing thread refuses it.
     pub const SPAWN: Self = Self {
         operation: ThreadOperation::Spawn,
@@ -387,9 +393,10 @@ impl Fence {
     /// status refuses the operation.
     pub fn check(&self, thread_id: &ThreadId, thread: Option<&Thread>) -> anyhow::Result<()> {
         match (thread, self.missing) {
-            (Some(thread), _) => thread
-                .require_active(self.operation)
-                .map_err(anyhow::Error::new),
+            (Some(thread), _) => thread.require_active(self.operation).map_err(|conflict| {
+                conflict.record();
+                anyhow::Error::new(conflict)
+            }),
             (None, MissingThread::Allow) => Ok(()),
             (None, MissingThread::Refuse) => {
                 Err(anyhow::Error::new(super::thread::ThreadNotFound {

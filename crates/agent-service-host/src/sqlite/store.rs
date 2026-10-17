@@ -14,11 +14,13 @@
 //! - **TEXT for timestamps and JSON.** `SQLite` stores `OffsetDateTime`
 //!   as ISO 8601 TEXT and JSON values as TEXT.
 
+use crate::tx_ctx::TxCtx;
 use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::{
     ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, TerminalReason, ThreadId,
     TokenUsage, llm,
 };
+use agent_server::journal::view::ViewConfig;
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -112,6 +114,7 @@ mod documents;
 pub struct SqliteDurableStore {
     pool: SqlitePool,
     held_probe: HeldProbe<HeldKey>,
+    view: ViewConfig,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -136,7 +139,12 @@ impl SqliteDurableStore {
         Self {
             pool,
             held_probe: HeldProbe::default(),
+            view: ViewConfig::default(),
         }
+    }
+
+    const fn tx_ctx(&self) -> TxCtx<'_> {
+        TxCtx { view: &self.view }
     }
 
     /// Default pooled connections for a file-backed database when the
@@ -317,13 +325,14 @@ impl SqliteDurableStore {
                 "cancel rejected: task {root_id} is not running under this worker and lease"
             ));
         }
-        let outcome = Self::cancel_scoped_tx(&mut tx, root_id, scope, now).await?;
+        let outcome = Self::cancel_scoped_tx(&self.tx_ctx(), &mut tx, root_id, scope, now).await?;
         tx.commit().await.context("commit cancel_tree")?;
         Ok(outcome)
     }
 
     /// The body of `cancel_scoped`, inside the caller's transaction.
     async fn cancel_scoped_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         root_id: &AgentTaskId,
         scope: CancelScope,
@@ -391,6 +400,7 @@ impl SqliteDurableStore {
                     .continuation()
                     .map(|continuation| continuation.payload.total_usage.clone());
                 let committed = Self::insert_cancelled_marker_tx(
+                    ctx,
                     tx,
                     &thread_id,
                     &row.id,
@@ -509,8 +519,7 @@ ON CONFLICT (thread_id) DO NOTHING
         retained_message_count: usize,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
-        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
-        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
+        Self::bootstrap_appendable_thread_tx(tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -529,6 +538,23 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<()> {
         let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    async fn bootstrap_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await
+    }
+
+    async fn require_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+    ) -> Result<()> {
+        let thread = Self::get_thread_tx(tx, thread_id).await?;
+        agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref())
     }
 
     async fn claim_thread_creation_tx(
@@ -621,7 +647,9 @@ WHERE thread_id = ?1
                 thread_id: thread_id.clone(),
             })
         })?;
-        thread.require_active(operation)?;
+        thread
+            .require_active(operation)
+            .inspect_err(agent_server::journal::thread::ThreadStateConflict::record)?;
         Ok(())
     }
 
@@ -1413,9 +1441,15 @@ INSERT INTO agent_sdk_tasks (
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let _settled =
-                        Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
-                            .await?;
+                    let _settled = Self::fail_closed_tx(
+                        &self.tx_ctx(),
+                        &mut tx,
+                        &old,
+                        reason,
+                        now,
+                        "acquire_next_runnable",
+                    )
+                    .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
@@ -1872,6 +1906,7 @@ LIMIT 1
     /// Commit `events` on `thread_id` with their outbox row, inside the
     /// caller's transaction; nothing for an empty list.
     async fn commit_parent_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
         events: Vec<AgentEvent>,
@@ -1881,7 +1916,7 @@ LIMIT 1
             return Ok(Vec::new());
         }
         let start_seq = Self::next_event_sequence_tx(tx, thread_id).await?;
-        let committed = Self::insert_events_tx(tx, thread_id, events, start_seq, now).await?;
+        let committed = Self::insert_events_tx(ctx, tx, thread_id, events, start_seq, now).await?;
         Self::insert_thread_events_outbox_row_tx(
             tx,
             &committed,
@@ -2113,6 +2148,7 @@ WHERE operation_id = ?1
     /// turn (see [`FailureReason::terminal_event`]), and the parent /
     /// successor wake-up land together.
     async fn fail_closed_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         old: &AgentTask,
         reason: FailureReason,
@@ -2120,7 +2156,7 @@ WHERE operation_id = ?1
         error_prefix: &str,
     ) -> Result<CancelTreeOutcome> {
         let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
-            Self::cancel_scoped_tx(tx, &old.id, CancelScope::Descendants, now).await?
+            Self::cancel_scoped_tx(ctx, tx, &old.id, CancelScope::Descendants, now).await?
         } else {
             CancelTreeOutcome::default()
         };
@@ -2132,7 +2168,8 @@ WHERE operation_id = ?1
         if let Some(event) = reason.terminal_event(old) {
             let start_seq = Self::next_event_sequence_tx(tx, &old.thread_id).await?;
             let committed =
-                Self::insert_events_tx(tx, &old.thread_id, vec![event], start_seq, now).await?;
+                Self::insert_events_tx(ctx, tx, &old.thread_id, vec![event], start_seq, now)
+                    .await?;
             Self::insert_thread_events_outbox_row_tx(
                 tx,
                 &committed,
@@ -2394,12 +2431,14 @@ WHERE operation_id = ?1
     /// Insert a spawned child thread's `ThreadCreated` and its
     /// events-available advisory inside the caller's transaction.
     async fn insert_child_created_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         child_thread: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<()> {
         let seq = Self::next_event_sequence_tx(tx, child_thread).await?;
         let committed = Self::insert_events_tx(
+            ctx,
             tx,
             child_thread,
             vec![AgentEvent::thread_created(child_thread.clone(), None, None)],
@@ -2422,6 +2461,7 @@ WHERE operation_id = ?1
     /// inside the caller's spawn transaction. Attached tool-only batches
     /// have neither and therefore commit no event batch or advisory.
     async fn insert_spawn_started_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         parent_thread: &ThreadId,
         prepared: &[(AgentTask, AgentTask)],
@@ -2439,7 +2479,7 @@ WHERE operation_id = ?1
         } else {
             let start_seq = Self::next_event_sequence_tx(tx, parent_thread).await?;
             let committed =
-                Self::insert_events_tx(tx, parent_thread, started, start_seq, now).await?;
+                Self::insert_events_tx(ctx, tx, parent_thread, started, start_seq, now).await?;
             Self::insert_thread_events_outbox_row_tx(
                 tx,
                 &committed,
@@ -2450,18 +2490,23 @@ WHERE operation_id = ?1
             committed
         };
         for (_, child_root) in prepared {
-            Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+            Self::insert_child_created_tx(ctx, tx, &child_root.thread_id, now).await?;
         }
         Ok(committed)
     }
 
     async fn insert_events_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
         events: Vec<AgentEvent>,
         start_seq: u64,
         now: OffsetDateTime,
     ) -> Result<Vec<CommittedEvent>> {
+        ensure!(
+            !ctx.view.enabled,
+            "thread views are enabled, but this build does not maintain them"
+        );
         let mut committed = Vec::with_capacity(events.len());
         for (idx, event) in events.into_iter().enumerate() {
             let seq = start_seq + idx as u64;
@@ -2632,6 +2677,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     /// Postgres analogue for the full contract; `SQLite` serializes
     /// writers via `BEGIN IMMEDIATE`, so no lock ordering applies.
     async fn insert_cancelled_marker_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         thread_id: &ThreadId,
         task_id: &AgentTaskId,
@@ -2648,6 +2694,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         let turn = usize::try_from(thread.committed_turns).unwrap_or(0);
         let usage = continuation_usage.unwrap_or(thread.total_usage);
         let mut committed = Self::insert_events_tx(
+            ctx,
             tx,
             thread_id,
             vec![
@@ -2669,6 +2716,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     }
 
     async fn insert_subagent_spawn_event_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         subagent: &SubagentSpawn,
         parent_task: &AgentTask,
@@ -2683,7 +2731,8 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         );
         let start_seq = Self::next_event_sequence_tx(tx, &parent_task.thread_id).await?;
         let mut committed =
-            Self::insert_events_tx(tx, &parent_task.thread_id, vec![event], start_seq, now).await?;
+            Self::insert_events_tx(ctx, tx, &parent_task.thread_id, vec![event], start_seq, now)
+                .await?;
         Self::insert_thread_events_outbox_row_tx(tx, &committed, subagent.outbox_max_attempts, now)
             .await?;
         committed.pop().context("spawn event batch was empty")
@@ -2726,6 +2775,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
 
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
         let mut committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.thread_id,
             vec![params.event],
@@ -2772,6 +2822,10 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         use agent_server::journal::message::MessageProjection;
 
         let mut tx = self.begin().await?;
+
+        let source = Self::get_thread_tx(&mut tx, &params.source_thread_id).await?;
+        agent_server::journal::Fence::FORK_SOURCE
+            .check(&params.source_thread_id, source.as_ref())?;
 
         // Claim caller-minted destinations by primary key inside the same
         // transaction as the fork copy. Matching retries are no-ops; a
@@ -2855,6 +2909,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         //    above, which is the point of this committer.
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.new_thread_id).await?;
         let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.new_thread_id,
             params.events,
@@ -3017,6 +3072,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         } else {
             let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
             let committed = Self::insert_events_tx(
+                &self.tx_ctx(),
                 &mut tx,
                 &params.thread_id,
                 params.events,
@@ -3337,15 +3393,22 @@ impl SqliteDurableStore {
         Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
         for (index, write) in agent_server::journal::writes_in_apply_order(&transition) {
-            Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed)
-                .await
-                .map_err(|error| {
-                    agent_server::journal::Rejected::from_write_error(
-                        error,
-                        transition.guards.len(),
-                        index,
-                    )
-                })?;
+            Self::apply_write_tx(
+                &self.tx_ctx(),
+                &mut tx,
+                &transition,
+                write,
+                now,
+                &mut committed,
+            )
+            .await
+            .map_err(|error| {
+                agent_server::journal::Rejected::from_write_error(
+                    error,
+                    transition.guards.len(),
+                    index,
+                )
+            })?;
         }
         agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
@@ -3356,6 +3419,7 @@ impl SqliteDurableStore {
 impl SqliteDurableStore {
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
         write: agent_server::journal::Write,
@@ -3430,7 +3494,7 @@ impl SqliteDurableStore {
                 }
                 agent_server::fail_point!("transition.before_events");
                 let start = Self::next_event_sequence_tx(tx, &thread).await?;
-                let batch = Self::insert_events_tx(tx, &thread, events, start, now).await?;
+                let batch = Self::insert_events_tx(ctx, tx, &thread, events, start, now).await?;
                 Self::insert_thread_events_outbox_row_tx(
                     tx,
                     &batch,
@@ -3441,7 +3505,8 @@ impl SqliteDurableStore {
                 committed.events.extend(batch);
             }
             Write::SpawnChildren { parent, spawn } => {
-                let spawned = Self::apply_spawn_tx(tx, transition, &parent, *spawn, now).await?;
+                let spawned =
+                    Self::apply_spawn_tx(ctx, tx, transition, &parent, *spawn, now).await?;
                 committed.events.extend(spawned.events.iter().cloned());
                 committed.spawned.push(spawned);
             }
@@ -3569,6 +3634,7 @@ impl SqliteDurableStore {
     /// held the parent running under its lease, and the purge fence was
     /// checked before it.
     async fn apply_spawn_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
         parent_id: &AgentTaskId,
@@ -3597,16 +3663,16 @@ impl SqliteDurableStore {
                     spawns: vec![spawn],
                     events: Vec::new(),
                 };
-                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+                Self::spawn_subagent_batch_tx(ctx, tx, old_parent, batch, now).await
             }
             ChildSpawn::Subagent(subagent) => {
-                Self::spawn_subagent_tx(tx, old_parent, subagent, now).await
+                Self::spawn_subagent_tx(ctx, tx, old_parent, subagent, now).await
             }
             ChildSpawn::SubagentBatch(batch) => {
-                Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
+                Self::spawn_subagent_batch_tx(ctx, tx, old_parent, batch, now).await
             }
             ChildSpawn::Mixed { spawn, events } => {
-                Self::spawn_mixed_children_tx(tx, old_parent, spawn, events, now).await
+                Self::spawn_mixed_children_tx(ctx, tx, old_parent, spawn, events, now).await
             }
         }
     }
@@ -3662,6 +3728,7 @@ impl SqliteDurableStore {
     }
 
     async fn spawn_subagent_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         old_parent: AgentTask,
         subagent: SubagentSpawn,
@@ -3738,6 +3805,7 @@ impl SqliteDurableStore {
         agent_server::fail_point!("atomic_spawn.after_rows");
 
         let committed_event = Self::insert_subagent_spawn_event_tx(
+            ctx,
             tx,
             &subagent,
             &parent_task,
@@ -3745,7 +3813,7 @@ impl SqliteDurableStore {
             now,
         )
         .await?;
-        Self::insert_child_created_tx(tx, &child_root.thread_id, now).await?;
+        Self::insert_child_created_tx(ctx, tx, &child_root.thread_id, now).await?;
         Ok(SpawnedChildren {
             parent: parent_task,
             subagents: vec![(invocation, child_root)],
@@ -3756,6 +3824,7 @@ impl SqliteDurableStore {
     }
 
     async fn spawn_subagent_batch_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         old_parent: AgentTask,
         SubagentBatchSpawn {
@@ -3788,8 +3857,15 @@ impl SqliteDurableStore {
             Vec::new()
         } else {
             agent_server::fail_point!("atomic_spawn_batch.after_rows");
-            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
-                .await?
+            Self::insert_spawn_started_events_tx(
+                ctx,
+                tx,
+                &new_parent.thread_id,
+                &prepared,
+                events,
+                now,
+            )
+            .await?
         };
         Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
         Ok(SpawnedChildren {
@@ -3802,6 +3878,7 @@ impl SqliteDurableStore {
     }
 
     async fn spawn_mixed_children_tx(
+        ctx: &TxCtx<'_>,
         tx: &mut Transaction<'_, Sqlite>,
         old_parent: AgentTask,
         spawn: MixedChildrenSpawn,
@@ -3861,13 +3938,22 @@ impl SqliteDurableStore {
         agent_server::fail_point!("atomic_spawn_batch.after_rows");
 
         let mut committed =
-            Self::commit_parent_events_tx(tx, &new_parent.thread_id, boundary_events, now).await?;
+            Self::commit_parent_events_tx(ctx, tx, &new_parent.thread_id, boundary_events, now)
+                .await?;
         committed.extend(
-            Self::insert_spawn_started_events_tx(tx, &new_parent.thread_id, &prepared, events, now)
-                .await?,
+            Self::insert_spawn_started_events_tx(
+                ctx,
+                tx,
+                &new_parent.thread_id,
+                &prepared,
+                events,
+                now,
+            )
+            .await?,
         );
         committed.extend(
-            Self::commit_parent_events_tx(tx, &new_parent.thread_id, trailing_events, now).await?,
+            Self::commit_parent_events_tx(ctx, tx, &new_parent.thread_id, trailing_events, now)
+                .await?,
         );
         Self::complete_injections_tx(tx, &delivered_injection_ids, now).await?;
         Ok(SpawnedChildren {
@@ -4374,8 +4460,15 @@ impl AgentTaskStore for SqliteDurableStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let _settled =
-                    Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
+                let _settled = Self::fail_closed_tx(
+                    &self.tx_ctx(),
+                    &mut tx,
+                    &old,
+                    reason,
+                    now,
+                    "try_acquire_task",
+                )
+                .await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
                 return Ok(None);
             }
@@ -4564,9 +4657,15 @@ impl AgentTaskStore for SqliteDurableStore {
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let settled =
-                        Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
-                            .await?;
+                    let settled = Self::fail_closed_tx(
+                        &self.tx_ctx(),
+                        &mut tx,
+                        &old,
+                        reason,
+                        now,
+                        "release_expired_leases",
+                    )
+                    .await?;
                     RecoveryRecord::failed_closed(old.id.clone(), reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
@@ -4609,10 +4708,17 @@ impl AgentTaskStore for SqliteDurableStore {
         // pattern): it lands iff this caller still owned the row, and
         // it is durable before the row is acquirable.
         if let Some(event) = boundary {
+            Self::require_appendable_thread_tx(&mut tx, &old.thread_id).await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
-            let committed =
-                Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
-                    .await?;
+            let committed = Self::insert_events_tx(
+                &self.tx_ctx(),
+                &mut tx,
+                &old.thread_id,
+                vec![event],
+                start_seq,
+                now,
+            )
+            .await?;
             Self::insert_thread_events_outbox_row_tx(
                 &mut tx,
                 &committed,
@@ -4781,11 +4887,19 @@ impl AgentTaskStore for SqliteDurableStore {
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::require_appendable_thread_tx(&mut tx, &paused.thread_id).await?;
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
-        let committed =
-            Self::insert_events_tx(&mut tx, &paused.thread_id, events, start_seq, now).await?;
+        let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
+            &mut tx,
+            &paused.thread_id,
+            events,
+            start_seq,
+            now,
+        )
+        .await?;
         Self::insert_thread_events_outbox_row_tx(
             &mut tx,
             &committed,
@@ -5331,7 +5445,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_committed(messages, now)?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5346,7 +5460,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5385,7 +5499,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_repair(
             repair_messages,
@@ -5405,7 +5519,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.set_draft(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5418,14 +5532,15 @@ impl MessageProjectionStore for SqliteDurableStore {
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<Option<MessageProjection>> {
-        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+        let mut tx = self.begin().await?;
+        Self::require_appendable_thread_tx(&mut tx, thread_id).await?;
+        let Some(projection) = read_message_head(&mut *tx, thread_id).await? else {
             // No projection row exists yet — nothing to clear. The
             // commit path treats this as a no-op so first-turn
             // happy-paths don't bootstrap rows just to clear them.
             return Ok(None);
         };
         let updated = projection.clear_draft(now);
-        let mut tx = self.begin().await?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit clear_draft")?;
         Ok(Some(updated))
@@ -5626,7 +5741,9 @@ impl EventRepository for SqliteDurableStore {
             thread.require_active(ThreadOperation::Append)?;
         }
         let start_seq = Self::next_event_sequence_tx(&mut tx, thread_id).await?;
-        let committed = Self::insert_events_tx(&mut tx, thread_id, events, start_seq, now).await?;
+        let committed =
+            Self::insert_events_tx(&self.tx_ctx(), &mut tx, thread_id, events, start_seq, now)
+                .await?;
         tx.commit().await.context("commit event batch insert")?;
         Ok(committed)
     }
@@ -5762,6 +5879,7 @@ impl SqliteDurableStore {
         let mut tx = self.begin().await?;
         let start_seq = Self::next_event_sequence_tx(&mut tx, &params.thread_id).await?;
         let committed = Self::insert_events_tx(
+            &self.tx_ctx(),
             &mut tx,
             &params.thread_id,
             params.events,
@@ -8702,6 +8820,7 @@ INSERT INTO agent_sdk_turn_attempts (
             ),
         ];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -8789,6 +8908,7 @@ INSERT INTO agent_sdk_turn_attempts (
         };
         let messages = vec![Message::user("u"), Message::assistant("a")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -8901,6 +9021,7 @@ INSERT INTO agent_sdk_turn_attempts (
         // collide and the transaction rolls back.
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
