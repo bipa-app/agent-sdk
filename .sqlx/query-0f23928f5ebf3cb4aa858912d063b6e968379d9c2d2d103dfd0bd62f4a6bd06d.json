@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM agent_sdk_thread_views WHERE thread_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0f23928f5ebf3cb4aa858912d063b6e968379d9c2d2d103dfd0bd62f4a6bd06d"
+}

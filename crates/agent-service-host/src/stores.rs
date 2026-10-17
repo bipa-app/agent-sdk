@@ -29,7 +29,7 @@ use agent_server::journal::checkpoint_store::{CheckpointStore, InMemoryCheckpoin
 use agent_server::journal::document::DocumentStore;
 use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::{
-    EventRepository, InMemoryEventRepository, PurgeFencedEventRepository,
+    EventRepository, InMemoryEventRepository, PurgeFencedEventRepository, PurgeFencedViewStore,
 };
 use agent_server::journal::execution_intent::{ExecutionIntentStore, InMemoryExecutionIntentStore};
 use agent_server::journal::message_store::{
@@ -47,6 +47,8 @@ use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadJournalSink
 use agent_server::journal::tool_audit::RedactingToolAuditEventStore;
 use agent_server::journal::tool_audit::{InMemoryToolAuditEventStore, ToolAuditEventStore};
 use agent_server::journal::turn_attempt_store::{InMemoryTurnAttemptStore, TurnAttemptStore};
+use agent_server::journal::view::ViewConfig;
+use agent_server::journal::view_store::ThreadViewStore;
 use agent_server::worker::registry::AgentDefinitionRegistry;
 use tokio_util::sync::CancellationToken;
 
@@ -323,6 +325,13 @@ impl PostgresBackend {
 // Registry
 // ─────────────────────────────────────────────────────────────────────
 
+/// Settings a host passes when it builds the stores.
+#[derive(Clone, Debug, Default)]
+pub struct StoreOptions {
+    /// Whether and how the stores maintain each thread's session view.
+    pub view: ViewConfig,
+}
+
 /// Owns every store the server needs, behind trait objects.
 ///
 /// Constructed once at startup via [`StoreRegistry::from_config`] and
@@ -354,6 +363,8 @@ pub struct StoreRegistry {
     pub outbox_store: Arc<dyn OutboxStore>,
     /// Retention-floor tracking for committed events.
     pub retention_store: Arc<dyn RetentionStore>,
+    /// Session views, when [`StoreOptions::view`] enables them.
+    pub view_store: Arc<dyn ThreadViewStore>,
     /// Agent definition lookup surface.
     pub definition_registry: Arc<dyn AgentDefinitionRegistry>,
     /// Same-process event notification hub for replay-to-live handoff.
@@ -492,11 +503,23 @@ impl StoreRegistry {
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
+        Self::from_config_with(config, definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::from_config`] with host settings for the stores.
+    ///
+    /// # Errors
+    /// Returns an error if backend initialisation fails.
+    pub fn from_config_with(
+        config: &StorageConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Result<Self> {
         match config.backend {
-            StorageBackend::InMemory => Ok(Self::in_memory(definition_registry)),
+            StorageBackend::InMemory => Ok(Self::in_memory_with(definition_registry, options)),
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres => {
-                Self::postgres(config.postgres_settings()?, definition_registry)
+                Self::postgres(config.postgres_settings()?, definition_registry, &options)
             }
             #[cfg(not(feature = "postgres"))]
             StorageBackend::Postgres => {
@@ -505,7 +528,7 @@ impl StoreRegistry {
             StorageBackend::Sqlite { .. } => {
                 #[cfg(feature = "sqlite")]
                 {
-                    Self::sqlite(config, definition_registry)
+                    Self::sqlite(config, definition_registry, &options)
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -572,11 +595,21 @@ impl StoreRegistry {
     /// empty instance.
     #[must_use]
     pub fn in_memory(definition_registry: Arc<dyn AgentDefinitionRegistry>) -> Self {
+        Self::in_memory_with(definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::in_memory`] with host settings for the stores.
+    #[must_use]
+    pub fn in_memory_with(
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Self {
         // The task store's `cancel_tree` commits terminal `Cancelled`
         // markers (+ outbox advisories) through these shared stores —
         // the in-memory analogue of the durable backends committing
         // the marker inside the cancellation transaction (issue #354).
-        let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
+        let event_repo: Arc<InMemoryEventRepository> =
+            Arc::new(InMemoryEventRepository::with_view_config(options.view));
         let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
         let execution_intent_store: Arc<InMemoryExecutionIntentStore> =
             Arc::new(InMemoryExecutionIntentStore::new());
@@ -609,6 +642,10 @@ impl StoreRegistry {
                 attempt_store: attempt_store.clone(),
                 checkpoint_store: checkpoint_store.clone(),
             });
+        let view_store: Arc<dyn ThreadViewStore> = Arc::new(PurgeFencedViewStore::new(
+            event_repo.clone(),
+            thread_store.clone(),
+        ));
         let event_repo: Arc<dyn EventRepository> = Arc::new(PurgeFencedEventRepository::new(
             event_repo,
             thread_store.clone(),
@@ -629,6 +666,7 @@ impl StoreRegistry {
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store,
             retention_store: Arc::new(InMemoryRetentionStore::new()),
+            view_store,
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
@@ -640,8 +678,9 @@ impl StoreRegistry {
     fn postgres(
         config: &PostgresStorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: &StoreOptions,
     ) -> Result<Self> {
-        let durable_store = build_postgres_store(config)?;
+        let durable_store = build_postgres_store(config, &options.view)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -658,6 +697,7 @@ impl StoreRegistry {
             tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
+            view_store: durable_store.clone(),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
@@ -672,9 +712,14 @@ impl StoreRegistry {
     fn sqlite(
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: &StoreOptions,
     ) -> Result<Self> {
         let database_url = config.sqlite_database_url()?;
-        let durable_store = build_sqlite_store(&database_url, config.sqlite_max_connections()?)?;
+        let durable_store = build_sqlite_store(
+            &database_url,
+            config.sqlite_max_connections()?,
+            &options.view,
+        )?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -691,6 +736,7 @@ impl StoreRegistry {
             tool_audit_store,
             outbox_store: durable_store.clone(),
             retention_store: durable_store.clone(),
+            view_store: durable_store.clone(),
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
@@ -822,13 +868,16 @@ impl StoreRegistry {
 }
 
 #[cfg(feature = "postgres")]
-fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDurableStore>> {
+fn build_postgres_store(
+    config: &PostgresStorageConfig,
+    view: &ViewConfig,
+) -> Result<Arc<PostgresDurableStore>> {
     let database_url = config.resolved_database_url()?;
     let max_connections = config.max_connections;
     let schema = config.schema.clone();
     let build = || {
         PostgresDurableStore::connect_lazy(&database_url, max_connections, schema.as_deref())
-            .map(Arc::new)
+            .map(|store| Arc::new(store.with_view_config(view.clone())))
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -846,6 +895,7 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
 fn build_sqlite_store(
     database_url: &str,
     max_connections: Option<u32>,
+    view: &ViewConfig,
 ) -> Result<Arc<SqliteDurableStore>> {
     // SqliteDurableStore::connect is async (runs PRAGMAs and
     // migrations), but `from_config` is a sync constructor.  We
@@ -856,6 +906,7 @@ fn build_sqlite_store(
     // OS thread with its own current_thread runtime works
     // regardless of the caller's runtime flavor (or absence of one).
     let url = database_url.to_owned();
+    let view = view.clone();
     let max_connections = max_connections.unwrap_or(SqliteDurableStore::DEFAULT_MAX_CONNECTIONS);
     std::thread::spawn(move || -> Result<Arc<SqliteDurableStore>> {
         tokio::runtime::Builder::new_current_thread()
@@ -865,7 +916,7 @@ fn build_sqlite_store(
             .block_on(async {
                 SqliteDurableStore::connect_with_max_connections(&url, max_connections)
                     .await
-                    .map(Arc::new)
+                    .map(|store| Arc::new(store.with_view_config(view)))
                     .context("connect sqlite durable store")
             })
     })

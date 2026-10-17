@@ -85,6 +85,9 @@ pub mod runtime;
 pub mod sqlite;
 pub mod stores;
 mod tx_ctx;
+mod view_apply;
+#[cfg(test)]
+mod view_conformance_test;
 pub mod wakeup;
 pub mod watch;
 

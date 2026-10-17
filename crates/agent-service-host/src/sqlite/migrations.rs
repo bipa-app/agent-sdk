@@ -125,11 +125,15 @@ const DOCUMENTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0030_documents.sql"
 ));
+const THREAD_VIEWS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0035_thread_views.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 25] = [
+const MIGRATIONS: [SqliteMigration; 26] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -255,6 +259,11 @@ const MIGRATIONS: [SqliteMigration; 25] = [
         summary: "typed JSON documents written in the same transaction as their transition",
         sql: DOCUMENTS_SQL,
     },
+    SqliteMigration {
+        version: "0035",
+        summary: "the session view of each thread, and its items",
+        sql: THREAD_VIEWS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -297,6 +306,10 @@ pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
 /// Version of the migration that adds the document table.
 #[cfg(test)]
 pub(crate) const DOCUMENTS_MIGRATION_VERSION: i64 = 30;
+
+/// Version of the migration that adds the session view tables.
+#[cfg(test)]
+pub(crate) const THREAD_VIEWS_MIGRATION_VERSION: i64 = 35;
 
 /// The reviewable SQL of the after-siblings column migration.
 #[cfg(test)]

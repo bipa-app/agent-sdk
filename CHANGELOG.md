@@ -91,6 +91,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Session views in the stores** (crash-safety Phase 4, S2). With
+  `StoreOptions { view: ViewConfig { enabled: true, .. } }` (new
+  `StoreRegistry::from_config_with` / `in_memory_with`, or
+  `with_view_config` on a concrete store), every committed-event write folds
+  its events into the thread's view **in the same transaction**: SQLite and
+  Postgres in `insert_events_tx`, the in-memory store in its event
+  repository. `StoreRegistry::view_store` (`ThreadViewStore`) reads a
+  `ThreadViewSnapshot` (status, newest items, `next_index`) and pages older
+  items. Off by default: a host that does not enable views writes no view
+  rows, and a read answers `ViewsDisabled`. A view is materialized on the
+  first read (or when a batch starts the thread), a view an older binary
+  left behind is caught up by the next write or read under the thread lock,
+  and a batch of streaming deltas alone defers its view update to the next
+  write or read. `finish_purge` deletes the thread's view rows.
+- **Migration 0035** (SQLite and Postgres): `agent_sdk_thread_views` and
+  `agent_sdk_thread_view_items`. Additive: two new tables and one index, no
+  foreign key, no backfill; on Postgres it locks only the new relations
+  (measured: 4 ms on a database with 1M tasks and 1M events, beside an open
+  write transaction on the task, thread and event tables). Rollback:
+  `DROP TABLE agent_sdk_thread_view_items; DROP TABLE agent_sdk_thread_views;
+  DELETE FROM _sqlx_migrations WHERE version = 35;`. A pre-0035 binary does
+  not start on a migrated database; one already running beside a new one
+  keeps appending, and the new one's view catches up.
 - **Session view fold** (`agent_sdk_foundation::view`, re-exported as
   `agent_server::journal::view`). `fold(status, sequence, at, event,
   &ViewConfig)` is a pure function that turns one committed event into the

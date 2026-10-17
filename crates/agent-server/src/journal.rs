@@ -619,6 +619,7 @@ pub mod transition;
 pub mod turn_attempt;
 pub mod turn_attempt_store;
 pub mod view;
+pub mod view_store;
 
 pub use broker::{BrokerAdapter, InMemoryBrokerAdapter};
 pub use checkpoint::{Checkpoint, CheckpointId, CheckpointSchemaError, NewCheckpointParams};
