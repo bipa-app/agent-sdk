@@ -722,6 +722,7 @@ async fn subagent_completion_failpoint_keeps_the_invocation_running_without_its_
         message_store: stores.message_store.as_ref(),
         event_repo: stores.event_repo.as_ref(),
         artifact_store: None,
+        completion_hook: None,
     };
 
     fail::cfg("transition.before_events", "panic")
@@ -819,6 +820,7 @@ async fn a_failed_subagent_completion_surfaces_and_writes_neither_half() -> Resu
         message_store: stores.message_store.as_ref(),
         event_repo: stores.event_repo.as_ref(),
         artifact_store: None,
+        completion_hook: None,
     };
 
     let error = agent_server::worker::execute_subagent_task(bootstrap, &deps, now)
@@ -855,4 +857,178 @@ async fn a_failed_subagent_completion_surfaces_and_writes_neither_half() -> Resu
         after.status,
     );
     Ok(())
+}
+
+/// A completion hook that counts its runs and records each `prior` state.
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+#[derive(Default)]
+struct CountingCompletionHook {
+    runs: std::sync::Mutex<Vec<(u32, Option<agent_server::journal::EffectState>)>>,
+}
+
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+#[async_trait::async_trait]
+impl agent_server::worker::SubagentCompletionHook for CountingCompletionHook {
+    fn plan(
+        &self,
+        _ctx: &agent_server::worker::CompletionContext,
+    ) -> Option<agent_server::worker::CompletionPlan> {
+        Some(agent_server::worker::CompletionPlan {
+            step: "merge_back".into(),
+            repo: "repo_1".into(),
+            unit: "unit_1".into(),
+        })
+    }
+
+    async fn run(
+        &self,
+        ctx: &agent_server::worker::CompletionContext,
+        prior: Option<&agent_server::journal::EffectRecord>,
+        _mode: agent_server::worker::RunMode,
+    ) -> Result<agent_server::worker::CompletionOutput> {
+        self.runs
+            .lock()
+            .ok()
+            .context("runs lock")?
+            .push((ctx.attempt, prior.map(|record| record.state.clone())));
+        Ok(agent_server::worker::CompletionOutput {
+            result: agent_sdk_foundation::ToolResult::success("merged unit_1"),
+            state: agent_server::journal::EffectState::Completed,
+            extra_writes: Vec::new(),
+            park: None,
+        })
+    }
+}
+
+/// `subagent.completion_hook.before_settle` fires after the hook's start
+/// record committed and the hook ran, before the settle. A crash there
+/// leaves the record `Started`, the invocation running and the parent
+/// without its result; the requeued invocation runs the hook again with
+/// that record as `prior` and settles once.
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+#[tokio::test]
+async fn a_crash_before_the_hook_settle_keeps_its_record_started_for_the_next_attempt() -> Result<()>
+{
+    use agent_server::journal::EffectState;
+    use agent_server::journal::effect::EffectKey;
+
+    let _scenario = fail::FailScenario::setup();
+    let dir = tempfile::tempdir()?;
+    let storage = StorageConfig {
+        backend: StorageBackend::Sqlite {
+            path: Some(dir.path().join("hook-settle.db").display().to_string()),
+            max_connections: None,
+        },
+        ..StorageConfig::default()
+    };
+    let hook = Arc::new(CountingCompletionHook::default());
+    let stores = StoreRegistry::from_config(&storage, super::sample_registry())?
+        .with_subagent_completion_hook(
+            Arc::clone(&hook) as Arc<dyn agent_server::worker::SubagentCompletionHook>
+        );
+    stores.initialize().await?;
+    let parent_thread = ThreadId::from_string("t-hook-settle-crash");
+    let now = OffsetDateTime::now_utc();
+    let (parent, invocation, child_root) =
+        super::persist_subagent_fixture(&stores, &parent_thread, 60_000, now).await?;
+    stores.task_store.cancel_tree(&child_root.id, now).await?;
+    let acquire = |at| acquire_invocation(&stores, &invocation.id, at);
+    let completed_progress = || completed_subagent_progress(&stores, &parent_thread);
+
+    fail::cfg("subagent.completion_hook.before_settle", "panic")
+        .map_err(|error| anyhow::anyhow!("configure failpoint: {error}"))?;
+    let bootstrap = acquire(now).await?;
+    let deps = stores.subagent_result_deps(None);
+    let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+        agent_server::worker::execute_subagent_task(bootstrap, &deps, now),
+    ))
+    .await;
+    fail::remove("subagent.completion_hook.before_settle");
+    anyhow::ensure!(
+        crashed.is_err(),
+        "the failpoint before the settle must fire"
+    );
+
+    let key = EffectKey::git(&invocation.id, "merge_back");
+    let record = stores
+        .task_store
+        .effect(&key)
+        .await?
+        .context("the start record committed before the crash")?;
+    anyhow::ensure!(record.state == EffectState::Started, "{:?}", record.state);
+    let runs = hook.runs.lock().ok().context("runs lock")?.clone();
+    anyhow::ensure!(
+        runs == vec![(1, None)],
+        "the hook ran before the crash: {runs:?}"
+    );
+    let row = stores
+        .task_store
+        .get(&invocation.id)
+        .await?
+        .context("row")?;
+    anyhow::ensure!(row.status == TaskStatus::Running, "{:?}", row.status);
+    anyhow::ensure!(completed_progress().await? == 0);
+
+    let later = now + time::Duration::minutes(1);
+    stores.task_store.release_expired_leases(later).await?;
+    let bootstrap = acquire(later).await?;
+    let outcome = agent_server::worker::execute_subagent_task(bootstrap, &deps, later).await?;
+    let runs = hook.runs.lock().ok().context("runs lock")?.clone();
+    anyhow::ensure!(
+        runs == vec![(1, None), (2, Some(EffectState::Started))],
+        "the requeued attempt continues the record: {runs:?}"
+    );
+    anyhow::ensure!(outcome.invocation_task.status == TaskStatus::Completed);
+    let resumed = stores.task_store.get(&parent.id).await?.context("parent")?;
+    anyhow::ensure!(
+        resumed.status == TaskStatus::Pending,
+        "{:?}",
+        resumed.status
+    );
+    let record = stores.task_store.effect(&key).await?.context("record")?;
+    anyhow::ensure!(record.state == EffectState::Completed, "{:?}", record.state);
+    anyhow::ensure!(completed_progress().await? == 1);
+    Ok(())
+}
+
+/// Acquire the invocation `id` at `at` with a five-second lease, and resolve
+/// its bootstrap.
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+async fn acquire_invocation(
+    stores: &StoreRegistry,
+    id: &AgentTaskId,
+    at: OffsetDateTime,
+) -> Result<agent_server::worker::SubagentTaskBootstrap> {
+    let running = stores
+        .task_store
+        .try_acquire_task(
+            id,
+            WorkerId::new(),
+            LeaseId::new(),
+            at + time::Duration::seconds(5),
+            at,
+        )
+        .await?
+        .context("the invocation must acquire")?;
+    agent_server::worker::resolve_subagent_bootstrap(running, stores.task_store.as_ref()).await
+}
+
+/// The completed `SubagentProgress` events on `thread`.
+#[cfg(all(feature = "sqlite", feature = "failpoints"))]
+async fn completed_subagent_progress(stores: &StoreRegistry, thread: &ThreadId) -> Result<usize> {
+    Ok(stores
+        .event_repo
+        .get_events(thread)
+        .await?
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                agent_sdk_foundation::AgentEvent::SubagentProgress {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .count())
 }

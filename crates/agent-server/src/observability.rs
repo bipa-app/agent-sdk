@@ -122,6 +122,15 @@ pub mod attrs {
     pub const SPAN_EFFECT_ID: &str = "agent_server.effect.id";
     /// Span-only: the owner task of an effect.
     pub const SPAN_TASK_ID: &str = "agent_server.task.id";
+    /// Span-only: the task's acquisition count, from 1.
+    pub const SPAN_TASK_ATTEMPT: &str = "agent_server.task.attempt";
+    /// Span-only: the `RunMode` of a subagent completion hook run
+    /// (`execute` / `inspect`).
+    pub const SPAN_COMPLETION_HOOK_MODE: &str = "agent_server.completion_hook.mode";
+    /// Span-only: how a subagent completion hook run ended: the effect's
+    /// end state (`completed`, `failed`, `salvaged`, ...), `no_effect`,
+    /// `refused` or `error`.
+    pub const SPAN_COMPLETION_HOOK_OUTCOME: &str = "agent_server.completion_hook.outcome";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -221,6 +230,9 @@ pub struct ServerMetrics {
     pub(crate) view_folded_events: Histogram<f64>,
     pub(crate) view_stream: Counter<u64>,
     pub(crate) prompts: Counter<u64>,
+    /// `agent_server.subagent.completion_hook.refused`: hook outputs the
+    /// SDK refused, by `reason`.
+    pub(crate) completion_hook_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -492,7 +504,7 @@ impl ServerMetrics {
     }
 
     /// Count one effect transition (`started`, `refused`, `finished`,
-    /// `reclaimed`, `abandoned`) on `agent_server.effects`.
+    /// `reclaimed`, `abandoned`, `continued`) on `agent_server.effects`.
     pub fn record_effect(
         &self,
         kind: crate::journal::effect::EffectKind,
@@ -503,6 +515,14 @@ impl ServerMetrics {
             KeyValue::new(attrs::TRANSITION, transition),
         ];
         self.effects.add(1, &attrs);
+    }
+
+    /// Count a subagent completion hook output the SDK refused, by `reason`:
+    /// `extra_write` (a write other than `Document` or `AppendEvents`),
+    /// `park` (unsupported in this release) or `state` (a `Started` finish).
+    pub fn record_completion_hook_refused(&self, reason: &'static str) {
+        self.completion_hook_refused
+            .add(1, &[KeyValue::new(attrs::REASON, reason)]);
     }
 
     /// Record how long an effect ran, started to finished, with the state it
@@ -647,6 +667,13 @@ impl ServerMetrics {
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
+        let completion_hook_refused = meter
+            .u64_counter("agent_server.subagent.completion_hook.refused")
+            .with_description(
+                "Subagent completion hook outputs refused before the settle, by reason: \
+                 extra_write, park or state. The invocation then fails closed.",
+            )
+            .build();
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
 
@@ -670,6 +697,7 @@ impl ServerMetrics {
             view_folded_events,
             view_stream,
             prompts,
+            completion_hook_refused,
             meter,
         }
     }
@@ -692,7 +720,8 @@ fn durability_instruments(
         .u64_counter("agent_server.effects")
         .with_description(
             "Effect transitions by kind: started (its record committed), refused (the \
-             claim did not commit), finished, reclaimed (recovery ended it without \
+             claim did not commit), continued (a requeued owner continues its started \
+             record), finished, reclaimed (recovery ended it without \
              running it again), abandoned (its owner became terminal first).",
         )
         .build();

@@ -343,6 +343,9 @@ pub struct StoreRegistry {
     /// moment its task row is cancelled instead of waiting out the
     /// drive's next heartbeat rejection.
     pub confirm_drive_cancels: Arc<ConfirmDriveCancels>,
+    /// The host's subagent completion hook, if one is installed
+    /// ([`Self::with_subagent_completion_hook`]).
+    completion_hook: Option<Arc<dyn agent_server::worker::SubagentCompletionHook>>,
     backend: RegistryBackend,
 }
 
@@ -604,6 +607,7 @@ impl StoreRegistry {
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
+            completion_hook: None,
             backend: RegistryBackend::InMemory,
         }
     }
@@ -632,6 +636,7 @@ impl StoreRegistry {
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
+            completion_hook: None,
             backend: RegistryBackend::Postgres(PostgresBackend {
                 store: durable_store,
                 init_once: Arc::new(tokio::sync::OnceCell::new()),
@@ -664,6 +669,7 @@ impl StoreRegistry {
             definition_registry,
             event_notifier: Arc::new(EventNotifier::new()),
             confirm_drive_cancels: Arc::new(ConfirmDriveCancels::default()),
+            completion_hook: None,
             backend: RegistryBackend::Sqlite(durable_store),
         })
     }
@@ -774,6 +780,17 @@ impl StoreRegistry {
         deps
     }
 
+    /// Install `hook` for every subagent invocation this registry's
+    /// workers settle (see [`agent_server::worker::SubagentCompletionHook`]).
+    #[must_use]
+    pub fn with_subagent_completion_hook(
+        mut self,
+        hook: Arc<dyn agent_server::worker::SubagentCompletionHook>,
+    ) -> Self {
+        self.completion_hook = Some(hook);
+        self
+    }
+
     /// Build [`agent_server::SubagentResultDeps`] for invocation-task
     /// materialization.
     #[must_use]
@@ -787,6 +804,13 @@ impl StoreRegistry {
             message_store: self.message_store.as_ref(),
             event_repo: self.event_repo.as_ref(),
             artifact_store,
+            completion_hook: self.completion_hook.as_ref().map(|hook| {
+                agent_server::worker::InstalledCompletionHook {
+                    hook: Arc::clone(hook),
+                    store: Arc::clone(&self.task_store)
+                        as Arc<dyn agent_server::journal::DurableStore>,
+                }
+            }),
         }
     }
 }

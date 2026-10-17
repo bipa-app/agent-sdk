@@ -799,7 +799,9 @@ impl AgentTask {
     /// terminal child root into its parent. A crash or an expired lease
     /// requeues it up to this many acquisitions in all, so a host's
     /// completion work (a merge-back, for example) gets a second and a third
-    /// run. The store spawn paths use it for
+    /// run. The last attempt runs the
+    /// [`SubagentCompletionHook`](crate::worker::SubagentCompletionHook) in
+    /// [`RunMode::Inspect`](crate::worker::RunMode::Inspect). The store spawn paths use it for
     /// [`Self::new_subagent_invocation`] only; tool children keep
     /// [`Self::DEFAULT_MAX_ATTEMPTS`] and never retry.
     pub const SUBAGENT_INVOCATION_MAX_ATTEMPTS: u32 = 3;
