@@ -24,10 +24,10 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMete
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, MutexGuard};
 
-use agent_server::journal::execution_intent::ToolEffectClass;
 use agent_server::journal::recovery::{FailureReason, RecoveryRecord};
 use agent_server::journal::relay::RelayTick;
 use agent_server::journal::task::AgentTaskId;
+use agent_server::journal::tool_audit::ToolEffectClass;
 use agent_server::journal::tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventKind, ToolAuditEventParams,
     ToolAuditEventStore,

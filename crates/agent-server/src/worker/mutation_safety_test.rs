@@ -20,7 +20,7 @@
 //!
 //! These tests intentionally exercise the **integration** between
 //! multiple Phase 5 modules (`tool_task`, `confirmation`,
-//! `execution_intent`, `tool_audit`, `redaction`) rather than testing
+//! `tool_effect`, `tool_audit`, `redaction`) rather than testing
 //! each in isolation.
 
 use crate::worker::activity::ActivityBeacon;
@@ -33,16 +33,15 @@ use super::confirmation::{
     pause_tool_for_confirmation, resume_confirmed_tool,
 };
 use super::root_turn::{RootTurnDeps, RootTurnOutcome, execute_root_turn};
-use super::tool_task::{ToolTaskOutcome, resolve_tool_bootstrap};
+use super::tool_effect::{run_tool_effect, tool_intent};
+use super::tool_task::{ToolTaskBootstrap, ToolTaskOutcome, resolve_tool_bootstrap};
 use crate::journal::checkpoint_store::InMemoryCheckpointStore;
+use crate::journal::effect::{
+    EffectKey, EffectRecord, EffectState, EffectSubject, EffectWrite, TOOL_INTERRUPTED_PREFIX,
+};
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::InMemoryEventRepository;
 use crate::journal::execution_context::build_root_worker_inputs;
-use crate::journal::execution_intent::{
-    ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, InMemoryExecutionIntentStore,
-    IntentStatus, OperationId, TOOL_INTERRUPTED_PREFIX, ToolEffectClass, classify_tool_effect,
-    guarded_tool_execution,
-};
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::redaction::{RedactionPolicy, redact_value};
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
@@ -51,8 +50,9 @@ use crate::journal::task_state::TaskState;
 use crate::journal::thread_store::InMemoryThreadStore;
 use crate::journal::tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventKind, ToolAuditEventParams,
-    ToolAuditEventStore,
+    ToolAuditEventStore, ToolEffectClass,
 };
+use crate::journal::transition::{Committed, DurableStore, Guard, Rejected, Transition, Write};
 use crate::journal::turn_attempt_store::InMemoryTurnAttemptStore;
 use crate::worker::bootstrap::WorkerBootstrapContext;
 use crate::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
@@ -60,7 +60,7 @@ use agent_sdk_foundation::events::AgentEvent;
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
 };
-use agent_sdk_foundation::{PendingToolCallInfo, ThreadId, ToolResult, ToolTier};
+use agent_sdk_foundation::{PendingToolCallInfo, ThreadId, ToolReplay, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -192,33 +192,39 @@ impl ConfirmationPolicy for DenyAllPolicy {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Failing intent store
+// A store that refuses every effect start
 // ─────────────────────────────────────────────────────────────────────
 
-struct FailingIntentStore;
+/// Commits through `inner`, except a transition that starts an effect,
+/// which fails as a store error would.
+struct FailingEffectStart<'a> {
+    inner: &'a InMemoryAgentTaskStore,
+}
 
 #[async_trait]
-impl ExecutionIntentStore for FailingIntentStore {
-    async fn persist_intent(&self, _intent: &ExecutionIntent) -> anyhow::Result<()> {
-        anyhow::bail!("simulated intent store failure")
-    }
-
-    async fn update_intent(&self, _intent: &ExecutionIntent) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_intent(
+impl DurableStore for FailingEffectStart<'_> {
+    async fn commit(
         &self,
-        _operation_id: &OperationId,
-    ) -> anyhow::Result<Option<ExecutionIntent>> {
-        Ok(None)
+        transition: Transition,
+        now: time::OffsetDateTime,
+    ) -> std::result::Result<Committed, Rejected> {
+        if transition
+            .effect_writes()
+            .any(|write| matches!(write, EffectWrite::Start(_)))
+        {
+            return Err(Rejected::Store(anyhow::anyhow!(
+                "simulated storage failure"
+            )));
+        }
+        self.inner.commit(transition, now).await
     }
 
-    async fn get_intent_by_task(
-        &self,
-        _child_task_id: &AgentTaskId,
-    ) -> anyhow::Result<Option<ExecutionIntent>> {
-        Ok(None)
+    async fn effect(&self, key: &EffectKey) -> Result<Option<EffectRecord>> {
+        self.inner.effect(key).await
+    }
+
+    async fn effects_for_task(&self, owner: &AgentTaskId) -> Result<Vec<EffectRecord>> {
+        self.inner.effects_for_task(owner).await
     }
 }
 
@@ -241,6 +247,15 @@ fn sample_definition() -> AgentDefinition {
                 tier: ToolTier::Observe,
                 concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
                 replay: agent_sdk_foundation::ToolReplay::Unsafe,
+            },
+            Tool {
+                name: "read".into(),
+                description: "Read a file".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                display_name: "Read".into(),
+                tier: ToolTier::Observe,
+                concurrency: agent_sdk_foundation::ToolConcurrency::ReadOnly,
+                replay: ToolReplay::Safe,
             },
             Tool {
                 name: "transfer".into(),
@@ -275,7 +290,6 @@ fn sample_bootstrap(task: AgentTask) -> WorkerBootstrapContext {
 }
 
 struct TestStores {
-    intents: InMemoryExecutionIntentStore,
     tasks: InMemoryAgentTaskStore,
     threads: InMemoryThreadStore,
     messages: InMemoryMessageProjectionStore,
@@ -290,7 +304,6 @@ impl TestStores {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
-        let intents = InMemoryExecutionIntentStore::new();
         Self {
             tasks: InMemoryAgentTaskStore::new()
                 .with_cancellation_markers(crate::journal::CancellationMarkerSink {
@@ -303,15 +316,13 @@ impl TestStores {
                         events.clone(),
                         outbox,
                     ),
-                ))
-                .with_intent_store(Arc::new(intents.clone())),
+                )),
             threads,
             messages: InMemoryMessageProjectionStore::new(),
             attempts: InMemoryTurnAttemptStore::new(),
             checkpoints: InMemoryCheckpointStore::new(),
             events,
             event_notifier: Arc::new(EventNotifier::new()),
-            intents,
         }
     }
 
@@ -397,12 +408,12 @@ async fn acquire_child(
 
 async fn emit_audit_event(
     audit_store: &InMemoryToolAuditEventStore,
-    bootstrap: &super::tool_task::ToolTaskBootstrap,
+    bootstrap: &ToolTaskBootstrap,
     kind: ToolAuditEventKind,
     now: time::OffsetDateTime,
 ) -> ToolAuditEvent {
     let event = ToolAuditEvent::new(ToolAuditEventParams {
-        operation_id: OperationId::new(&bootstrap.task_id, &bootstrap.tool_call.id).to_string(),
+        operation_id: EffectKey::tool(&bootstrap.task_id, &bootstrap.tool_call.id).to_string(),
         task_id: bootstrap.task_id.clone(),
         parent_task_id: bootstrap
             .child_task
@@ -412,7 +423,10 @@ async fn emit_audit_event(
         thread_id: bootstrap.thread_id.clone(),
         tool_call_id: bootstrap.tool_call.id.clone(),
         tool_name: bootstrap.tool_call.name.clone(),
-        effect_class: classify_tool_effect(&bootstrap.tool_call),
+        effect_class: match bootstrap.tool_call.replay {
+            ToolReplay::Safe => ToolEffectClass::ReplaySafe,
+            ToolReplay::Unsafe => ToolEffectClass::SideEffecting,
+        },
         kind,
         provider: "mock".into(),
         model: "mock-model".into(),
@@ -426,6 +440,51 @@ async fn emit_audit_event(
     event
 }
 
+/// Commit the record a previous attempt of `ctx`'s call left: started,
+/// then ended with `end` when given.
+async fn seed_effect(
+    store: &InMemoryAgentTaskStore,
+    ctx: &ToolTaskBootstrap,
+    replay: ToolReplay,
+    end: Option<EffectState>,
+) -> Result<EffectKey> {
+    let mut intent = tool_intent(ctx);
+    intent.replay = replay;
+    let key = intent.key.clone();
+    store
+        .commit(
+            Transition {
+                guards: vec![
+                    Guard::TaskIs {
+                        task: ctx.task_id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((ctx.worker_id.clone(), ctx.lease_id.clone())),
+                    },
+                    Guard::EffectFree { key: key.clone() },
+                ],
+                writes: vec![Write::Effect(EffectWrite::Start(intent))],
+            },
+            t_plus(11),
+        )
+        .await?;
+    if let Some(state) = end {
+        store
+            .commit(
+                Transition {
+                    guards: Vec::new(),
+                    writes: vec![Write::Effect(EffectWrite::Finish {
+                        key: key.clone(),
+                        owner: ctx.task_id.clone(),
+                        state,
+                    })],
+                },
+                t_plus(12),
+            )
+            .await?;
+    }
+    Ok(key)
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // 1. DUPLICATE RETRY RISK
 // ═════════════════════════════════════════════════════════════════════
@@ -436,7 +495,6 @@ async fn emit_audit_event(
 #[tokio::test]
 async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -452,17 +510,12 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
     // First execution: success
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
-    let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
+    let key = EffectKey::tool(&ctx.task_id, &ctx.tool_call.id);
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { Ok(ToolResult::success("transfer complete")) },
         t_plus(20),
     )
@@ -471,14 +524,19 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
     assert!(matches!(outcome, ToolTaskOutcome::Completed { .. }));
 
     // Verify intent is Completed — the core safety invariant
-    let intent = intent_store
-        .get_intent(&op_id)
+    let intent = stores
+        .tasks
+        .effect(&key)
         .await?
         .context("intent should exist")?;
-    assert_eq!(intent.status, IntentStatus::Completed);
-    assert_eq!(intent.effect_class, ToolEffectClass::SideEffecting);
-    assert_eq!(intent.tool_name, "transfer");
-    assert!(intent.is_terminal());
+    assert_eq!(intent.state, EffectState::Completed);
+    assert_eq!(intent.replay, ToolReplay::Unsafe);
+    assert!(
+        matches!(&intent.subject, EffectSubject::Tool { name, .. } if name == "transfer"),
+        "{:?}",
+        intent.subject
+    );
+    assert!(!intent.state.is_started());
 
     Ok(())
 }
@@ -488,7 +546,6 @@ async fn execution_marks_intent_completed_blocking_retry() -> Result<()> {
 #[tokio::test]
 async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = stores.intents.clone();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -503,29 +560,14 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
 
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
-    let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
 
     // Pre-seed a Started intent (simulates crash mid-execution)
-    let mut started_intent = ExecutionIntent::new(
-        op_id.clone(),
-        ToolEffectClass::SideEffecting,
-        &ctx.tool_call,
-        ctx.task_id.clone(),
-        t_plus(10),
-    );
-    started_intent.mark_started(t_plus(11));
-    intent_store.persist_intent(&started_intent).await?;
-    intent_store.update_intent(&started_intent).await?;
+    let key = seed_effect(&stores.tasks, &ctx, ToolReplay::Unsafe, None).await?;
 
-    let result = guarded_tool_execution(
+    let result = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { panic!("executor must not be called for ambiguous retry") },
         t_plus(20),
     )
@@ -536,13 +578,22 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
         error.contains("transfer"),
         "the result names the tool: {error}"
     );
-    let intent = intent_store
-        .get_intent(&op_id)
+    let intent = stores
+        .tasks
+        .effect(&key)
         .await?
         .context("intent should exist")?;
+    // Effects close a started record as `Interrupted`, stored as "failed".
     assert_eq!(
-        intent.status,
-        IntentStatus::Failed,
+        intent.state,
+        EffectState::Interrupted {
+            captured_output: None
+        },
+        "the started intent is closed as interrupted"
+    );
+    assert_eq!(
+        intent.state.columns().status,
+        "failed",
         "the started intent is closed as failed"
     );
 
@@ -553,15 +604,16 @@ async fn retry_with_ambiguous_in_flight_is_blocked() -> Result<()> {
 #[tokio::test]
 async fn replay_safe_tool_retries_freely_after_failure() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
+    // The replay class comes from the tool's declaration, so this uses the
+    // replay-safe `read` tool.
     let (_parent, children) = suspend_root_with_tools(
         &stores,
         vec![(
             "call_1".into(),
-            "bash".into(),
-            serde_json::json!({"command": "echo hello"}),
+            "read".into(),
+            serde_json::json!({"path": "a.txt"}),
         )],
     )
     .await?;
@@ -569,16 +621,22 @@ async fn replay_safe_tool_retries_freely_after_failure() -> Result<()> {
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
-    // ReplaySafe bypasses intent entirely, so no intent to seed.
-    let outcome = guarded_tool_execution(
+    // A failed record, as an older release could leave: a replay-safe call
+    // ignores it and runs again.
+    seed_effect(
+        &stores.tasks,
+        &ctx,
+        ToolReplay::Safe,
+        Some(EffectState::Failed {
+            error: "transient error".into(),
+        }),
+    )
+    .await?;
+
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::ReplaySafe,
         |_, _collector| async { Ok(ToolResult::success("hello")) },
         t_plus(20),
     )
@@ -663,7 +721,6 @@ async fn confirmation_state_survives_restart() -> Result<()> {
 #[tokio::test]
 async fn confirmation_approved_then_policy_denied() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -715,11 +772,7 @@ async fn confirmation_approved_then_policy_denied() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         ctx2,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &deny_policy,
         &cancel,
         |_, _collector| async { panic!("executor must not be called when policy denies") },
@@ -884,7 +937,6 @@ async fn confirmation_timeout_produces_canonical_error() -> Result<()> {
 #[tokio::test]
 async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -904,15 +956,10 @@ async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
     // Cancel before execution
     cancel.cancel();
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { panic!("executor should not run when cancelled") },
         t_plus(20),
     )
@@ -923,17 +970,13 @@ async fn cancellation_before_execution_returns_cancelled() -> Result<()> {
         "expected Cancelled, got: {outcome:?}"
     );
 
-    // For side-effecting tools, intent is persisted before the cancel
-    // check in execute_tool_task, so it should exist and be Failed.
-    let op_id = OperationId::new(&child_id, "call_1");
-    let intent = intent_store.get_intent(&op_id).await?;
+    // The cancel check now runs before the record is claimed, so the call
+    // that never ran leaves no record and the next attempt may run it.
+    // (The old guard persisted the intent first and marked it Failed.)
+    let key = EffectKey::tool(&child_id, "call_1");
     assert!(
-        intent.is_some(),
-        "intent should be persisted for SideEffecting tool even when cancelled"
-    );
-    assert_eq!(
-        intent.as_ref().map(|i| i.status),
-        Some(IntentStatus::Failed)
+        stores.tasks.effect(&key).await?.is_none(),
+        "no record should be claimed for a side-effecting tool cancelled before it runs"
     );
 
     Ok(())
@@ -1002,7 +1045,9 @@ async fn cancel_tree_cascades_to_all_children() -> Result<()> {
 #[tokio::test]
 async fn fail_closed_on_intent_persist_failure() -> Result<()> {
     let stores = TestStores::new();
-    let failing_store = FailingIntentStore;
+    let failing_store = FailingEffectStart {
+        inner: &stores.tasks,
+    };
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -1019,15 +1064,10 @@ async fn fail_closed_on_intent_persist_failure() -> Result<()> {
     let child_id = child.id.clone();
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &failing_store,
-            event_repo: &stores.events,
-        },
+        &failing_store,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { panic!("executor must not be called when intent persist fails") },
         t_plus(20),
     )
@@ -1058,7 +1098,6 @@ async fn fail_closed_on_intent_persist_failure() -> Result<()> {
 #[tokio::test]
 async fn confirmation_approval_then_successful_execution() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -1104,11 +1143,7 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         ctx2,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &AllowAllPolicy,
         &cancel,
         |_, _collector| async { Ok(ToolResult::success("transfer done")) },
@@ -1126,12 +1161,16 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
     );
 
     // Verify intent was persisted and completed
-    let intent = intent_store
-        .get_intent_by_task(&child_id)
-        .await?
-        .context("intent should exist")?;
-    assert_eq!(intent.status, IntentStatus::Completed);
-    assert_eq!(intent.tool_name, "transfer");
+    let records = stores.tasks.effects_for_task(&child_id).await?;
+    let [intent] = records.as_slice() else {
+        anyhow::bail!("expected exactly one intent, got {records:?}");
+    };
+    assert_eq!(intent.state, EffectState::Completed);
+    assert!(
+        matches!(&intent.subject, EffectSubject::Tool { name, .. } if name == "transfer"),
+        "{:?}",
+        intent.subject
+    );
 
     Ok(())
 }
@@ -1145,7 +1184,6 @@ async fn confirmation_approval_then_successful_execution() -> Result<()> {
 #[tokio::test]
 async fn audit_trail_covers_full_lifecycle() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let audit_store = InMemoryToolAuditEventStore::new();
     let cancel = CancellationToken::new();
 
@@ -1162,7 +1200,7 @@ async fn audit_trail_covers_full_lifecycle() -> Result<()> {
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
     let child_id = ctx.task_id.clone();
-    let op_str = OperationId::new(&child_id, "call_1").to_string();
+    let op_str = EffectKey::tool(&child_id, "call_1").to_string();
 
     // Emit audit events through the lifecycle
     emit_audit_event(
@@ -1181,15 +1219,10 @@ async fn audit_trail_covers_full_lifecycle() -> Result<()> {
     )
     .await;
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { Ok(ToolResult::success("done")) },
         t_plus(20),
     )
@@ -1404,7 +1437,6 @@ async fn audit_event_with_redacted_input() -> Result<()> {
 #[tokio::test]
 async fn multi_child_independence_and_parent_resume() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (parent, children) = suspend_root_with_tools(
@@ -1412,8 +1444,8 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
         vec![
             (
                 "call_1".into(),
-                "bash".into(),
-                serde_json::json!({"command": "echo a"}),
+                "read".into(),
+                serde_json::json!({"path": "a.txt"}),
             ),
             (
                 "call_2".into(),
@@ -1426,35 +1458,31 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 
     assert_eq!(children.len(), 2);
 
-    // Complete the bash (Observe) child — should succeed immediately
-    let bash_child = acquire_child(&stores.tasks, &children[0].id).await?;
-    let bash_ctx =
-        resolve_tool_bootstrap(bash_child, &stores.tasks, ActivityBeacon::default()).await?;
+    // Complete the replay-safe read (Observe) child — should succeed
+    // immediately
+    let read_child = acquire_child(&stores.tasks, &children[0].id).await?;
+    let read_ctx =
+        resolve_tool_bootstrap(read_child, &stores.tasks, ActivityBeacon::default()).await?;
 
-    let bash_outcome = guarded_tool_execution(
-        bash_ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+    let read_outcome = run_tool_effect(
+        read_ctx,
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::ReplaySafe,
         |_, _collector| async { Ok(ToolResult::success("a")) },
         t_plus(20),
     )
     .await?;
 
-    assert!(matches!(bash_outcome, ToolTaskOutcome::Completed { .. }));
+    assert!(matches!(read_outcome, ToolTaskOutcome::Completed { .. }));
 
     // Parent should NOT be ready yet (transfer child still pending)
-    let parent_after_bash = stores
+    let parent_after_read = stores
         .tasks
         .get(&parent.id)
         .await?
         .context("parent should exist")?;
     assert_eq!(
-        parent_after_bash.status,
+        parent_after_read.status,
         TaskStatus::WaitingOnChildren,
         "parent should still be waiting after first child completes"
     );
@@ -1464,15 +1492,10 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
     let transfer_ctx =
         resolve_tool_bootstrap(transfer_child, &stores.tasks, ActivityBeacon::default()).await?;
 
-    let transfer_outcome = guarded_tool_execution(
+    let transfer_outcome = run_tool_effect(
         transfer_ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { Ok(ToolResult::success("50 transferred")) },
         t_plus(30),
     )
@@ -1507,7 +1530,6 @@ async fn multi_child_independence_and_parent_resume() -> Result<()> {
 #[tokio::test]
 async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -1523,17 +1545,12 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
     let child = acquire_child(&stores.tasks, &children[0].id).await?;
     let child_id = child.id.clone();
     let ctx = resolve_tool_bootstrap(child, &stores.tasks, ActivityBeacon::default()).await?;
-    let op_id = OperationId::new(&ctx.task_id, &ctx.tool_call.id);
+    let key = EffectKey::tool(&ctx.task_id, &ctx.tool_call.id);
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &cancel,
-        ToolEffectClass::SideEffecting,
         |_, _collector| async { Err(anyhow::anyhow!("insufficient funds")) },
         t_plus(20),
     )
@@ -1550,19 +1567,17 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
     assert_eq!(persisted_child.status, TaskStatus::Failed);
 
     // Intent store: intent is Failed with matching error
-    let intent = intent_store
-        .get_intent(&op_id)
+    let intent = stores
+        .tasks
+        .effect(&key)
         .await?
         .context("intent should exist")?;
-    assert_eq!(intent.status, IntentStatus::Failed);
+    let EffectState::Failed { error } = &intent.state else {
+        anyhow::bail!("expected a failed intent, got {:?}", intent.state);
+    };
     assert!(
-        intent
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("insufficient funds"),
-        "intent error should contain root cause: {:?}",
-        intent.error,
+        error.contains("insufficient funds"),
+        "intent error should contain root cause: {error}",
     );
 
     Ok(())
@@ -1573,7 +1588,9 @@ async fn intent_and_task_coherent_after_execution_failure() -> Result<()> {
 #[tokio::test]
 async fn no_intent_means_no_execution_invariant() -> Result<()> {
     let stores = TestStores::new();
-    let failing_store = FailingIntentStore;
+    let failing_store = FailingEffectStart {
+        inner: &stores.tasks,
+    };
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -1594,15 +1611,10 @@ async fn no_intent_means_no_execution_invariant() -> Result<()> {
     let execution_count = std::sync::Arc::new(AtomicUsize::new(0));
     let count_clone = execution_count.clone();
 
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         ctx,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &failing_store,
-            event_repo: &stores.events,
-        },
+        &failing_store,
         &cancel,
-        ToolEffectClass::SideEffecting,
         move |_, _collector| {
             count_clone.fetch_add(1, Ordering::SeqCst);
             async { Ok(ToolResult::success("should not reach")) }

@@ -8,6 +8,7 @@ use agent_sdk_foundation::llm::{
 };
 use agent_sdk_foundation::{AgentEvent, ThreadId, ToolResult, ToolTier};
 use agent_sdk_providers::LlmProvider;
+use agent_server::journal::effect::{EffectKey, EffectRecord, EffectState, EffectWrite};
 use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::execution_context::build_root_worker_inputs;
@@ -15,11 +16,12 @@ use agent_server::journal::message_store::MessageProjectionStore;
 use agent_server::journal::store::AgentTaskStore;
 use agent_server::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
 use agent_server::journal::thread_store::ThreadStore;
+use agent_server::journal::{Committed, DurableStore, Guard, Rejected, Transition, Write};
 use agent_server::worker::bootstrap::WorkerBootstrapContext;
 use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
 use agent_server::worker::{
     ActivityBeacon, RootTurnDeps, RootTurnOutcome, ToolTaskBootstrap, execute_root_turn,
-    execute_tool_task, resolve_tool_bootstrap,
+    execute_tool_task, resolve_tool_bootstrap, run_tool_effect, tool_intent,
 };
 use agent_service_host::fail;
 use agent_service_host::sqlite::SqliteDurableStore;
@@ -597,14 +599,9 @@ async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_e
         .await?
         .context("the approved child was not acquired")?;
     let bootstrap = resolve_tool_bootstrap(resumed, &store, ActivityBeacon::default()).await?;
-    let deps = agent_server::journal::execution_intent::GuardedExecutionDeps {
-        task_store: &store,
-        intent_store: &store,
-        event_repo: &store,
-    };
     crash_in_transition(Box::pin(agent_server::worker::resume_confirmed_tool(
         bootstrap,
-        &deps,
+        &store,
         &DenyAll,
         &CancellationToken::new(),
         |_call, _collector| async { Ok(ToolResult::success("must not run")) },
@@ -616,112 +613,185 @@ async fn policy_denial_failpoint_keeps_the_child_running_without_its_tool_call_e
 
 #[tokio::test]
 async fn interrupt_failpoint_keeps_the_child_and_its_intent_unsettled() -> Result<()> {
-    use agent_server::journal::execution_intent::{
-        ExecutionIntent, ExecutionIntentStore, GuardedExecutionDeps, IntentStatus, OperationId,
-        ToolEffectClass, guarded_tool_execution,
-    };
     let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let bootstrap = leased_tool_child(&store).await?;
     let child = bootstrap.task_id.clone();
-    let operation = OperationId::new(&child, &bootstrap.tool_call.id);
-    let mut started = ExecutionIntent::new(
-        operation.clone(),
-        ToolEffectClass::SideEffecting,
-        &bootstrap.tool_call,
-        child.clone(),
-        at(11),
-    );
-    store.persist_intent(&started).await?;
-    started.mark_started(at(11));
-    store.update_intent(&started).await?;
+    let key = seed_started_effect(&store, &bootstrap).await?;
 
-    let deps = GuardedExecutionDeps {
-        task_store: &store,
-        intent_store: &store,
-        event_repo: &store,
-    };
-    crash_in_transition(guarded_tool_execution(
+    crash_in_transition(run_tool_effect(
         bootstrap,
-        &deps,
+        &store,
         &CancellationToken::new(),
-        ToolEffectClass::SideEffecting,
         |_call, _collector| async { Ok(ToolResult::success("must not run")) },
         at(12),
     ))
     .await?;
     assert_unchanged(&store, &child, TaskStatus::Running).await?;
-    let intent = store
-        .get_intent(&operation)
-        .await?
-        .context("the intent is gone")?;
+    let intent = store.effect(&key).await?.context("the intent is gone")?;
     ensure!(
-        intent.status == IntentStatus::Started,
-        "the intent's Failed status must roll back with the settle, got {:?}",
-        intent.status,
+        intent.state == EffectState::Started,
+        "the intent's interrupted state must roll back with the settle, got {:?}",
+        intent.state,
     );
     Ok(())
 }
 
-struct ClaimFails;
+/// Commits through the store, except a transition that starts an effect,
+/// which fails as an unavailable store would.
+struct ClaimFails<'a> {
+    inner: &'a SqliteDurableStore,
+}
 
 #[async_trait]
-impl agent_server::journal::execution_intent::ExecutionIntentStore for ClaimFails {
-    async fn persist_intent(
+impl DurableStore for ClaimFails<'_> {
+    async fn commit(
         &self,
-        _intent: &agent_server::journal::execution_intent::ExecutionIntent,
-    ) -> Result<()> {
-        bail!("intent store unavailable")
+        transition: Transition,
+        now: OffsetDateTime,
+    ) -> std::result::Result<Committed, Rejected> {
+        if transition
+            .effect_writes()
+            .any(|write| matches!(write, EffectWrite::Start(_)))
+        {
+            return Err(Rejected::Store(anyhow::anyhow!("intent store unavailable")));
+        }
+        self.inner.commit(transition, now).await
     }
 
-    async fn update_intent(
-        &self,
-        _intent: &agent_server::journal::execution_intent::ExecutionIntent,
-    ) -> Result<()> {
-        bail!("intent store unavailable")
+    async fn effect(&self, key: &EffectKey) -> Result<Option<EffectRecord>> {
+        self.inner.effect(key).await
     }
 
-    async fn get_intent(
-        &self,
-        _operation_id: &agent_server::journal::execution_intent::OperationId,
-    ) -> Result<Option<agent_server::journal::execution_intent::ExecutionIntent>> {
-        Ok(None)
-    }
-
-    async fn get_intent_by_task(
-        &self,
-        _child_task_id: &AgentTaskId,
-    ) -> Result<Option<agent_server::journal::execution_intent::ExecutionIntent>> {
-        Ok(None)
+    async fn effects_for_task(&self, owner: &AgentTaskId) -> Result<Vec<EffectRecord>> {
+        self.inner.effects_for_task(owner).await
     }
 }
 
 #[tokio::test]
 async fn claim_failure_failpoint_keeps_the_child_running_without_its_tool_call_end() -> Result<()> {
-    use agent_server::journal::execution_intent::{
-        GuardedExecutionDeps, ToolEffectClass, guarded_tool_execution,
-    };
     let _scenario = serial_failpoints();
     let temp = tempfile::tempdir()?;
     let store = fresh_store(&temp).await?;
     let bootstrap = leased_tool_child(&store).await?;
     let child = bootstrap.task_id.clone();
-    let deps = GuardedExecutionDeps {
-        task_store: &store,
-        intent_store: &ClaimFails,
-        event_repo: &store,
-    };
-    crash_in_transition(guarded_tool_execution(
+    crash_in_transition(run_tool_effect(
         bootstrap,
-        &deps,
+        &ClaimFails { inner: &store },
         &CancellationToken::new(),
-        ToolEffectClass::SideEffecting,
         |_call, _collector| async { Ok(ToolResult::success("must not run")) },
         at(12),
     ))
     .await?;
     assert_unchanged(&store, &child, TaskStatus::Running).await
+}
+
+/// The record a crashed earlier attempt of `bootstrap`'s call left.
+async fn seed_started_effect(
+    store: &SqliteDurableStore,
+    bootstrap: &ToolTaskBootstrap,
+) -> Result<EffectKey> {
+    let intent = tool_intent(bootstrap);
+    let key = intent.key.clone();
+    store
+        .commit(
+            Transition {
+                guards: vec![
+                    Guard::TaskIs {
+                        task: bootstrap.task_id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((bootstrap.worker_id.clone(), bootstrap.lease_id.clone())),
+                    },
+                    Guard::EffectFree { key: key.clone() },
+                ],
+                writes: vec![Write::Effect(EffectWrite::Start(intent))],
+            },
+            at(11),
+        )
+        .await?;
+    Ok(key)
+}
+
+/// Crash `run_tool_effect` at `failpoint` and return how often the tool
+/// ran, the child and the call's record.
+async fn crash_effect_at(
+    failpoint: &str,
+) -> Result<(usize, AgentTask, Option<EffectRecord>, tempfile::TempDir)> {
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let bootstrap = leased_tool_child(&store).await?;
+    let child = bootstrap.task_id.clone();
+    let key = EffectKey::tool(&child, &bootstrap.tool_call.id);
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    let cancel = CancellationToken::new();
+
+    fail::cfg(failpoint, "panic").map_err(|error| anyhow::anyhow!("{error}"))?;
+    let crashed = std::panic::AssertUnwindSafe(run_tool_effect(
+        bootstrap,
+        &store,
+        &cancel,
+        |_call, _collector| async {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::success("ran"))
+        },
+        at(12),
+    ));
+    let result = futures::FutureExt::catch_unwind(crashed).await;
+    fail::remove(failpoint);
+    ensure!(result.is_err(), "the failpoint {failpoint} must fire");
+
+    let task = AgentTaskStore::get(&store, &child)
+        .await?
+        .context("the tool child is gone")?;
+    let record = store.effect(&key).await?;
+    Ok((
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        task,
+        record,
+        temp,
+    ))
+}
+
+/// I5: the record commits before the tool runs. A crash right after the
+/// start leaves a `Started` record and a tool that never ran, so recovery
+/// settles the call as interrupted rather than guessing.
+#[tokio::test]
+async fn effect_after_start_failpoint_leaves_a_started_record_and_no_run() -> Result<()> {
+    let _scenario = serial_failpoints();
+    let (runs, child, record, _temp) = crash_effect_at("effect.after_start").await?;
+    ensure!(runs == 0, "the tool ran {runs} times");
+    ensure!(child.status == TaskStatus::Running, "{:?}", child.status);
+    let record = record.context("the start committed before the crash")?;
+    ensure!(record.state == EffectState::Started, "{:?}", record.state);
+    Ok(())
+}
+
+/// The outcome, the child's settle and its `ToolCallEnd` commit in one
+/// transaction: a crash after the tool ran but before that commit, and a
+/// crash inside it, both leave the child running and the record started,
+/// never one settled without the other.
+#[tokio::test]
+async fn effect_end_failpoints_never_settle_the_child_without_its_record() -> Result<()> {
+    let _scenario = serial_failpoints();
+    for failpoint in ["effect.before_finish", FAILPOINT] {
+        let (runs, child, record, temp) = crash_effect_at(failpoint).await?;
+        ensure!(runs == 1, "{failpoint}: the tool ran {runs} times");
+        ensure!(
+            child.status == TaskStatus::Running,
+            "{failpoint}: the child settled without its record: {:?}",
+            child.status
+        );
+        let record = record.with_context(|| format!("{failpoint}: no record"))?;
+        ensure!(
+            record.state == EffectState::Started,
+            "{failpoint}: the record ended without the settle: {:?}",
+            record.state
+        );
+        let store = fresh_store(&temp).await?;
+        assert_unchanged(&store, &child.id, TaskStatus::Running).await?;
+    }
+    Ok(())
 }
 
 struct Summarizer;

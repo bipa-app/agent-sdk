@@ -58,7 +58,6 @@ use agent_sdk_foundation::{TerminalReason, ToolTier};
 use agent_server::journal::commit::StaleTurnCommit;
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::execution_context::build_root_worker_inputs;
-use agent_server::journal::execution_intent::{GuardedExecutionDeps, classify_tool_effect};
 use agent_server::journal::store::{AgentTaskStore, RequeueOutcome};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId,
@@ -69,10 +68,10 @@ use agent_server::worker::{
     RootTurnOutcome, SubagentProgressSnapshot, SubagentTaskOutcome, ToolTaskOutcome,
     best_effort_close_open_attempts, build_parent_progress_event, canonical_subagent_name,
     execute_subagent_task, fail_root_turn_leaving_attempts_open_with_reason,
-    fail_root_turn_with_reason, guarded_tool_execution, pause_tool_for_confirmation,
-    resolve_bootstrap_context, resolve_subagent_bootstrap, resolve_tool_bootstrap,
-    resume_for_steering, resume_from_children, resume_from_question, revert_steering_wake,
-    settle_live_descendants, terminal_reason_for_root_error,
+    fail_root_turn_with_reason, pause_tool_for_confirmation, resolve_bootstrap_context,
+    resolve_subagent_bootstrap, resolve_tool_bootstrap, resume_for_steering, resume_from_children,
+    resume_from_question, revert_steering_wake, run_tool_effect, settle_live_descendants,
+    terminal_reason_for_root_error,
 };
 
 use super::broker::{BrokerAdapter, InMemoryBrokerAdapter};
@@ -3087,21 +3086,14 @@ async fn run_tool_task(
         .artifact_store(&bootstrap.thread_id)
         .context("hold artifact store through durable tool completion")?;
 
-    let guarded_deps = GuardedExecutionDeps {
-        task_store: stores.task_store.as_ref(),
-        intent_store: stores.execution_intent_store.as_ref(),
-        event_repo: stores.event_repo.as_ref(),
-    };
-    let effect_class = classify_tool_effect(&bootstrap.tool_call);
     let exec_bootstrap = bootstrap.clone();
     let settle_bootstrap = bootstrap.clone();
     let tool_executor = Arc::clone(runtime.tool_executor());
     let executor_artifact_store = artifact_store_guard.clone();
-    let outcome = guarded_tool_execution(
+    let outcome = run_tool_effect(
         bootstrap,
-        &guarded_deps,
+        stores.task_store.as_ref(),
         cancel,
-        effect_class,
         move |_tool_call, collector| {
             let tool_executor = Arc::clone(&tool_executor);
             let exec_bootstrap = exec_bootstrap.clone();
@@ -8438,10 +8430,10 @@ mod tests {
             .await?
             .context("tool child must acquire")?;
 
-        // Fail the FIRST `fail_task` — the one `guarded_tool_execution` makes to
+        // Fail the FIRST `fail_task` — the one the tool settle makes to
         // settle the tool's own terminal row (that instant is already captured
         // post-execution and is correct). The injected error propagates out of
-        // guarded execution as `Err`, which drives `execute_tool_task`'s own
+        // the tool run as `Err`, which drives `execute_tool_task`'s own
         // fail arm — the site under test. `recorded_fail_now` therefore ends up
         // holding the instant THAT arm stamped.
         let recording =
@@ -10195,7 +10187,7 @@ mod tests {
                     Write::RejectConfirmation { .. }
                     | Write::PauseOnConfirmation { .. }
                     | Write::ReparkAfterSteering { .. }
-                    | Write::RecordIntent(_)
+                    | Write::Effect(_)
                     | Write::AppendEvents { .. }
                     | Write::AppendCompaction { .. }
                     | Write::SpawnChildren { .. }
@@ -10203,6 +10195,20 @@ mod tests {
                 }
             }
             self.inner.commit(transition, now).await
+        }
+
+        async fn effect(
+            &self,
+            key: &agent_server::journal::EffectKey,
+        ) -> Result<Option<agent_server::journal::EffectRecord>> {
+            self.inner.effect(key).await
+        }
+
+        async fn effects_for_task(
+            &self,
+            owner: &AgentTaskId,
+        ) -> Result<Vec<agent_server::journal::EffectRecord>> {
+            self.inner.effects_for_task(owner).await
         }
     }
 

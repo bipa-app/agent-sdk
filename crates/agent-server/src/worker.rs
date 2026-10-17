@@ -21,15 +21,13 @@
 //! [`execute_tool_task`] drives the child to completion or failure
 //! through the journal.
 //!
-//! # Guarded execution
+//! # Tool effects
 //!
-//! [`guarded_tool_execution`] wraps [`execute_tool_task`] with the
-//! durable execution-intent guard. Side-effecting and resumable tools
-//! must persist an [`ExecutionIntent`] before the executor callback
-//! runs. If persistence fails, execution is blocked (fail-closed).
-//! The [`classify_tool_effect`] helper determines a tool's
-//! [`ToolEffectClass`] from the replay value its
-//! [`PendingToolCallInfo`] carries, never from its tier.
+//! [`run_tool_effect`] runs a tool child as an effect: a call declared
+//! replay-safe runs through [`execute_tool_task`], and any other call
+//! commits its effect record before the executor runs and its outcome with
+//! the child's settle. A call recovery finds started and unfinished is not
+//! run again (see [`crate::journal::effect`]).
 //!
 //! # Confirmation pause/resume
 //!
@@ -96,6 +94,7 @@ pub mod registry;
 pub mod root_turn;
 pub mod subagent;
 pub mod subagent_spawn_selector;
+pub mod tool_effect;
 pub mod tool_task;
 pub mod user_input;
 
@@ -176,12 +175,8 @@ pub use tool_task::{
 };
 pub use user_input::{UserInput, user_input_from_submitted};
 
-// Re-export durable execution intent from journal.
-pub use crate::journal::execution_intent::{
-    ExecutionIntent, ExecutionIntentStore, InMemoryExecutionIntentStore, IntentStatus, OperationId,
-    RetryDecision, TOOL_INTERRUPTED_PREFIX, ToolEffectClass, check_retry_safety,
-    classify_tool_effect, guarded_tool_execution,
-};
+pub use crate::journal::effect::TOOL_INTERRUPTED_PREFIX;
+pub use tool_effect::{run_tool_effect, tool_intent};
 
 // Re-export confirmation types and functions.
 pub use confirmation::{

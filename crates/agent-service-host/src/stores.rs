@@ -31,7 +31,6 @@ use agent_server::journal::event_notifier::EventNotifier;
 use agent_server::journal::event_repository::{
     EventRepository, InMemoryEventRepository, PurgeFencedEventRepository,
 };
-use agent_server::journal::execution_intent::{ExecutionIntentStore, InMemoryExecutionIntentStore};
 use agent_server::journal::message_store::{
     InMemoryMessageProjectionStore, MessageProjectionStore,
 };
@@ -75,7 +74,7 @@ pub struct StorageSurfaceStatus {
     pub note: &'static str,
 }
 
-const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 11] = [
+const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "in_memory",
@@ -108,12 +107,6 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 11] = [
     },
     StorageSurfaceStatus {
         surface: "event_repo",
-        backend: "in_memory",
-        persists_restart: false,
-        note: "all state is process-local",
-    },
-    StorageSurfaceStatus {
-        surface: "execution_intent_store",
         backend: "in_memory",
         persists_restart: false,
         note: "all state is process-local",
@@ -145,7 +138,7 @@ const IN_MEMORY_SURFACES: [StorageSurfaceStatus; 11] = [
 ];
 
 #[cfg(feature = "postgres")]
-const POSTGRES_SURFACES: [StorageSurfaceStatus; 11] = [
+const POSTGRES_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "postgres",
@@ -178,12 +171,6 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 11] = [
     },
     StorageSurfaceStatus {
         surface: "event_repo",
-        backend: "postgres",
-        persists_restart: true,
-        note: "",
-    },
-    StorageSurfaceStatus {
-        surface: "execution_intent_store",
         backend: "postgres",
         persists_restart: true,
         note: "",
@@ -215,7 +202,7 @@ const POSTGRES_SURFACES: [StorageSurfaceStatus; 11] = [
 ];
 
 #[cfg(feature = "sqlite")]
-const SQLITE_SURFACES: [StorageSurfaceStatus; 11] = [
+const SQLITE_SURFACES: [StorageSurfaceStatus; 10] = [
     StorageSurfaceStatus {
         surface: "task_store",
         backend: "sqlite",
@@ -248,12 +235,6 @@ const SQLITE_SURFACES: [StorageSurfaceStatus; 11] = [
     },
     StorageSurfaceStatus {
         surface: "event_repo",
-        backend: "sqlite",
-        persists_restart: true,
-        note: "",
-    },
-    StorageSurfaceStatus {
-        surface: "execution_intent_store",
         backend: "sqlite",
         persists_restart: true,
         note: "",
@@ -343,8 +324,6 @@ pub struct StoreRegistry {
     pub checkpoint_store: Arc<dyn CheckpointStore>,
     /// Committed-event repository.
     pub event_repo: Arc<dyn EventRepository>,
-    /// Execution-intent records for fail-closed guard.
-    pub execution_intent_store: Arc<dyn ExecutionIntentStore>,
     /// Reads of the documents transitions write; the same store as
     /// `task_store`, whose `commit` writes them.
     pub document_store: Arc<dyn DocumentStore>,
@@ -578,8 +557,6 @@ impl StoreRegistry {
         // the marker inside the cancellation transaction (issue #354).
         let event_repo: Arc<InMemoryEventRepository> = Arc::new(InMemoryEventRepository::new());
         let outbox_store: Arc<InMemoryOutboxStore> = Arc::new(InMemoryOutboxStore::new());
-        let execution_intent_store: Arc<InMemoryExecutionIntentStore> =
-            Arc::new(InMemoryExecutionIntentStore::new());
         let message_store: Arc<InMemoryMessageProjectionStore> =
             Arc::new(InMemoryMessageProjectionStore::new());
         let checkpoint_store: Arc<InMemoryCheckpointStore> =
@@ -603,7 +580,6 @@ impl StoreRegistry {
                 event_repo.as_ref().clone(),
                 outbox_store.as_ref().clone(),
             )))
-            .with_intent_store(execution_intent_store.clone())
             .with_message_store(message_store.clone())
             .with_completed_turns(CompletedTurnSink {
                 attempt_store: attempt_store.clone(),
@@ -622,7 +598,6 @@ impl StoreRegistry {
             attempt_store,
             checkpoint_store,
             event_repo,
-            execution_intent_store,
             tool_audit_store: Arc::new(InMemoryToolAuditEventStore::new()),
             outbox_store,
             retention_store: Arc::new(InMemoryRetentionStore::new()),
@@ -650,7 +625,6 @@ impl StoreRegistry {
             attempt_store: durable_store.clone(),
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
-            execution_intent_store: durable_store.clone(),
             document_store: durable_store.clone(),
             tool_audit_store,
             outbox_store: durable_store.clone(),
@@ -683,7 +657,6 @@ impl StoreRegistry {
             attempt_store: durable_store.clone(),
             checkpoint_store: durable_store.clone(),
             event_repo: durable_store.clone(),
-            execution_intent_store: durable_store.clone(),
             document_store: durable_store.clone(),
             tool_audit_store,
             outbox_store: durable_store.clone(),
@@ -909,7 +882,6 @@ mod tests {
         let _attempt = &stores.attempt_store;
         let _ckpt = &stores.checkpoint_store;
         let _event = &stores.event_repo;
-        let _intent = &stores.execution_intent_store;
         let _documents = &stores.document_store;
         let _audit = &stores.tool_audit_store;
         let _outbox = &stores.outbox_store;
