@@ -427,6 +427,8 @@ pub enum Settle {
         error: String,
         reason: TerminalReason,
     },
+    /// Complete with no result payload, as a root turn completes.
+    CompleteWithoutResult,
 }
 
 /// What a committed transition produced, in write order.

@@ -3544,6 +3544,8 @@ FOR UPDATE
         params: CompletedTurnCommit,
         fail_after: Option<InjectedCommitFailure>,
     ) -> Result<CommitOutcome> {
+        params.validate_extra_writes()?;
+        let extra = params.extra_transition();
         let mut tx = self.begin().await?;
 
         Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
@@ -3668,6 +3670,7 @@ FOR UPDATE
         agent_server::fail_point!("commit.before_event_commit");
 
         Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
+        let settled = Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
 
         tx.commit()
             .await
@@ -3678,6 +3681,7 @@ FOR UPDATE
             checkpoint,
             closed_attempt,
             committed_events,
+            settled,
         })
     }
 }
@@ -4344,6 +4348,23 @@ impl PostgresDurableStore {
 }
 
 impl PostgresDurableStore {
+    /// Apply a completed turn's extra writes inside its transaction,
+    /// through the same write arms as a transition, and return its settle.
+    async fn settle_completed_turn_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        extra: &agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
+        let mut committed = agent_server::journal::Committed::default();
+        for write in extra.writes.iter().cloned() {
+            Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
+        }
+        if !committed.settled.is_empty() {
+            agent_server::fail_point!("commit.completed_turn.settled");
+        }
+        Ok(committed.settled.pop())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -4488,6 +4509,18 @@ impl PostgresDurableStore {
                     now,
                     "commit",
                     move |child| child.fail(error, now),
+                )
+                .await
+            }
+            Settle::CompleteWithoutResult => {
+                Self::apply_task_terminal_transition_tx(
+                    tx,
+                    task,
+                    &worker,
+                    &lease,
+                    now,
+                    "commit",
+                    move |child| child.complete(now),
                 )
                 .await
             }
@@ -9425,6 +9458,7 @@ INSERT INTO agent_sdk_turn_attempts (
         let err = store
             .commit_completed_turn_atomic_with_failure(
                 CompletedTurnCommit {
+                    extra_writes: Vec::new(),
                     checkpoint_kind: CheckpointKind::FullTurn,
                     delivered_injection_ids: Vec::new(),
                     thread_id: running.thread_id.clone(),
@@ -9505,6 +9539,7 @@ INSERT INTO agent_sdk_turn_attempts (
 
         let thread_id = running.thread_id.clone();
         let commit_params = |now| CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
@@ -9590,6 +9625,7 @@ INSERT INTO agent_sdk_turn_attempts (
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: running.thread_id.clone(),

@@ -5725,6 +5725,54 @@ impl InMemoryAgentTaskStore {
         }
     }
 
+    /// A completed turn's lifecycle events and their advisory row.
+    async fn commit_turn_events(
+        marker_sink: &CancellationMarkerSink,
+        thread_id: &ThreadId,
+        events: Vec<AgentEvent>,
+        outbox_max_attempts: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<CommittedEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let committed = marker_sink
+            .event_repo
+            .commit_event_batch(thread_id, events, now)
+            .await
+            .context("commit: persist lifecycle events")?;
+        if let Some(last) = committed.last() {
+            super::outbox::insert_events_available_advisory(
+                marker_sink.outbox_store.as_ref(),
+                last,
+                outbox_max_attempts,
+                now,
+            )
+            .await?;
+        }
+        Ok(committed)
+    }
+
+    /// Apply a completed turn's settle, the one extra write
+    /// [`super::commit::CompletedTurnCommit::validate_extra_writes`] admits.
+    async fn settle_completed_turn_locked(
+        &self,
+        inner: &mut Inner,
+        extra: &super::transition::Transition,
+        now: OffsetDateTime,
+    ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
+        let mut settled = None;
+        for write in extra.writes.iter().cloned() {
+            if let super::transition::Write::SettleTask { task, outcome } = write {
+                settled = Some(
+                    self.apply_settle_locked(inner, extra, &task, outcome, now)
+                        .await?,
+                );
+            }
+        }
+        Ok(settled)
+    }
+
     /// Refuse a transition that appends to a purged thread, read through
     /// the event sink's thread store. A store built without a sink has no
     /// thread projection to read, so it refuses nothing.
@@ -5800,6 +5848,14 @@ impl InMemoryAgentTaskStore {
                 move |child| {
                     child.fail_with_terminal_reason(error, TerminalReason::InternalError, now)
                 },
+            ),
+            Settle::CompleteWithoutResult => inner.apply_task_terminal_transition(
+                task,
+                (&worker, &lease),
+                thread,
+                now,
+                "commit",
+                move |child| child.complete(now),
             ),
             Settle::FailWithReason { error, reason } => inner.apply_task_terminal_transition(
                 task,
@@ -6306,6 +6362,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                  with_cancellation_markers, with_message_store, with_completed_turns)"
             ));
         };
+        params.validate_extra_writes()?;
+        let extra = params.extra_transition();
         let mut inner = self.inner.write().await;
         inner.enforce_commit_owner_guard(&params.task_id, params.owner_guard.as_ref())?;
         let committed_turns = match marker_sink.thread_store.get(&params.thread_id).await? {
@@ -6371,31 +6429,24 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         for id in &params.delivered_injection_ids {
             let _ = inner.complete_input_injection(id, params.now)?;
         }
-        let committed_events = if params.events.is_empty() {
-            Vec::new()
-        } else {
-            let committed = marker_sink
-                .event_repo
-                .commit_event_batch(&params.thread_id, params.events, params.now)
-                .await
-                .context("commit: persist lifecycle events")?;
-            if let Some(last) = committed.last() {
-                super::outbox::insert_events_available_advisory(
-                    marker_sink.outbox_store.as_ref(),
-                    last,
-                    params.outbox_max_attempts,
-                    params.now,
-                )
-                .await?;
-            }
-            committed
-        };
+        let committed_events = Self::commit_turn_events(
+            marker_sink,
+            &params.thread_id,
+            params.events,
+            params.outbox_max_attempts,
+            params.now,
+        )
+        .await?;
+        let settled = self
+            .settle_completed_turn_locked(&mut inner, &extra, params.now)
+            .await?;
         drop(inner);
         Ok(super::commit::CommitOutcome {
             thread,
             checkpoint,
             closed_attempt,
             committed_events,
+            settled,
         })
     }
 

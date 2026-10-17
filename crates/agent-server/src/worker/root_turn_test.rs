@@ -11781,6 +11781,7 @@ impl SalvageRacingAttemptStore {
                 .context("open salvage attempt")?;
             crate::journal::commit::commit_completed_turn(
                 crate::journal::commit::CompletedTurnCommit {
+                    extra_writes: Vec::new(),
                     delivered_injection_ids: Vec::new(),
                     checkpoint_kind: *kind,
                     thread_id: thread_a(),
@@ -12453,6 +12454,7 @@ async fn lost_ownership_rejection_settles_the_open_attempt() -> Result<()> {
         .await?;
 
     let params = crate::journal::commit::CompletedTurnCommit {
+        extra_writes: Vec::new(),
         delivered_injection_ids: Vec::new(),
         checkpoint_kind: CheckpointKind::FullTurn,
         thread_id: thread_a(),

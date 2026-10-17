@@ -6834,7 +6834,11 @@ mod tests {
             &self,
             params: agent_server::journal::CompletedTurnCommit,
         ) -> Result<agent_server::journal::CommitOutcome> {
-            self.inner.commit_completed_turn(params).await
+            let outcome = self.inner.commit_completed_turn(params).await?;
+            if outcome.settled.is_some() {
+                self.complete_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
         }
         async fn insert(&self, task: AgentTask) -> Result<()> {
             self.inner.insert(task).await
@@ -7257,7 +7261,8 @@ mod tests {
             assert_eq!(
                 complete_calls.load(Ordering::SeqCst),
                 1,
-                "decorator must observe the root turn's complete_task",
+                "decorator must observe the root turn's completion, which the completed turn \
+                 commits (CommitOutcome::settled)",
             );
             // gRPC-plane guard: the completion methods above are only
             // ever called by host workers, so a regression that rebuilt

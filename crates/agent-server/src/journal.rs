@@ -607,8 +607,9 @@ pub use document::{
     DocumentWrite,
 };
 pub use effect::{
-    EffectIntent, EffectKey, EffectKind, EffectRecord, EffectRun, EffectState, EffectSubject,
-    EffectWrite, TOOL_INTERRUPTED_PREFIX, run_effect,
+    ABORTED_RESPONSE_NOTE, EffectIntent, EffectKey, EffectKind, EffectRecord, EffectRun,
+    EffectState, EffectSubject, EffectWrite, TOOL_INTERRUPTED_PREFIX, is_aborted_response_note,
+    run_effect,
 };
 pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
