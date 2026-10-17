@@ -195,6 +195,9 @@ pub struct ServerMetrics {
     /// `agent_server.effect.duration`: started to finished, by kind and
     /// the state it finished in.
     pub(crate) effect_duration: Histogram<f64>,
+    /// `agent_server.journal.completed_turn.commits`: completed-turn commits
+    /// by outcome.
+    pub(crate) completed_turn_commits: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -413,6 +416,13 @@ impl ServerMetrics {
 
     /// Record one `agent_server.tool_audit.outcome` increment for
     /// the given tool-audit event.
+    /// Count one completed-turn commit with its bounded outcome (see
+    /// [`crate::journal::commit::commit_outcome_label`]).
+    pub fn record_completed_turn_commit(&self, outcome: &'static str) {
+        self.completed_turn_commits
+            .add(1, &[KeyValue::new(attrs::OUTCOME, outcome)]);
+    }
+
     /// Count one effect transition (`started`, `refused`, `finished`,
     /// `reclaimed`, `abandoned`) on `agent_server.effects`.
     pub fn record_effect(
@@ -567,19 +577,7 @@ impl ServerMetrics {
             )
             .build();
 
-        let effects = meter
-            .u64_counter("agent_server.effects")
-            .with_description(
-                "Effect transitions by kind: started (its record committed), refused (the \
-                 claim did not commit), finished, reclaimed (recovery ended it without \
-                 running it again), abandoned (its owner became terminal first).",
-            )
-            .build();
-        let effect_duration = meter
-            .f64_histogram("agent_server.effect.duration")
-            .with_unit("s")
-            .with_description("Effect run time, started to finished, by kind and outcome.")
-            .build();
+        let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
 
         Self {
             workers_active,
@@ -596,9 +594,39 @@ impl ServerMetrics {
             documents_written,
             effects,
             effect_duration,
+            completed_turn_commits,
             meter,
         }
     }
+}
+
+/// The crash-safety instruments: effect transitions, effect run time and
+/// completed-turn commit outcomes.
+fn durability_instruments(
+    meter: &opentelemetry::metrics::Meter,
+) -> (Counter<u64>, Histogram<f64>, Counter<u64>) {
+    let completed_turn_commits = meter
+        .u64_counter("agent_server.journal.completed_turn.commits")
+        .with_description(
+            "Completed-turn commits by outcome: ok, lost_ownership (the worker no longer \
+             owned the task, so the finished turn was discarded), stale_turn (another \
+             commit took the turn slot) or error.",
+        )
+        .build();
+    let effects = meter
+        .u64_counter("agent_server.effects")
+        .with_description(
+            "Effect transitions by kind: started (its record committed), refused (the \
+             claim did not commit), finished, reclaimed (recovery ended it without \
+             running it again), abandoned (its owner became terminal first).",
+        )
+        .build();
+    let effect_duration = meter
+        .f64_histogram("agent_server.effect.duration")
+        .with_unit("s")
+        .with_description("Effect run time, started to finished, by kind and outcome.")
+        .build();
+    (effects, effect_duration, completed_turn_commits)
 }
 
 // ─────────────────────────────────────────────────────────────────────

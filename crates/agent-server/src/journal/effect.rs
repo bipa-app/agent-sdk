@@ -42,7 +42,7 @@
 //! | `Salvaged` | `failed` | `salvaged: aborted response` | `salvaged` |
 //! | `Abandoned` | `failed` | `abandoned: its owner ended first` | `abandoned` |
 
-use agent_sdk_foundation::{TerminalReason, ThreadId, ToolReplay};
+use agent_sdk_foundation::{TerminalReason, ThreadId, ToolReplay, llm};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -52,6 +52,29 @@ use super::transition::{Committed, DurableStore, Guard, Rejected, Transition, Wr
 
 /// Stable error prefix for a tool call that recovery did not run again.
 pub const TOOL_INTERRUPTED_PREFIX: &str = "interrupted:";
+
+/// The user message recovery appends after a cut-off response's partial
+/// text.
+///
+/// The request sent again then never ends on an assistant message, and the
+/// model continues instead of repeating itself. It is model context only:
+/// clients that render a thread's messages skip it
+/// ([`is_aborted_response_note`]).
+pub const ABORTED_RESPONSE_NOTE: &str = "[interrupted: the response above was cut off when the \
+     process stopped. Continue from where it ends; do not repeat it.]";
+
+/// Whether `message` is the [`ABORTED_RESPONSE_NOTE`] recovery appended.
+#[must_use]
+pub fn is_aborted_response_note(message: &llm::Message) -> bool {
+    message.role == llm::Role::User
+        && match &message.content {
+            llm::Content::Text(text) => text == ABORTED_RESPONSE_NOTE,
+            llm::Content::Blocks(blocks) => matches!(
+                blocks.as_slice(),
+                [llm::ContentBlock::Text { text }] if text == ABORTED_RESPONSE_NOTE
+            ),
+        }
+}
 
 /// The key of an effect's row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -810,6 +833,25 @@ mod tests {
             }
             assert_eq!(kind_from_wire(kind_wire(kind)), Some(kind));
         }
+    }
+
+    #[test]
+    fn only_the_note_itself_is_an_aborted_response_note() {
+        assert!(is_aborted_response_note(&llm::Message::user(
+            ABORTED_RESPONSE_NOTE
+        )));
+        assert!(is_aborted_response_note(&llm::Message {
+            role: llm::Role::User,
+            content: llm::Content::Blocks(vec![llm::ContentBlock::Text {
+                text: ABORTED_RESPONSE_NOTE.into(),
+            }]),
+        }));
+        assert!(!is_aborted_response_note(&llm::Message::assistant(
+            ABORTED_RESPONSE_NOTE
+        )));
+        assert!(!is_aborted_response_note(&llm::Message::user(
+            "a user who quotes the note: [interrupted: the response above"
+        )));
     }
 
     #[test]

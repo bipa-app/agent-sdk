@@ -320,6 +320,7 @@ mod tests {
             .context("open attempt for committed turn")?;
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread.clone(),
@@ -814,6 +815,117 @@ mod tests {
         Ok(())
     }
 
+    /// Design I2 on Postgres: the completed turn and its root's terminal
+    /// row commit together. `commit.completed_turn.settled` fires inside the
+    /// turn's transaction only once the root's settle has been written, and
+    /// the test requires it to fire, so the crash lands after the write it
+    /// protects: the root stays `Running`, the thread at no committed turn,
+    /// the attempt open. The SQLite twin is in `tests/tool_settle_crash.rs`.
+    ///
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_completed_turn_settle_failpoint_rolls_back_the_turn_with_its_root()
+    -> Result<()> {
+        use agent_server::journal::commit::CommitOwnerGuard;
+        use agent_server::journal::{Settle, Write};
+
+        const SETTLED: &str = "commit.completed_turn.settled";
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let thread = ThreadId::from_string("pg-completed-turn-settle");
+        let task_id = AgentTaskId::from_string("task_pg-completed-turn-settle");
+        let _scenario = fail::FailScenario::setup();
+
+        let attempt_id = {
+            let store = schema.open_store().await?;
+            let (worker, lease) =
+                prepare_running_root(&store, &thread, &task_id, t_plus(5)).await?;
+            let attempt = store
+                .open_attempt(OpenAttemptParams {
+                    task_id: task_id.clone(),
+                    attempt_number: 1,
+                    provenance: agent_sdk_foundation::audit::AuditProvenance::new(
+                        "anthropic",
+                        "claude-sonnet-5-5",
+                    ),
+                    request_blob: serde_json::json!({}),
+                    now: t_plus(6),
+                    otel_trace_id: None,
+                    otel_span_id: None,
+                })
+                .await?;
+            let params = CompletedTurnCommit {
+                extra_writes: vec![Write::SettleTask {
+                    task: task_id.clone(),
+                    outcome: Settle::CompleteWithoutResult,
+                }],
+                checkpoint_kind: CheckpointKind::FullTurn,
+                delivered_injection_ids: Vec::new(),
+                thread_id: thread.clone(),
+                task_id: task_id.clone(),
+                expected_turn: 1,
+                turn_attempt_id: attempt.id.clone(),
+                close_attempt_params: CloseAttemptParams {
+                    response_blob: serde_json::json!({}),
+                    response_id: None,
+                    response_model: None,
+                    stop_reason: None,
+                    outcome: TurnAttemptOutcome::Success,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    route_provider: None,
+                    thinking_mode: None,
+                    thinking_budget_tokens: None,
+                    thinking_effort: None,
+                },
+                messages: vec![llm::Message::assistant("done")],
+                turn_usage: TokenUsage::default(),
+                agent_state_snapshot: serde_json::json!({}),
+                events: vec![AgentEvent::text("settle-evt", "done")],
+                outbox_max_attempts: 3,
+                owner_guard: Some(CommitOwnerGuard {
+                    worker_id: worker,
+                    lease_id: lease,
+                }),
+                now: t_plus(7),
+            };
+            fail::cfg(SETTLED, "panic").map_err(|e| anyhow::anyhow!("configure failpoint: {e}"))?;
+            let crashed = std::panic::AssertUnwindSafe(commit_completed_turn(params, &store));
+            let result = futures::FutureExt::catch_unwind(crashed).await;
+            fail::remove(SETTLED);
+            anyhow::ensure!(
+                result.is_err(),
+                "the failpoint after the root's settle must fire"
+            );
+            attempt.id
+        };
+
+        let store = schema.open_store().await?;
+        let root = AgentTaskStore::get(&store, &task_id)
+            .await?
+            .context("root")?;
+        anyhow::ensure!(root.status == TaskStatus::Running, "{:?}", root.status);
+        let committed = ThreadStore::get(&store, &thread)
+            .await?
+            .map_or(0, |thread| thread.committed_turns);
+        anyhow::ensure!(
+            committed == 0,
+            "the turn landed without its root: {committed}"
+        );
+        let attempt = TurnAttemptStore::get(&store, &attempt_id)
+            .await?
+            .context("attempt")?;
+        anyhow::ensure!(
+            attempt.closed_at.is_none(),
+            "the attempt closed without the turn"
+        );
+        Ok(())
+    }
+
     /// Postgres mirror of the crash-then-replay test: crash inside the
     /// atomic commit transaction (failpoint), reopen the same schema, and
     /// assert no lost / duplicated work and no torn projection, then a
@@ -936,6 +1048,7 @@ mod tests {
             .context("open attempt for delivering commit")?;
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: vec![injection_id.clone(), task_id.clone()],
                 thread_id: thread.clone(),

@@ -91,6 +91,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Crash safety, Phase 2: effects
 
+- **Breaking: a completed root turn and the root's terminal row commit
+  together** (design I2; reconciliation C2). Before, `commit_completed_turn`
+  committed the turn and the worker called `complete_task` in a second
+  transaction, so a crash between the two left the turn committed under a
+  running root.
+  - `CompletedTurnCommit::extra_writes` holds writes applied inside the
+    turn's transaction. For now it holds only the task's own
+    `Write::SettleTask`, which needs `owner_guard`.
+  - The worker passes the owner guard on the first commit and settles the
+    root there. `CommitOutcome::settled` returns the root and the subagent
+    invocation it resumed, which `complete_task` used to return.
+  - A worker that lost its lease now has the whole commit refused
+    (`LostCommitOwnership`), where before the turn landed and the separate
+    settle failed.
+  - `Settle::CompleteWithoutResult` completes a task with no result
+    payload, as a root completes.
+  - A store decorator that watched `complete_task` for root completions
+    must read `CommitOutcome::settled` from `commit_completed_turn`
+    instead.
+  - The new counter `agent_server.journal.completed_turn.commits{outcome}`
+    (`ok`, `lost_ownership`, `stale_turn`, `error`) counts every
+    completed-turn commit. A refusal also logs a warning.
+- `ABORTED_RESPONSE_NOTE` and `is_aborted_response_note`: the user
+  message recovery will append after a cut-off response (Phase 2's
+  `LlmRequest` salvage). Clients that render messages skip it.
 - `ToolContext::idempotency_key` (`agent-sdk-tools`, additive). The agent
   server passes each tool call its effect key, `{child_task_id}:{tool_call_id}`,
   which is the same on every attempt of the call. A tool that changes state

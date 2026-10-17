@@ -10182,7 +10182,7 @@ mod tests {
             for write in &transition.writes {
                 match write {
                     Write::SettleTask {
-                        outcome: Settle::Complete { .. },
+                        outcome: Settle::Complete { .. } | Settle::CompleteWithoutResult,
                         ..
                     } => {
                         if Self::take_injected_failure(&self.complete_failures_remaining) {

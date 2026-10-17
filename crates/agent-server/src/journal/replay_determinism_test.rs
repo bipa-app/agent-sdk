@@ -135,6 +135,7 @@ impl ReplayStores {
             .await
             .context("open attempt for replay")?;
         Ok(CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread(),

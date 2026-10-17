@@ -936,3 +936,122 @@ async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_even
     );
     Ok(())
 }
+
+fn empty_close() -> agent_server::journal::turn_attempt::CloseAttemptParams {
+    use agent_server::journal::turn_attempt::{CloseAttemptParams, TurnAttemptOutcome};
+
+    CloseAttemptParams {
+        response_blob: json!({}),
+        response_id: None,
+        response_model: None,
+        stop_reason: None,
+        outcome: TurnAttemptOutcome::Success,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        route_provider: None,
+        thinking_mode: None,
+        thinking_budget_tokens: None,
+        thinking_effort: None,
+    }
+}
+
+/// Design I2: the completed turn and its root's terminal row commit together.
+/// `commit.completed_turn.settled` fires inside the turn's transaction only
+/// once the root's settle has been written (and is required to fire), so a
+/// crash there must leave neither: the root running, the thread at no
+/// committed turn, the attempt open.
+#[tokio::test]
+async fn completed_turn_settle_failpoint_rolls_back_the_turn_with_its_root() -> Result<()> {
+    use agent_sdk_foundation::TokenUsage;
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_server::journal::Settle;
+    use agent_server::journal::checkpoint::CheckpointKind;
+    use agent_server::journal::commit::{
+        CommitOwnerGuard, CompletedTurnCommit, commit_completed_turn,
+    };
+    use agent_server::journal::turn_attempt::OpenAttemptParams;
+    use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+
+    const SETTLED: &str = "commit.completed_turn.settled";
+    let _scenario = serial_failpoints();
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let thread = ThreadId::from_string("completed-turn-settle");
+    ThreadStore::get_or_create(&store, &thread, at(1)).await?;
+    let root = AgentTask::new_root_turn(thread.clone(), at(1), 3);
+    store.submit_root_turn(root.clone()).await?;
+    let (worker, lease) = (WorkerId::from_string("w"), LeaseId::from_string("l"));
+    store
+        .try_acquire_task(&root.id, worker.clone(), lease.clone(), at(600), at(2))
+        .await?
+        .context("acquire the root")?;
+    let attempt = TurnAttemptStore::open_attempt(
+        &store,
+        OpenAttemptParams {
+            task_id: root.id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-5-5"),
+            request_blob: json!({}),
+            now: at(3),
+            otel_trace_id: None,
+            otel_span_id: None,
+        },
+    )
+    .await?;
+    let params = CompletedTurnCommit {
+        extra_writes: vec![Write::SettleTask {
+            task: root.id.clone(),
+            outcome: Settle::CompleteWithoutResult,
+        }],
+        delivered_injection_ids: Vec::new(),
+        checkpoint_kind: CheckpointKind::FullTurn,
+        thread_id: thread.clone(),
+        task_id: root.id.clone(),
+        expected_turn: 1,
+        turn_attempt_id: attempt.id.clone(),
+        close_attempt_params: empty_close(),
+        messages: vec![llm::Message::assistant("done")],
+        turn_usage: TokenUsage::default(),
+        agent_state_snapshot: json!({}),
+        events: vec![AgentEvent::text("m1", "done")],
+        outbox_max_attempts: 3,
+        owner_guard: Some(CommitOwnerGuard {
+            worker_id: worker,
+            lease_id: lease,
+        }),
+        now: at(4),
+    };
+
+    fail::cfg(SETTLED, "panic").map_err(|error| anyhow::anyhow!("{error}"))?;
+    let crashed = std::panic::AssertUnwindSafe(commit_completed_turn(params, &store));
+    let result = futures::FutureExt::catch_unwind(crashed).await;
+    fail::remove(SETTLED);
+    ensure!(
+        result.is_err(),
+        "the failpoint after the root's settle must fire"
+    );
+
+    drop(store);
+    let store = fresh_store(&temp).await?;
+    let root = AgentTaskStore::get(&store, &root.id)
+        .await?
+        .context("root")?;
+    ensure!(root.status == TaskStatus::Running, "{:?}", root.status);
+    let committed = ThreadStore::get(&store, &thread)
+        .await?
+        .map_or(0, |thread| thread.committed_turns);
+    ensure!(
+        committed == 0,
+        "the turn landed without its root: {committed}"
+    );
+    let attempt = TurnAttemptStore::get(&store, &attempt.id)
+        .await?
+        .context("attempt")?;
+    ensure!(
+        attempt.closed_at.is_none(),
+        "the attempt closed without the turn"
+    );
+    Ok(())
+}

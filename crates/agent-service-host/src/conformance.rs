@@ -56,7 +56,9 @@ mod tests {
     };
     use agent_server::journal::checkpoint::CheckpointKind;
     use agent_server::journal::checkpoint_store::CheckpointStore;
-    use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
+    use agent_server::journal::commit::{
+        CommitOwnerGuard, CompletedTurnCommit, commit_completed_turn,
+    };
     use agent_server::journal::committed_event::CommittedEvent;
     use agent_server::journal::effect::{
         EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite,
@@ -683,6 +685,121 @@ mod tests {
         }
     }
 
+    fn sample_open_attempt(task_id: &AgentTaskId, now: time::OffsetDateTime) -> OpenAttemptParams {
+        OpenAttemptParams {
+            task_id: task_id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("anthropic", "claude-sonnet-5-5"),
+            request_blob: serde_json::json!({"messages": []}),
+            now,
+            otel_trace_id: None,
+            otel_span_id: None,
+        }
+    }
+
+    /// Design I2: a completed turn settles its own task inside its
+    /// transaction. A settle without the owner guard, a settle of another
+    /// task, and any other extra write are refused before anything is
+    /// written; a guarded settle lands with the turn.
+    async fn test_completed_turn_settles_its_task(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+    ) -> Result<()> {
+        let tid = thread_id("conformance-commit-settle");
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let attempt = attempt_store
+            .open_attempt(sample_open_attempt(&root.id, t_plus(52)))
+            .await?;
+        let settle = |task: &AgentTaskId| Write::SettleTask {
+            task: task.clone(),
+            outcome: Settle::CompleteWithoutResult,
+        };
+        let commit =
+            |owner_guard: Option<CommitOwnerGuard>, extra_writes: Vec<Write>| CompletedTurnCommit {
+                extra_writes,
+                delivered_injection_ids: Vec::new(),
+                checkpoint_kind: CheckpointKind::FullTurn,
+                thread_id: tid.clone(),
+                task_id: root.id.clone(),
+                expected_turn: 1,
+                turn_attempt_id: attempt.id.clone(),
+                close_attempt_params: evidence_close_params(),
+                messages: vec![agent_sdk_foundation::llm::Message::assistant("done")],
+                turn_usage: TokenUsage::default(),
+                agent_state_snapshot: serde_json::json!({}),
+                events: vec![AgentEvent::text("m1", "done")],
+                outbox_max_attempts: 3,
+                owner_guard,
+                now: t_plus(55),
+            };
+        let guard = CommitOwnerGuard {
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+        };
+
+        for (refused, why) in [
+            (
+                commit(None, vec![settle(&root.id)]),
+                "a settle without the owner guard",
+            ),
+            (
+                commit(Some(guard.clone()), vec![settle(&AgentTaskId::new())]),
+                "a settle of another task",
+            ),
+            (
+                commit(
+                    Some(guard.clone()),
+                    vec![Write::AppendEvents {
+                        thread: tid.clone(),
+                        events: vec![AgentEvent::text("m2", "stray")],
+                    }],
+                ),
+                "another write",
+            ),
+        ] {
+            anyhow::ensure!(
+                commit_completed_turn(refused, task_store).await.is_err(),
+                "{why} must be refused"
+            );
+        }
+        let running = task_store.get(&root.id).await?.context("root")?.status;
+        assert_eq!(
+            running,
+            TaskStatus::Running,
+            "a refused commit settles nothing"
+        );
+        let open = TurnAttemptStore::get(attempt_store, &attempt.id)
+            .await?
+            .context("attempt")?;
+        assert!(
+            open.closed_at.is_none(),
+            "a refused commit closes no attempt"
+        );
+
+        let outcome =
+            commit_completed_turn(commit(Some(guard), vec![settle(&root.id)]), task_store).await?;
+        assert_eq!(outcome.thread.committed_turns, 1);
+        let (settled, parent) = outcome.settled.context("the settle's result")?;
+        assert_eq!(settled.status, TaskStatus::Completed);
+        assert_eq!(settled.result_payload, None);
+        assert!(parent.is_none(), "a root has no parent");
+        let stored = task_store.get(&root.id).await?.context("root")?;
+        assert_eq!(stored.status, TaskStatus::Completed);
+        Ok(())
+    }
+
     /// Completed-turn commit creates a checkpoint.
     async fn test_completed_turn_commit(
         task_store: &dyn AgentTaskStore,
@@ -717,6 +834,7 @@ mod tests {
         };
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: tid.clone(),
@@ -814,6 +932,7 @@ mod tests {
             })
             .await?;
         let params = CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id(tid),
@@ -1045,6 +1164,7 @@ mod tests {
             })
             .await?;
         let stale = CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id("conformance-stale-typed"),
@@ -5159,6 +5279,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_completed_turn_settles_its_task() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_completed_turn_settles_its_task(s.task.as_ref(), s.attempt.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_completed_turn() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_completed_turn_commit(s.task.as_ref(), s.attempt.as_ref(), s.checkpoint.as_ref()).await
@@ -5656,6 +5782,13 @@ mod tests {
     async fn conformance_sqlite_subagent_spawn_is_fenced_by_a_purge() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_subagent_spawn_is_fenced_by_a_purge(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_completed_turn_settles_its_task() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_completed_turn_settles_its_task(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6327,6 +6460,15 @@ mod tests {
             return Ok(());
         };
         test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_completed_turn_settles_its_task() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_completed_turn_settles_its_task(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

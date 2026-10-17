@@ -3019,13 +3019,12 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
     }
 
     /// Enforce [`CompletedTurnCommit::owner_guard`] on the task row
-    /// inside the completed-turn transaction (issue #354): the
-    /// slot-shift retry validates — under `SQLite`'s exclusive write
-    /// transaction — that the presenting worker still owns a live
-    /// `Running` row, so a cancellation / lease loss between the
-    /// caller's shift-eligibility check and the retry rejects here
-    /// instead of splicing a dead root's turn into the shifted slot.
-    /// A `None` guard (every first, non-shifted commit) is a no-op.
+    /// inside the completed-turn transaction (issue #354): the worker
+    /// passes it on every root completion, so — under `SQLite`'s exclusive
+    /// write transaction — a cancellation or lease loss since the worker
+    /// last checked rejects the whole turn here, with its settle, instead
+    /// of committing a turn under a task the worker no longer owns. A
+    /// `None` guard (callers that complete no task) is a no-op.
     async fn enforce_commit_owner_guard_tx(
         tx: &mut Transaction<'_, Sqlite>,
         task_id: &AgentTaskId,
@@ -3078,6 +3077,8 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         &self,
         params: CompletedTurnCommit,
     ) -> Result<CommitOutcome> {
+        params.validate_extra_writes()?;
+        let extra = params.extra_transition();
         let mut tx = self.begin().await?;
 
         Self::bootstrap_thread_row_tx(&mut tx, &params.thread_id, params.now).await?;
@@ -3187,6 +3188,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         agent_server::fail_point!("commit.before_event_commit");
 
         Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
+        let settled = Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
 
         tx.commit()
             .await
@@ -3197,6 +3199,7 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
             thread,
             checkpoint,
             committed_events,
+            settled,
         })
     }
 }
@@ -3525,6 +3528,23 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
+    /// Apply a completed turn's extra writes inside its transaction,
+    /// through the same write arms as a transition, and return its settle.
+    async fn settle_completed_turn_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        extra: &agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
+        let mut committed = agent_server::journal::Committed::default();
+        for write in extra.writes.iter().cloned() {
+            Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
+        }
+        if !committed.settled.is_empty() {
+            agent_server::fail_point!("commit.completed_turn.settled");
+        }
+        Ok(committed.settled.pop())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Sqlite>,
@@ -3669,6 +3689,18 @@ impl SqliteDurableStore {
                     now,
                     "commit",
                     move |child| child.fail(error, now),
+                )
+                .await
+            }
+            Settle::CompleteWithoutResult => {
+                Self::apply_task_terminal_transition_tx(
+                    tx,
+                    task,
+                    &worker,
+                    &lease,
+                    now,
+                    "commit",
+                    move |child| child.complete(now),
                 )
                 .await
             }
@@ -8420,6 +8452,7 @@ INSERT INTO agent_sdk_execution_intents (
         let commit = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread_id.clone(),
@@ -8550,6 +8583,7 @@ INSERT INTO agent_sdk_execution_intents (
         let outcome = AgentTaskStore::commit_completed_turn(
             &store,
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 delivered_injection_ids: Vec::new(),
                 thread_id: thread_id.clone(),

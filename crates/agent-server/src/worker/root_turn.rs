@@ -83,6 +83,7 @@ use crate::journal::task::{
 use crate::journal::task_state::TaskState;
 use crate::journal::task_wakeup::WakeupSignal;
 use crate::journal::thread_store::ThreadStore;
+use crate::journal::transition::{Settle, Write};
 use crate::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, ThinkingModeEvidence, TurnAttempt, TurnAttemptOutcome,
     TurnAttemptSchemaError,
@@ -1344,6 +1345,7 @@ pub(crate) async fn commit_partial_turn_on_cancel(
 
     let commit_result = commit_completed_turn(
         CompletedTurnCommit {
+            extra_writes: Vec::new(),
             checkpoint_kind: CheckpointKind::CancelSalvage,
             delivered_injection_ids: Vec::new(),
             thread_id: thread_id.clone(),
@@ -2283,7 +2285,16 @@ async fn commit_text_only_turn(
             delivered_injection_ids: close_ctx.delivered_injections.clone(),
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-            owner_guard: None,
+            // The root's terminal row commits with the turn (design I2):
+            // the settle needs the lease, which the guard checks first.
+            owner_guard: Some(CommitOwnerGuard {
+                worker_id: inputs.bootstrap.worker_id.clone(),
+                lease_id: inputs.bootstrap.lease_id.clone(),
+            }),
+            extra_writes: vec![Write::SettleTask {
+                task: task_id.clone(),
+                outcome: Settle::CompleteWithoutResult,
+            }],
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -2303,16 +2314,10 @@ async fn commit_text_only_turn(
     committed_events.extend(close_ctx.boundary_committed);
     committed_events.extend(commit.committed_events.iter().cloned());
 
-    let (completed_task, resumed_invocation) = deps
-        .task_store
-        .complete_task(
-            task_id,
-            &inputs.bootstrap.worker_id,
-            &inputs.bootstrap.lease_id,
-            now,
-        )
-        .await
-        .context("complete root task")?;
+    let (completed_task, resumed_invocation) = commit
+        .settled
+        .clone()
+        .context("the completed turn settles its root task")?;
 
     // When this root turn is a subagent's child root, its terminal
     // transition resumes the linked subagent invocation task
@@ -8046,7 +8051,16 @@ async fn commit_resumed_turn(
             delivered_injection_ids: close.delivered_injections.to_vec(),
             events: lifecycle_events,
             outbox_max_attempts: DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS,
-            owner_guard: None,
+            // The root's terminal row commits with the turn (design I2):
+            // the settle needs the lease, which the guard checks first.
+            owner_guard: Some(CommitOwnerGuard {
+                worker_id: inputs.bootstrap.worker_id.clone(),
+                lease_id: inputs.bootstrap.lease_id.clone(),
+            }),
+            extra_writes: vec![Write::SettleTask {
+                task: task_id.clone(),
+                outcome: Settle::CompleteWithoutResult,
+            }],
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -8059,16 +8073,10 @@ async fn commit_resumed_turn(
     let committed_events = commit.committed_events.clone();
 
     // Advance the root task to Completed.
-    let (completed_task, resumed_invocation) = deps
-        .task_store
-        .complete_task(
-            task_id,
-            &inputs.bootstrap.worker_id,
-            &inputs.bootstrap.lease_id,
-            now,
-        )
-        .await
-        .context("complete resumed root task")?;
+    let (completed_task, resumed_invocation) = commit
+        .settled
+        .clone()
+        .context("the completed turn settles its root task")?;
 
     // When this root turn is a subagent's child root, its terminal
     // transition resumes the linked subagent invocation task

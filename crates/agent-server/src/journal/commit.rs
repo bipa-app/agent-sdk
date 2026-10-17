@@ -57,8 +57,9 @@ use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointKind;
 use super::committed_event::CommittedEvent;
 use super::store::AgentTaskStore;
-use super::task::{AgentTaskId, LeaseId, WorkerId};
+use super::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
 use super::thread::Thread;
+use super::transition::{Guard, Transition, Write};
 use super::turn_attempt::{CloseAttemptParams, TurnAttempt, TurnAttemptId};
 
 // ─────────────────────────────────────────────────────────────────────
@@ -120,8 +121,8 @@ pub struct CompletedTurnCommit {
     /// Maximum relay attempts for the coalesced advisory outbox row
     /// written alongside `events`. Ignored when `events` is empty.
     pub outbox_max_attempts: u32,
-    /// Optional task-row ownership validation performed **inside** the
-    /// commit transaction.
+    /// Task-row ownership validation performed **inside** the commit
+    /// transaction.
     ///
     /// When set, the store re-reads the task row (`FOR UPDATE` on
     /// Postgres; under `SQLite`'s exclusive write transaction; under the
@@ -130,12 +131,79 @@ pub struct CompletedTurnCommit {
     /// unless the row is still `Running` and owned by exactly this
     /// `(worker, lease)` pair — closing the window where a
     /// cancellation or lease loss lands between a caller-side
-    /// ownership check and the commit. Used only by the worker's
-    /// turn-slot-shift retry; the first (non-shifted) commit attempt
-    /// passes `None` so the normal path is unchanged.
+    /// ownership check and the commit. The worker passes it on every root
+    /// completion, the first commit and each turn-slot-shift retry alike,
+    /// because the root's settle among [`Self::extra_writes`] needs it.
     pub owner_guard: Option<CommitOwnerGuard>,
+    /// Further writes applied inside the completed turn's transaction,
+    /// after its own rows and events. Only the task's own
+    /// [`Write::SettleTask`] for now (see [`Self::validate_extra_writes`]),
+    /// which needs [`Self::owner_guard`]: the turn and the task's terminal
+    /// row then commit together (design I2).
+    pub extra_writes: Vec<Write>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
+}
+
+impl CompletedTurnCommit {
+    /// Check the extra writes every backend applies inside the turn's
+    /// transaction: at most one, the task's own [`Write::SettleTask`], and
+    /// only with an [`Self::owner_guard`] for its lease.
+    ///
+    /// # Errors
+    /// Names the first write a completed turn may not carry.
+    pub fn validate_extra_writes(&self) -> Result<()> {
+        let mut settles = 0;
+        for write in &self.extra_writes {
+            match write {
+                Write::SettleTask { task, .. } if *task == self.task_id => {
+                    anyhow::ensure!(
+                        self.owner_guard.is_some(),
+                        "a completed turn settles its task {task} only under an owner guard"
+                    );
+                    settles += 1;
+                }
+                Write::SettleTask { .. }
+                | Write::RejectConfirmation { .. }
+                | Write::PauseOnConfirmation { .. }
+                | Write::ReparkAfterSteering { .. }
+                | Write::Effect(_)
+                | Write::AppendCompaction { .. }
+                | Write::AppendEvents { .. }
+                | Write::SpawnChildren { .. }
+                | Write::Document(_) => {
+                    anyhow::bail!(
+                        "a completed turn may carry only its own task's settle among its extra \
+                         writes, not {write:?}"
+                    );
+                }
+            }
+        }
+        anyhow::ensure!(
+            settles <= 1,
+            "a completed turn settles its task at most once"
+        );
+        Ok(())
+    }
+
+    /// The extra writes as a transition for the backends' shared write
+    /// arms, guarded by the owner's lease when the turn has an owner
+    /// guard (which the commit itself checks first).
+    #[must_use]
+    pub fn extra_transition(&self) -> Transition {
+        Transition {
+            guards: self
+                .owner_guard
+                .iter()
+                .map(|owner| Guard::TaskIs {
+                    task: self.task_id.clone(),
+                    status: TaskStatus::Running,
+                    lease: Some((owner.worker_id.clone(), owner.lease_id.clone())),
+                })
+                .collect(),
+            writes: self.extra_writes.clone(),
+        }
+    }
 }
 
 /// The `(worker, lease)` pair a guarded commit must still own — see
@@ -232,6 +300,10 @@ pub struct CommitOutcome {
     pub closed_attempt: TurnAttempt,
     /// Lifecycle events committed as part of this turn.
     pub committed_events: Vec<CommittedEvent>,
+    /// The task and its parent (or the subagent invocation it resumed)
+    /// after a [`Write::SettleTask`] among the extra writes, as
+    /// [`super::Committed::settled`] reports it.
+    pub settled: Option<(AgentTask, Option<AgentTask>)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -252,16 +324,45 @@ pub async fn commit_completed_turn(
 ) -> Result<CommitOutcome> {
     #[cfg(feature = "otel")]
     let started_at = std::time::Instant::now();
+    let task_id = params.task_id.clone();
 
-    let outcome = task_store.commit_completed_turn(params).await?;
+    let result = task_store.commit_completed_turn(params).await;
 
+    let outcome = commit_outcome_label(&result);
     #[cfg(feature = "otel")]
-    crate::observability::ServerMetrics::global().record_journal_commit(
-        crate::observability::attrs::COMMIT_KIND_ATOMIC,
-        started_at.elapsed().as_secs_f64(),
-    );
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        metrics.record_completed_turn_commit(outcome);
+        if result.is_ok() {
+            metrics.record_journal_commit(
+                crate::observability::attrs::COMMIT_KIND_ATOMIC,
+                started_at.elapsed().as_secs_f64(),
+            );
+        }
+    }
+    if let Err(error) = &result
+        && outcome != "error"
+    {
+        log::warn!(
+            task_id = task_id.as_str(),
+            outcome = outcome;
+            "completed turn refused; the finished turn is discarded: {error:#}"
+        );
+    }
+    result
+}
 
-    Ok(outcome)
+/// The bounded outcome of a completed-turn commit: `ok`, `lost_ownership`
+/// (the worker no longer owns the task), `stale_turn` (another commit took
+/// the turn slot) or `error`.
+#[must_use]
+pub fn commit_outcome_label(result: &Result<CommitOutcome>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(error) if error.downcast_ref::<LostCommitOwnership>().is_some() => "lost_ownership",
+        Err(error) if error.downcast_ref::<StaleTurnCommit>().is_some() => "stale_turn",
+        Err(_) => "error",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -396,6 +497,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -457,6 +559,7 @@ mod tests {
         // Turn 1
         let o1 = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -480,6 +583,7 @@ mod tests {
         // Turn 2
         let o2 = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -541,6 +645,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -576,6 +681,7 @@ mod tests {
         let new_message = llm::Message::user("turn 2");
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -643,6 +749,7 @@ mod tests {
         // Turn 1 commits cleanly; the thread now sits at committed_turns = 1.
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -667,6 +774,7 @@ mod tests {
         // The guard rejects it before any projection advances.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -699,6 +807,7 @@ mod tests {
         // The correct expected_turn for the next turn succeeds.
         let ok = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -737,6 +846,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -759,6 +869,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_b(),
@@ -801,6 +912,7 @@ mod tests {
         let s = Stores::new();
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -854,6 +966,7 @@ mod tests {
         // Attempt to commit with the already-closed attempt.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -901,6 +1014,7 @@ mod tests {
         let commit_for = |task_id: AgentTaskId,
                           attempt_id: crate::journal::turn_attempt::TurnAttemptId,
                           expected_turn: u32| CompletedTurnCommit {
+            extra_writes: Vec::new(),
             delivered_injection_ids: Vec::new(),
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_a(),
@@ -988,6 +1102,7 @@ mod tests {
         // Commit first turn then mark thread completed.
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1016,6 +1131,7 @@ mod tests {
         // Second commit should fail at thread aggregate step.
         let err = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1081,6 +1197,7 @@ mod tests {
 
         commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1127,6 +1244,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
@@ -1186,6 +1304,7 @@ mod tests {
 
         let outcome = commit_completed_turn(
             CompletedTurnCommit {
+                extra_writes: Vec::new(),
                 delivered_injection_ids: Vec::new(),
                 checkpoint_kind: CheckpointKind::FullTurn,
                 thread_id: thread_a(),
