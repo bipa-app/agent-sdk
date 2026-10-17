@@ -12767,4 +12767,50 @@ mod tests {
         assert_eq!(closes_on(&shared, session, "relayed-task").await?, 1);
         Ok(())
     }
+
+    /// A start-up re-drive counts as `step=redrive`, never as a live
+    /// `handle`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_redriven_prompt_counts_as_redrive() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        agent_server::observability::ServerMetrics::reset_for_testing();
+        let handler = Arc::new(CountingPromptHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (control, shared) =
+            prompt_service(Arc::clone(&handler) as crate::prompts::SharedPromptHandler)?;
+        let thread_owned = uuid::Uuid::new_v4().to_string();
+        let thread = thread_owned.as_str();
+        create_prompt_thread(&control, "create-redrive-signal", thread).await?;
+        let mut answered = gate_prompt(thread, "gate-signal", false);
+        answered.state = agent_server::journal::PromptState::Answered {
+            answer: agent_server::journal::PromptAnswer {
+                decision: agent_server::journal::PromptDecision::Approved,
+                request_id: "before-restart".into(),
+                automatic: false,
+                answered_at: OffsetDateTime::now_utc(),
+            },
+        };
+        open_gate(&shared, &answered, false).await?;
+        shared.recover_prompts().await;
+        wait_until_retired(&shared, thread, "gate-signal").await?;
+
+        // Lower bounds: under plain `cargo test` other tests record into the
+        // same global meter (nextest runs one per process).
+        let redrive = meter.counter(
+            "agent_server.prompts",
+            &[
+                ("owner", "host"),
+                ("step", "redrive"),
+                ("outcome", "closed"),
+            ],
+        );
+        drop(meter);
+        ensure!(
+            redrive >= 1,
+            "the re-drive is counted as redrive: {redrive}"
+        );
+        Ok(())
+    }
 }

@@ -17,7 +17,7 @@ use super::{
     DecideConfirmationResult, GrpcControlService, GrpcShared, RpcResult,
     decide_confirmation_fingerprint, decode_idempotency_result, idempotency_conflict_status,
     internal_status, map_confirmation_decision, map_json_value, map_pending_question,
-    map_timestamp, pb,
+    map_timestamp, observe_idempotency_claim, pb,
 };
 use crate::confirmation_guard::PromptDecisionRequest;
 use crate::prompts::{
@@ -188,6 +188,7 @@ impl GrpcShared {
             return false;
         };
         let store = std::sync::Arc::clone(&self.stores.task_store);
+        let documents = std::sync::Arc::clone(&self.stores.document_store);
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             let _slot = slot;
@@ -204,11 +205,22 @@ impl GrpcShared {
             .await
             {
                 Ok(true) => {}
-                Ok(false) => warn!(
-                    prompt.id = %prompt.record.id,
-                    "answered prompt stays unclosed (the handler waits, or its close was \
-                     refused); the next start hands it over again"
-                ),
+                Ok(false) => {
+                    let current = get_prompt(
+                        documents.as_ref(),
+                        &prompt.record.surface_thread,
+                        &prompt.record.id,
+                    )
+                    .await;
+                    if matches!(&current, Ok(Some(row)) if matches!(row.record.state, PromptState::Answered { .. }))
+                    {
+                        warn!(
+                            prompt.id = %prompt.record.id,
+                            "answered prompt stays unclosed (the handler waits, or its close \
+                             was refused); the next start hands it over again"
+                        );
+                    }
+                }
                 Err(error) => warn!(
                     prompt.id = %prompt.record.id,
                     error = %format!("{error:#}"),
@@ -339,15 +351,16 @@ impl GrpcControlService {
 
         let fingerprint = decide_confirmation_fingerprint(&request);
         let store = self.shared.stores.task_store.as_ref();
-        match store
+        let claim = store
             .claim_idempotency(
                 &request.request_id,
                 IdempotencyKind::DecideConfirmation,
                 &fingerprint,
             )
             .await
-            .map_err(internal_status("decide-prompt idempotency lookup"))?
-        {
+            .map_err(internal_status("decide-prompt idempotency lookup"))?;
+        observe_idempotency_claim(IdempotencyKind::DecideConfirmation, &claim);
+        match claim {
             IdempotencyClaim::Conflict => {
                 return Err(
                     idempotency_conflict_status("DecideConfirmation", &request.request_id).into(),

@@ -460,7 +460,7 @@ async fn close_stale_task_prompts(
 ///
 /// # Errors
 /// A store failed.
-pub async fn close_task_prompts(
+pub(crate) async fn close_task_prompts(
     tasks: &dyn AgentTaskStore,
     documents: &dyn DocumentStore,
     task: &AgentTaskId,

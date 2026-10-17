@@ -51,6 +51,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Durable prompt rows (primitive 6)
 
+- Follow-up: `DecideConfirmation{prompt_id}` counts its idempotency claim on
+  `agent_service_host.idempotency.claims`; a test pins `step=redrive`; the
+  "stays unclosed" warning is logged only while the row is still answered;
+  `prompt_kind`, `prompt_key`, `thread_prompts` and `close_task_prompts`
+  are crate-private.
+
 - A human prompt that no task parks on is a **prompt row**: a document of the
   SDK-owned kind `agent.prompt`, scoped to the thread whose clients see it and
   keyed by the id they answer with (`agent_server::journal::prompt`). It is
