@@ -770,6 +770,64 @@ const fn live_descendant_in(status: TaskStatus) -> Option<LiveDescendant> {
     }
 }
 
+/// A malformed spawn is refused for its shape before the store reads its
+/// parent: under a parent that does not exist, the shape's error wins.
+pub(super) async fn test_a_malformed_spawn_is_refused_before_its_parent_is_read(
+    task_store: &dyn AgentTaskStore,
+) -> Result<()> {
+    use agent_server::journal::store::SubagentBatchSpawn;
+
+    let missing = AgentTaskId::new();
+    let (worker, lease) = (WorkerId::new(), LeaseId::new());
+    let refusal = |result: Result<()>| -> Result<String> {
+        Ok(format!(
+            "{:#}",
+            result.err().context("a malformed spawn must be refused")?
+        ))
+    };
+    let empty = refusal(
+        task_store
+            .spawn_subagent_batch(
+                &missing,
+                &worker,
+                &lease,
+                SubagentBatchSpawn {
+                    delivered_injection_ids: Vec::new(),
+                    spawns: Vec::new(),
+                    payload: suspension_payload("malformed-spawn"),
+                    events: Vec::new(),
+                },
+                t_plus(1),
+            )
+            .await
+            .map(|_| ()),
+    )?;
+    anyhow::ensure!(
+        empty.contains("spawns must be non-empty"),
+        "an empty batch is refused for its shape first: {empty}"
+    );
+    let no_specs = refusal(
+        task_store
+            .spawn_tool_children(
+                &missing,
+                &worker,
+                &lease,
+                Vec::new(),
+                suspension_payload("malformed-spawn"),
+                None,
+                Vec::new(),
+                t_plus(1),
+            )
+            .await
+            .map(|_| ()),
+    )?;
+    anyhow::ensure!(
+        no_specs.contains("specs must be non-empty"),
+        "a tool spawn with no specs is refused for its shape first: {no_specs}"
+    );
+    Ok(())
+}
+
 /// A one-subagent spawn under `parent` onto `child_thread`.
 fn subagent_spawn(
     parent: AgentTaskId,
@@ -1604,6 +1662,13 @@ mod in_memory {
     use super::super::fresh_in_memory_stores;
 
     #[tokio::test]
+    async fn settlement_in_memory_a_malformed_spawn_is_refused_before_its_parent_is_read()
+    -> Result<()> {
+        let s = fresh_in_memory_stores();
+        super::test_a_malformed_spawn_is_refused_before_its_parent_is_read(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn settlement_in_memory_nested_spawn_racing_a_cancel_leaves_nothing_live() -> Result<()> {
         let s = fresh_in_memory_stores();
         for round in 0..8 {
@@ -1734,6 +1799,13 @@ mod sqlite {
 
     async fn store() -> Result<SqliteDurableStore> {
         SqliteDurableStore::connect("sqlite::memory:").await
+    }
+
+    #[tokio::test]
+    async fn settlement_sqlite_a_malformed_spawn_is_refused_before_its_parent_is_read() -> Result<()>
+    {
+        let store = store().await?;
+        super::test_a_malformed_spawn_is_refused_before_its_parent_is_read(&store).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2189,6 +2261,15 @@ SELECT count(*) AS "blocked!" FROM blocked
     /// neither may deadlock (no transition is retried for a lock conflict,
     /// and the cancel, which is not retried, commits), and nothing stays
     /// live.
+    #[tokio::test]
+    async fn settlement_postgres_a_malformed_spawn_is_refused_before_its_parent_is_read()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        super::test_a_malformed_spawn_is_refused_before_its_parent_is_read(&store).await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn settlement_postgres_nested_spawn_racing_a_cancel_never_deadlocks() -> Result<()> {
         let Some((store, _guard)) = pg_test_store().await? else {

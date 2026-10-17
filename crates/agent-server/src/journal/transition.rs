@@ -189,6 +189,65 @@ impl ChildSpawn {
         }
     }
 
+    /// Refuse a malformed spawn before any backend opens a transaction, so
+    /// bad input loses to no purge fence, lease check or row lock: an empty
+    /// batch, an event count that does not match the subagents, tool
+    /// specs the pure tool spawn cannot persist, and a mixed batch that
+    /// does not cover its pending calls or whose precompleted children lack
+    /// their boundary events. A re-attached child that is missing or not
+    /// the parent's is refused later, under its row lock.
+    ///
+    /// # Errors
+    /// The same `spawn rejected: …` error the spawn method returned for
+    /// that input before it became a wrapper.
+    pub fn validate_shape(&self) -> anyhow::Result<()> {
+        use super::store::{
+            validate_mixed_children_spawn, validate_precompleted_boundary_events,
+            validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
+        };
+
+        match self {
+            Self::Tools(tools) => {
+                validate_tool_child_specs_for_pure_spawn(&tools.specs)?;
+                super::sibling_order::pure_spawn_waits(&tools.specs)?;
+            }
+            Self::Subagent(_) | Self::SubagentRows { .. } => {}
+            Self::SubagentBatch(batch) => {
+                anyhow::ensure!(
+                    !batch.spawns.is_empty(),
+                    "spawn rejected: spawns must be non-empty"
+                );
+                anyhow::ensure!(
+                    batch.events.len() == batch.spawns.len(),
+                    "spawn rejected: {} events for {} spawns",
+                    batch.events.len(),
+                    batch.spawns.len()
+                );
+            }
+            Self::Mixed { spawn, events } => {
+                validate_mixed_children_spawn(spawn)?;
+                validate_precompleted_boundary_events(spawn)?;
+                validate_subagent_event_count(events.len(), spawn.subagents.len())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The boundary-injection rows the spawn completes.
+    #[must_use]
+    pub fn delivered_injection_ids(&self) -> &[AgentTaskId] {
+        match self {
+            Self::Tools(tools) => &tools.delivered_injection_ids,
+            Self::Subagent(subagent) => &subagent.delivered_injection_ids,
+            Self::SubagentRows {
+                delivered_injection_ids,
+                ..
+            } => delivered_injection_ids,
+            Self::SubagentBatch(batch) => &batch.delivered_injection_ids,
+            Self::Mixed { spawn, .. } => &spawn.delivered_injection_ids,
+        }
+    }
+
     /// The existing children the spawn re-attaches to its parent.
     #[must_use]
     pub fn reattached(&self) -> Vec<&AgentTaskId> {
@@ -634,7 +693,7 @@ impl Transition {
                         )));
                     }
                 }
-                Write::SpawnChildren { parent, .. } => {
+                Write::SpawnChildren { parent, spawn } => {
                     if self.lease_for(parent).is_none()
                         || !self.guards_status(parent, TaskStatus::Running)
                     {
@@ -643,6 +702,7 @@ impl Transition {
                              it is running under its lease"
                         )));
                     }
+                    spawn.validate_shape()?;
                 }
                 Write::RecordIntent(_)
                 | Write::AppendEvents { .. }
@@ -698,6 +758,13 @@ impl Write {
                         }),
                 );
                 locks.extend(spawn.reattached().into_iter().cloned().map(Lock::Task));
+                locks.extend(
+                    spawn
+                        .delivered_injection_ids()
+                        .iter()
+                        .cloned()
+                        .map(Lock::Task),
+                );
                 locks.push(Lock::Task(parent.clone()));
                 locks
             }

@@ -69,8 +69,6 @@ use agent_server::journal::store::{
     cancel_reason, has_precompleted_tool_child, is_owned_by, live_mixed_child_count,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, publish_transactional_mixed_parent,
     release_undelivered_input, settles_undelivered_input, submitted_task_disposition,
-    validate_mixed_children_spawn, validate_precompleted_boundary_events,
-    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     SubagentSpawnEvent, started_event_from_invocation, subagent_started_event,
@@ -4340,16 +4338,6 @@ impl PostgresDurableStore {
                 Self::spawn_subagent_tx(tx, old_parent, subagent, now).await
             }
             ChildSpawn::SubagentBatch(batch) => {
-                ensure!(
-                    !batch.spawns.is_empty(),
-                    "spawn rejected: spawns must be non-empty"
-                );
-                ensure!(
-                    batch.events.len() == batch.spawns.len(),
-                    "spawn rejected: {} events for {} spawns",
-                    batch.events.len(),
-                    batch.spawns.len()
-                );
                 Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
             }
             ChildSpawn::Mixed { spawn, events } => {
@@ -4369,7 +4357,6 @@ impl PostgresDurableStore {
         }: ToolChildrenSpawn,
         now: OffsetDateTime,
     ) -> Result<SpawnedChildren> {
-        validate_tool_child_specs_for_pure_spawn(&specs)?;
         let waits = pure_spawn_waits(&specs)?;
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -4536,8 +4523,6 @@ impl PostgresDurableStore {
         events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<SpawnedChildren> {
-        validate_mixed_children_spawn(&spawn)?;
-        validate_precompleted_boundary_events(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
@@ -4548,7 +4533,6 @@ impl PostgresDurableStore {
             payload,
             child_otel_traceparent,
         } = spawn;
-        validate_subagent_event_count(events.len(), subagents.len())?;
         let has_precompleted = has_precompleted_tool_child(&tool_children);
 
         let prepared = prepare_subagent_batch_rows_tx(tx, &old_parent, subagents, now).await?;

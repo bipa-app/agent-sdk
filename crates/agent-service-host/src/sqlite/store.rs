@@ -68,8 +68,6 @@ use agent_server::journal::store::{
     cancel_reason, has_precompleted_tool_child, is_owned_by, live_mixed_child_count,
     mixed_child_ids_in_slot_order, new_mixed_tool_child, publish_transactional_mixed_parent,
     release_undelivered_input, settles_undelivered_input, submitted_task_disposition,
-    validate_mixed_children_spawn, validate_precompleted_boundary_events,
-    validate_subagent_event_count, validate_tool_child_specs_for_pure_spawn,
 };
 use agent_server::journal::subagent_spawn_transaction::{
     SubagentSpawnEvent, started_event_from_invocation, subagent_started_event,
@@ -90,7 +88,7 @@ use agent_server::journal::thread_store::{
 };
 use agent_server::journal::tool_audit::{ToolAuditEvent, ToolAuditEventId, ToolAuditEventStore};
 use agent_server::journal::transition::{
-    ChildSpawn, SpawnedChildren, SubagentSpawn, ToolChildrenSpawn,
+    ChildSpawn, Lock, SpawnedChildren, SubagentSpawn, ThreadTier, ToolChildrenSpawn,
 };
 use agent_server::journal::turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
@@ -3309,11 +3307,12 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut tx = self.begin().await?;
-        Self::check_declared_threads_tx(&mut tx, &transition, now).await?;
+        Self::check_declared_threads_tx(&mut tx, &transition, ThreadTier::Own, now).await?;
         for (index, guard) in transition.guards.iter().enumerate() {
             let stored = Self::load_task_tx(&mut tx, guard.task()).await?;
             guard.check(index, stored.as_ref())?;
         }
+        Self::check_declared_threads_tx(&mut tx, &transition, ThreadTier::Spawned, now).await?;
         let mut committed = agent_server::journal::Committed::default();
         for write in transition.writes.iter().cloned() {
             Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed).await?;
@@ -3478,24 +3477,28 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
-    /// The purge fence of every thread the transition declares with an
-    /// operation, creating the rows it declares with `create`, before any
-    /// guard is read.
+    /// The purge fence of every thread at `tier` the transition declares
+    /// with an operation, creating the rows it declares with `create`.
+    /// `commit` checks its own threads before the guards and the spawned
+    /// subagents' threads after them, the order the spawn methods used: the
+    /// parent's thread, the parent's lease, then each child thread.
     async fn check_declared_threads_tx(
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
+        tier: ThreadTier,
         now: OffsetDateTime,
     ) -> Result<()> {
-        use agent_server::journal::Lock;
-
         for lock in transition.locks() {
             match lock {
                 Lock::Thread {
                     thread,
                     operation,
                     create,
-                    tier: _,
+                    tier: declared,
                 } => {
+                    if declared != tier {
+                        continue;
+                    }
                     if create {
                         Self::bootstrap_thread_row_tx(tx, &thread, now).await?;
                     }
@@ -3507,6 +3510,9 @@ impl SqliteDurableStore {
                     task,
                     operation: Some(operation),
                 } => {
+                    if tier != ThreadTier::Own {
+                        continue;
+                    }
                     if let Some(task) = Self::load_task_tx(tx, &task).await? {
                         Self::require_active_thread_tx(tx, &task.thread_id, operation).await?;
                     }
@@ -3558,16 +3564,6 @@ impl SqliteDurableStore {
                 Self::spawn_subagent_tx(tx, old_parent, subagent, now).await
             }
             ChildSpawn::SubagentBatch(batch) => {
-                ensure!(
-                    !batch.spawns.is_empty(),
-                    "spawn rejected: spawns must be non-empty"
-                );
-                ensure!(
-                    batch.events.len() == batch.spawns.len(),
-                    "spawn rejected: {} events for {} spawns",
-                    batch.events.len(),
-                    batch.spawns.len()
-                );
                 Self::spawn_subagent_batch_tx(tx, old_parent, batch, now).await
             }
             ChildSpawn::Mixed { spawn, events } => {
@@ -3587,7 +3583,6 @@ impl SqliteDurableStore {
         }: ToolChildrenSpawn,
         now: OffsetDateTime,
     ) -> Result<SpawnedChildren> {
-        validate_tool_child_specs_for_pure_spawn(&specs)?;
         let waits = pure_spawn_waits(&specs)?;
         let mut children = Vec::with_capacity(specs.len());
         for (idx, spec) in specs.into_iter().enumerate() {
@@ -3774,8 +3769,6 @@ impl SqliteDurableStore {
         events: Vec<SubagentSpawnEvent>,
         now: OffsetDateTime,
     ) -> Result<SpawnedChildren> {
-        validate_mixed_children_spawn(&spawn)?;
-        validate_precompleted_boundary_events(&spawn)?;
         let MixedChildrenSpawn {
             delivered_injection_ids,
             boundary_events,
@@ -3786,7 +3779,6 @@ impl SqliteDurableStore {
             payload,
             child_otel_traceparent,
         } = spawn;
-        validate_subagent_event_count(events.len(), subagents.len())?;
         let has_precompleted = has_precompleted_tool_child(&tool_children);
         let parent_id = old_parent.id.clone();
 

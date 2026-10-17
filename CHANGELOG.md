@@ -109,8 +109,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     threads in tree order (the transition's own threads, then the threads
     of the subagents it spawns, each by key), the order `cancel_tree`
     takes them in, then the declared tasks children first, so a spawn's
-    re-attached children lock before its parent. A spawn's purge fence is
-    checked in that lock phase.
+    re-attached children and delivered injections lock with the parent in
+    one order. A spawn's purge fence is checked in that lock phase.
+  - A malformed spawn (an empty batch, an event count that does not match
+    its subagents, tool specs the pure tool spawn refuses, a mixed batch
+    that does not cover its pending calls) is refused by
+    `Transition::validate`, before any fence, lease check or row lock. A
+    re-attached child that is missing or not the parent's is refused under
+    its row lock, after the parent's lease check. On SQLite a single
+    subagent spawn checks the parent's purge fence and lease before the
+    child thread's fence (it checked the child's first); on Postgres a
+    spawn whose parent's thread has no row fails with `ThreadNotFound`.
+  - Postgres spawns run inside `commit`'s retry loop: a spawn Postgres
+    aborts for a deadlock or a serialization failure is retried up to
+    three times, like every other transition.
+  - The in-memory `spawn_subagent_batch` commits its start events while it
+    holds the task store's write lock, so no reader sees the children
+    before their events.
 - **Breaking: a completed turn commits through a required store method,
   and the last committer traits are gone.** `AgentTaskStore::commit_completed_turn`
   has no default, and `journal::commit::commit_completed_turn(params, task_store)`

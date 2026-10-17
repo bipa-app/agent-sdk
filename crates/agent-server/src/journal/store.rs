@@ -5225,6 +5225,7 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
+        self.require_spawn_event_sink(&transition)?;
         transition.validate()?;
         let (sink, intent_store, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
@@ -5443,6 +5444,24 @@ impl InMemoryAgentTaskStore {
         ))
     }
 
+    /// Refuse a mixed spawn that carries boundary or trailing events when
+    /// the store has no event sink to commit them through, before its
+    /// shape is checked.
+    fn require_spawn_event_sink(&self, transition: &super::transition::Transition) -> Result<()> {
+        for write in &transition.writes {
+            if let super::transition::Write::SpawnChildren { spawn, .. } = write
+                && let super::transition::ChildSpawn::Mixed { spawn, .. } = &**spawn
+            {
+                ensure!(
+                    self.marker_sink.is_some()
+                        || (spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty()),
+                    "spawn rejected: boundary events require an in-memory event sink"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::check_spawn_unlocked`] for every spawn of `transition`.
     async fn check_spawns_unlocked(
         &self,
@@ -5456,20 +5475,20 @@ impl InMemoryAgentTaskStore {
         Ok(())
     }
 
-    /// The checks a spawn makes before it takes the write lock: its shape,
-    /// and the purge fence on the parent's thread and each child thread.
+    /// The checks a spawn makes before it takes the write lock, after
+    /// [`super::transition::ChildSpawn::validate_shape`]: the handles it
+    /// needs, and the purge fence on the parent's thread and each child
+    /// thread.
     async fn check_spawn_unlocked(
         &self,
         parent_id: &AgentTaskId,
         spawn: &super::transition::ChildSpawn,
     ) -> Result<()> {
         use super::thread::ThreadOperation;
-        use super::transition::{ChildSpawn, SubagentSpawn, ToolChildrenSpawn};
+        use super::transition::{ChildSpawn, SubagentSpawn};
 
         match spawn {
-            ChildSpawn::Tools(ToolChildrenSpawn { specs, .. }) => {
-                validate_tool_child_specs_for_pure_spawn(specs)?;
-                super::sibling_order::pure_spawn_waits(specs)?;
+            ChildSpawn::Tools(_) => {
                 self.guard_task_thread(parent_id, ThreadOperation::Spawn)
                     .await
             }
@@ -5494,29 +5513,10 @@ impl InMemoryAgentTaskStore {
                     .await
             }
             ChildSpawn::SubagentBatch(batch) => {
-                ensure!(
-                    !batch.spawns.is_empty(),
-                    "spawn rejected: spawns must be non-empty"
-                );
                 self.guard_mixed_spawn_threads(parent_id, &batch.spawns)
-                    .await?;
-                ensure!(
-                    batch.events.len() == batch.spawns.len(),
-                    "spawn rejected: {} events for {} spawns",
-                    batch.events.len(),
-                    batch.spawns.len()
-                );
-                Ok(())
+                    .await
             }
-            ChildSpawn::Mixed { spawn, events } => {
-                validate_mixed_children_spawn(spawn)?;
-                ensure!(
-                    self.marker_sink.is_some()
-                        || (spawn.boundary_events.is_empty() && spawn.trailing_events.is_empty()),
-                    "spawn rejected: boundary events require an in-memory event sink"
-                );
-                validate_precompleted_boundary_events(spawn)?;
-                validate_subagent_event_count(events.len(), spawn.subagents.len())?;
+            ChildSpawn::Mixed { spawn, .. } => {
                 self.guard_mixed_spawn_threads(parent_id, &spawn.subagents)
                     .await
             }
