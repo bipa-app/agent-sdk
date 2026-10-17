@@ -5284,6 +5284,11 @@ impl InMemoryAgentTaskStore {
         for (_, write) in super::transition::writes_in_apply_order(&transition) {
             let inner = &mut *lock.inner;
             match write {
+                Write::EnqueueSteeringResume { parent, steering } => committed
+                    .steering_resumed
+                    .push(Self::enqueue_steering_resume_locked(
+                        inner, &parent, steering, now,
+                    )?),
                 Write::Document(document) => committed.documents.push(apply_document_locked(
                     &mut inner.documents,
                     document,
@@ -5335,24 +5340,9 @@ impl InMemoryAgentTaskStore {
                     let anchor = anchors.get(effect.key()).copied();
                     Self::apply_effect_locked(inner, effect, anchor, now);
                 }
-                Write::AppendCompaction {
-                    thread,
-                    messages,
-                    source_message_count,
-                    retained_message_count,
-                } => {
-                    let message_store = message_store.ok_or_else(|| anyhow!("no message store"))?;
-                    let compacted = message_store
-                        .append_compaction(
-                            &thread,
-                            messages,
-                            source_message_count,
-                            retained_message_count,
-                            now,
-                        )
-                        .await?;
-                    committed.compacted.push(compacted);
-                }
+                write @ Write::AppendCompaction { .. } => committed
+                    .compacted
+                    .push(append_compaction(message_store, write, now).await?),
                 Write::AppendEvents { thread, events } => {
                     let batch = Self::append_transition_events(sink, &thread, events, now).await?;
                     committed.events.extend(batch);
@@ -5369,6 +5359,33 @@ impl InMemoryAgentTaskStore {
         drop(lock);
         Ok(committed)
     }
+}
+
+/// A transition's compaction, through the store's message store.
+async fn append_compaction(
+    message_store: Option<&Arc<dyn super::message_store::MessageProjectionStore>>,
+    write: super::transition::Write,
+    now: OffsetDateTime,
+) -> Result<super::message::MessageProjection> {
+    let super::transition::Write::AppendCompaction {
+        thread,
+        messages,
+        source_message_count,
+        retained_message_count,
+    } = write
+    else {
+        return Err(anyhow!("not a compaction write"));
+    };
+    let message_store = message_store.ok_or_else(|| anyhow!("no message store"))?;
+    message_store
+        .append_compaction(
+            &thread,
+            messages,
+            source_message_count,
+            retained_message_count,
+            now,
+        )
+        .await
 }
 
 /// A document's stored key: (scope kind, scope id, kind, key).
@@ -5493,6 +5510,33 @@ fn apply_document_locked(
 }
 
 impl InMemoryAgentTaskStore {
+    /// Wake a parked parent for a steering exchange. Only a parent still
+    /// waiting on its children can be woken: any other status means it
+    /// already left that state (a concurrent last-child fan-in reached
+    /// `ReadyToResume`, a prior wake is mid-exchange, or the row is
+    /// terminal), and the wake declines rather than racing.
+    fn enqueue_steering_resume_locked(
+        inner: &mut Inner,
+        parent_id: &AgentTaskId,
+        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let old =
+            inner.by_id.get(parent_id).cloned().ok_or_else(|| {
+                anyhow!("steering wake rejected: task {parent_id} does not exist")
+            })?;
+        if old.status != TaskStatus::WaitingOnChildren {
+            return Ok(None);
+        }
+        let woken = old
+            .clone()
+            .begin_steering_resume(steering, now)
+            .context("steering wake rejected: begin_steering_resume transition failed")?;
+        inner.rebalance_after_row_change(&old, &woken);
+        inner.put_row(woken.id.clone(), woken.clone());
+        Ok(Some(woken))
+    }
+
     /// Every guard, the purge fence on appends, then a plan for every
     /// document write, all under the write lock and before the first
     /// mutation.
@@ -5507,6 +5551,15 @@ impl InMemoryAgentTaskStore {
             }
         }
         transition.check_effects(|key| inner.effects.get(key))?;
+        for write in &transition.writes {
+            if let super::transition::Write::EnqueueSteeringResume { parent, .. } = write
+                && !inner.by_id.contains_key(parent)
+            {
+                return Err(super::transition::Rejected::Store(anyhow!(
+                    "steering wake rejected: task {parent} does not exist"
+                )));
+            }
+        }
         self.require_appendable_threads(transition).await?;
         self.require_document_tasks(inner, transition).await?;
         Ok(plan_documents_locked(&inner.documents, transition)?.into_iter())
@@ -5696,7 +5749,8 @@ impl InMemoryAgentTaskStore {
                 | Write::ReparkAfterSteering { .. }
                 | Write::AppendCompaction { .. }
                 | Write::SpawnChildren { .. }
-                | Write::Document(_) => {}
+                | Write::Document(_)
+                | Write::EnqueueSteeringResume { .. } => {}
             }
         }
         Ok(anchors)
@@ -7095,39 +7149,14 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
-        // A steering wake is distinguished from an ordinary fan-in only
-        // by a non-empty steering payload (both share the ReadyToResume
-        // kind). An empty payload would create a ReadyToResume whose
-        // children are still running — a broken fan-in — so reject it.
-        if steering.is_empty() {
-            return Err(anyhow!(
-                "steering wake rejected: steering content must be non-empty"
-            ));
-        }
-        let mut inner = self.inner.write().await;
-        let old =
-            inner.by_id.get(parent_id).cloned().ok_or_else(|| {
-                anyhow!("steering wake rejected: task {parent_id} does not exist")
-            })?;
-
-        // Idempotent CAS: only a parked parent can be woken. Any other
-        // status means the parent already left the WaitingOnChildren
-        // state (a concurrent last-child fan-in reached ReadyToResume,
-        // a prior wake is mid-exchange, or the row is terminal) — the
-        // sweep declines rather than racing.
-        if old.status != TaskStatus::WaitingOnChildren {
-            drop(inner);
-            return Ok(None);
-        }
-
-        let woken = old
-            .clone()
-            .begin_steering_resume(steering, now)
-            .context("steering wake rejected: begin_steering_resume transition failed")?;
-        inner.rebalance_after_row_change(&old, &woken);
-        inner.put_row(woken.id.clone(), woken.clone());
-        drop(inner);
-        Ok(Some(woken))
+        let committed = super::transition::DurableStore::commit(
+            self,
+            super::transition::Transition::enqueue_steering_resume(parent_id.clone(), steering),
+            now,
+        )
+        .await
+        .map_err(|rejected| super::transition::wrapper_error("steering wake", rejected))?;
+        Ok(committed.steering_resumed.into_iter().next().flatten())
     }
 
     async fn repark_after_steering(
