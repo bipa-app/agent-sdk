@@ -42,6 +42,7 @@
 #[cfg(test)]
 mod tests {
     use agent_server::journal::SpawnChildrenExt;
+    use agent_server::journal::{EpochId, EpochRecord, LeaseRecoveryScope};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
@@ -501,7 +502,10 @@ mod tests {
                 .await?
                 .context("claim for retry-budget exhaustion")?;
             last = task_store
-                .release_expired_leases(t_plus(start_secs + offset + 6))
+                .release_expired_leases(
+                    t_plus(start_secs + offset + 6),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
                 .await?;
         }
         Ok(last)
@@ -618,7 +622,12 @@ mod tests {
             .await?;
 
         // Sweep after lease expires.
-        let records = task_store.release_expired_leases(t_plus(43)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(43),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::Requeue));
 
@@ -634,6 +643,134 @@ mod tests {
     /// cancelled row reports `NotOwned` without touching the row; a
     /// budget-exhausted row reports `BudgetExhausted` leaving the row
     /// owned so the caller can run its terminal envelope.
+    async fn begin_epoch(task_store: &dyn AgentTaskStore, secs: i64) -> Result<EpochId> {
+        let record = EpochRecord::begin(t_plus(secs), Some("conformance".to_owned()));
+        let epoch = record.id.clone();
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![agent_server::journal::Write::BeginEpoch(record)],
+                },
+                t_plus(secs),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(epoch)
+    }
+
+    /// Lease `root` (submitted first) for an hour, so only an epoch change
+    /// can reclaim it.
+    async fn lease_for_an_hour(
+        task_store: &dyn AgentTaskStore,
+        root: &AgentTask,
+        secs: i64,
+    ) -> Result<LeaseId> {
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::from_string("worker-0"),
+                lease.clone(),
+                t_plus(secs + 3_600),
+                t_plus(secs),
+            )
+            .await?
+            .context("the root is acquirable")?;
+        Ok(lease)
+    }
+
+    /// A lease records the epoch the store began last. Reclaiming the
+    /// leases of other epochs requeues every live lease granted before
+    /// the current epoch (and before any epoch), fails closed the one at
+    /// its budget, leaves the current epoch's lease alone, and refuses an
+    /// epoch the store did not begin. Lease expiry is unaffected.
+    async fn test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        use agent_server::journal::recovery::FailureReason;
+
+        let before_epochs = fresh_root("conformance-epoch-none", 300);
+        let _ = lease_for_an_hour(task_store, &before_epochs, 301).await?;
+        let old = begin_epoch(task_store, 302).await?;
+        let earlier = fresh_root("conformance-epoch-old", 303);
+        let _ = lease_for_an_hour(task_store, &earlier, 304).await?;
+        let at_budget =
+            AgentTask::new_root_turn(thread_id("conformance-epoch-last"), t_plus(305), 1);
+        let _ = lease_for_an_hour(task_store, &at_budget, 306).await?;
+        let current = begin_epoch(task_store, 307).await?;
+        let live = fresh_root("conformance-epoch-live", 308);
+        let live_lease = lease_for_an_hour(task_store, &live, 309).await?;
+
+        let expired = task_store
+            .release_expired_leases(t_plus(310), LeaseRecoveryScope::Expired)
+            .await?;
+        assert!(expired.is_empty(), "no lease has expired: {expired:?}");
+        assert!(
+            task_store
+                .release_expired_leases(t_plus(310), LeaseRecoveryScope::ForeignEpoch(old.clone()))
+                .await
+                .is_err(),
+            "only the epoch the store began reclaims"
+        );
+        let duplicate = task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![agent_server::journal::Write::BeginEpoch(EpochRecord {
+                        id: current.clone(),
+                        started_at: t_plus(310),
+                        label: None,
+                    })],
+                },
+                t_plus(310),
+            )
+            .await;
+        assert!(duplicate.is_err(), "an epoch id begins once");
+
+        let reclaimed = task_store
+            .release_expired_leases(
+                t_plus(311),
+                LeaseRecoveryScope::ForeignEpoch(current.clone()),
+            )
+            .await?;
+        let mut requeued: Vec<_> = reclaimed
+            .iter()
+            .filter(|record| record.action.is_requeue())
+            .map(|record| record.id.clone())
+            .collect();
+        requeued.sort();
+        let mut expected = vec![before_epochs.id.clone(), earlier.id.clone()];
+        expected.sort();
+        assert_eq!(requeued, expected, "{reclaimed:?}");
+        for id in &expected {
+            let row = task_store.get(id).await?.context("row")?;
+            assert_eq!(row.status, TaskStatus::Pending);
+            assert!(row.lease_id.is_none());
+        }
+        let failed = task_store.get(&at_budget.id).await?.context("row")?;
+        assert_eq!(failed.status, TaskStatus::Failed, "{reclaimed:?}");
+        assert!(
+            failed.last_error.as_deref().is_some_and(|error| error
+                .starts_with(FailureReason::LeaseExpiredBudgetExhausted.error_prefix())),
+            "{:?}",
+            failed.last_error,
+        );
+        let untouched = task_store.get(&live.id).await?.context("row")?;
+        assert_eq!(untouched.status, TaskStatus::Running);
+        assert_eq!(untouched.lease_id, Some(live_lease));
+
+        let again = task_store
+            .release_expired_leases(t_plus(312), LeaseRecoveryScope::ForeignEpoch(current))
+            .await?;
+        assert!(
+            again.is_empty(),
+            "a reclaimed lease is reclaimed once: {again:?}"
+        );
+        Ok(())
+    }
+
     async fn test_requeue_owned_task(task_store: &dyn AgentTaskStore) -> Result<()> {
         use agent_server::journal::store::RequeueOutcome;
 
@@ -1103,7 +1240,12 @@ mod tests {
         let attempt_id = params.turn_attempt_id.clone();
         params.now = t_plus(630);
 
-        let released = task_store.release_expired_leases(t_plus(621)).await?;
+        let released = task_store
+            .release_expired_leases(
+                t_plus(621),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(released.len(), 1, "the first worker's lease expired");
         let thief = task_store
             .try_acquire_task(
@@ -2268,7 +2410,12 @@ mod tests {
             )
             .await?
             .context("child root must be acquirable")?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         let record = records
             .iter()
             .find(|record| record.id == child_root.id)
@@ -2310,7 +2457,10 @@ mod tests {
             "the acquisition is attempt {attempt}"
         );
         let records = task_store
-            .release_expired_leases(t_plus(start_secs + 6))
+            .release_expired_leases(
+                t_plus(start_secs + 6),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
             .await?;
         let record = records
             .iter()
@@ -2514,7 +2664,12 @@ mod tests {
                 "attempt {attempt}: settle dropped"
             );
             assert_eq!(completed_progress().await?, 0, "attempt {attempt}");
-            let records = task_store.release_expired_leases(t_plus(start + 6)).await?;
+            let records = task_store
+                .release_expired_leases(
+                    t_plus(start + 6),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
+                .await?;
             assert!(
                 records.iter().any(|record| record.id == invocation.id
                     && matches!(record.action, RecoveryAction::Requeue)),
@@ -4951,7 +5106,12 @@ mod tests {
                 t_plus(2),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert!(
             records.iter().any(|record| record.id == swept.id
                 && matches!(record.action, RecoveryAction::FailClosed(_))),
@@ -5116,7 +5276,12 @@ mod tests {
                 t_plus(90),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(92)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(92),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
 
@@ -5193,7 +5358,12 @@ mod tests {
                 t_plus(203),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(211)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(211),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
 
@@ -5415,7 +5585,12 @@ mod tests {
                 )
                 .await?
                 .with_context(|| format!("acquire for crash {crash}"))?;
-            let records = task_store.release_expired_leases(t_plus(secs + 6)).await?;
+            let records = task_store
+                .release_expired_leases(
+                    t_plus(secs + 6),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
+                .await?;
             anyhow::ensure!(records.len() == 1, "one expired lease per crash");
             actions.push(records[0].action);
         }
@@ -5475,7 +5650,12 @@ mod tests {
             )
             .await?
             .context("claim swept root")?;
-        let records = task_store.release_expired_leases(t_plus(6)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(6),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(
             records.first().map(|record| record.action),
             Some(RecoveryAction::FailClosed(
@@ -5552,7 +5732,12 @@ mod tests {
             )
             .await?
             .context("claim child")?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(
             records.first().map(|record| record.action),
             Some(RecoveryAction::FailClosed(
@@ -5852,7 +6037,12 @@ mod tests {
                 t_plus(10),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(12)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(12),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(
             records[0].action.is_requeue(),
@@ -6375,6 +6565,13 @@ mod tests {
     async fn conformance_in_memory_lease_expiry() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_lease_expiry_sweep(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(s.task.as_ref()).await
     }
 
     #[tokio::test]
@@ -7021,6 +7218,14 @@ mod tests {
     async fn conformance_sqlite_lease_expiry() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_lease_expiry_sweep(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -7792,6 +7997,16 @@ mod tests {
             return Ok(());
         };
         test_lease_expiry_sweep(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
     }
 
     #[cfg(feature = "postgres")]

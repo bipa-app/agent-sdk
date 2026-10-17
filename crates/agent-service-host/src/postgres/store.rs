@@ -38,6 +38,7 @@ use agent_server::journal::commit::{
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::effect::{EffectKey, EffectRecord, EffectRow, EffectState, EffectWrite};
+use agent_server::journal::epoch::{EpochId, LeaseRecoveryScope};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -148,6 +149,9 @@ pub struct PostgresDurableStore {
     pool: PgPool,
     held_probe: HeldProbe<HeldKey>,
     lock_conflict_retries: Arc<AtomicU64>,
+    /// The epoch the newest committed `Write::BeginEpoch` began; every
+    /// lease this store grants after it records it.
+    current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
 }
 
 impl PostgresDurableStore {
@@ -187,6 +191,7 @@ impl PostgresDurableStore {
             pool,
             held_probe: HeldProbe::default(),
             lock_conflict_retries: Arc::default(),
+            current_epoch: Arc::default(),
         }
     }
 
@@ -463,6 +468,170 @@ FOR UPDATE
         .await
         .with_context(|| format!("lock thread {thread_id}"))?;
         record.map(TryInto::try_into).transpose()
+    }
+
+    /// Up to [`agent_server::journal::store::LEASE_RELEASE_BATCH`] running
+    /// rows `scope` reclaims at `now`, in expiry order, locked and skipping
+    /// rows another sweep holds.
+    async fn load_reclaimable_leases_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &LeaseRecoveryScope,
+        now: OffsetDateTime,
+    ) -> Result<Vec<TaskRecord>> {
+        let batch =
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX);
+        let rows = match scope {
+            LeaseRecoveryScope::Expired => sqlx::query_as!(
+                TaskRecord,
+                r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
+FROM agent_sdk_tasks
+WHERE status = 'running'
+  AND lease_expires_at <= $1
+ORDER BY lease_expires_at, id
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+",
+                now,
+                batch,
+            )
+            .fetch_all(&mut **tx)
+            .await
+            .context("load expired leases")?,
+            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as::<_, TaskRecord>(
+                r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
+FROM agent_sdk_tasks
+WHERE status = 'running'
+  AND lease_epoch IS DISTINCT FROM $1
+ORDER BY lease_expires_at, id
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+",
+            )
+            .bind(epoch.as_str())
+            .bind(batch)
+            .fetch_all(&mut **tx)
+            .await
+            .context("load leases of older epochs")?,
+        };
+        Ok(rows)
+    }
+
+    /// The epoch new leases record, if one has begun.
+    fn current_epoch(&self) -> Option<EpochId> {
+        self.current_epoch.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |epoch| epoch.clone(),
+        )
+    }
+
+    fn set_current_epoch(&self, epoch: EpochId) {
+        let mut current = self
+            .current_epoch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(epoch);
+    }
+
+    async fn insert_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        record: &agent_server::journal::EpochRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES ($1, $2, $3)",
+        )
+        .bind(record.id.as_str())
+        .bind(record.started_at)
+        .bind(record.label.as_deref())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("begin epoch {}", record.id))?;
+        Ok(())
+    }
+
+    /// The epoch `task`'s lease was granted under, read under the row's
+    /// lock.
+    async fn load_lease_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTaskId,
+    ) -> Result<Option<EpochId>> {
+        let epoch: Option<Option<String>> =
+            sqlx::query_scalar("SELECT lease_epoch FROM agent_sdk_tasks WHERE id = $1")
+                .bind(task.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .with_context(|| format!("load the lease epoch of {task}"))?;
+        Ok(epoch.flatten().map(EpochId::from_string))
+    }
+
+    /// Record that `task`'s new lease was granted under `epoch`.
+    async fn stamp_lease_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTaskId,
+        epoch: Option<&EpochId>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = $1 WHERE id = $2")
+            .bind(epoch.map(EpochId::as_str))
+            .bind(task.as_str())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("stamp the lease epoch of {task}"))?;
+        Ok(())
     }
 
     async fn require_appendable_thread_tx(
@@ -1905,6 +2074,8 @@ WHERE id = ANY($1::text[])
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
                     Self::update_task_tx(&mut tx, &claimed).await?;
+                    Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref())
+                        .await?;
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
@@ -2563,17 +2734,13 @@ WHERE parent_id = $1
     async fn fail_close_expired_roots(
         &self,
         roots: Vec<AgentTaskId>,
+        scope: &LeaseRecoveryScope,
         now: OffsetDateTime,
         released: &mut Vec<RecoveryRecord>,
     ) {
         for id in roots {
             match self
-                .fail_closed_root_thread_first(
-                    &id,
-                    RecoveryContext::ExpiredLease,
-                    now,
-                    "release_expired_leases",
-                )
+                .fail_closed_root_thread_first(&id, scope.context(), now, "release_expired_leases")
                 .await
             {
                 Ok(Some((reason, settled))) => {
@@ -2644,6 +2811,10 @@ WHERE parent_id = $1
             RecoveryContext::ExpiredLease => {
                 old.status == TaskStatus::Running
                     && old.lease_expires_at.is_some_and(|expiry| expiry <= now)
+            }
+            RecoveryContext::EpochChanged => {
+                old.status == TaskStatus::Running
+                    && Self::load_lease_epoch_tx(&mut tx, &old.id).await? != self.current_epoch()
             }
         };
         let action = if still_eligible {
@@ -4175,7 +4346,14 @@ impl PostgresDurableStore {
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
                 }
-                result => return mark_lock_conflict(result, attempt),
+                result => {
+                    if result.is_ok()
+                        && let Some(record) = transition.begun_epochs().last()
+                    {
+                        self.set_current_epoch(record.id.clone());
+                    }
+                    return mark_lock_conflict(result, attempt);
+                }
             }
         }
     }
@@ -4447,10 +4625,9 @@ impl PostgresDurableStore {
                 committed.settled.push(settled);
                 agent_server::fail_point!("transition.settle_written");
             }
-            Write::RejectConfirmation { task, error } => {
-                let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
-                committed.settled.push(rejected);
-            }
+            Write::RejectConfirmation { task, error } => committed
+                .settled
+                .push(Self::reject_confirmation_tx(tx, &task, error, now).await?),
             Write::PauseOnConfirmation {
                 task,
                 continuation,
@@ -4485,6 +4662,7 @@ impl PostgresDurableStore {
                 committed.reparked.push(reparked);
             }
             Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
+            Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
@@ -5601,6 +5779,7 @@ ORDER BY created_at, id
             .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
+        Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref()).await?;
         tx.commit().await.context("commit try_acquire_task")?;
         Ok(Some(claimed))
     }
@@ -5746,52 +5925,19 @@ RETURNING
         })
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>> {
+        if let LeaseRecoveryScope::ForeignEpoch(epoch) = &scope {
+            ensure!(
+                self.current_epoch().as_ref() == Some(epoch),
+                "release_expired_leases: epoch {epoch} is not the epoch this store began"
+            );
+        }
         let mut tx = self.begin().await?;
-        let expired = sqlx::query_as!(
-            TaskRecord,
-            r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at,
-    after_siblings_json
-FROM agent_sdk_tasks
-WHERE status = 'running'
-  AND lease_expires_at <= $1
-ORDER BY lease_expires_at, id
-LIMIT $2
-FOR UPDATE SKIP LOCKED
-",
-            now,
-            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX),
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .context("load expired leases")?;
+        let expired = Self::load_reclaimable_leases_tx(&mut tx, &scope, now).await?;
 
         let mut released = Vec::with_capacity(expired.len());
         let mut exhausted_roots = Vec::new();
@@ -5804,7 +5950,7 @@ FOR UPDATE SKIP LOCKED
                     old.id
                 ));
             }
-            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+            let record = match classify_recovery(&old, scope.context()) {
                 RecoveryAction::Requeue => {
                     let released_row = old
                         .clone()
@@ -5838,7 +5984,7 @@ FOR UPDATE SKIP LOCKED
 
         // The batch locked these roots before their threads; journaling
         // their terminal events needs thread → task order.
-        self.fail_close_expired_roots(exhausted_roots, now, &mut released)
+        self.fail_close_expired_roots(exhausted_roots, &scope, now, &mut released)
             .await;
         Ok(released)
     }
@@ -9542,7 +9688,12 @@ INSERT INTO agent_sdk_turn_attempts (
         let _scenario = fail::FailScenario::setup();
         fail::cfg("fail_closed_root_thread_first", "1*off->return")
             .map_err(|error| anyhow::anyhow!("configure fail-close failpoint: {error}"))?;
-        let swept = store.release_expired_leases(t_plus(100)).await;
+        let swept = store
+            .release_expired_leases(
+                t_plus(100),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await;
         fail::remove("fail_closed_root_thread_first");
 
         let swept = swept?;
@@ -9561,7 +9712,12 @@ INSERT INTO agent_sdk_turn_attempts (
         assert_eq!(status(first.clone()).await?, TaskStatus::Failed);
         assert_eq!(status(second.clone()).await?, TaskStatus::Running);
 
-        let retried = store.release_expired_leases(t_plus(101)).await?;
+        let retried = store
+            .release_expired_leases(
+                t_plus(101),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         let ids: Vec<&AgentTaskId> = retried.iter().map(|record| &record.id).collect();
         assert_eq!(
             ids,

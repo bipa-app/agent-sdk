@@ -224,6 +224,7 @@ Prompt-row spans (`agent_service_host::prompts`, `grpc::prompt_rpc`):
 
 Ids are on spans only, never on the counter. A host opens a row inside its own transition, so it counts its own opens.
 | `agent_server.fence.refused` | Counter | `writer`, `thread_status` | `[agent-server]` (+ the `agent_server.fence.refused` tracing event with `thread.id` from the SQL backends) | crash-safety P2-1 |
+| `agent_server.epoch.reclaims` | Counter | `scope`, `action` | `[agent-server]` (recorded by the host drain; start-up span `agent_server.epoch.begin`) | crash-safety P2-4 |
 
 ### 4.4 Agent-service-host metrics
 

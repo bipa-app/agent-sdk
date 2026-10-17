@@ -526,6 +526,72 @@ long as it needs. No migration, table, `Write` variant or protocol change.
   and survives turn boundaries until its `ToolCallEnd`; a `ToolProgress` named
   by `ViewConfig::stall_tool_name` sets `status.stalled` until the next event.
 - `ToolResult` derives `PartialEq` and `Eq`.
+- **Breaking: process epochs.** Every host begins an epoch when it starts, and
+  every lease records the epoch it was granted under, so a host that is the
+  only process on its store can requeue a dead process's leases at once
+  instead of waiting for them to expire (design §6.5).
+  - `Write::BeginEpoch(EpochRecord)` writes the epoch in one transaction.
+    `ServiceHost::run` commits it before it settles orphans and before the
+    worker pool starts. Every lease the store grants after that commit
+    stamps `agent_sdk_tasks.lease_epoch`; an epoch id that already exists is
+    refused.
+  - `AgentTaskStore::release_expired_leases` takes a `LeaseRecoveryScope`:
+    `Expired` (the lease sweep, unchanged) or `ForeignEpoch(epoch)`, which
+    reclaims every `Running` lease granted under another epoch or before
+    epochs existed, whatever its expiry. The method keeps no default, so a
+    decorating store forwards both scopes through its own hooks. A
+    `ForeignEpoch` for an epoch the store did not begin is refused.
+  - `RecoveryContext::EpochChanged` classifies a reclaimed row exactly as
+    `ExpiredLease` does: requeue, or fail closed with
+    `LeaseExpiredBudgetExhausted` at its budget.
+  - `WorkerConfig::epoch_recovery` (`EpochRecovery`): the default
+    `LeaseExpiry` keeps today's behaviour, which is right for every host
+    that shares its store (several processes on one `SQLite` file, several
+    pods on one Postgres database, a rolling deploy). `SingleHost`
+    reclaims the leases of earlier epochs at start, before the first
+    worker runs; only an embedder that guarantees one process per store
+    (for example with a single-instance lock) may set it. The backend
+    cannot tell the two apart.
+  - Migration 0028 adds the `agent_sdk_host_epochs` table and the nullable
+    `agent_sdk_tasks.lease_epoch` column, on Postgres and `SQLite`.
+  - Signals (`otel`):
+    - `agent_server.tasks.lease_expired` gains a `scope` label (`expired` or
+      `foreign_epoch`, `LeaseRecoveryScope::as_str`). The host's drain now
+      records it for every backend. Before, only the in-memory store
+      recorded it, so the SQL backends' sweeps counted nothing.
+    - New counter `agent_server.epoch.reclaims{scope, action}`. `action` is
+      `requeued` or `failed_interrupted`.
+    - `ServerMetrics::record_lease_reclaim` records the rows of one call.
+    - Start-up runs in an `agent_server.epoch.begin` span that covers the
+      epoch write and the reclaim. Its attributes are `agent_server.epoch.id`
+      (span-only), `agent_server.epoch.recovery` (`EpochRecovery::as_str`),
+      `agent_server.epoch.requeued`, `agent_server.epoch.failed_interrupted`
+      and `outcome`.
+
+  **Lock window (Postgres):** both statements are catalog-only, with no
+  rewrite and no scan. The `ALTER TABLE agent_sdk_tasks` takes
+  `ACCESS EXCLUSIVE` briefly, but the lock queues behind any open
+  transaction on the table, and every task query queues behind it. The
+  migration therefore starts with `SET LOCAL lock_timeout = '5s'`: a boot
+  that cannot get the lock fails and restarts instead of stalling the
+  table. Measured on Postgres 18 with 1M task rows (509 MB) and four
+  heartbeat loops: the migration took 118 ms. With a 30 s read
+  transaction open, the migration failed after 5.0 s with "canceling
+  statement due to lock timeout", and the heartbeats queued behind its
+  waiting lock for at most 5.7 s instead of 30 s. The retry, after the
+  read transaction ended, took 21 ms. On `SQLite` with 1M rows the
+  migration took 4 ms.
+
+  **Rollback and rolling deploys:** a pod of the previous build keeps
+  running against the migrated database: it never reads the new table or
+  column, and its leases leave `lease_epoch` NULL, which `LeaseExpiry`
+  ignores. A restarted older build refuses to start (`VersionMissing(28)`).
+  To roll back, revert 0028 by hand first, in one transaction, on either
+  backend: `DROP TABLE agent_sdk_host_epochs; ALTER TABLE agent_sdk_tasks
+  DROP COLUMN lease_epoch; DELETE FROM _sqlx_migrations WHERE version =
+  28`. No task state is lost: the epochs only decide when a dead lease is
+  reclaimed.
+
 - `agent_sdk_providers::impls::normalized_strict_schema` and its error,
   `StrictSchemaError` (`#[non_exhaustive]`), behind `openai`/`openai-codex`.
   They return a tool schema as `OpenAI` strict mode receives it, so callers

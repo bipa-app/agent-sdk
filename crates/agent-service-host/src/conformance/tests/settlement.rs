@@ -708,7 +708,12 @@ pub(super) async fn test_approved_confirmation_pickup_keeps_the_paused_attempt(
         );
 
         if max_attempts == 1 {
-            let records = task_store.release_expired_leases(t_plus(at + 13)).await?;
+            let records = task_store
+                .release_expired_leases(
+                    t_plus(at + 13),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
+                .await?;
             let record = records
                 .iter()
                 .find(|record| record.id == child_id)
@@ -1170,7 +1175,12 @@ async fn end_root(
         RootEnd::FailedClosed => {
             let mut now = at;
             loop {
-                let records = task_store.release_expired_leases(t_plus(now)).await?;
+                let records = task_store
+                    .release_expired_leases(
+                        t_plus(now),
+                        agent_server::journal::LeaseRecoveryScope::Expired,
+                    )
+                    .await?;
                 let record = records
                     .iter()
                     .find(|record| record.id == *id)
@@ -1555,7 +1565,12 @@ async fn fail_closed_by_lease_expiry(
             )
             .await?
             .context("woken root must acquire")?;
-        let records = task_store.release_expired_leases(t_plus(at + 3)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(at + 3),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         if let Some(record) = records
             .into_iter()
             .find(|record| record.id == *root && record.action.is_fail_closed())

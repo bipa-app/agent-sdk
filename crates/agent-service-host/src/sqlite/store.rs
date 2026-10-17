@@ -26,6 +26,7 @@ use serde::de::DeserializeOwned;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -38,6 +39,7 @@ use agent_server::journal::commit::{
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::effect::{EffectKey, EffectRecord, EffectRow, EffectState, EffectWrite};
+use agent_server::journal::epoch::{EpochId, LeaseRecoveryScope};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -112,6 +114,9 @@ mod documents;
 pub struct SqliteDurableStore {
     pool: SqlitePool,
     held_probe: HeldProbe<HeldKey>,
+    /// The epoch the newest committed `Write::BeginEpoch` began; every
+    /// lease this store grants after it records it.
+    current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -136,6 +141,7 @@ impl SqliteDurableStore {
         Self {
             pool,
             held_probe: HeldProbe::default(),
+            current_epoch: Arc::default(),
         }
     }
 
@@ -527,6 +533,53 @@ ON CONFLICT (thread_id) DO NOTHING
         now: OffsetDateTime,
     ) -> Result<()> {
         let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
+        Ok(())
+    }
+
+    /// The epoch new leases record, if one has begun.
+    fn current_epoch(&self) -> Option<EpochId> {
+        self.current_epoch.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |epoch| epoch.clone(),
+        )
+    }
+
+    fn set_current_epoch(&self, epoch: EpochId) {
+        let mut current = self
+            .current_epoch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(epoch);
+    }
+
+    async fn insert_epoch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        record: &agent_server::journal::EpochRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES (?1, ?2, ?3)",
+        )
+        .bind(record.id.as_str())
+        .bind(record.started_at)
+        .bind(record.label.as_deref())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("begin epoch {}", record.id))?;
+        Ok(())
+    }
+
+    /// Record that `task`'s new lease was granted under `epoch`.
+    async fn stamp_lease_epoch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task: &AgentTaskId,
+        epoch: Option<&EpochId>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = ?1 WHERE id = ?2")
+            .bind(epoch.map(EpochId::as_str))
+            .bind(task.as_str())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("stamp the lease epoch of {task}"))?;
         Ok(())
     }
 
@@ -1432,6 +1485,8 @@ INSERT INTO agent_sdk_tasks (
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
                     Self::update_task_tx(&mut tx, &claimed).await?;
+                    Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref())
+                        .await?;
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
@@ -3583,6 +3638,9 @@ impl SqliteDurableStore {
         }
         agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
+        if let Some(record) = transition.begun_epochs().last() {
+            self.set_current_epoch(record.id.clone());
+        }
         Ok(committed)
     }
 }
@@ -3642,10 +3700,9 @@ impl SqliteDurableStore {
                 committed.settled.push(settled);
                 agent_server::fail_point!("transition.settle_written");
             }
-            Write::RejectConfirmation { task, error } => {
-                let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
-                committed.settled.push(rejected);
-            }
+            Write::RejectConfirmation { task, error } => committed
+                .settled
+                .push(Self::reject_confirmation_tx(tx, &task, error, now).await?),
             Write::PauseOnConfirmation {
                 task,
                 continuation,
@@ -3680,6 +3737,7 @@ impl SqliteDurableStore {
                 committed.reparked.push(reparked);
             }
             Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
+            Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
@@ -4710,6 +4768,7 @@ impl AgentTaskStore for SqliteDurableStore {
             .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
+        Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref()).await?;
         tx.commit().await.context("commit try_acquire_task")?;
         Ok(Some(claimed))
     }
@@ -4837,25 +4896,52 @@ impl AgentTaskStore for SqliteDurableStore {
         })
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>> {
+        if let LeaseRecoveryScope::ForeignEpoch(epoch) = &scope {
+            ensure!(
+                self.current_epoch().as_ref() == Some(epoch),
+                "release_expired_leases: epoch {epoch} is not the epoch this store began"
+            );
+        }
         let mut tx = self.begin().await?;
         // Bound the sweep to a batch so a mass worker outage cannot turn
         // one sweep into a giant transaction that locks every expired
         // task at once; the host's drain loop (and any other caller)
         // keeps calling until a pass returns fewer than the batch.
-        let expired = sqlx::query_as::<_, TaskRecord>(concat!(
-            "SELECT ",
-            task_columns!(),
-            " FROM agent_sdk_tasks \
-             WHERE status = 'running' AND lease_expires_at <= ?1 \
-             ORDER BY lease_expires_at, id \
-             LIMIT ?2",
-        ))
-        .bind(now)
-        .bind(i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX))
-        .fetch_all(&mut *tx)
-        .await
-        .context("load expired leases")?;
+        let batch =
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX);
+        let expired = match &scope {
+            LeaseRecoveryScope::Expired => sqlx::query_as::<_, TaskRecord>(concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM agent_sdk_tasks \
+                 WHERE status = 'running' AND lease_expires_at <= ?1 \
+                 ORDER BY lease_expires_at, id \
+                 LIMIT ?2",
+            ))
+            .bind(now)
+            .bind(batch)
+            .fetch_all(&mut *tx)
+            .await
+            .context("load expired leases")?,
+            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as::<_, TaskRecord>(concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM agent_sdk_tasks \
+                 WHERE status = 'running' AND lease_epoch IS NOT ?1 \
+                 ORDER BY lease_expires_at, id \
+                 LIMIT ?2",
+            ))
+            .bind(epoch.as_str())
+            .bind(batch)
+            .fetch_all(&mut *tx)
+            .await
+            .context("load leases of older epochs")?,
+        };
 
         let mut released = Vec::with_capacity(expired.len());
         for record in expired {
@@ -4873,7 +4959,7 @@ impl AgentTaskStore for SqliteDurableStore {
                     old.id
                 ));
             }
-            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+            let record = match classify_recovery(&old, scope.context()) {
                 RecoveryAction::Requeue => {
                     let released_row = old
                         .clone()

@@ -19,6 +19,7 @@ use time::OffsetDateTime;
 use super::committed_event::CommittedEvent;
 use super::document::{DocScope, DocumentKey, DocumentOutcome, DocumentWrite, ExpectationFailed};
 use super::effect::{EffectKey, EffectRecord, EffectWrite};
+use super::epoch::EpochRecord;
 use super::message::MessageProjection;
 use super::store::{MixedChildrenSpawn, SubagentBatchSpawn, SubagentInvocationSpawn};
 use super::subagent_spawn_transaction::SubagentSpawnEvent;
@@ -123,6 +124,11 @@ pub enum Write {
         parent: AgentTaskId,
         steering: Vec<llm::ContentBlock>,
     },
+
+    /// Record the start of a host process's epoch. Every lease the store
+    /// grants after the commit carries this epoch (see
+    /// [`super::epoch`]). An epoch id that already exists is refused.
+    BeginEpoch(EpochRecord),
 }
 
 /// What a [`Write::SpawnChildren`] spawns, one shape per spawn method of
@@ -777,7 +783,25 @@ impl Transition {
             | Write::Effect(_)
             | Write::AppendCompaction { .. }
             | Write::Document(_)
-            | Write::EnqueueSteeringResume { .. } => false,
+            | Write::EnqueueSteeringResume { .. }
+            | Write::BeginEpoch(_) => false,
+        })
+    }
+
+    /// The epochs the transition begins.
+    pub fn begun_epochs(&self) -> impl Iterator<Item = &EpochRecord> {
+        self.writes.iter().filter_map(|write| match write {
+            Write::BeginEpoch(record) => Some(record),
+            Write::Document(_)
+            | Write::AppendEvents { .. }
+            | Write::SettleTask { .. }
+            | Write::RejectConfirmation { .. }
+            | Write::PauseOnConfirmation { .. }
+            | Write::ReparkAfterSteering { .. }
+            | Write::Effect(_)
+            | Write::AppendCompaction { .. }
+            | Write::SpawnChildren { .. }
+            | Write::EnqueueSteeringResume { .. } => None,
         })
     }
     /// Whether any write appends a compaction.
@@ -811,7 +835,8 @@ impl Transition {
             | Write::Effect(_)
             | Write::SpawnChildren { .. }
             | Write::Document(_)
-            | Write::EnqueueSteeringResume { .. } => None,
+            | Write::EnqueueSteeringResume { .. }
+            | Write::BeginEpoch(_) => None,
         })
     }
 
@@ -840,7 +865,8 @@ impl Transition {
                 | Write::AppendEvents { .. }
                 | Write::SpawnChildren { .. }
                 | Write::Document(_)
-                | Write::EnqueueSteeringResume { .. } => {}
+                | Write::EnqueueSteeringResume { .. }
+                | Write::BeginEpoch(_) => {}
             }
         }
         Ok(())
@@ -933,7 +959,9 @@ impl Transition {
                         )));
                     }
                 }
-                Write::AppendEvents { .. } | Write::AppendCompaction { .. } => {}
+                Write::AppendEvents { .. }
+                | Write::AppendCompaction { .. }
+                | Write::BeginEpoch(_) => {}
             }
         }
         self.validate_effect_order()?;
@@ -1026,7 +1054,8 @@ impl Write {
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }
-            | Self::PauseOnConfirmation { .. } => Vec::new(),
+            | Self::PauseOnConfirmation { .. }
+            | Self::BeginEpoch(_) => Vec::new(),
         }
     }
 }

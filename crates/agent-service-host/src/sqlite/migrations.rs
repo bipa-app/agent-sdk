@@ -125,6 +125,10 @@ const EFFECTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0027_effects.sql"
 ));
+const HOST_EPOCHS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0028_host_epochs.sql"
+));
 const DOCUMENTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0030_documents.sql"
@@ -133,7 +137,7 @@ const DOCUMENTS_SQL: &str = include_str!(concat!(
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 26] = [
+const MIGRATIONS: [SqliteMigration; 27] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -260,6 +264,11 @@ const MIGRATIONS: [SqliteMigration; 26] = [
         sql: EFFECTS_SQL,
     },
     SqliteMigration {
+        version: "0028",
+        summary: "process epochs and the epoch of each lease",
+        sql: HOST_EPOCHS_SQL,
+    },
+    SqliteMigration {
         version: "0030",
         summary: "typed JSON documents written in the same transaction as their transition",
         sql: DOCUMENTS_SQL,
@@ -307,6 +316,11 @@ pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
 /// of every effect kind.
 #[cfg(test)]
 pub(crate) const EFFECTS_MIGRATION_VERSION: i64 = 27;
+
+/// Version of the migration that records process epochs and the epoch of
+/// each lease.
+#[cfg(test)]
+pub(crate) const HOST_EPOCHS_MIGRATION_VERSION: i64 = 28;
 
 /// Version of the migration that adds the document table.
 #[cfg(test)]

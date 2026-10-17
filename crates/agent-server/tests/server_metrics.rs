@@ -1313,7 +1313,10 @@ async fn an_invocation_retry_is_counted_by_attempt_and_traced() -> Result<()> {
         .context("attempt 1 acquires")?;
     stores
         .tasks
-        .release_expired_leases(t0() + time::Duration::seconds(6))
+        .release_expired_leases(
+            t0() + time::Duration::seconds(6),
+            agent_server::journal::LeaseRecoveryScope::Expired,
+        )
         .await?;
     let outcome = stores
         .run_invocation(&invocation.id, t0() + time::Duration::seconds(10))
@@ -1906,4 +1909,62 @@ mod hook_fixture {
             child_join_policy: agent_server::ChildJoinPolicy::default(),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// tasks.lease_expired carries the reclaim scope
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_lease_reclaim_is_counted_with_its_scope() -> Result<()> {
+    use agent_server::journal::{EpochId, LeaseRecoveryScope};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+    metrics.record_lease_expiry_outcomes(&[RecoveryRecord::requeued(AgentTaskId::from_string(
+        "swept",
+    ))]);
+    metrics.record_lease_reclaim(
+        &[
+            RecoveryRecord::requeued(AgentTaskId::from_string("reclaimed")),
+            RecoveryRecord::failed_closed(
+                AgentTaskId::from_string("at-budget"),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            ),
+        ],
+        &LeaseRecoveryScope::ForeignEpoch(EpochId::from_string("epoch-b")),
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.tasks.lease_expired");
+    let scoped = |scope: &str| -> u64 {
+        counts
+            .iter()
+            .filter(|(s, _)| has_label(s, attrs::SCOPE, scope))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    assert_eq!(scoped("expired"), 1, "{counts:?}");
+    assert_eq!(scoped("foreign_epoch"), 2, "{counts:?}");
+
+    let reclaims = collect_u64_counter(&snapshots, "agent_server.epoch.reclaims");
+    let reclaimed = |scope: &str, action: &str| -> u64 {
+        reclaims
+            .iter()
+            .filter(|(s, _)| {
+                has_label(s, attrs::SCOPE, scope) && has_label(s, attrs::ACTION, action)
+            })
+            .map(|(_, v)| v)
+            .sum()
+    };
+    assert_eq!(reclaimed("expired", "requeued"), 1, "{reclaims:?}");
+    assert_eq!(reclaimed("foreign_epoch", "requeued"), 1, "{reclaims:?}");
+    assert_eq!(
+        reclaimed("foreign_epoch", "failed_interrupted"),
+        1,
+        "{reclaims:?}"
+    );
+    Ok(())
 }

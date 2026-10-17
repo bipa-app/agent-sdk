@@ -3068,7 +3068,10 @@ async fn reacquire_after_lease_expiry(
 ) -> Result<AgentTask> {
     fixtures
         .tasks
-        .release_expired_leases(t0() + Duration::seconds(301))
+        .release_expired_leases(
+            t0() + Duration::seconds(301),
+            crate::journal::LeaseRecoveryScope::Expired,
+        )
         .await?;
     let retried = fixtures
         .tasks

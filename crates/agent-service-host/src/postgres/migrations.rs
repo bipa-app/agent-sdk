@@ -140,6 +140,10 @@ const EFFECTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0027_effects.sql"
 ));
+const HOST_EPOCHS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0028_host_epochs.sql"
+));
 const VALIDATE_EFFECTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0029_validate_effects.sql"
@@ -152,7 +156,7 @@ const DOCUMENTS_SQL: &str = include_str!(concat!(
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 27] = [
+const MIGRATIONS: [PostgresMigration; 28] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -279,6 +283,11 @@ const MIGRATIONS: [PostgresMigration; 27] = [
         sql: EFFECTS_SQL,
     },
     PostgresMigration {
+        version: "0028",
+        summary: "process epochs and the epoch of each lease",
+        sql: HOST_EPOCHS_SQL,
+    },
+    PostgresMigration {
         version: "0029",
         summary: "validate the effect checks outside the column migration",
         sql: VALIDATE_EFFECTS_SQL,
@@ -341,6 +350,11 @@ pub(crate) const EFFECTS_MIGRATION_VERSION: i64 = 27;
 /// column migration's ACCESS EXCLUSIVE lock.
 #[cfg(test)]
 pub(crate) const EFFECTS_VALIDATION_MIGRATION_VERSION: i64 = 29;
+
+/// Version of the migration that records process epochs and the epoch of
+/// each lease.
+#[cfg(test)]
+pub(crate) const HOST_EPOCHS_MIGRATION_VERSION: i64 = 28;
 
 /// Version of the migration that adds the document table.
 #[cfg(test)]
