@@ -199,6 +199,7 @@ inventory covers the whole observability surface.
 | `agent_server.journal.transition.duration` | Histogram (s) | `backend` (`memory`/`sqlite`/`postgres`), `outcome` (`committed`/`guard`/`expectation`/`store`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
 | `agent_server.journal.transition.lock_conflict_retries` | Counter | `backend` | `[agent-service-host]` Postgres `commit` | crash-safety Phase 3 |
 | `agent_server.journal.documents.written` | Counter | `backend`, `scope` (`host`/`thread`/`task`), `op` (`put`/`retire`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
+| `agent_server.effect.transitions` | Counter | `effect_kind`, `outcome` (`started`, `refused`, `completed`, `failed`, `interrupted`, `salvaged`, `abandoned`) | `[agent-server]` (abandons also from the SQL stores) | Phase 2 |
 
 ### 4.4 Agent-service-host metrics
 

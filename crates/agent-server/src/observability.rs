@@ -105,6 +105,8 @@ pub mod attrs {
     pub const AUDIT_OUTCOME: &str = "outcome";
     /// Tool effect class on audit events.
     pub const EFFECT_CLASS: &str = "effect_class";
+    /// Kind of an effect (`tool_call`, `llm_request`, …), as its row stores it.
+    pub const EFFECT_KIND: &str = "effect_kind";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -180,6 +182,9 @@ pub struct ServerMetrics {
     pub(crate) transition_duration: Histogram<f64>,
     pub(crate) transition_lock_conflict_retries: Counter<u64>,
     pub(crate) documents_written: Counter<u64>,
+    /// `agent_server.effect.transitions`: effect records written, by kind
+    /// and outcome.
+    pub(crate) effect_transitions: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -398,6 +403,16 @@ impl ServerMetrics {
 
     /// Record one `agent_server.tool_audit.outcome` increment for
     /// the given tool-audit event.
+    /// Count one effect record written with `outcome` (see
+    /// [`crate::journal::effect::EffectState::outcome_label`]).
+    pub fn record_effect(&self, kind: crate::journal::effect::EffectKind, outcome: &'static str) {
+        let attrs = [
+            KeyValue::new(attrs::EFFECT_KIND, crate::journal::effect::kind_wire(kind)),
+            KeyValue::new(attrs::OUTCOME, outcome),
+        ];
+        self.effect_transitions.add(1, &attrs);
+    }
+
     pub fn record_tool_audit(&self, event: &ToolAuditEvent) {
         let attrs = [
             KeyValue::new(attrs::AUDIT_OUTCOME, event.kind.as_str()),
@@ -498,6 +513,14 @@ impl ServerMetrics {
             )
             .build();
 
+        let effect_transitions = meter
+            .u64_counter("agent_server.effect.transitions")
+            .with_description(
+                "Effect records written, by kind and outcome: started, refused (the claim \
+                 did not commit), completed, failed, interrupted, salvaged, abandoned.",
+            )
+            .build();
+
         Self {
             workers_active,
             tasks_acquired,
@@ -511,6 +534,7 @@ impl ServerMetrics {
             transition_duration,
             transition_lock_conflict_retries,
             documents_written,
+            effect_transitions,
             meter,
         }
     }

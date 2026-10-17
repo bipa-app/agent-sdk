@@ -130,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - Readers treat a `Started` record whose owner is already terminal (a
       row an earlier release left behind) as `Abandoned`, and never run
       it again.
+  - **Signals.** The new counter `agent_server.effect.transitions`
+    (`effect_kind`, `outcome`) counts effect records:
+    - `started` and `refused` (the claim did not commit) from `run_effect`;
+    - `completed` or `failed` when the end transition commits;
+    - `interrupted` from recovery;
+    - `abandoned` from the stores, counted inside the transaction that
+      ends the owner, so a rolled-back transaction can over-count it.
+
+    A refused claim logs a warning. An interrupted recovery and an abandon
+    log at info level, with the effect key and the task id.
 - **Breaking: the write and guard types.**
   - `Write::Effect(EffectWrite::{Start, Finish})` and `Guard::EffectFree`
     replace `Write::RecordIntent`.

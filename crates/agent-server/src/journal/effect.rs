@@ -144,7 +144,31 @@ impl EffectState {
     pub const fn is_started(&self) -> bool {
         matches!(self, Self::Started)
     }
+
+    /// The state as the `outcome` attribute of the
+    /// `agent_server.effect.transitions` metric labels it.
+    #[must_use]
+    pub const fn outcome_label(&self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed { .. } => "failed",
+            Self::Interrupted { .. } => "interrupted",
+            Self::Salvaged { .. } => "salvaged",
+            Self::Abandoned => "abandoned",
+        }
+    }
 }
+
+/// Count an effect record written with `outcome`.
+#[cfg(feature = "otel")]
+pub(crate) fn record_effect(kind: EffectKind, outcome: &'static str) {
+    crate::observability::ServerMetrics::global().record_effect(kind, outcome);
+}
+
+/// Without `otel` there is nothing to count.
+#[cfg(not(feature = "otel"))]
+pub(crate) const fn record_effect(_kind: EffectKind, _outcome: &'static str) {}
 
 /// An effect about to start: the row [`EffectWrite::Start`] inserts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,6 +365,18 @@ pub const fn replay_wire(replay: ToolReplay) -> &'static str {
     match replay {
         ToolReplay::Safe => "replay_safe",
         ToolReplay::Unsafe => "side_effecting",
+    }
+}
+
+/// The kind a row's `effect_kind` names, if it names one this release
+/// knows.
+#[doc(hidden)]
+#[must_use]
+pub fn kind_from_wire(kind: &str) -> Option<EffectKind> {
+    match kind {
+        "tool_call" => Some(EffectKind::ToolCall),
+        "llm_request" => Some(EffectKind::LlmRequest),
+        _ => None,
     }
 }
 
@@ -593,16 +629,26 @@ where
 {
     let key = intent.key.clone();
     let owner = intent.owner.clone();
+    let kind = intent.kind();
     start.guards.push(Guard::EffectFree { key: key.clone() });
     start.writes.push(Write::Effect(EffectWrite::Start(intent)));
     if let Err(rejected) = store.commit(start, now).await {
+        record_effect(kind, "refused");
+        log::warn!(
+            effect_key = key.as_str(),
+            effect_kind = kind_wire(kind),
+            task_id = owner.as_str();
+            "effect claim did not commit; the effect will not run: {rejected:#}"
+        );
         return Ok(EffectRun::Refused(rejected));
     }
+    record_effect(kind, "started");
     crate::fail_point!("effect.after_start");
 
     let value = effect().await;
 
     let (mut end_transition, state) = end(&value)?;
+    let outcome = state.outcome_label();
     end_transition
         .writes
         .insert(0, Write::Effect(EffectWrite::Finish { key, owner, state }));
@@ -611,6 +657,7 @@ where
         .commit(end_transition, OffsetDateTime::now_utc())
         .await
         .map_err(anyhow::Error::from)?;
+    record_effect(kind, outcome);
     Ok(EffectRun::Ran { value, committed })
 }
 
