@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Crash safety, Phase 2: effects
+
+- **Breaking: tool calls run as effects** (design §6.3). An effect is work
+  outside the store whose record commits before it runs, under its owner
+  task's lease, and whose outcome commits in the same transaction as the
+  owner's change and the events that report it. `journal::effect::run_effect`
+  is the one way to run one; `worker::run_tool_effect` runs a tool child
+  through it, and both tool paths (the host's tool worker and
+  `resume_confirmed_tool`) use it. What changes:
+  - An unsafe call's record is claimed by a transition guarded by the child's
+    lease (`Guard::TaskIs` + `Guard::EffectFree`), so a worker that lost its
+    lease can no longer claim it. Before, `persist_intent` was a standalone
+    insert.
+  - The record's outcome commits with the child's settle and its
+    `ToolCallEnd`. Before, it was a best-effort update after the settle, and
+    a failure left the record `Started` under a completed child.
+  - A call declared `ToolReplay::Safe` still writes no record: running it
+    again is its recovery. This is a deliberate reading of invariant I5, on
+    the hottest path.
+  - A worker cancelled before the executor runs claims nothing, so the next
+    attempt may run the call. Before, it left a `Failed` intent behind, and
+    every later attempt settled the call as interrupted.
+  - Recovery is unchanged: `Started` or `Failed` settles the call as
+    `interrupted:` without running it, and `Completed` refuses a duplicate.
+    An interrupted record is now stored as `failed` with
+    `resolution = 'interrupted'`.
+- **Breaking: the write and guard types.**
+  - `Write::Effect(EffectWrite::{Start, Finish})` and `Guard::EffectFree`
+    replace `Write::RecordIntent`.
+  - `Guard::task()` returns `Option<&AgentTaskId>`.
+  - Every backend checks a transition's effect expectations before its first
+    write: an `EffectFree` key has no row; a `Finish` key's row is `Started`
+    and belongs to that owner. A failure returns `Rejected::Guard`. The
+    in-memory store therefore never fails midway through effect writes. Its
+    effect rows live under the task store's lock, so `with_intent_store` is
+    gone.
+  - `DurableStore` gains the required reads `effect` and `effects_for_task`.
+    Every implementation and decorator must add them.
+- **Breaking: removed APIs.**
+  - `ExecutionIntentStore`, `InMemoryExecutionIntentStore`,
+    `ExecutionIntent`, `IntentStatus`, `OperationId`, `RetryDecision`,
+    `check_retry_safety`, `classify_tool_effect`, `guarded_tool_execution`
+    and `GuardedExecutionDeps`.
+  - `StoreRegistry::execution_intent_store`, and its storage-surface rows.
+  - `resume_confirmed_tool` now takes `&dyn AgentTaskStore` instead of the
+    deps struct.
+  - `ToolEffectClass` moved to `journal::tool_audit`. It is only the
+    tool-audit column and the metric label now.
+  - The architecture test counts `persist_intent` and `update_intent` as
+    split writes, so they cannot come back.
+- **Migration 0027 (both backends) and 0029 (Postgres only).**
+  `agent_sdk_execution_intents` gains six columns:
+  - `effect_kind`: `NOT NULL DEFAULT 'tool_call'`, with a check listing
+    `tool_call`, `llm_request`, `process_start` and `git_step`. All four are
+    listed now because SQLite cannot widen the check later.
+  - `attempt`: `NOT NULL DEFAULT 1`, with a check that it is `>= 1`.
+  - `resolution`: `interrupted` or `salvaged`, only on `failed` rows.
+  - `captured_output`, `journal_anchor` (the owner thread's next event
+    sequence at start) and `thread_id`, all nullable.
+
+  A tool call's key is still `{child_task_id}:{tool_call_id}`. The 0003
+  status and class checks are unchanged. An interrupted row sets
+  `error = 'interrupted'` and a salvaged row sets
+  `error = 'salvaged: aborted response'`, as 0003's error check requires.
+  A legacy `pending` row reads as `Started`.
+
+  **Locks (Postgres):**
+  - 0027 starts with `SET LOCAL lock_timeout = '5s'` and adds its checks
+    `NOT VALID`. Its ALTERs are catalog-only, with a brief ACCESS
+    EXCLUSIVE lock. A boot blocked behind an open transaction on the table
+    fails after 5s and restarts, instead of queueing every intent query
+    behind it.
+  - 0029 validates the three checks in its own transaction under SHARE
+    UPDATE EXCLUSIVE, so reads and writes continue.
+
+  **Measured** (Postgres 18; 1M tasks, 1M intents, 5M events; four
+  connections of task and intent traffic):
+
+  | Run | Result |
+  |---|---|
+  | No blocker | 0027 in 2.6 ms, 0029 in 290 ms; load p99 71 ms, no errors |
+  | 30 s read transaction open on the table | 0027 failed after 5.0 s on the lock timeout and applied nothing; load statements queued behind it for at most 5.0 s |
+  | After the blocker ended | migrated cleanly |
+
+  On SQLite each checked `ADD COLUMN` scans the table once: 0027 took 8 s
+  on a 1M-row intents table, once, at boot, before the daemon serves.
+
+  **Mixed deploys:** a running older binary keeps working next to a
+  migrated database:
+  - its inserts name their columns, so the defaults fill the new ones;
+  - its readers select explicit columns;
+  - it looks up only tool operation ids, so it never meets another kind.
+
+  **Rollback:** an older binary that restarts refuses the database
+  (`VersionMissing(27)`). Revert by hand, one version at a time, each in
+  one transaction:
+  - **0029:** `DELETE FROM _sqlx_migrations WHERE version = 29`.
+  - **0027:**
+    1. Postgres only: `ALTER TABLE agent_sdk_execution_intents DROP CONSTRAINT
+       agent_sdk_execution_intents_kind_check, DROP CONSTRAINT
+       agent_sdk_execution_intents_resolution_check, DROP CONSTRAINT
+       agent_sdk_execution_intents_attempt_check`.
+    2. `DELETE FROM agent_sdk_execution_intents WHERE effect_kind <> 'tool_call'`.
+       This loses no user data: those rows record model requests and other
+       effects that the older binary does not run.
+    3. `ALTER TABLE agent_sdk_execution_intents DROP COLUMN effect_kind`, and
+       the same for `attempt`, `resolution`, `captured_output`,
+       `journal_anchor` and `thread_id` (SQLite 3.35+, one statement each).
+    4. `DELETE FROM _sqlx_migrations WHERE version = 27`.
+
+  Interrupted rows stay `failed` with an error, which the older binary
+  reads as before. Production never deletes task rows, so effect rows grow
+  with tasks, as turn attempts already do.
+
 ### Added
 
 - **Session view fold** (`agent_sdk_foundation::view`, re-exported as

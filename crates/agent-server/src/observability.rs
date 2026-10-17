@@ -54,10 +54,10 @@ use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::{Counter, Histogram, ObservableGauge, UpDownCounter};
 
-use crate::journal::execution_intent::ToolEffectClass;
 use crate::journal::recovery::{FailureReason, RecoveryAction, RecoveryRecord};
 use crate::journal::relay::RelayTick;
 use crate::journal::tool_audit::ToolAuditEvent;
+use crate::journal::tool_audit::ToolEffectClass;
 
 // ─────────────────────────────────────────────────────────────────────
 // Bucket boundaries

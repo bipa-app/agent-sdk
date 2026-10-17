@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
-use super::execution_intent::ExecutionIntent;
+use super::effect::{EffectKey, EffectRecord, EffectWrite};
 use super::message::MessageProjection;
 use super::store::{MixedChildrenSpawn, SubagentBatchSpawn, SubagentInvocationSpawn};
 use super::subagent_spawn_transaction::SubagentSpawnEvent;
@@ -43,6 +43,9 @@ pub enum Guard {
         status: TaskStatus,
         lease: Option<(WorkerId, LeaseId)>,
     },
+    /// No effect row has `key` yet: the claim an
+    /// [`EffectWrite::Start`] needs.
+    EffectFree { key: EffectKey },
 }
 
 /// One write of a transition, applied in order.
@@ -76,8 +79,9 @@ pub enum Write {
         payload: Box<SuspensionPayload>,
         reattach: Vec<AgentTaskId>,
     },
-    /// Store an execution intent's new status.
-    RecordIntent(Box<ExecutionIntent>),
+    /// Start or finish an effect (see [`super::effect`]). Its row is
+    /// owned by its owner task's lock.
+    Effect(EffectWrite),
     /// Append a compaction to `thread`'s message projection: `messages`, the
     /// compactor's output, replace the `source_message_count` messages of
     /// its effective view, and their last `retained_message_count` are that
@@ -458,6 +462,18 @@ pub trait DurableStore: Send + Sync {
         transition: Transition,
         now: OffsetDateTime,
     ) -> Result<Committed, Rejected>;
+
+    /// The record of the effect `key`, if it has one.
+    ///
+    /// # Errors
+    /// The store could not be read.
+    async fn effect(&self, key: &EffectKey) -> anyhow::Result<Option<EffectRecord>>;
+
+    /// Every effect record of `owner`, oldest first.
+    ///
+    /// # Errors
+    /// The store could not be read.
+    async fn effects_for_task(&self, owner: &AgentTaskId) -> anyhow::Result<Vec<EffectRecord>>;
 }
 
 impl Transition {
@@ -644,7 +660,9 @@ impl Transition {
     pub fn locks(&self) -> Vec<Lock> {
         self.guards
             .iter()
-            .map(|guard| Lock::Task(guard.task().clone()))
+            .filter_map(Guard::task)
+            .cloned()
+            .map(Lock::Task)
             .chain(self.writes.iter().flat_map(Write::locks))
             .collect()
     }
@@ -658,6 +676,7 @@ impl Transition {
                 status: guarded_status,
                 ..
             } => guarded == task && *guarded_status == status,
+            Guard::EffectFree { .. } => false,
         })
     }
 
@@ -671,7 +690,7 @@ impl Transition {
                 lease: Some((worker, lease)),
                 ..
             } if guarded == task => Some((worker, lease)),
-            Guard::TaskIs { .. } => None,
+            Guard::TaskIs { .. } | Guard::EffectFree { .. } => None,
         })
     }
 
@@ -686,19 +705,10 @@ impl Transition {
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
-            | Write::RecordIntent(_)
+            | Write::Effect(_)
             | Write::AppendCompaction { .. } => false,
         })
     }
-
-    /// Whether any write records an execution intent.
-    #[must_use]
-    pub fn records_intents(&self) -> bool {
-        self.writes
-            .iter()
-            .any(|write| matches!(write, Write::RecordIntent(_)))
-    }
-
     /// Whether any write appends a compaction.
     #[must_use]
     pub fn appends_compactions(&self) -> bool {
@@ -719,7 +729,7 @@ impl Transition {
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
             | Write::ReparkAfterSteering { .. }
-            | Write::RecordIntent(_)
+            | Write::Effect(_)
             | Write::SpawnChildren { .. } => None,
         })
     }
@@ -763,7 +773,7 @@ impl Transition {
                     }
                 }
                 Write::ReparkAfterSteering { task, .. } => {
-                    if self.guards.iter().any(|guard| guard.task() == task) {
+                    if self.guards.iter().any(|guard| guard.task() == Some(task)) {
                         return Err(Rejected::Store(anyhow::anyhow!(
                             "re-parking task {task} takes no guard on it: the backend checks \
                              its ownership after locking its children"
@@ -781,9 +791,36 @@ impl Transition {
                     }
                     spawn.validate_shape()?;
                 }
-                Write::RecordIntent(_)
-                | Write::AppendEvents { .. }
-                | Write::AppendCompaction { .. } => {}
+                Write::Effect(EffectWrite::Start(intent)) => {
+                    let claimed = self.guards.iter().any(
+                        |guard| matches!(guard, Guard::EffectFree { key } if key == &intent.key),
+                    );
+                    if !claimed || self.lease_for(&intent.owner).is_none() {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "starting effect {} needs an EffectFree guard on its key and a \
+                             TaskIs guard with the lease of its owner {}",
+                            intent.key,
+                            intent.owner
+                        )));
+                    }
+                }
+                Write::Effect(EffectWrite::Finish { key, state, .. }) => {
+                    if state.is_started() {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "finishing effect {key} needs an end state"
+                        )));
+                    }
+                }
+                Write::AppendEvents { .. } | Write::AppendCompaction { .. } => {}
+            }
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for effect in self.effect_writes() {
+            if !keys.insert(effect.key()) {
+                return Err(Rejected::Store(anyhow::anyhow!(
+                    "effect {} is written twice in one transition",
+                    effect.key()
+                )));
             }
         }
         Ok(())
@@ -811,6 +848,7 @@ impl Write {
                 fence: Some(Fence::APPEND),
                 create: false,
             }],
+            Self::Effect(effect) => vec![Lock::Task(effect.owner().clone())],
             Self::ReparkAfterSteering { task, reattach, .. } => reattach
                 .iter()
                 .chain(std::iter::once(task))
@@ -848,8 +886,7 @@ impl Write {
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }
-            | Self::PauseOnConfirmation { .. }
-            | Self::RecordIntent(_) => Vec::new(),
+            | Self::PauseOnConfirmation { .. } => Vec::new(),
         }
     }
 }
@@ -882,7 +919,9 @@ pub fn wrapper_error(method: &str, rejected: Rejected) -> anyhow::Error {
 }
 
 impl Guard {
-    /// Check this guard against the stored row of its task.
+    /// Check a [`Self::TaskIs`] guard against the stored row of its task.
+    /// An effect guard passes here; [`Transition::check_effects`] checks
+    /// it against its effect row.
     ///
     /// # Errors
     ///
@@ -915,14 +954,17 @@ impl Guard {
                 }
                 Ok(())
             }
+            Self::EffectFree { .. } => Ok(()),
         }
     }
 
-    /// The task this guard reads.
+    /// The task a [`Self::TaskIs`] guard reads; an effect guard reads an
+    /// effect row instead (see [`Transition::check_effects`]).
     #[must_use]
-    pub const fn task(&self) -> &AgentTaskId {
+    pub const fn task(&self) -> Option<&AgentTaskId> {
         match self {
-            Self::TaskIs { task, .. } => task,
+            Self::TaskIs { task, .. } => Some(task),
+            Self::EffectFree { .. } => None,
         }
     }
 }

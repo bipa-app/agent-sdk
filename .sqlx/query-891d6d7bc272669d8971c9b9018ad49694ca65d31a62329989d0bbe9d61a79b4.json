@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nINSERT INTO agent_sdk_execution_intents (\n    operation_id, effect_class, tool_call_id, child_task_id,\n    tool_name, input, status, error, created_at, updated_at, resolution\n) VALUES ('op_resolution', 'side_effecting', 'call', 'task', 'tool', '{}', 'started', NULL, $1, $1, 'interrupted')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "891d6d7bc272669d8971c9b9018ad49694ca65d31a62329989d0bbe9d61a79b4"
+}

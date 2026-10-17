@@ -206,7 +206,7 @@
 //! aggregated success / failure outcomes). The counter is
 //! re-derived the next time any child reaches a terminal state.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_sdk_foundation::events::AgentEvent;
@@ -2873,6 +2873,8 @@ struct Inner {
     /// sweep). Populated when an invocation row is indexed and pruned
     /// when it is resumed or reaches a terminal state.
     invocation_by_child_root: HashMap<AgentTaskId, AgentTaskId>,
+    /// Effect records, keyed as the SQL backends' intents table.
+    effects: BTreeMap<super::effect::EffectKey, super::effect::EffectRecord>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -2894,10 +2896,6 @@ pub struct InMemoryAgentTaskStore {
     /// from cancellation markers because cancellation retains its own
     /// idempotent retry protocol.
     spawn_event_committer: Option<Arc<dyn AtomicSpawnEventCommitter>>,
-    /// Intent store a transition's [`super::transition::Write::RecordIntent`]
-    /// writes to, under the same lock as its task writes. `None` refuses
-    /// such a transition.
-    intent_store: Option<Arc<dyn super::execution_intent::ExecutionIntentStore>>,
     /// Message projections a transition's
     /// [`super::transition::Write::AppendCompaction`] writes to, under the
     /// same lock as its events. `None` refuses such a transition.
@@ -3206,16 +3204,6 @@ impl InMemoryAgentTaskStore {
         };
 
         Ok((failed, parent))
-    }
-
-    /// Wire the intent store a transition's intent writes go to.
-    #[must_use]
-    pub fn with_intent_store(
-        mut self,
-        intent_store: Arc<dyn super::execution_intent::ExecutionIntentStore>,
-    ) -> Self {
-        self.intent_store = Some(intent_store);
-        self
     }
 
     /// Wire the attempt and checkpoint stores a completed turn writes to.
@@ -5227,12 +5215,15 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
 
         self.require_spawn_event_sink(&transition)?;
         transition.validate()?;
-        let (sink, intent_store, message_store) = self.transition_handles(&transition)?;
+        let (sink, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
         for (index, guard) in transition.guards.iter().enumerate() {
-            guard.check(index, lock.inner.by_id.get(guard.task()))?;
+            if let Some(task) = guard.task() {
+                guard.check(index, lock.inner.by_id.get(task))?;
+            }
         }
+        transition.check_effects(|key| lock.inner.effects.get(key))?;
         self.require_appendable_threads(&transition).await?;
         let mut committed = Committed::default();
         for write in transition.writes.iter().cloned() {
@@ -5279,12 +5270,14 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
                     )?;
                     committed.reparked.push(reparked);
                 }
-                Write::RecordIntent(intent) => {
-                    let intent_store = intent_store.ok_or_else(|| anyhow!("no intent store"))?;
-                    intent_store
-                        .update_intent(&intent)
-                        .await
-                        .context("record transition intent")?;
+                Write::Effect(effect) => {
+                    let anchor = match (&effect, &self.marker_sink) {
+                        (super::effect::EffectWrite::Start(intent), Some(sink)) => {
+                            Some(sink.event_repo.next_sequence(&intent.thread).await?)
+                        }
+                        _ => None,
+                    };
+                    Self::apply_effect_locked(inner, effect, anchor, now);
                 }
                 Write::AppendCompaction {
                     thread,
@@ -5320,9 +5313,56 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         drop(lock);
         Ok(committed)
     }
+
+    async fn effect(
+        &self,
+        key: &super::effect::EffectKey,
+    ) -> Result<Option<super::effect::EffectRecord>> {
+        Ok(self.inner.read().await.effects.get(key).cloned())
+    }
+
+    async fn effects_for_task(
+        &self,
+        owner: &AgentTaskId,
+    ) -> Result<Vec<super::effect::EffectRecord>> {
+        let mut records: Vec<_> = self
+            .inner
+            .read()
+            .await
+            .effects
+            .values()
+            .filter(|record| &record.owner == owner)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| (a.created_at, &a.key).cmp(&(b.created_at, &b.key)));
+        Ok(records)
+    }
 }
 
 impl InMemoryAgentTaskStore {
+    /// Apply an effect write whose expectation
+    /// [`super::transition::Transition::check_effects`] already checked, so
+    /// it cannot fail after an earlier write of the transition landed.
+    fn apply_effect_locked(
+        inner: &mut Inner,
+        effect: super::effect::EffectWrite,
+        journal_anchor: Option<u64>,
+        now: OffsetDateTime,
+    ) {
+        match effect {
+            super::effect::EffectWrite::Start(intent) => {
+                let record = super::effect::EffectRecord::started(intent, journal_anchor, now);
+                inner.effects.insert(record.key.clone(), record);
+            }
+            super::effect::EffectWrite::Finish { key, state, .. } => {
+                if let Some(record) = inner.effects.get_mut(&key) {
+                    record.state = state;
+                    record.updated_at = now;
+                }
+            }
+        }
+    }
+
     /// Refuse a transition that appends to a purged thread, read through
     /// the event sink's thread store. A store built without a sink has no
     /// thread projection to read, so it refuses nothing.
@@ -5414,12 +5454,11 @@ impl InMemoryAgentTaskStore {
 /// The handles a transition's writes reach beyond the task rows.
 type TransitionHandles<'a> = (
     Option<&'a Arc<CancellationMarkerSink>>,
-    Option<&'a Arc<dyn super::execution_intent::ExecutionIntentStore>>,
     Option<&'a Arc<dyn super::message_store::MessageProjectionStore>>,
 );
 
 impl InMemoryAgentTaskStore {
-    /// The event sink, intent store and message store `transition` needs,
+    /// The event sink and message store `transition` needs,
     /// refused when the store has not been given one it needs.
     fn transition_handles(
         &self,
@@ -5430,11 +5469,6 @@ impl InMemoryAgentTaskStore {
                 transition.appends_events(),
                 self.marker_sink.as_ref(),
                 "a transition that appends events needs the store's event sink",
-            )?,
-            required_handle(
-                transition.records_intents(),
-                self.intent_store.as_ref(),
-                "a transition that records intents needs the store's intent store",
             )?,
             required_handle(
                 transition.appends_compactions(),

@@ -10,7 +10,6 @@ use agent_sdk_foundation::llm::{self, ContentBlock, ContentSource};
 use agent_sdk_foundation::{QuestionAnswer, ThreadId, TokenUsage, ToolResult, ToolTier};
 use agent_server::journal::checkpoint::NewCheckpointParams;
 use agent_server::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
-use agent_server::journal::execution_intent::GuardedExecutionDeps;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use agent_server::journal::store::{
@@ -671,15 +670,10 @@ async fn resume_confirmed_tool_with_abort_grace(
     let tool_executor = Arc::clone(runtime.tool_executor());
     let exec_cancel = drive_cancel.clone();
     let executor_artifact_store = artifact_store;
-    let deps = GuardedExecutionDeps {
-        task_store: stores.task_store.as_ref(),
-        intent_store: stores.execution_intent_store.as_ref(),
-        event_repo: stores.event_repo.as_ref(),
-    };
 
     let mut resume_fut = Box::pin(resume_confirmed_tool(
         bootstrap,
-        &deps,
+        stores.task_store.as_ref(),
         runtime.confirmation_policy().as_ref(),
         drive_cancel,
         move |_tool_call, collector| {
@@ -6817,6 +6811,20 @@ mod tests {
                 }
             }
             self.inner.commit(transition, now).await
+        }
+
+        async fn effect(
+            &self,
+            key: &agent_server::journal::EffectKey,
+        ) -> Result<Option<agent_server::journal::EffectRecord>> {
+            self.inner.effect(key).await
+        }
+
+        async fn effects_for_task(
+            &self,
+            owner: &AgentTaskId,
+        ) -> Result<Vec<agent_server::journal::EffectRecord>> {
+            self.inner.effects_for_task(owner).await
         }
     }
 

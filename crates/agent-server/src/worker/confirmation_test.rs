@@ -27,7 +27,6 @@ use crate::journal::checkpoint_store::InMemoryCheckpointStore;
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::{EventRepository, InMemoryEventRepository};
 use crate::journal::execution_context::build_root_worker_inputs;
-use crate::journal::execution_intent::{GuardedExecutionDeps, InMemoryExecutionIntentStore};
 use crate::journal::message_store::InMemoryMessageProjectionStore;
 use crate::journal::store::{AgentTaskStore, InMemoryAgentTaskStore};
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
@@ -489,7 +488,6 @@ async fn pause_persists_prepared_operation_from_listen_context() -> Result<()> {
 #[tokio::test]
 async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -537,11 +535,7 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
     // Resume with AllowAll policy → should execute.
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &AllowAllPolicy,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("transfer completed")) },
@@ -580,7 +574,6 @@ async fn approve_and_policy_allows_executes_tool_successfully() -> Result<()> {
 #[tokio::test]
 async fn approve_but_policy_denies_fails_child() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     let (_parent, children) = suspend_root_with_tools(
@@ -621,11 +614,7 @@ async fn approve_but_policy_denies_fails_child() -> Result<()> {
     let policy = DenyAllPolicy::new("tool disabled by administrator");
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &policy,
         &cancel,
         |_info, _collector| async {
@@ -1185,7 +1174,6 @@ fn confirmation_decision_round_trips_through_json() -> Result<()> {
 #[tokio::test]
 async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
     let stores = TestStores::new();
-    let intent_store = InMemoryExecutionIntentStore::new();
     let cancel = CancellationToken::new();
 
     // Step 1: Suspend root with a confirm-tier tool.
@@ -1234,11 +1222,7 @@ async fn full_confirmation_lifecycle_pause_approve_execute() -> Result<()> {
 
     let resume_outcome = resume_confirmed_tool(
         resume_bootstrap,
-        &GuardedExecutionDeps {
-            task_store: &stores.tasks,
-            intent_store: &intent_store,
-            event_repo: &stores.events,
-        },
+        &stores.tasks,
         &AllowAllPolicy,
         &cancel,
         |_info, _collector| async { Ok(ToolResult::success("transfer of 42 completed")) },

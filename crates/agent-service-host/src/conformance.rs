@@ -47,6 +47,7 @@ mod tests {
 
     #[cfg(all(feature = "sqlite", feature = "failpoints"))]
     use crate::fail;
+    use agent_sdk_foundation::ToolReplay;
     use agent_sdk_foundation::audit::AuditProvenance;
     use agent_sdk_foundation::events::AgentEvent;
     use agent_sdk_foundation::{
@@ -57,10 +58,10 @@ mod tests {
     use agent_server::journal::checkpoint_store::CheckpointStore;
     use agent_server::journal::commit::{CompletedTurnCommit, commit_completed_turn};
     use agent_server::journal::committed_event::CommittedEvent;
-    use agent_server::journal::event_repository::EventRepository;
-    use agent_server::journal::execution_intent::{
-        ExecutionIntent, ExecutionIntentStore, IntentStatus, OperationId, ToolEffectClass,
+    use agent_server::journal::effect::{
+        EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite,
     };
+    use agent_server::journal::event_repository::EventRepository;
     use agent_server::journal::idempotency::{
         IdempotencyClaim, IdempotencyKind, IdempotencyRecord,
     };
@@ -84,6 +85,7 @@ mod tests {
         CloseAttemptParams, OpenAttemptParams, TurnAttemptOutcome,
     };
     use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+    use agent_server::journal::{Guard, Rejected, Settle, Transition, Write};
     use agent_server::worker::subagent::{
         EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
         InheritedSubagentPolicy, SubagentCapabilityProfile, SubagentSandboxPolicy,
@@ -2934,57 +2936,231 @@ mod tests {
         Ok(())
     }
 
-    fn make_test_intent(task_name: &str, secs: i64) -> ExecutionIntent {
-        let task_id = AgentTaskId::from_string(format!("task_{task_name}"));
-        let op_id = OperationId::new(&task_id, "call_1");
-        ExecutionIntent {
-            operation_id: op_id,
-            effect_class: ToolEffectClass::SideEffecting,
-            tool_call_id: "call_1".into(),
-            child_task_id: task_id,
-            tool_name: "test_tool".into(),
-            input: serde_json::json!({ "key": "value" }),
-            status: IntentStatus::Pending,
-            error: None,
-            created_at: t_plus(secs),
-            updated_at: t_plus(secs),
+    /// A running root on `{name}`, leased, for the effect cases.
+    async fn running_effect_owner(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        name: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        let thread = thread_id(name);
+        thread_store.get_or_create(&thread, t0()).await?;
+        let task = AgentTask::new_root_turn(thread, t0(), 3);
+        let task_id = task.id.clone();
+        task_store.submit_root_turn(task).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let task = task_store
+            .try_acquire_task(
+                &task_id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(1),
+            )
+            .await?
+            .context("the effect owner must acquire")?;
+        Ok((task, worker, lease))
+    }
+
+    fn effect_intent(owner: &AgentTask, call_id: &str) -> EffectIntent {
+        EffectIntent {
+            key: EffectKey::tool(&owner.id, call_id),
+            replay: ToolReplay::Unsafe,
+            owner: owner.id.clone(),
+            thread: owner.thread_id.clone(),
+            subject: EffectSubject::Tool {
+                call_id: call_id.to_owned(),
+                name: "test_tool".into(),
+                input: serde_json::json!({ "key": "value" }),
+            },
+            attempt: 1,
         }
     }
 
-    /// `persist_intent` is insert-if-absent, not an upsert (findings
-    /// #1/#2/#10): the first claim on an `operation_id` wins, and a second
-    /// `persist_intent` for the same id returns an **error** (claim
-    /// conflict) without clobbering the in-flight record back to a weaker
-    /// status. This is the atomic claim the side-effecting-tool guard
-    /// relies on to fail closed, and it must hold on every backend.
-    async fn test_persist_intent_insert_if_absent(
-        intent_store: &dyn ExecutionIntentStore,
+    fn start_effect(intent: EffectIntent, worker: &WorkerId, lease: &LeaseId) -> Transition {
+        Transition {
+            guards: vec![
+                Guard::TaskIs {
+                    task: intent.owner.clone(),
+                    status: TaskStatus::Running,
+                    lease: Some((worker.clone(), lease.clone())),
+                },
+                Guard::EffectFree {
+                    key: intent.key.clone(),
+                },
+            ],
+            writes: vec![Write::Effect(EffectWrite::Start(intent))],
+        }
+    }
+
+    fn finish_effect(key: &EffectKey, owner: &AgentTaskId, state: EffectState) -> Transition {
+        Transition {
+            guards: Vec::new(),
+            writes: vec![Write::Effect(EffectWrite::Finish {
+                key: key.clone(),
+                owner: owner.clone(),
+                state,
+            })],
+        }
+    }
+
+    /// An effect's record is claimed once, under its owner's lease, and
+    /// ended once: a second claim, a claim under a stale lease, a second
+    /// finish and a finish by another owner are all refused by a guard and
+    /// change nothing. The start records the owner thread's next event
+    /// sequence as its anchor.
+    async fn test_effect_claim_and_finish(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
     ) -> Result<()> {
-        let mut intent = make_test_intent("conformance-claim", 25);
-        intent_store.persist_intent(&intent).await?;
+        let (owner, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-claim").await?;
+        let intent = effect_intent(&owner, "call_1");
+        let key = intent.key.clone();
 
-        // A racing second claim (e.g. a stale worker) must lose with a
-        // conflict and must NOT downgrade the record.
-        intent.mark_started(t_plus(26));
-        let err = intent_store
-            .persist_intent(&intent)
-            .await
-            .err()
-            .context("second persist for the same operation_id must conflict")?;
-        assert!(
-            err.to_string().contains("conflict"),
-            "expected a claim conflict, got: {err}",
-        );
-
-        let loaded = intent_store
-            .get_intent(&intent.operation_id)
+        task_store
+            .commit(start_effect(intent.clone(), &worker, &lease), t_plus(2))
+            .await?;
+        let started = task_store
+            .effect(&key)
             .await?
-            .context("intent should be present after the winning claim")?;
-        assert_eq!(
-            loaded.status,
-            IntentStatus::Pending,
-            "the losing claim must not clobber the in-flight Pending record",
+            .context("the start commits the record")?;
+        assert_eq!(started.state, EffectState::Started);
+        assert_eq!(started.subject, intent.subject);
+        assert_eq!(started.thread.as_ref(), Some(&owner.thread_id));
+        assert!(started.journal_anchor.is_some(), "{started:?}");
+
+        let second = task_store
+            .commit(start_effect(intent.clone(), &worker, &lease), t_plus(3))
+            .await;
+        assert!(
+            matches!(second, Err(Rejected::Guard { .. })),
+            "a second claim must lose to a guard: {second:?}"
         );
+
+        let stale = task_store
+            .commit(
+                start_effect(effect_intent(&owner, "call_2"), &worker, &LeaseId::new()),
+                t_plus(3),
+            )
+            .await;
+        assert!(
+            matches!(stale, Err(Rejected::Guard { .. })),
+            "a stale lease cannot claim: {stale:?}"
+        );
+        assert!(
+            task_store
+                .effect(&EffectKey::tool(&owner.id, "call_2"))
+                .await?
+                .is_none(),
+            "a refused claim writes no record"
+        );
+
+        let foreign = task_store
+            .commit(
+                finish_effect(&key, &AgentTaskId::new(), EffectState::Completed),
+                t_plus(4),
+            )
+            .await;
+        assert!(
+            matches!(foreign, Err(Rejected::Guard { .. })),
+            "{foreign:?}"
+        );
+
+        task_store
+            .commit(
+                finish_effect(&key, &owner.id, EffectState::Completed),
+                t_plus(5),
+            )
+            .await?;
+        let again = task_store
+            .commit(
+                finish_effect(
+                    &key,
+                    &owner.id,
+                    EffectState::Failed {
+                        error: "late".into(),
+                    },
+                ),
+                t_plus(6),
+            )
+            .await;
+        assert!(
+            matches!(again, Err(Rejected::Guard { .. })),
+            "a second finish must not overwrite the outcome: {again:?}"
+        );
+
+        let records = task_store.effects_for_task(&owner.id).await?;
+        let [record] = records.as_slice() else {
+            anyhow::bail!("expected the one record, got {records:?}");
+        };
+        assert_eq!(record.state, EffectState::Completed);
+        assert_eq!(record.created_at, t_plus(2));
+        assert_eq!(record.updated_at, t_plus(5));
+        Ok(())
+    }
+
+    /// Design C15: every backend checks a transition's effect expectations
+    /// before its first write, so when the LAST write's expectation fails
+    /// nothing earlier in the transition is visible — on the in-memory
+    /// store, which cannot roll back, too.
+    async fn test_effect_expectation_failure_writes_nothing(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let (owner, worker, lease) =
+            running_effect_owner(task_store, thread_store, "effect-atomic").await?;
+        let intent = effect_intent(&owner, "call_1");
+        let key = intent.key.clone();
+        let events_before = event_repo.get_events(&owner.thread_id).await?.len();
+
+        let mut transition = Transition::settle(
+            owner.id.clone(),
+            worker.clone(),
+            lease.clone(),
+            Settle::Complete {
+                result: serde_json::json!("done"),
+            },
+            owner.thread_id.clone(),
+            vec![AgentEvent::text("m1", "reported")],
+        );
+        transition.guards.push(Guard::EffectFree {
+            key: EffectKey::tool(&owner.id, "call_0"),
+        });
+        transition
+            .writes
+            .push(Write::Effect(EffectWrite::Start(effect_intent(
+                &owner, "call_0",
+            ))));
+        transition.writes.push(Write::Effect(EffectWrite::Finish {
+            key: key.clone(),
+            owner: owner.id.clone(),
+            state: EffectState::Completed,
+        }));
+        let refused = task_store.commit(transition, t_plus(2)).await;
+        assert!(
+            matches!(refused, Err(Rejected::Guard { .. })),
+            "finishing an effect with no record is refused by a guard: {refused:?}"
+        );
+
+        let task = task_store.get(&owner.id).await?.context("owner")?;
+        assert_eq!(task.status, TaskStatus::Running, "the settle did not land");
+        assert_eq!(
+            event_repo.get_events(&owner.thread_id).await?.len(),
+            events_before,
+            "the events did not land"
+        );
+        assert_eq!(
+            task_store.effects_for_task(&owner.id).await?,
+            Vec::new(),
+            "the start did not land"
+        );
+
+        task_store
+            .commit(start_effect(intent, &worker, &lease), t_plus(3))
+            .await?;
+        assert!(task_store.effect(&key).await?.is_some());
         Ok(())
     }
 
@@ -4660,9 +4836,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conformance_in_memory_persist_intent_insert_if_absent() -> Result<()> {
-        let store = agent_server::journal::execution_intent::InMemoryExecutionIntentStore::new();
-        test_persist_intent_insert_if_absent(&store).await
+    async fn conformance_in_memory_effect_claim_and_finish() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_effect_claim_and_finish(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_effect_expectation_failure_writes_nothing() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_effect_expectation_failure_writes_nothing(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.event.as_ref(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -5131,9 +5318,16 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn conformance_sqlite_persist_intent_insert_if_absent() -> Result<()> {
+    async fn conformance_sqlite_effect_claim_and_finish() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
-        test_persist_intent_insert_if_absent(&store).await
+        test_effect_claim_and_finish(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_effect_expectation_failure_writes_nothing() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_effect_expectation_failure_writes_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6027,11 +6221,20 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn conformance_postgres_persist_intent_insert_if_absent() -> Result<()> {
+    async fn conformance_postgres_effect_claim_and_finish() -> Result<()> {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
         };
-        test_persist_intent_insert_if_absent(&store).await
+        test_effect_claim_and_finish(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_effect_expectation_failure_writes_nothing() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_effect_expectation_failure_writes_nothing(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]
