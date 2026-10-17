@@ -531,6 +531,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     event writers `pause_on_question` and `requeue_owned_task`, which can
     reach a purged thread only between `begin_purge` and its `cancel_tree`,
     the window the `commit` fence covers.
+- **Breaking: the lease-guarded event writers, the message-head writers and a
+  fork refuse a purged thread.** This closes the gaps the entry above lists
+  as still unfenced, except `MessageProjectionStore::get_or_create`. On a
+  `Deleting` or `Deleted` thread these writes now fail with a typed
+  `ThreadStateConflict` and write nothing:
+  - `AgentTaskStore::requeue_owned_task` with a boundary event and
+    `AgentTaskStore::pause_on_question`, on all three backends, after the
+    lease check as for every append. The task stays leased, and no event
+    or advisory row is written.
+  - `MessageProjectionStore::commit_messages`, `replace_history`,
+    `append_repair`, `set_draft` and `clear_draft`, on all three backends.
+    `clear_draft` refuses a purged thread whether or not it has a head.
+    SQLite and Postgres lock the thread row before the message head, the
+    order `append_compaction` already used. `clear_draft` now reads and
+    writes the head in one transaction.
+  - `ThreadStore::commit_fork` from a purged source. `ForkCommitParams`
+    gains the required `source_thread_id` field. `Fence::FORK_SOURCE` lets
+    a source with no row through. Postgres locks the source thread before
+    it claims the destination.
+  - In memory, `StoreRegistry::in_memory` wraps its message store in the
+    new `PurgeFencedMessageProjectionStore`, as it wraps its event journal
+    in `PurgeFencedEventRepository`. The in-memory question pause commits
+    its events before it releases the task store's lock. The in-memory
+    fences call `Fence::APPEND.check` instead of repeating its rule.
+  - `get_or_create` still adds an empty message head to a purged thread
+    with none, on every backend. It writes no history, and readers of a
+    deleted thread call it.
+  - Each of these refusals is counted on the new `agent_server.fence.refused`
+    counter (`otel`), by `writer` (`requeue_owned_task`, `pause_on_question`,
+    `message_head`, `fork_source`; `FencedWriter`) and `thread_status`. It is
+    also logged at debug with the thread id, and on SQLite and Postgres
+    emitted as an `agent_server.fence.refused` tracing event with `thread.id`
+    on the current span. `journal::thread::record_fence_refusal` records one
+    refusal. `ThreadOperation` and `ThreadStatus` gain `as_str`.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).
@@ -749,6 +783,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-memory `commit` runs `Transition::validate` before it checks for an
+  event sink, so a malformed mixed spawn gets the same validation error on
+  every backend (it got "boundary events require an in-memory event sink"
+  on a store with no sink).
+- A `kill -9` test on SQLite holds the compaction transaction open and kills
+  the process: a new process sees neither the compaction nor its
+  `ContextCompacted`.
 - `agent-sdk-providers` test targets compile with any single provider
   feature. Tests that build an `OpenAIProvider` or use its model constants
   need `openai`, and `tests/provider_tiers.rs` needs `anthropic`; with the
