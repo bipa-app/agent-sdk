@@ -4926,7 +4926,7 @@ impl Inner {
                 },
                 spawn_index,
                 now,
-                AgentTask::DEFAULT_MAX_ATTEMPTS,
+                AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
             )
             .context("spawn rejected: new_subagent_invocation failed")?;
             if self.by_id.contains_key(&invocation.id) {

@@ -31,7 +31,9 @@
 //! The rows live in `agent_sdk_execution_intents` (migrations 0003 and
 //! 0027). A tool call's key is `{child_task_id}:{tool_call_id}`, the
 //! operation id every earlier release wrote and read, so an old and a new
-//! process find each other's rows during a rolling deploy.
+//! process find each other's rows during a rolling deploy. A git step's key
+//! is `{invocation}:git:{step}`; its row keeps the unit in `tool_call_id`,
+//! `git:{step}` in `tool_name` and the whole subject in `input`.
 //!
 //! | [`EffectState`] | `status` | `error` | `resolution` |
 //! |---|---|---|---|
@@ -89,6 +91,13 @@ impl EffectKey {
         Self(format!("{}:{tool_call_id}", child.0))
     }
 
+    /// The key of the git step `step` that the subagent invocation
+    /// `invocation` runs when it completes: `{invocation}:git:{step}`.
+    #[must_use]
+    pub fn git(invocation: &AgentTaskId, step: &str) -> Self {
+        Self(format!("{}:git:{step}", invocation.0))
+    }
+
     /// A key as a store read it back. Public because the stores live in
     /// another crate, and a host may keep a key it read to finish later.
     #[must_use]
@@ -114,6 +123,7 @@ impl std::fmt::Display for EffectKey {
 pub enum EffectKind {
     ToolCall,
     LlmRequest,
+    GitStep,
 }
 
 /// The kind-specific part of an effect.
@@ -129,6 +139,14 @@ pub enum EffectSubject {
         provider: String,
         model: String,
     },
+    /// One git step a host runs when a subagent invocation completes (for
+    /// example `merge_back`), in the repository `repo`, for the work unit
+    /// `unit`.
+    Git {
+        step: String,
+        repo: String,
+        unit: String,
+    },
 }
 
 impl EffectSubject {
@@ -137,6 +155,7 @@ impl EffectSubject {
         match self {
             Self::Tool { .. } => EffectKind::ToolCall,
             Self::Llm { .. } => EffectKind::LlmRequest,
+            Self::Git { .. } => EffectKind::GitStep,
         }
     }
 }
@@ -514,6 +533,7 @@ pub fn kind_from_wire(kind: &str) -> Option<EffectKind> {
     match kind {
         "tool_call" => Some(EffectKind::ToolCall),
         "llm_request" => Some(EffectKind::LlmRequest),
+        "git_step" => Some(EffectKind::GitStep),
         _ => None,
     }
 }
@@ -532,6 +552,7 @@ pub const fn kind_wire(kind: EffectKind) -> &'static str {
     match kind {
         EffectKind::ToolCall => "tool_call",
         EffectKind::LlmRequest => "llm_request",
+        EffectKind::GitStep => "git_step",
     }
 }
 
@@ -559,6 +580,15 @@ impl EffectRecord {
                     "turn_attempt_id": turn_attempt_id,
                     "provider": provider,
                     "model": model,
+                }),
+            ),
+            EffectSubject::Git { step, repo, unit } => (
+                unit.clone(),
+                format!("git:{step}"),
+                serde_json::json!({
+                    "step": step,
+                    "repo": repo,
+                    "unit": unit,
                 }),
             ),
         };
@@ -593,28 +623,34 @@ impl EffectRecord {
     /// A value no release writes.
     #[doc(hidden)]
     pub fn from_row(row: EffectRow) -> anyhow::Result<Self> {
+        let field = |name: &str| {
+            row.input
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .with_context(|| {
+                    format!(
+                        "{} effect row {} lacks {name}",
+                        row.effect_kind, row.operation_id
+                    )
+                })
+        };
         let subject = match row.effect_kind.as_str() {
             "tool_call" => EffectSubject::Tool {
                 call_id: row.tool_call_id,
                 name: row.tool_name,
                 input: row.input,
             },
-            "llm_request" => {
-                let field = |name: &str| {
-                    row.input
-                        .get(name)
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .with_context(|| {
-                            format!("llm effect row {} lacks {name}", row.operation_id)
-                        })
-                };
-                EffectSubject::Llm {
-                    turn_attempt_id: field("turn_attempt_id")?,
-                    provider: field("provider")?,
-                    model: field("model")?,
-                }
-            }
+            "llm_request" => EffectSubject::Llm {
+                turn_attempt_id: field("turn_attempt_id")?,
+                provider: field("provider")?,
+                model: field("model")?,
+            },
+            "git_step" => EffectSubject::Git {
+                step: field("step")?,
+                repo: field("repo")?,
+                unit: field("unit")?,
+            },
             other => bail!("unknown effect kind {other:?}"),
         };
         Ok(Self {
@@ -825,11 +861,15 @@ mod tests {
 
     #[test]
     fn every_kind_round_trips_through_its_wire_name() {
-        for kind in [EffectKind::ToolCall, EffectKind::LlmRequest] {
+        for kind in [
+            EffectKind::ToolCall,
+            EffectKind::LlmRequest,
+            EffectKind::GitStep,
+        ] {
             // A kind added to the enum fails to compile here until it is
             // listed above, so the stores' abandon counts cannot drop it.
             match kind {
-                EffectKind::ToolCall | EffectKind::LlmRequest => {}
+                EffectKind::ToolCall | EffectKind::LlmRequest | EffectKind::GitStep => {}
             }
             assert_eq!(kind_from_wire(kind_wire(kind)), Some(kind));
         }
@@ -901,6 +941,26 @@ mod tests {
         let row = stored.to_row()?;
         assert_eq!(row.effect_kind, "llm_request");
         assert_eq!(row.tool_name, "llm:anthropic/claude-sonnet-5-5");
+        assert_eq!(EffectRecord::from_row(row)?, stored);
+        Ok(())
+    }
+
+    #[test]
+    fn a_git_subject_round_trips_through_the_legacy_columns() -> anyhow::Result<()> {
+        let invocation = AgentTaskId::from_string("task_1");
+        let mut stored = record(EffectState::Completed);
+        stored.key = EffectKey::git(&invocation, "merge_back");
+        stored.replay = ToolReplay::Safe;
+        stored.subject = EffectSubject::Git {
+            step: "merge_back".into(),
+            repo: "repo_1".into(),
+            unit: "unit_1".into(),
+        };
+        let row = stored.to_row()?;
+        assert_eq!(row.operation_id, "task_1:git:merge_back");
+        assert_eq!(row.effect_kind, "git_step");
+        assert_eq!(row.tool_name, "git:merge_back");
+        assert_eq!(row.tool_call_id, "unit_1");
         assert_eq!(EffectRecord::from_row(row)?, stored);
         Ok(())
     }
