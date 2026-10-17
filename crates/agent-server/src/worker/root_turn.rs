@@ -684,6 +684,7 @@ async fn fail_root_turn_inner(
                 crate::journal::Settle::FailWithReason {
                     error: error_msg,
                     reason,
+                    result: None,
                 },
                 thread_id.clone(),
                 vec![error_event],
@@ -8448,17 +8449,24 @@ fn extract_child_tool_result(child: &AgentTask) -> Result<ToolResult> {
                 format!("failed to deserialize result_payload on child {}", child.id)
             })
         }
-        TaskStatus::Failed => {
-            let error = child.last_error.as_deref().unwrap_or("unknown error");
-            Ok(ToolResult {
+        // A child that failed with a result for its parent (a stalled tool's
+        // report) hands that result over in place of its error.
+        TaskStatus::Failed => Ok(child
+            .result_payload
+            .clone()
+            .and_then(|payload| serde_json::from_value(payload).ok())
+            .unwrap_or_else(|| ToolResult {
                 success: false,
-                output: error.to_owned(),
+                output: child
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+                    .to_owned(),
                 artifact: None,
                 data: None,
                 documents: Vec::new(),
                 duration_ms: None,
-            })
-        }
+            })),
         TaskStatus::Cancelled => Ok(ToolResult {
             success: false,
             output: "tool execution was cancelled".to_owned(),
@@ -10023,6 +10031,45 @@ async fn repark_after_steering_exchange(
 mod tests {
     use super::*;
     use crate::journal::message_store::InMemoryMessageProjectionStore;
+
+    fn failed_child(result_payload: Option<serde_json::Value>) -> AgentTask {
+        let mut child = AgentTask::new_root_turn_with_input(
+            ThreadId::from_string("t-failed-child"),
+            Vec::new(),
+            OffsetDateTime::UNIX_EPOCH,
+            1,
+        );
+        child.status = TaskStatus::Failed;
+        child.last_error = Some("tool 'probe' stalled".into());
+        child.result_payload = result_payload;
+        child
+    }
+
+    #[test]
+    fn a_failed_child_hands_its_parent_the_result_it_keeps() -> Result<()> {
+        let kept = ToolResult {
+            success: false,
+            output: "tool 'probe' stalled".into(),
+            artifact: None,
+            data: Some(serde_json::json!({"outcome": "stalled"})),
+            documents: Vec::new(),
+            duration_ms: None,
+        };
+        let read = extract_child_tool_result(&failed_child(Some(serde_json::to_value(&kept)?)))?;
+        assert_eq!(read, kept);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_child_whose_payload_is_not_a_result_reads_as_its_error() -> Result<()> {
+        for payload in [None, Some(serde_json::json!({"not": "a tool result"}))] {
+            let read = extract_child_tool_result(&failed_child(payload))?;
+            assert!(!read.success);
+            assert_eq!(read.output, "tool 'probe' stalled");
+            assert_eq!(read.data, None);
+        }
+        Ok(())
+    }
     use crate::worker::definition::{
         ProviderRequestKind, RequestContextFn, RequestContextInput, RuntimePolicy,
     };

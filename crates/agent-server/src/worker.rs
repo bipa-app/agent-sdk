@@ -95,6 +95,7 @@ pub mod root_turn;
 pub mod subagent;
 pub mod subagent_spawn_selector;
 pub mod tool_effect;
+pub mod tool_stall;
 pub mod tool_task;
 pub mod user_input;
 
@@ -169,6 +170,7 @@ pub use subagent_spawn_selector::{
     BatchRouting, NoopSubagentSpawnSelector, SubagentSpawnDecision, SubagentSpawnSelector,
     classify_batch,
 };
+pub use tool_stall::{StallBudget, StallSignal, StallTrip, ToolStallReport};
 pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,
     resolve_tool_bootstrap,

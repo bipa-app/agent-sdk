@@ -59,6 +59,8 @@ use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
 use crate::journal::transition::{Committed, DurableStore, Settle, Transition};
 use crate::worker::activity::ActivityBeacon;
+use crate::worker::tool_stall::{StallSignal, StallTrip, ToolStallReport};
+use agent_sdk_foundation::events::TerminalReason;
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool event collector
@@ -119,6 +121,13 @@ impl ToolEventCollector {
         }
     }
 
+    /// Mark the tool alive without reporting an event: evidence of work
+    /// for the stall budget, such as output bytes or process activity that
+    /// the host reports some other way.
+    pub fn note_progress(&self) {
+        self.activity.bump(OffsetDateTime::now_utc());
+    }
+
     /// Drain all collected events, leaving the collector empty.
     ///
     /// Used by the worker to flush events at commit time, and by
@@ -169,6 +178,9 @@ pub struct ToolTaskBootstrap {
     /// harmless: the tool simply reports no live progress, exactly as
     /// before this field existed.
     pub activity: ActivityBeacon,
+    /// Stops the tool when its heartbeat finds it silent for its stall
+    /// budget. A [`Default`] signal never trips.
+    pub stall: StallSignal,
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -274,6 +286,7 @@ pub async fn resolve_tool_bootstrap(
         lease_id,
         tool_call,
         activity,
+        stall: StallSignal::default(),
     })
 }
 
@@ -432,6 +445,8 @@ where
 /// A tool call's executor run, before the transition that settles it.
 pub(crate) struct ToolRun {
     pub(crate) result: anyhow::Result<ToolResult>,
+    /// Set when the stall signal stopped the tool before it returned.
+    pub(crate) stalled: Option<ToolStallReport>,
     progress_events: Vec<AgentEvent>,
     /// When the executor returned.
     pub(crate) finished_at: OffsetDateTime,
@@ -462,7 +477,13 @@ where
     // runs for longer than a stall budget can prove it is alive while it
     // runs.
     let collector = ToolEventCollector::with_activity(bootstrap.activity.clone());
-    let result = executor(bootstrap.tool_call.clone(), collector.clone()).await;
+    // A tool that stalls is dropped mid-flight; whatever it did is unknown,
+    // which is what its result and its effect record then say.
+    let outcome = tokio::select! {
+        biased;
+        result = executor(bootstrap.tool_call.clone(), collector.clone()) => Ok(result),
+        trip = bootstrap.stall.tripped() => Err(trip),
+    };
 
     // The tool may have run for a long time. Drive the terminal transition
     // and its committed events with the ACTUAL completion instant, not the
@@ -483,11 +504,54 @@ where
     // the CAS-guarded settle commits. This prevents orphaned progress
     // events when a stale-lease worker's CAS fails and another worker
     // re-executes the tool.
-    ToolRun {
-        result,
-        progress_events: collector.drain(),
-        finished_at,
+    let progress_events = collector.drain();
+    match outcome {
+        Ok(result) => ToolRun {
+            result,
+            stalled: None,
+            progress_events,
+            finished_at,
+        },
+        Err(trip) => ToolRun::stalled(bootstrap, trip, progress_events, finished_at),
     }
+}
+
+impl ToolRun {
+    /// The run of a tool stopped as stalled, keeping what it reported.
+    #[must_use]
+    pub(crate) fn stalled(
+        bootstrap: &ToolTaskBootstrap,
+        trip: StallTrip,
+        progress_events: Vec<AgentEvent>,
+        finished_at: OffsetDateTime,
+    ) -> Self {
+        let report = ToolStallReport::new(trip, &progress_events);
+        Self {
+            result: Err(anyhow::anyhow!(report.message(&bootstrap.tool_call.name))),
+            stalled: Some(report),
+            progress_events,
+            finished_at,
+        }
+    }
+}
+
+/// The settle of a stalled tool call, for the heartbeat to commit when the
+/// tool's run has ignored the stall signal for the abort grace.
+///
+/// It carries no partial output: the progress the tool reported is held by
+/// the run.
+///
+/// # Errors
+/// Serialising the stall report fails.
+pub fn stalled_settle_transition(
+    bootstrap: &ToolTaskBootstrap,
+    trip: StallTrip,
+    now: OffsetDateTime,
+) -> anyhow::Result<Transition> {
+    settle_transition(
+        bootstrap,
+        &ToolRun::stalled(bootstrap, trip, Vec::new(), now),
+    )
 }
 
 /// The transition that settles the tool child from its run: the child's
@@ -499,15 +563,38 @@ pub(crate) fn settle_transition(
     bootstrap: &ToolTaskBootstrap,
     run: &ToolRun,
 ) -> anyhow::Result<Transition> {
-    let (outcome, end_result) = match &run.result {
-        Ok(result) => (
+    let (outcome, end_result) = match (&run.result, &run.stalled) {
+        (_, Some(report)) => {
+            let result = ToolResult {
+                success: false,
+                output: report.message(&bootstrap.tool_call.name),
+                artifact: None,
+                data: Some(
+                    serde_json::to_value(report).context("serialize the tool stall report")?,
+                ),
+                documents: Vec::new(),
+                duration_ms: None,
+            };
+            (
+                Settle::FailWithReason {
+                    error: result.output.clone(),
+                    reason: TerminalReason::WatchdogStall,
+                    result: Some(
+                        serde_json::to_value(&result)
+                            .context("serialize the stalled tool result")?,
+                    ),
+                },
+                result,
+            )
+        }
+        (Ok(result), None) => (
             Settle::Complete {
                 result: serde_json::to_value(result)
                     .context("serialize tool result for durable storage")?,
             },
             result.clone(),
         ),
-        Err(err) => {
+        (Err(err), None) => {
             let error_msg = format!("{err:#}");
             (
                 Settle::Fail {

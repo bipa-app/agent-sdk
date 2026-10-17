@@ -136,6 +136,14 @@ pub fn tool_intent(bootstrap: &ToolTaskBootstrap) -> EffectIntent {
 }
 
 fn end_state(run: &ToolRun) -> EffectState {
+    // A stalled tool was dropped mid-flight: it may have acted, so its
+    // record says interrupted, with what it reported, not failed.
+    if let Some(report) = &run.stalled {
+        return EffectState::Interrupted {
+            captured_output: (!report.partial_output.is_empty())
+                .then(|| report.partial_output.clone()),
+        };
+    }
     match &run.result {
         Ok(_) => EffectState::Completed,
         Err(err) => EffectState::Failed {

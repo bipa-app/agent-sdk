@@ -3559,6 +3559,7 @@ impl SqliteDurableStore {
             Write::SettleTask { task, outcome } => {
                 let settled = Self::apply_settle_tx(tx, transition, &task, outcome, now).await?;
                 committed.settled.push(settled);
+                agent_server::fail_point!("transition.settle_written");
             }
             Write::RejectConfirmation { task, error } => {
                 let rejected = Self::reject_confirmation_tx(tx, &task, error, now).await?;
@@ -3704,7 +3705,11 @@ impl SqliteDurableStore {
                 )
                 .await
             }
-            Settle::FailWithReason { error, reason } => {
+            Settle::FailWithReason {
+                error,
+                reason,
+                result,
+            } => {
                 Self::apply_task_terminal_transition_tx(
                     tx,
                     task,
@@ -3712,7 +3717,11 @@ impl SqliteDurableStore {
                     &lease,
                     now,
                     "commit",
-                    move |child| child.fail_with_terminal_reason(error, reason, now),
+                    move |child| {
+                        child
+                            .fail_with_terminal_reason(error, reason, now)
+                            .map(|failed| failed.with_failure_result(result))
+                    },
                 )
                 .await
             }
@@ -5175,7 +5184,11 @@ impl AgentTaskStore for SqliteDurableStore {
                 child_id.clone(),
                 worker.clone(),
                 lease.clone(),
-                agent_server::journal::Settle::FailWithReason { error, reason },
+                agent_server::journal::Settle::FailWithReason {
+                    error,
+                    reason,
+                    result: None,
+                },
             ),
             now,
         )

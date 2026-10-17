@@ -81,6 +81,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused), and a host answer committed before the kill is applied and
   closed once.
 
+### A tool call ends when its tool goes silent (bip #756)
+
+A parent waiting on a tool child could wait forever: a tool hung on a dead
+socket keeps its lease heartbeat alive, and nothing else ended the wait.
+Now the tool child owns its end. When its tool shows no evidence of work
+for its stall budget, the call fails as stalled and the parent resumes
+through the ordinary child-terminal edge, with a typed partial result.
+The budget measures silence, not age: a tool that reports progress runs as
+long as it needs. No migration, table, `Write` variant or protocol change.
+
+- **Breaking:** `Settle::FailWithReason` gains `result: Option<Value>`, a
+  `ToolResult` the parent reads in place of the error. Existing callers
+  pass `None`. A failed row that carries one keeps it in `result_payload`
+  (`AgentTask::with_failure_result`), and the parent's resume returns it.
+  A failed row whose payload is not a `ToolResult` still reads as its
+  error.
+- **Breaking:** `ToolTaskBootstrap` gains `stall: StallSignal`. The tool's
+  run races the tool against it; a tripped signal drops the tool and
+  settles the call `Failed` with `TerminalReason::WatchdogStall`, its
+  buffered progress and its `ToolCallEnd` in one transaction. The
+  `ToolResult` has `success: false` and `data` = `ToolStallReport` (budget,
+  silence, last progress, the last 4 KiB of the tool's progress text). The
+  effect record ends `Interrupted`, with that text as `captured_output`.
+- `ToolCallExecutor::stall_budget(&PendingToolCallInfo) -> StallBudget`
+  (`Inherit`, `After(Duration)`, `Unbounded`); default `Inherit`.
+- `WorkerConfig::tool_stall_budget_secs` (default 900; `0` sets no default
+  budget) and `GrpcTransport::with_tool_stall_budget` for the approved
+  Confirm-tier drive.
+- `ToolEventCollector::note_progress()` marks a tool alive without an
+  event, for evidence a host reports some other way (output bytes, process
+  activity). Every `emit` already counts.
+- The tool child's own heartbeat enforces the budget. If the tool's run
+  ignores the stop for `EXECUTION_ABORT_GRACE`, the heartbeat settles the
+  call itself (without partial output). The lease guard decides a race
+  with a run that settles at the same moment.
+- Signals: `agent_server.tool.stalls{outcome=tripped|fallback_settled}`,
+  `agent_server.tool.stall_budget.unbounded`, and a short
+  `agent_server.tool.stall` span (parented on the tool child's stored
+  `traceparent`) carrying the events `agent_server.tool.stalled` (tool name,
+  task id, budget, silence) or `agent_server.tool.stall_budget_unbounded`,
+  plus a `warn` log at each step. Tool names stay off metric labels.
+  `ServerMetrics::record_tool_stall` and `record_tool_stall_unbounded` take
+  a `ToolStallSignal`.
+- Test marker: the SQLite and Postgres `apply_write_tx` hit the
+  `transition.settle_written` failpoint after a settle write (a no-op
+  without the `failpoints` feature).
+- **Upgrade note for hosts (satoshi):** the budget is on by default (900 s
+  of silence). A host whose tools can run longer than that without emitting
+  progress must declare a budget for them through
+  `ToolCallExecutor::stall_budget` (or set `worker.tool_stall_budget_secs`)
+  before it deploys this release. satoshi: its sandbox execute (caller
+  `timeout_secs` + 15 s) and sandbox readiness wait (up to 15 min) can both
+  exceed 900 s with no progress, so `SatoshiToolExecutor` should return
+  `StallBudget::After(timeout + margin)` for those tools. satoshi builds
+  unchanged otherwise: it constructs neither `ToolTaskBootstrap` nor
+  `Settle::FailWithReason`, and its `ToolCallExecutor` impls get the new
+  method's default.
+
 ### Crash-safety Phase 3: documents
 
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed

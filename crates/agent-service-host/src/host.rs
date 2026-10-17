@@ -84,11 +84,16 @@ use super::runtime::ExecutionRuntime;
 use super::stores::StoreRegistry;
 use super::wakeup::WakeupScheduler;
 use super::watch::ThreadEventsWatchScheduler;
+
+mod tool_stall;
+
 use agent_server::journal::relay::RetryBackoff;
 use agent_server::journal::{
     JournalTaskWakeupHandler, NotifierThreadEventsWatchHandler, TaskWakeupHandler,
     ThreadEventsWatchHandler, WakeupSignal,
 };
+pub(crate) use tool_stall::ToolStallWatch;
+use tool_stall::{ToolStallLeg, ToolStallTick};
 
 // ─────────────────────────────────────────────────────────────────────
 // ServiceHost
@@ -508,6 +513,7 @@ impl ServiceHost {
                 lease_duration: self.config.worker.lease_duration(),
                 heartbeat_interval: self.config.worker.heartbeat_interval(),
                 progress_interval: self.config.worker.subagent_progress_interval(),
+                tool_stall_budget: self.config.worker.tool_stall_budget(),
                 poll_interval: self.config.worker.acquisition_interval(),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
@@ -1059,6 +1065,7 @@ struct WorkerLoopParams {
     lease_duration: time::Duration,
     heartbeat_interval: std::time::Duration,
     progress_interval: std::time::Duration,
+    tool_stall_budget: Option<std::time::Duration>,
     poll_interval: std::time::Duration,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
@@ -1068,6 +1075,8 @@ struct TaskRunIntervals {
     lease: time::Duration,
     heartbeat: std::time::Duration,
     progress: std::time::Duration,
+    /// The default stall budget of a tool child's call.
+    tool_stall_budget: Option<std::time::Duration>,
 }
 
 /// A single worker's acquisition loop.
@@ -1092,6 +1101,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         lease_duration,
         heartbeat_interval,
         progress_interval,
+        tool_stall_budget,
         poll_interval,
         wakeup_signal,
         cancel,
@@ -1169,6 +1179,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                         lease: lease_duration,
                         heartbeat: heartbeat_interval,
                         progress: progress_interval,
+                        tool_stall_budget,
                     },
                 )
                 .await;
@@ -1269,6 +1280,7 @@ async fn run_task_with_heartbeat(
         lease: lease_duration,
         heartbeat: heartbeat_interval,
         progress: progress_interval,
+        tool_stall_budget,
     } = intervals;
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
@@ -1288,6 +1300,7 @@ async fn run_task_with_heartbeat(
             runtime,
             cancel,
             &ActivityBeacon::new(),
+            None,
         ))
         .await
         {
@@ -1305,6 +1318,10 @@ async fn run_task_with_heartbeat(
     // letting the sweep requeue the row and a second worker acquire it
     // while this one later dispatched blind: duplicate LLM/tool execution.
     let initial_deadline = initial_deadline_state(&task);
+    // A tool child's call ends when its tool goes silent for its stall
+    // budget; this acquisition's heartbeat enforces it (bip #756).
+    let tool_stall =
+        (task.kind == TaskKind::ToolRuntime).then(|| ToolStallWatch::new(tool_stall_budget));
 
     // Per-task cancellation token wired into the worker's `RootTurnDeps`
     // (seam B). The heartbeat loop trips it on a terminal lease rejection
@@ -1333,6 +1350,7 @@ async fn run_task_with_heartbeat(
         task_cancel: task_cancel.clone(),
         deadline: initial_deadline,
         activity: activity.clone(),
+        tool_stall: tool_stall.clone(),
     }));
     let progress_handle = tokio::spawn(subagent_progress_loop(
         stores.clone(),
@@ -1352,8 +1370,16 @@ async fn run_task_with_heartbeat(
     // wedged child is now reaped by the heartbeat's own per-tick check,
     // one budget after this acquisition, and never-started children by the
     // parked sweep off their `created_at` floor.
-    let exec_result =
-        execute_with_abort_grace(task, worker_id, stores, runtime, &task_cancel, &activity).await;
+    let exec_result = execute_with_abort_grace(
+        task,
+        worker_id,
+        stores,
+        runtime,
+        &task_cancel,
+        &activity,
+        tool_stall.as_ref(),
+    )
+    .await;
 
     heartbeat_cancel.cancel();
     if let Err(join_err) = heartbeat_handle.await {
@@ -1412,6 +1438,7 @@ async fn execute_with_abort_grace(
     runtime: Arc<ExecutionRuntime>,
     task_cancel: &CancellationToken,
     activity: &ActivityBeacon,
+    tool_stall: Option<&ToolStallWatch>,
 ) -> Option<Result<()>> {
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
@@ -1422,6 +1449,7 @@ async fn execute_with_abort_grace(
         runtime,
         task_cancel,
         activity,
+        tool_stall,
     ));
     let outcome = tokio::select! {
         biased;
@@ -2070,6 +2098,9 @@ pub(crate) struct HeartbeatLoopParams {
     /// tool child's activity is what keeps its PARKED subagent parent
     /// alive, and that parent has no heartbeat of its own while it waits.
     pub(crate) activity: ActivityBeacon,
+    /// The stall budget of the tool call this loop's task runs, for a tool
+    /// child; `None` for every other task.
+    pub(crate) tool_stall: Option<ToolStallWatch>,
 }
 
 pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
@@ -2085,7 +2116,9 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         task_cancel,
         mut deadline,
         activity,
+        tool_stall,
     } = params;
+    let mut tool_stall = tool_stall.map(ToolStallLeg::new);
     let mut ticker = tokio::time::interval(heartbeat_interval);
     // The stall probe runs under the lease this loop renews each tick; bound
     // it to half that lease (capped) so a slow store or large subtree can
@@ -2195,6 +2228,17 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
                 return;
             }
             DeadlineTick::Continue(next) => deadline = next,
+        }
+
+        if let Some(leg) = tool_stall.as_mut() {
+            let min_budget = std::time::Duration::from_millis(min_budget_ms);
+            match leg.tick(&stores, observed_activity, min_budget, now).await {
+                ToolStallTick::Continue => {}
+                ToolStallTick::Stop => {
+                    task_cancel.cancel();
+                    return;
+                }
+            }
         }
     }
 }
@@ -2509,11 +2553,15 @@ async fn execute_acquired_task(
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
     activity: &ActivityBeacon,
+    tool_stall: Option<&ToolStallWatch>,
 ) -> Result<()> {
     match task.kind {
         TaskKind::RootTurn => execute_root_task(task, stores, runtime, cancel, activity).await,
         TaskKind::ToolRuntime => {
-            Box::pin(execute_tool_task(task, stores, runtime, cancel, activity)).await
+            Box::pin(execute_tool_task(
+                task, stores, runtime, cancel, activity, tool_stall,
+            ))
+            .await
         }
         // A subagent invocation task neither streams from a provider nor
         // runs a tool: it only fans results in. It has no work of its own
@@ -3052,6 +3100,7 @@ async fn execute_tool_task(
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
     activity: &ActivityBeacon,
+    tool_stall: Option<&ToolStallWatch>,
 ) -> Result<()> {
     let parent_id = task.parent_id.clone();
     let result = Box::pin(run_tool_task(
@@ -3060,6 +3109,7 @@ async fn execute_tool_task(
         Arc::clone(&runtime),
         cancel,
         activity,
+        tool_stall,
     ))
     .await;
     settle_tool_child(
@@ -3077,6 +3127,7 @@ async fn run_tool_task(
     runtime: Arc<ExecutionRuntime>,
     cancel: &CancellationToken,
     activity: &ActivityBeacon,
+    tool_stall: Option<&ToolStallWatch>,
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc();
     let (worker_id, lease_id) = running_lease(&task)?;
@@ -3084,7 +3135,7 @@ async fn run_tool_task(
     // The beacon rides the bootstrap into the `ToolEventCollector`, so a
     // tool that reports progress refreshes THIS tool task's row — which is
     // the row this task's heartbeat owns.
-    let bootstrap =
+    let mut bootstrap =
         match resolve_tool_bootstrap(task.clone(), stores.task_store.as_ref(), activity.clone())
             .await
         {
@@ -3110,6 +3161,10 @@ async fn run_tool_task(
     let artifact_store_guard = runtime
         .artifact_store(&bootstrap.thread_id)
         .context("hold artifact store through durable tool completion")?;
+    if let Some(watch) = tool_stall {
+        let declared = runtime.tool_executor().stall_budget(&bootstrap.tool_call);
+        watch.arm(&mut bootstrap, declared, &runtime, now);
+    }
 
     let exec_bootstrap = bootstrap.clone();
     let settle_bootstrap = bootstrap.clone();
@@ -4475,6 +4530,7 @@ mod tests {
             runtime,
             &cancel,
             &ActivityBeacon::new(),
+            None,
         )
         .await?;
         assert!(
@@ -4642,6 +4698,7 @@ mod tests {
                 Arc::clone(&runtime),
                 &cancel,
                 &ActivityBeacon::new(),
+                None,
             )
             .await?;
             let row = stores.task_store.get(&id).await?.context("root row")?;
@@ -5475,6 +5532,7 @@ mod tests {
             task_cancel: CancellationToken::new(),
             deadline: SubagentDeadlineState::Exempt,
             activity: ActivityBeacon::new(),
+            tool_stall: None,
         }));
 
         // Auto-advance the synthetic clock past two heartbeat ticks.
@@ -5543,6 +5601,7 @@ mod tests {
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Exempt,
             activity: ActivityBeacon::new(),
+            tool_stall: None,
         }));
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6417,19 +6476,57 @@ mod tests {
 
     struct ScriptedBatchProvider {
         responses: std::sync::Mutex<std::collections::VecDeque<ChatResponse>>,
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
     }
 
     impl ScriptedBatchProvider {
         fn new(responses: Vec<ChatResponse>) -> Self {
             Self {
                 responses: std::sync::Mutex::new(responses.into()),
+                requests: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// The tool results the last request handed the model.
+        fn last_tool_results(&self) -> Result<Vec<(String, String, Option<bool>)>> {
+            let last = self
+                .requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recorded requests lock poisoned"))?
+                .last()
+                .cloned()
+                .context("the provider was called")?;
+            Ok(last
+                .messages
+                .iter()
+                .filter_map(|message| match &message.content {
+                    agent_sdk_foundation::llm::Content::Blocks(blocks) => Some(blocks),
+                    agent_sdk_foundation::llm::Content::Text(_) => None,
+                })
+                .flatten()
+                .filter_map(|block| {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                        ..
+                    } = block
+                    {
+                        Some((tool_use_id.clone(), content.clone(), *is_error))
+                    } else {
+                        None
+                    }
+                })
+                .collect())
         }
     }
 
     #[async_trait]
     impl LlmProvider for ScriptedBatchProvider {
-        async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+        async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+            if let Ok(mut requests) = self.requests.lock() {
+                requests.push(request);
+            }
             let response = {
                 let mut queue = self
                     .responses
@@ -8472,6 +8569,7 @@ mod tests {
             runtime,
             &CancellationToken::new(),
             &ActivityBeacon::new(),
+            None,
         ))
         .await?;
 
@@ -8632,6 +8730,7 @@ mod tests {
             runtime,
             &CancellationToken::new(),
             &ActivityBeacon::new(),
+            None,
         ))
         .await?;
 
@@ -9211,6 +9310,7 @@ mod tests {
             task_cancel: CancellationToken::new(),
             deadline: SubagentDeadlineState::Enforced(deadline),
             activity: agent_server::worker::ActivityBeacon::new(),
+            tool_stall: None,
         }));
 
         // Wait until the probe is in-flight (its stall has begun): the beat
@@ -9625,6 +9725,406 @@ mod tests {
 
         token.cancel();
         host_handle.await??;
+        Ok(())
+    }
+
+    // ── Tool stall budget: a parent's wait on a hung tool ends (bip #756) ──
+
+    /// How a [`StallProbeExecutor`] call behaves.
+    #[derive(Clone, Copy)]
+    enum StallProbe {
+        /// Report one line of output, then hang forever without a sign of
+        /// life, ignoring its cancellation token.
+        ReportThenHang,
+        /// Report evidence of work every 300 ms for `secs`, then succeed.
+        ReportFor { secs: u64 },
+        /// Block its thread for `secs` without a sign of life (a tool
+        /// whose future cannot be dropped mid-call), then succeed.
+        BlockThread { secs: u64 },
+        /// Stay silent for `secs`, then succeed.
+        SilentFor { secs: u64 },
+    }
+
+    struct StallProbeExecutor {
+        probe: StallProbe,
+        budget: agent_server::worker::StallBudget,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl StallProbeExecutor {
+        fn new(probe: StallProbe) -> Self {
+            Self {
+                probe,
+                budget: agent_server::worker::StallBudget::Inherit,
+                started: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::runtime::ToolCallExecutor for StallProbeExecutor {
+        async fn execute_tool_call(
+            &self,
+            bootstrap: &agent_server::worker::ToolTaskBootstrap,
+            collector: agent_server::worker::ToolEventCollector,
+            _cancel: tokio_util::sync::CancellationToken,
+            _artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
+        ) -> Result<agent_sdk_foundation::ToolResult> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            match self.probe {
+                StallProbe::ReportThenHang => {
+                    collector.emit(agent_sdk_foundation::events::AgentEvent::ToolProgress {
+                        id: bootstrap.tool_call.id.clone(),
+                        name: bootstrap.tool_call.name.clone(),
+                        display_name: bootstrap.tool_call.display_name.clone(),
+                        stage: "running".into(),
+                        message: "compiling 1/40".into(),
+                        data: None,
+                    });
+                    std::future::pending::<()>().await;
+                }
+                StallProbe::ReportFor { secs } => {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                    while std::time::Instant::now() < until {
+                        collector.note_progress();
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                }
+                StallProbe::BlockThread { secs } => {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
+                StallProbe::SilentFor { secs } => {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+            }
+            Ok(agent_sdk_foundation::ToolResult::success("probe done"))
+        }
+
+        fn stall_budget(
+            &self,
+            _tool_call: &agent_sdk_foundation::PendingToolCallInfo,
+        ) -> agent_server::worker::StallBudget {
+            self.budget
+        }
+    }
+
+    /// What a plain root over one `probe` call left behind.
+    struct ProbeRun {
+        /// The finished root's tool child.
+        child: AgentTask,
+        /// The root thread's events.
+        events: Vec<CommittedEvent>,
+        /// The tool results the root's resumed request handed the model:
+        /// `(tool_use_id, content, is_error)`.
+        tool_results: Vec<(String, String, Option<bool>)>,
+    }
+
+    /// Run a plain root that calls `probe` once and then answers, against
+    /// `executor` and on `storage`, with a 2 s tool stall budget and a 1 s
+    /// heartbeat.
+    async fn run_plain_root_over_probe_on(
+        storage: crate::config::StorageConfig,
+        thread: &str,
+        executor: Arc<StallProbeExecutor>,
+    ) -> Result<ProbeRun> {
+        let config = ServiceConfig {
+            storage,
+            worker: crate::config::WorkerConfig {
+                pool_size: 2,
+                heartbeat_interval_secs: 1,
+                acquisition_interval_secs: 1,
+                sweep_interval_secs: 1,
+                tool_stall_budget_secs: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = Arc::new(ScriptedBatchProvider::new(vec![
+            tool_use_batch_response("resp_probe", &[("call_probe", "probe")]),
+            text_response("resp_final", "done"),
+        ]));
+        let runtime = tool_runtime(Arc::clone(&provider) as Arc<dyn LlmProvider>, executor)?;
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(probe_definition()));
+        let host = ServiceHost::new(config, registry, runtime)?;
+        host.initialize().await?;
+        let stores = host.stores().clone();
+        let token = host.shutdown_token();
+
+        let thread_id = agent_sdk_foundation::ThreadId::from_string(thread);
+        let root = AgentTask::new_root_turn_with_input(
+            thread_id.clone(),
+            vec![SubmittedInputItem::Text {
+                text: "run the probe".into(),
+            }],
+            time::OffsetDateTime::now_utc(),
+            3,
+        );
+        let root_id = root.id.clone();
+        stores.task_store.submit_root_turn(root).await?;
+        let host_handle = tokio::spawn(async move { host.run().await });
+
+        let finished = wait_for_status(&stores, &root_id, TaskStatus::Completed, 750).await;
+        let children = stores.task_store.list_children(&root_id).await?;
+        let events = stores.event_repo.get_events(&thread_id).await?;
+        token.cancel();
+        host_handle.await??;
+        finished?;
+        let child = children
+            .into_iter()
+            .next()
+            .context("the root spawned its probe tool child")?;
+        Ok(ProbeRun {
+            child,
+            events,
+            tool_results: provider.last_tool_results()?,
+        })
+    }
+
+    async fn run_plain_root_over_probe(
+        thread: &str,
+        executor: Arc<StallProbeExecutor>,
+    ) -> Result<(AgentTask, Vec<CommittedEvent>)> {
+        let run =
+            run_plain_root_over_probe_on(crate::config::StorageConfig::default(), thread, executor)
+                .await?;
+        Ok((run.child, run.events))
+    }
+
+    fn tool_call_ends(events: &[CommittedEvent]) -> Vec<agent_sdk_foundation::ToolResult> {
+        events
+            .iter()
+            .filter_map(|committed| {
+                if let agent_sdk_foundation::events::AgentEvent::ToolCallEnd { result, .. } =
+                    &committed.event
+                {
+                    Some(result.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn stall_report(
+        result: &agent_sdk_foundation::ToolResult,
+    ) -> Result<agent_server::worker::ToolStallReport> {
+        serde_json::from_value(
+            result
+                .data
+                .clone()
+                .context("a stalled result carries data")?,
+        )
+        .context("the data is a stall report")
+    }
+
+    /// S7 of the crash matrix, the bip #756 wedge, on `storage`: a plain root
+    /// waits on a tool child whose tool hangs forever while its lease
+    /// heartbeat keeps beating. One stall budget after its last sign of work,
+    /// the tool child fails as stalled and the parent resumes with a typed
+    /// partial result, through the ordinary child-terminal edge.
+    async fn assert_s7(storage: crate::config::StorageConfig, thread: &str) -> Result<()> {
+        let executor = Arc::new(StallProbeExecutor::new(StallProbe::ReportThenHang));
+        let run = run_plain_root_over_probe_on(storage, thread, Arc::clone(&executor)).await?;
+        let child = run.child;
+
+        assert_eq!(
+            executor.started.load(Ordering::SeqCst),
+            1,
+            "the tool ran once"
+        );
+        assert_eq!(child.status, TaskStatus::Failed);
+        assert_eq!(child.terminal_reason, Some(TerminalReason::WatchdogStall));
+
+        let ends = tool_call_ends(&run.events);
+        assert_eq!(ends.len(), 1, "exactly one ToolCallEnd, got {ends:?}");
+        let report = stall_report(&ends[0])?;
+        assert_eq!(report.outcome, "stalled");
+        assert_eq!(report.stall_budget_ms, 2_000);
+        assert!(report.silent_for_ms >= 2_000);
+        assert_eq!(report.partial_output, "compiling 1/40");
+        assert!(!ends[0].success);
+        assert!(ends[0].output.contains("stalled"), "{}", ends[0].output);
+
+        let kept: agent_sdk_foundation::ToolResult = serde_json::from_value(
+            child
+                .result_payload
+                .context("a stalled row keeps its result")?,
+        )?;
+        assert_eq!(kept, ends[0]);
+
+        // The model read the stall as a failed tool call with its partial
+        // output.
+        let [(call_id, content, is_error)] = run.tool_results.as_slice() else {
+            anyhow::bail!(
+                "one tool result in the resumed request, got {:?}",
+                run.tool_results
+            );
+        };
+        assert_eq!(call_id, "call_probe");
+        assert_eq!(*is_error, Some(true));
+        assert!(
+            content.contains("stalled") && content.contains("compiling 1/40"),
+            "{content}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s7_a_hung_tool_ends_its_parents_wait_with_a_stall_report() -> Result<()> {
+        assert_s7(crate::config::StorageConfig::default(), "t-stall-s7").await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn s7_a_hung_tool_ends_its_parents_wait_on_sqlite() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Sqlite {
+                path: Some(dir.path().join("s7.db").display().to_string()),
+                max_connections: None,
+            },
+            ..crate::config::StorageConfig::default()
+        };
+        assert_s7(storage, "t-stall-s7-sqlite").await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn s7_a_hung_tool_ends_its_parents_wait_on_postgres() -> Result<()> {
+        use sqlx::Connection;
+
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(());
+        };
+        let schema = format!("s7_pg_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = sqlx::postgres::PgConnection::connect(&database_url).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await?;
+        let storage = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Postgres,
+            postgres: crate::config::PostgresStorageConfig {
+                database_url: Some(database_url.clone()),
+                schema: Some(schema.clone()),
+                max_connections: 8,
+            },
+        };
+        let outcome = assert_s7(storage, "t-stall-s7-postgres").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut admin)
+            .await?;
+        outcome
+    }
+
+    /// The stall's ids reach a trace: the tool child's heartbeat runs under no
+    /// span of its own, so the stall opens an `agent_server.tool.stall` span
+    /// and records `agent_server.tool.stalled` on it.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_stall_is_recorded_on_its_own_span() -> Result<()> {
+        use opentelemetry::Value;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(provider.clone());
+
+        let executor = Arc::new(StallProbeExecutor::new(StallProbe::ReportThenHang));
+        let run = run_plain_root_over_probe_on(
+            crate::config::StorageConfig::default(),
+            "t-stall-span",
+            executor,
+        )
+        .await?;
+        provider.force_flush()?;
+
+        let spans = exporter.get_finished_spans()?;
+        let span = spans
+            .iter()
+            .find(|span| span.name.as_ref() == "agent_server.tool.stall")
+            .context("an agent_server.tool.stall span")?;
+        let event = span
+            .events
+            .iter()
+            .find(|event| event.name.as_ref() == "agent_server.tool.stalled")
+            .context("the agent_server.tool.stalled event")?;
+        let attribute = |key: &str| {
+            event
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+        assert_eq!(attribute("outcome"), Some(Value::from("tripped")));
+        assert_eq!(
+            attribute("agent_server.tool.name"),
+            Some(Value::from("probe"))
+        );
+        assert_eq!(
+            attribute("agent_server.task.id"),
+            Some(Value::from(run.child.id.as_str().to_owned()))
+        );
+        assert_eq!(
+            attribute("agent_server.tool.stall_budget_ms"),
+            Some(Value::I64(2_000))
+        );
+        assert!(
+            matches!(attribute("agent_server.tool.silent_for_ms"), Some(Value::I64(ms)) if ms >= 2_000),
+            "{event:?}"
+        );
+        Ok(())
+    }
+
+    /// Silence, not age: a tool that keeps reporting runs well past its
+    /// budget and completes.
+    #[tokio::test]
+    async fn a_tool_that_reports_progress_outlives_its_stall_budget() -> Result<()> {
+        let executor = Arc::new(StallProbeExecutor::new(StallProbe::ReportFor { secs: 6 }));
+        let (child, events) = run_plain_root_over_probe("t-stall-progress", executor).await?;
+
+        assert_eq!(child.status, TaskStatus::Completed);
+        let ends = tool_call_ends(&events);
+        assert_eq!(ends.len(), 1);
+        assert!(ends[0].success, "{ends:?}");
+        Ok(())
+    }
+
+    /// Only the tool's owner can lift the budget, and then nothing stops it.
+    #[tokio::test]
+    async fn an_unbounded_tool_is_never_stopped_for_silence() -> Result<()> {
+        let mut executor = StallProbeExecutor::new(StallProbe::SilentFor { secs: 5 });
+        executor.budget = agent_server::worker::StallBudget::Unbounded;
+        let (child, _events) =
+            run_plain_root_over_probe("t-stall-unbounded", Arc::new(executor)).await?;
+
+        assert_eq!(child.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    /// A tool whose future cannot be dropped mid-call blocks the run's
+    /// settle. The heartbeat settles the call after the abort grace, the run
+    /// returns later and its own settle is refused: one terminal row, one
+    /// `ToolCallEnd`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_heartbeat_settles_a_stalled_tool_that_ignores_the_stop() -> Result<()> {
+        let executor = Arc::new(StallProbeExecutor::new(StallProbe::BlockThread {
+            secs: 15,
+        }));
+        let (child, events) = run_plain_root_over_probe("t-stall-blocking", executor).await?;
+
+        assert_eq!(child.status, TaskStatus::Failed);
+        assert_eq!(child.terminal_reason, Some(TerminalReason::WatchdogStall));
+        let ends = tool_call_ends(&events);
+        assert_eq!(ends.len(), 1, "exactly one ToolCallEnd, got {ends:?}");
+        let report = stall_report(&ends[0])?;
+        assert_eq!(
+            report.partial_output, "",
+            "the heartbeat cannot see the run's output"
+        );
         Ok(())
     }
 
@@ -10690,6 +11190,7 @@ mod tests {
             runtime,
             &CancellationToken::new(),
             &ActivityBeacon::new(),
+            None,
         ))
         .await?;
 
@@ -10862,6 +11363,7 @@ mod tests {
                 created_at: child_root.created_at,
             },
             activity: ActivityBeacon::new(),
+            tool_stall: None,
         }));
 
         // Two injected lookup failures burn two ticks; the third tick
@@ -10939,6 +11441,7 @@ mod tests {
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Enforced(deadline),
             activity: ActivityBeacon::new(),
+            tool_stall: None,
         }));
 
         // Tick 1's fail hits the injected error; tick 2 retries and
@@ -11373,6 +11876,7 @@ mod tests {
                 lease: time::Duration::seconds(30),
                 heartbeat: std::time::Duration::from_millis(50),
                 progress: std::time::Duration::from_secs(30),
+                tool_stall_budget: None,
             },
         )
         .await;
@@ -11543,6 +12047,7 @@ mod tests {
                     lease: time::Duration::milliseconds(300),
                     heartbeat: std::time::Duration::from_millis(50),
                     progress: std::time::Duration::from_secs(30),
+                    tool_stall_budget: None,
                 },
             )
             .await;
@@ -11672,4 +12177,5 @@ mod tests {
     }
 
     mod settlement;
+    mod tool_stall;
 }

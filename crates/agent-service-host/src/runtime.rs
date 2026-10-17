@@ -14,7 +14,7 @@ use agent_sdk_foundation::{PendingToolCallInfo, ThreadId, ToolResult};
 use agent_sdk_providers::LlmProvider;
 use agent_server::journal::WakeupSignal;
 use agent_server::worker::{
-    AgentDefinition, ConfirmationPolicy, NoopSubagentSpawnSelector, PolicyVerdict,
+    AgentDefinition, ConfirmationPolicy, NoopSubagentSpawnSelector, PolicyVerdict, StallBudget,
     SubagentSpawnSelector, ToolEventCollector, ToolTaskBootstrap,
 };
 use anyhow::{Context, Result, anyhow};
@@ -40,6 +40,13 @@ pub trait ToolCallExecutor: Send + Sync {
         cancel: CancellationToken,
         artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
     ) -> Result<ToolResult>;
+
+    /// How long `tool_call` may run without evidence of work before it
+    /// fails as stalled. Evidence is anything the tool emits into its
+    /// collector, or [`ToolEventCollector::note_progress`].
+    fn stall_budget(&self, _tool_call: &PendingToolCallInfo) -> StallBudget {
+        StallBudget::Inherit
+    }
 }
 
 /// Concrete host runtime wiring shared by the worker loop and the

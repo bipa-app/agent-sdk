@@ -215,6 +215,7 @@ fn make_bootstrap(
         child_task,
         parent_task,
         activity: ActivityBeacon::default(),
+        stall: agent_server::worker::StallSignal::default(),
         thread_id: thread.clone(),
         task_id: child_id,
         worker_id,

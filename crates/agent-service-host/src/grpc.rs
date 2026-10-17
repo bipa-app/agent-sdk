@@ -155,6 +155,9 @@ struct GrpcShared {
     /// (`2 x heartbeat_interval`) covers every cadence that can persist
     /// activity for a probed subtree.
     heartbeat_interval: std::time::Duration,
+    /// The default stall budget of an approved Confirm-tier tool's call
+    /// (`worker.tool_stall_budget_secs`).
+    tool_stall_budget: Option<std::time::Duration>,
     admission: AdmissionConfig,
     confirmation_guard: Option<Arc<dyn ConfirmationDecisionGuard>>,
     /// Whether and how the view RPCs fold a thread's events.
@@ -181,6 +184,7 @@ impl GrpcShared {
             shutdown,
             lease_duration,
             heartbeat_interval,
+            tool_stall_budget: crate::config::WorkerConfig::default().tool_stall_budget(),
             admission,
             confirmation_guard: None,
             view: agent_server::journal::view::ViewConfig {
@@ -446,13 +450,26 @@ impl GrpcShared {
         // heartbeat there beats for `bootstrap.task_id` — the same row the
         // collector's emissions describe — which is what makes persisting
         // this beacon on that row correct.
-        let bootstrap = resolve_tool_bootstrap(
+        let mut bootstrap = resolve_tool_bootstrap(
             acquired,
             self.stores.task_store.as_ref(),
             ActivityBeacon::new(),
         )
         .await
         .context("bootstrapping approved confirmation task")?;
+        // The drive's heartbeat enforces the tool's stall budget, as a
+        // worker's does for an unconfirmed call.
+        let tool_stall = crate::host::ToolStallWatch::new(self.tool_stall_budget);
+        let declared = self
+            .runtime
+            .tool_executor()
+            .stall_budget(&bootstrap.tool_call);
+        tool_stall.arm(
+            &mut bootstrap,
+            declared,
+            &self.runtime,
+            OffsetDateTime::now_utc(),
+        );
 
         // Decouple the side-effecting tool from the RPC lifetime. A
         // Confirm-tier tool can run longer than one lease, so driving it
@@ -470,6 +487,7 @@ impl GrpcShared {
             watermark,
             lease_duration: self.lease_duration,
             heartbeat_interval: self.heartbeat_interval,
+            tool_stall,
         }));
         Ok(())
     }
@@ -514,6 +532,8 @@ struct DriveApprovedConfirmation {
     watermark: u64,
     lease_duration: time::Duration,
     heartbeat_interval: std::time::Duration,
+    /// Armed for `bootstrap`'s call.
+    tool_stall: crate::host::ToolStallWatch,
 }
 
 /// Drive an approved confirmation's resumed tool to completion on a
@@ -532,11 +552,11 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
         watermark,
         lease_duration,
         heartbeat_interval,
+        tool_stall,
     } = params;
 
-    let task_id = bootstrap.task_id.clone();
+    let (task_id, thread_id) = (bootstrap.task_id.clone(), bootstrap.thread_id.clone());
     let parent_id = bootstrap.parent_task.id.clone();
-    let thread_id = bootstrap.thread_id.clone();
     let worker_id = bootstrap.worker_id.clone();
     let lease_id = bootstrap.lease_id.clone();
 
@@ -590,6 +610,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // stall probe reads this row.
             deadline: crate::host::SubagentDeadlineState::Exempt,
             activity: bootstrap.activity.clone(),
+            tool_stall: Some(tool_stall),
         },
     ));
 
@@ -2772,6 +2793,14 @@ impl GrpcTransport {
     #[must_use]
     pub fn with_prompt_handler(mut self, handler: crate::prompts::SharedPromptHandler) -> Self {
         Arc::make_mut(&mut self.shared).prompt_handler = Some(handler);
+        self
+    }
+
+    /// The default stall budget of an approved Confirm-tier tool's call; the
+    /// same `worker.tool_stall_budget_secs` the worker pool uses.
+    #[must_use]
+    pub fn with_tool_stall_budget(mut self, budget: Option<std::time::Duration>) -> Self {
+        Arc::make_mut(&mut self.shared).tool_stall_budget = budget;
         self
     }
 

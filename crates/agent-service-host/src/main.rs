@@ -63,6 +63,7 @@ fn main() -> Result<()> {
     // ADR-0003 I4: the detached Confirm-tier drive must beat at the SAME
     // cadence the worker pool does — the stall floor is derived from it.
     let heartbeat_interval = config.worker.heartbeat_interval();
+    let tool_stall_budget = config.worker.tool_stall_budget();
     let admission = config.admission.clone();
     let host = ServiceHost::new(config, registry, Arc::clone(&runtime))
         .context("creating service host")?;
@@ -106,7 +107,8 @@ fn main() -> Result<()> {
                     lease_duration,
                     heartbeat_interval,
                     admission,
-                );
+                )
+                .with_tool_stall_budget(tool_stall_budget);
                 tokio::try_join!(host.run(), grpc.serve(grpc_addr))?;
                 Ok(())
             } else {

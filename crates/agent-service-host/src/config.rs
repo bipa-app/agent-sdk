@@ -347,6 +347,12 @@ pub struct WorkerConfig {
     pub sweep_interval_secs: u64,
     /// Seconds between coarse parent-visible subagent progress snapshots.
     pub subagent_progress_interval_secs: u64,
+    /// Seconds a tool may run without any evidence of work before its call
+    /// fails as stalled, unless the tool declares its own budget
+    /// ([`crate::runtime::ToolCallExecutor::stall_budget`]). `0` sets no
+    /// default budget. Silence, not age: a tool that reports progress runs
+    /// as long as it needs.
+    pub tool_stall_budget_secs: u64,
     /// Seconds between idle worker acquisition polls.
     ///
     /// When a worker has no active task it sleeps for this duration
@@ -364,6 +370,7 @@ impl Default for WorkerConfig {
             heartbeat_interval_secs: 10,
             sweep_interval_secs: 5,
             subagent_progress_interval_secs: 30,
+            tool_stall_budget_secs: 900,
             acquisition_interval_secs: 1,
         }
     }
@@ -393,6 +400,16 @@ impl WorkerConfig {
     #[must_use]
     pub const fn subagent_progress_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.subagent_progress_interval_secs)
+    }
+
+    /// The default tool stall budget, or `None` when there is none.
+    #[must_use]
+    pub const fn tool_stall_budget(&self) -> Option<std::time::Duration> {
+        if self.tool_stall_budget_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(self.tool_stall_budget_secs))
+        }
     }
 
     /// Acquisition poll interval as a [`std::time::Duration`] (for tokio timers).

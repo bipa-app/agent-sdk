@@ -426,6 +426,10 @@ pub enum Settle {
     FailWithReason {
         error: String,
         reason: TerminalReason,
+        /// What the parent reads in place of the error, as a
+        /// [`ToolResult`](agent_sdk_foundation::ToolResult) value; `None`
+        /// leaves it the error alone.
+        result: Option<serde_json::Value>,
     },
     /// Complete with no result payload, as a root turn completes.
     CompleteWithoutResult,
