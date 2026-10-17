@@ -849,17 +849,14 @@ impl LlmProvider for Summarizer {
     }
 }
 
-/// Site 10: a compaction and its `ContextCompacted` event commit in one
-/// transaction. A crash between the writes leaves the message projection
-/// uncompacted with no `ContextCompacted` and no advisory row.
-#[tokio::test]
-async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_event() -> Result<()> {
-    let _scenario = serial_failpoints();
-    let temp = tempfile::tempdir()?;
-    let store = fresh_store(&temp).await?;
+const EARLIER_TURNS: usize = 6;
+
+/// Run a root turn on a fresh thread whose first transition is a
+/// compaction of `EARLIER_TURNS` committed messages.
+async fn run_compacting_turn(store: &SqliteDurableStore) -> Result<()> {
     let thread_id = ThreadId::from_string(THREAD);
-    ThreadStore::get_or_create(&store, &thread_id, at(0)).await?;
-    let earlier: Vec<llm::Message> = (0..6)
+    ThreadStore::get_or_create(store, &thread_id, at(0)).await?;
+    let earlier: Vec<llm::Message> = (0..EARLIER_TURNS)
         .map(|turn| {
             let text = format!("turn {turn}: {}", "context ".repeat(400));
             if turn % 2 == 0 {
@@ -869,7 +866,7 @@ async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_even
             }
         })
         .collect();
-    MessageProjectionStore::commit_messages(&store, &thread_id, earlier.clone(), at(0)).await?;
+    MessageProjectionStore::commit_messages(store, &thread_id, earlier, at(0)).await?;
     let root = AgentTask::new_root_turn(thread_id.clone(), at(0), 3);
     let root_id = root.id.clone();
     store.submit_root_turn(root).await?;
@@ -880,14 +877,14 @@ async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_even
         .await?
         .context("root was not acquired")?;
     let bootstrap = WorkerBootstrapContext {
-        thread_id: thread_id.clone(),
+        thread_id,
         task_id: root_id,
         task: root,
         worker_id: worker,
         lease_id: lease,
         definition: definition(),
     };
-    let inputs = build_root_worker_inputs(bootstrap, &store, &store, &store, at(1)).await?;
+    let inputs = build_root_worker_inputs(bootstrap, store, store, store, at(1)).await?;
     let config = agent_sdk::context::CompactionConfig::default()
         .with_threshold_tokens(1)
         .with_min_messages(2)
@@ -897,26 +894,25 @@ async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_even
     let deps = RootTurnDeps {
         compaction_config: Some(&config),
         compaction_provider: Some(&summarizer),
-        ..root_deps(&store, &notifier)
+        ..root_deps(store, &notifier)
     };
-    crash_in_transition(execute_root_turn(
-        inputs,
-        "Carry on",
-        &OneToolCallProvider,
-        &deps,
-        at(2),
-    ))
-    .await?;
+    execute_root_turn(inputs, "Carry on", &OneToolCallProvider, &deps, at(2)).await?;
+    Ok(())
+}
 
-    let projection = MessageProjectionStore::get(&store, &thread_id)
+/// The projection holds no compaction and the journal no
+/// `ContextCompacted` or advisory: the compaction and its event agree.
+async fn assert_uncompacted(store: &SqliteDurableStore) -> Result<()> {
+    let thread_id = ThreadId::from_string(THREAD);
+    let projection = MessageProjectionStore::get(store, &thread_id)
         .await?
         .context("the projection")?;
-    let compacted = EventRepository::get_events(&store, &thread_id)
+    let compacted = EventRepository::get_events(store, &thread_id)
         .await?
         .iter()
         .filter(|event| matches!(event.event, AgentEvent::ContextCompacted { .. }))
         .count();
-    let advisories = agent_server::journal::outbox::OutboxStore::list_by_thread(&store, &thread_id)
+    let advisories = agent_server::journal::outbox::OutboxStore::list_by_thread(store, &thread_id)
         .await?
         .iter()
         .filter(|row| {
@@ -931,8 +927,87 @@ async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_even
         projection.compactions.len(),
     );
     ensure!(
-        projection.messages.len() == earlier.len(),
+        projection.messages.len() == EARLIER_TURNS,
         "the raw transcript is unchanged"
     );
     Ok(())
+}
+
+/// Site 10: a compaction and its `ContextCompacted` event commit in one
+/// transaction. A crash between the writes leaves the message projection
+/// uncompacted with no `ContextCompacted` and no advisory row.
+#[tokio::test]
+async fn compaction_failpoint_leaves_the_projection_uncompacted_without_its_event() -> Result<()> {
+    let _scenario = serial_failpoints();
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    crash_in_transition(run_compacting_turn(&store)).await?;
+    assert_uncompacted(&store).await
+}
+
+/// Child-process half of the compaction kill test: pause inside the
+/// compaction transaction and wait to be killed there.
+#[tokio::test]
+async fn compaction_failpoint_kill_child() -> Result<()> {
+    let _scenario = serial_failpoints();
+    if std::env::var_os(CHILD_ENV).is_none() {
+        return Ok(());
+    }
+    let url = std::env::var(DB_ENV).context("missing crash database URL")?;
+    let ready = std::env::var(READY_ENV).context("missing crash ready path")?;
+    let store = SqliteDurableStore::connect(&url).await?;
+    fail::cfg_callback(FAILPOINT, move || {
+        let _ = std::fs::write(&ready, THREAD);
+        std::thread::sleep(Duration::from_mins(1));
+    })
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    run_compacting_turn(&store).await?;
+    bail!("the child was not killed inside the compaction transaction")
+}
+
+/// A real `kill -9` inside the compaction transaction: a new process that
+/// opens the file sees neither the compaction nor its event.
+#[tokio::test]
+async fn kill_nine_inside_the_compaction_failpoint_leaves_neither_half() -> Result<()> {
+    let _scenario = serial_failpoints();
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("compaction-kill.db");
+    let ready = temp.path().join("in-compaction");
+    let url = format!("sqlite://{}?mode=rwc", db.display());
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("compaction_failpoint_kill_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .env(DB_ENV, &url)
+        .env(READY_ENV, &ready)
+        .spawn()
+        .context("spawn the compaction child")?;
+    let mut reached = false;
+    for _ in 0..400 {
+        if std::fs::read_to_string(&ready).is_ok_and(|text| !text.is_empty()) {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !reached {
+        let _ = child.kill();
+        let output = child.wait_with_output()?;
+        bail!(
+            "the child never reached the compaction transaction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let killed = Command::new("kill")
+        .arg("-9")
+        .arg(child.id().to_string())
+        .status()
+        .context("kill -9 the compaction child")?;
+    ensure!(killed.success(), "kill -9 failed with {killed}");
+    let _ = child.wait()?;
+
+    let store = SqliteDurableStore::connect(&url).await?;
+    assert_uncompacted(&store).await
 }
