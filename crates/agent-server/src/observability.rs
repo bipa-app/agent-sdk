@@ -580,12 +580,7 @@ impl ServerMetrics {
                 "Transitions the store retried after a deadlock or serialization failure.",
             )
             .build();
-        let steering_resumes = meter
-            .u64_counter("agent_server.journal.steering_resumes")
-            .with_description(
-                "Steering wakes committed, attributed by backend and outcome (woken or declined).",
-            )
-            .build();
+        let steering_resumes = steering_resumes_counter(&meter);
         let documents_written = meter
             .u64_counter("agent_server.journal.documents.written")
             .with_description(
@@ -626,6 +621,17 @@ impl ServerMetrics {
             meter,
         }
     }
+}
+
+/// `agent_server.journal.steering_resumes`: steering wakes committed, by
+/// backend and outcome.
+fn steering_resumes_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.journal.steering_resumes")
+        .with_description(
+            "Steering wakes committed, attributed by backend and outcome (woken or declined).",
+        )
+        .build()
 }
 
 // ─────────────────────────────────────────────────────────────────────

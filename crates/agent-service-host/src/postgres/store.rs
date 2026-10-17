@@ -4344,6 +4344,27 @@ impl PostgresDurableStore {
 }
 
 impl PostgresDurableStore {
+    /// Apply one effect write of a transition inside its transaction.
+    async fn apply_effect_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        effect: EffectWrite,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        match effect {
+            EffectWrite::Start(intent) => {
+                let anchor = Self::unlocked_next_event_sequence_tx(tx, &intent.thread).await?;
+                let record = EffectRecord::started(intent, Some(anchor), now);
+                Self::insert_effect_tx(tx, &record).await?;
+                agent_server::fail_point!("effect.start_written");
+            }
+            EffectWrite::Finish { key, owner, state } => {
+                Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
+                agent_server::fail_point!("effect.finish_written");
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -4396,16 +4417,7 @@ impl PostgresDurableStore {
                 .await?;
                 committed.reparked.push(reparked);
             }
-            Write::Effect(EffectWrite::Start(intent)) => {
-                let anchor = Self::unlocked_next_event_sequence_tx(tx, &intent.thread).await?;
-                let record = EffectRecord::started(intent, Some(anchor), now);
-                Self::insert_effect_tx(tx, &record).await?;
-                agent_server::fail_point!("effect.start_written");
-            }
-            Write::Effect(EffectWrite::Finish { key, owner, state }) => {
-                Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
-                agent_server::fail_point!("effect.finish_written");
-            }
+            Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
