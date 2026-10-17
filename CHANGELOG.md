@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Any other write rejects the commit before anything is written.
   - The extension is a pure function of what is committed: it reads
     nothing and does no I/O.
+- The extension's signals (feature `otel`):
+  `agent_server.journal.extension.writes` counts the writes it adds, and
+  `agent_server.journal.extension.refused` counts commits refused for a
+  write it may not add. Both are attributed by `view` (`commit`,
+  `completed_turn`).
 - **Breaking:** `CompletedTurnCommit` gains `extra_writes`: writes applied
   inside the completed turn's transaction, through the same write arms as a
   transition. For now these are documents only

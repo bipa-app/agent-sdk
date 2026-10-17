@@ -5287,9 +5287,7 @@ impl InMemoryAgentTaskStore {
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
-        let transition = transition.extended(self.extension.as_deref())?;
-        self.require_spawn_event_sink(&transition)?;
-        transition.validate()?;
+        let transition = self.prepare_transition(transition)?;
         let (sink, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
@@ -5548,6 +5546,18 @@ fn apply_document_locked(
 }
 
 impl InMemoryAgentTaskStore {
+    /// `transition` with the host extension's writes, checked: a mixed
+    /// spawn's events need the event sink, and the shape must validate.
+    fn prepare_transition(
+        &self,
+        transition: super::transition::Transition,
+    ) -> Result<super::transition::Transition, super::transition::Rejected> {
+        let transition = transition.extended(self.extension.as_deref())?;
+        self.require_spawn_event_sink(&transition)?;
+        transition.validate()?;
+        Ok(transition)
+    }
+
     /// Every guard, the purge fence on appends, then a plan for every
     /// document write, all under the write lock and before the first
     /// mutation.
