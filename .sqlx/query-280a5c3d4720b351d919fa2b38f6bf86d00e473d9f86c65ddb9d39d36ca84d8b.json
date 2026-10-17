@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT item_key, item_index, body_json FROM agent_sdk_thread_view_items WHERE thread_id = $1 AND ($2::BIGINT IS NULL OR item_index < $2) ORDER BY item_index DESC LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_thread_view_items",
+            "name": "item_key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "item_index",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_thread_view_items",
+            "name": "item_index"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_thread_view_items",
+            "name": "body_json"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "280a5c3d4720b351d919fa2b38f6bf86d00e473d9f86c65ddb9d39d36ca84d8b"
+}

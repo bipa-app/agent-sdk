@@ -30,6 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
+mod view;
+
 use agent_server::journal::checkpoint::{
     Checkpoint, CheckpointId, CheckpointKind, NewCheckpointParams,
 };
@@ -192,6 +194,13 @@ impl PostgresDurableStore {
             lock_conflict_retries: Arc::default(),
             view: ViewConfig::default(),
         }
+    }
+
+    /// Maintain the session view of each thread with `view`.
+    #[must_use]
+    pub fn with_view_config(mut self, view: ViewConfig) -> Self {
+        self.view = view;
+        self
     }
 
     const fn tx_ctx(&self) -> TxCtx<'_> {
@@ -6370,6 +6379,7 @@ impl ThreadStore for PostgresDurableStore {
         Self::upsert_thread_tx(&mut tx, &deleted).await?;
         Self::retire_thread_documents_tx(&mut tx, thread_key(thread_id), deleted.updated_at)
             .await?;
+        Self::delete_view_tx(&mut tx, thread_id).await?;
         tx.commit().await.context("commit finish thread purge")?;
         Ok(receipt.clone())
     }
@@ -7134,10 +7144,6 @@ impl PostgresDurableStore {
         start_seq: u64,
         now: OffsetDateTime,
     ) -> Result<Vec<CommittedEvent>> {
-        ensure!(
-            !ctx.view.enabled,
-            "thread views are enabled, but this build does not maintain them"
-        );
         let mut committed = Vec::with_capacity(events.len());
         for (idx, event) in events.into_iter().enumerate() {
             let seq = start_seq + idx as u64;
@@ -7167,6 +7173,7 @@ VALUES ($1, $2, $3, $4, $5)
                 event,
             });
         }
+        Self::apply_view_tx(ctx, tx, thread_id, &committed, now).await?;
         Ok(committed)
     }
 

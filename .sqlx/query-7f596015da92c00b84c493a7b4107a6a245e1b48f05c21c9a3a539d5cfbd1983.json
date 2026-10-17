@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_thread_view_items (thread_id, item_key, item_index, sequence, body_json)\nVALUES (?1, ?2, ?3, ?4, ?5)\nON CONFLICT (thread_id, item_key) DO UPDATE SET item_index = excluded.item_index,\n    sequence = excluded.sequence, body_json = excluded.body_json",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "7f596015da92c00b84c493a7b4107a6a245e1b48f05c21c9a3a539d5cfbd1983"
+}

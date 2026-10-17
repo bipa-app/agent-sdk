@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sdk_thread_views (thread_id, view_schema, sequence, next_index, status_json, updated_at)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (thread_id) DO UPDATE SET view_schema = excluded.view_schema, sequence = excluded.sequence,\n    next_index = excluded.next_index, status_json = excluded.status_json, updated_at = excluded.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5cd0881dbc6b2abf4b64418672de0739fcf001b1488c7cb5f9ff65b7fd46cc89"
+}

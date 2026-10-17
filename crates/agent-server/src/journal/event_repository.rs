@@ -26,6 +26,8 @@
 //! interleaved sequences from concurrent turns on the same thread.
 
 use super::committed_event::CommittedEvent;
+use super::view::{ThreadView, ViewConfig};
+use super::view_store::{ThreadViewSnapshot, ThreadViewStore, ViewsDisabled, items_before};
 use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::AgentEvent;
 use anyhow::{Result, ensure};
@@ -147,9 +149,25 @@ pub(crate) struct InMemoryEventRepositoryInner {
     /// Events keyed by `thread_id`, stored in append order (which is
     /// also sequence order).
     pub(crate) events: HashMap<String, Vec<CommittedEvent>>,
+    view: ViewConfig,
+    views: HashMap<String, ThreadView>,
 }
 
 impl InMemoryEventRepositoryInner {
+    fn append(&mut self, thread_id: &ThreadId, committed: &[CommittedEvent]) {
+        self.events
+            .entry(thread_id.0.clone())
+            .or_default()
+            .extend_from_slice(committed);
+        if !self.view.enabled {
+            return;
+        }
+        let view = self.views.entry(thread_id.0.clone()).or_default();
+        for event in committed {
+            view.fold(event.sequence, event.timestamp, &event.event, &self.view);
+        }
+    }
+
     pub(crate) fn next_sequence(&self, thread_id: &ThreadId) -> u64 {
         self.events
             .get(&thread_id.0)
@@ -175,6 +193,18 @@ impl InMemoryEventRepository {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// A repository that folds every committed event into its thread's view
+    /// under the same lock, when `view.enabled`.
+    #[must_use]
+    pub fn with_view_config(view: ViewConfig) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InMemoryEventRepositoryInner {
+                view,
+                ..InMemoryEventRepositoryInner::default()
+            })),
+        }
+    }
 }
 
 #[async_trait]
@@ -196,11 +226,7 @@ impl EventRepository for InMemoryEventRepository {
             event,
         };
 
-        inner
-            .events
-            .entry(thread_id.0.clone())
-            .or_default()
-            .push(committed.clone());
+        inner.append(thread_id, std::slice::from_ref(&committed));
         drop(inner);
 
         Ok(committed)
@@ -229,11 +255,7 @@ impl EventRepository for InMemoryEventRepository {
             })
             .collect();
 
-        inner
-            .events
-            .entry(thread_id.0.clone())
-            .or_default()
-            .extend(committed.clone());
+        inner.append(thread_id, &committed);
         drop(inner);
 
         Ok(committed)
@@ -328,6 +350,94 @@ impl EventRepository for InMemoryEventRepository {
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl ThreadViewStore for InMemoryEventRepository {
+    async fn thread_view(
+        &self,
+        thread_id: &ThreadId,
+        item_limit: usize,
+    ) -> Result<Option<ThreadViewSnapshot>> {
+        let inner = self.inner.read().await;
+        if !inner.view.enabled {
+            return Err(ViewsDisabled.into());
+        }
+        Ok(inner
+            .views
+            .get(&thread_id.0)
+            .map(|view| ThreadViewSnapshot::of(view, item_limit)))
+    }
+
+    async fn thread_view_items(
+        &self,
+        thread_id: &ThreadId,
+        before_index: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<(String, super::view::IndexedItem)>>> {
+        let inner = self.inner.read().await;
+        if !inner.view.enabled {
+            return Err(ViewsDisabled.into());
+        }
+        Ok(inner.views.get(&thread_id.0).map(|view| {
+            let items = view
+                .items
+                .iter()
+                .map(|(key, indexed)| (key.clone(), indexed.clone()))
+                .collect();
+            items_before(items, before_index, limit)
+        }))
+    }
+}
+
+/// A [`ThreadViewStore`] that answers `None` for a thread being purged, read
+/// through `threads`, and otherwise delegates to `views`.
+pub struct PurgeFencedViewStore {
+    views: Arc<dyn ThreadViewStore>,
+    threads: Arc<dyn super::thread_store::ThreadStore>,
+}
+
+impl PurgeFencedViewStore {
+    #[must_use]
+    pub fn new(
+        views: Arc<dyn ThreadViewStore>,
+        threads: Arc<dyn super::thread_store::ThreadStore>,
+    ) -> Self {
+        Self { views, threads }
+    }
+
+    async fn purging(&self, thread_id: &ThreadId) -> Result<bool> {
+        let thread = self.threads.get(thread_id).await?;
+        Ok(thread.is_some_and(|thread| thread.status.is_purge_fenced()))
+    }
+}
+
+#[async_trait]
+impl ThreadViewStore for PurgeFencedViewStore {
+    async fn thread_view(
+        &self,
+        thread_id: &ThreadId,
+        item_limit: usize,
+    ) -> Result<Option<ThreadViewSnapshot>> {
+        if self.purging(thread_id).await? {
+            return Ok(None);
+        }
+        self.views.thread_view(thread_id, item_limit).await
+    }
+
+    async fn thread_view_items(
+        &self,
+        thread_id: &ThreadId,
+        before_index: u64,
+        limit: usize,
+    ) -> Result<Option<Vec<(String, super::view::IndexedItem)>>> {
+        if self.purging(thread_id).await? {
+            return Ok(None);
+        }
+        self.views
+            .thread_view_items(thread_id, before_index, limit)
+            .await
+    }
+}
 
 /// An [`EventRepository`] that refuses appends to a purged thread, read
 /// through `threads`, and otherwise delegates to `events`.

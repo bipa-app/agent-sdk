@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM agent_sdk_thread_view_items WHERE thread_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "223d94d5335d769641a0340da73cc52aaf62c98fdf3ca91b8edc43802b71419e"
+}

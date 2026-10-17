@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event_id, thread_id, sequence, event_json, committed_at FROM agent_sdk_committed_events WHERE thread_id = $1 AND sequence > $2 AND sequence < $3 ORDER BY sequence",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_committed_events",
+            "name": "event_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "thread_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_committed_events",
+            "name": "thread_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "sequence",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_committed_events",
+            "name": "sequence"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "event_json",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_committed_events",
+            "name": "event_json"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "committed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_committed_events",
+            "name": "committed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "74014504e3f97ef435e7b29d702f793ab9b6cf11ff6c0671a652a2d0ae2f29ac"
+}
