@@ -353,6 +353,9 @@ pub struct StoreOptions {
     /// Runs inside every transition and completed-turn commit (see
     /// [`agent_server::journal::TransitionExtension`]).
     pub transition_extension: Option<Arc<dyn agent_server::journal::TransitionExtension>>,
+    /// The session view settings (reconciliation C3). Off by default; the
+    /// view storage reads them once it exists.
+    pub view: agent_sdk_foundation::view::ViewConfig,
 }
 
 /// Registry of live cancellation tokens for detached
