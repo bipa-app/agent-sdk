@@ -3194,9 +3194,7 @@ impl InMemoryAgentTaskStore {
                     .recompute_pending_children(live, now)
                     .context("reject_confirmation: recompute_pending_children failed")?;
                 inner.rebalance_after_row_change(&old_parent, &new_parent);
-                inner
-                    .by_id
-                    .insert(new_parent.id.clone(), new_parent.clone());
+                inner.put_row(new_parent.id.clone(), new_parent.clone());
                 Some(new_parent)
             } else {
                 Some(old_parent)
@@ -4050,7 +4048,7 @@ impl Inner {
             {
                 record.state = super::effect::EffectState::Abandoned;
                 record.updated_at = task.updated_at;
-                super::effect::record_effect(record.kind(), "abandoned");
+                super::effect::report_abandoned(record, &task);
             }
         }
         self.by_id.insert(id, task);
@@ -4737,8 +4735,7 @@ impl Inner {
         for old in undelivered {
             let released = release_undelivered_input(old.clone(), hand_over, now)?;
             self.rebalance_after_row_change(&old, &released.injection);
-            self.by_id
-                .insert(released.injection.id.clone(), released.injection);
+            self.put_row(released.injection.id.clone(), released.injection);
             if let Some(next_turn) = released.next_turn {
                 self.add_to_indexes(&next_turn);
                 self.put_row(next_turn.id.clone(), next_turn);
@@ -4783,8 +4780,7 @@ impl Inner {
                 format!("{error_prefix}: subagent invocation resume transition failed")
             })?;
         self.rebalance_after_row_change(&old_invocation, &new_invocation);
-        self.by_id
-            .insert(new_invocation.id.clone(), new_invocation.clone());
+        self.put_row(new_invocation.id.clone(), new_invocation.clone());
         // The invocation has been woken; the child-root linkage is
         // consumed, so drop the reverse-index entry.
         self.invocation_by_child_root.remove(&child_root.id);
@@ -6017,9 +6013,7 @@ impl InMemoryAgentTaskStore {
             .wait_on_children(child_count, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old_parent, &new_parent);
-        inner
-            .by_id
-            .insert(new_parent.id.clone(), new_parent.clone());
+        inner.put_row(new_parent.id.clone(), new_parent.clone());
         for child in &children {
             inner.add_to_indexes(child);
             inner.put_row(child.id.clone(), child.clone());
@@ -6062,18 +6056,12 @@ impl InMemoryAgentTaskStore {
             .wait_on_children(1, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old_parent, &new_parent);
-        inner
-            .by_id
-            .insert(new_parent.id.clone(), new_parent.clone());
+        inner.put_row(new_parent.id.clone(), new_parent.clone());
         for (invocation, child_root) in &prepared {
             inner.add_to_indexes(invocation);
-            inner
-                .by_id
-                .insert(invocation.id.clone(), invocation.clone());
+            inner.put_row(invocation.id.clone(), invocation.clone());
             inner.add_to_indexes(child_root);
-            inner
-                .by_id
-                .insert(child_root.id.clone(), child_root.clone());
+            inner.put_row(child_root.id.clone(), child_root.clone());
         }
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
         Ok(SpawnedChildren {
@@ -6182,18 +6170,12 @@ impl InMemoryAgentTaskStore {
             .wait_on_children(child_count, payload, child_ids, now)
             .context("spawn rejected: wait_on_children transition failed")?;
         inner.rebalance_after_row_change(&old_parent, &new_parent);
-        inner
-            .by_id
-            .insert(new_parent.id.clone(), new_parent.clone());
+        inner.put_row(new_parent.id.clone(), new_parent.clone());
         for (invocation, child_root) in &prepared {
             inner.add_to_indexes(invocation);
-            inner
-                .by_id
-                .insert(invocation.id.clone(), invocation.clone());
+            inner.put_row(invocation.id.clone(), invocation.clone());
             inner.add_to_indexes(child_root);
-            inner
-                .by_id
-                .insert(child_root.id.clone(), child_root.clone());
+            inner.put_row(child_root.id.clone(), child_root.clone());
         }
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
         let committed = self
@@ -7543,6 +7525,18 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
 #[cfg(test)]
 mod tests {
+    /// Every in-memory task row is stored through `Inner::put_row`, which
+    /// abandons a terminal owner's started effects: no other `by_id` insert.
+    #[test]
+    fn task_rows_are_stored_only_through_put_row() {
+        let source: String = include_str!("store.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = ["by_id", ".insert("].concat();
+        assert_eq!(source.matches(&needle).count(), 1);
+    }
+
     use super::*;
     use crate::journal::spawn_children::SpawnChildrenExt;
     use crate::journal::task::{LeaseId, TaskSchemaError, WorkerId};

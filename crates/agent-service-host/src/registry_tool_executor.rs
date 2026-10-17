@@ -28,6 +28,7 @@
 //! [`Tool::execute`]: agent_sdk_tools::Tool::execute
 //! [`execute_tool_task`]: agent_server::worker::tool_task::execute_tool_task
 
+use agent_server::journal::effect::EffectKey;
 use std::sync::Arc;
 
 use agent_sdk_foundation::ToolResult;
@@ -97,6 +98,8 @@ struct DispatchContext {
     collector: ToolEventCollector,
     cancel: CancellationToken,
     artifact_store: Option<Arc<agent_sdk::ArtifactStore>>,
+    /// The call's effect key, passed to the tool as its idempotency key.
+    idempotency_key: Option<String>,
 }
 
 impl<Ctx> RegistryToolExecutor<Ctx>
@@ -151,7 +154,10 @@ where
             artifact_store: context.artifact_store,
         };
 
-        let ctx = self.factory.build(&context.seed, self.app.clone(), deps);
+        let mut ctx = self.factory.build(&context.seed, self.app.clone(), deps);
+        if let Some(key) = context.idempotency_key {
+            ctx = ctx.with_idempotency_key(key);
+        }
         tool.execute(&ctx, input).await
     }
 
@@ -270,6 +276,11 @@ where
                 collector,
                 cancel,
                 artifact_store,
+                idempotency_key: Some(
+                    EffectKey::tool(&bootstrap.task_id, &bootstrap.tool_call.id)
+                        .as_str()
+                        .to_owned(),
+                ),
             },
         );
 
@@ -379,6 +390,7 @@ mod tests {
             collector,
             cancel: CancellationToken::new(),
             artifact_store: None,
+            idempotency_key: None,
         }
     }
 

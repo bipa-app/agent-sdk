@@ -335,6 +335,9 @@ pub struct ToolContext<Ctx> {
     /// footer into the inline result; the `read` tool resolves
     /// `artifact://<id>` URIs against the same store.
     artifact_store: Option<Arc<crate::artifacts::ArtifactStore>>,
+    /// The same key on every attempt of this tool call (see
+    /// [`Self::idempotency_key`]).
+    idempotency_key: Option<String>,
 }
 
 impl<Ctx> ToolContext<Ctx> {
@@ -351,6 +354,7 @@ impl<Ctx> ToolContext<Ctx> {
             subagent_semaphore: None,
             tool_timeout: None,
             artifact_store: None,
+            idempotency_key: None,
         }
     }
 
@@ -381,6 +385,7 @@ impl<Ctx> ToolContext<Ctx> {
             subagent_semaphore: deps.subagent_semaphore,
             tool_timeout: None,
             artifact_store: deps.artifact_store,
+            idempotency_key: None,
         }
     }
 
@@ -509,6 +514,22 @@ impl<Ctx> ToolContext<Ctx> {
     pub fn with_artifact_store(mut self, store: Arc<crate::artifacts::ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
         self
+    }
+
+    /// Set the call's idempotency key.
+    #[must_use]
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+
+    /// A key that is the same on every attempt of this tool call, when the
+    /// host runs tools durably (the agent server passes the call's effect
+    /// key). A tool that changes state outside the agent can send it to
+    /// the service it calls, so the service recognises a repeated attempt.
+    #[must_use]
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
     }
 
     /// Get the per-thread artifact spill store (if set).

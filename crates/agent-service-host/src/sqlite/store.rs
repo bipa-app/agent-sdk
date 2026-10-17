@@ -1612,7 +1612,7 @@ WHERE id = ?1
     ) -> Result<()> {
         let columns = EffectState::Abandoned.columns();
         let abandoned = sqlx::query!(
-            r"
+            r#"
 UPDATE agent_sdk_execution_intents
 SET status     = ?1,
     error      = ?2,
@@ -1620,8 +1620,8 @@ SET status     = ?1,
     updated_at = ?4
 WHERE child_task_id = ?5
   AND status IN ('pending', 'started')
-RETURNING effect_kind
-",
+RETURNING operation_id AS "operation_id!", effect_kind AS "effect_kind!"
+"#,
             columns.status,
             columns.error,
             columns.resolution,
@@ -1631,18 +1631,23 @@ RETURNING effect_kind
         .fetch_all(&mut **tx)
         .await
         .with_context(|| format!("abandon the started effects of task {}", task.id))?;
-        if !abandoned.is_empty() {
-            tracing::info!(
-                task_id = %task.id,
-                abandoned = abandoned.len(),
-                "a task became terminal with started effects; they are abandoned, never run again"
-            );
-        }
-        #[cfg(feature = "otel")]
+        let reason = agent_server::journal::effect::abandon_reason(task);
         for row in &abandoned {
+            tracing::info!(
+                effect_key = %row.operation_id,
+                effect_kind = %row.effect_kind,
+                task_id = %task.id,
+                reason,
+                "an effect was abandoned because its owner ended first; it is never run again"
+            );
+            #[cfg(feature = "otel")]
             if let Some(kind) = agent_server::journal::effect::kind_from_wire(&row.effect_kind) {
-                agent_server::observability::ServerMetrics::global()
-                    .record_effect(kind, "abandoned");
+                agent_server::observability::ServerMetrics::global().record_effect_abandoned(
+                    kind,
+                    reason,
+                    &row.operation_id,
+                    task.id.as_str(),
+                );
             }
         }
         Ok(())
@@ -3576,9 +3581,11 @@ impl SqliteDurableStore {
                 let anchor = Self::next_event_sequence_tx(tx, &intent.thread).await?;
                 let record = EffectRecord::started(intent, Some(anchor), now);
                 Self::insert_effect_tx(tx, &record).await?;
+                agent_server::fail_point!("effect.start_written");
             }
             Write::Effect(EffectWrite::Finish { key, owner, state }) => {
                 Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
+                agent_server::fail_point!("effect.finish_written");
             }
             Write::AppendCompaction {
                 thread,

@@ -767,14 +767,37 @@ async fn effect_after_start_failpoint_leaves_a_started_record_and_no_run() -> Re
     Ok(())
 }
 
+/// The claim commits whole or not at all. `effect.start_written` fires
+/// inside the start transaction right after the record's INSERT succeeded
+/// (`crash_effect_at` requires it to fire), so the crash lands after the
+/// write it protects: the record must be gone and the tool unrun.
+#[tokio::test]
+async fn effect_start_written_failpoint_rolls_back_the_claim() -> Result<()> {
+    let _scenario = serial_failpoints();
+    let (runs, child, record, _temp) = crash_effect_at("effect.start_written").await?;
+    ensure!(runs == 0, "the tool ran {runs} times");
+    ensure!(child.status == TaskStatus::Running, "{:?}", child.status);
+    ensure!(record.is_none(), "a rolled-back claim left {record:?}");
+    Ok(())
+}
+
 /// The outcome, the child's settle and its `ToolCallEnd` commit in one
-/// transaction: a crash after the tool ran but before that commit, and a
-/// crash inside it, both leave the child running and the record started,
-/// never one settled without the other.
+/// transaction. Each crash point is required to fire (`crash_effect_at`),
+/// and each comes after a write it protects:
+/// - `effect.before_finish`: after the tool ran, before the end commit
+///   (the mutation that commits the finish in its own transaction after the
+///   settle turns this case red);
+/// - `effect.finish_written`: inside the end transaction, right after the
+///   record's UPDATE to its outcome succeeded (the finish is its first
+///   write);
+/// - `transition.before_events`: inside the end transaction, in the events
+///   write, after the finish and the child's settle were written.
+///
+/// Every one must leave the child running and the record started.
 #[tokio::test]
 async fn effect_end_failpoints_never_settle_the_child_without_its_record() -> Result<()> {
     let _scenario = serial_failpoints();
-    for failpoint in ["effect.before_finish", FAILPOINT] {
+    for failpoint in ["effect.before_finish", "effect.finish_written", FAILPOINT] {
         let (runs, child, record, temp) = crash_effect_at(failpoint).await?;
         ensure!(runs == 1, "{failpoint}: the tool ran {runs} times");
         ensure!(

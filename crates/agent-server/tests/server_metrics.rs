@@ -681,8 +681,21 @@ async fn a_commit_records_its_outcome_and_its_documents() -> Result<()> {
     Ok(())
 }
 
+fn tool_call_effects(counts: &[(Vec<(String, String)>, u64)], transition: &str) -> u64 {
+    counts
+        .iter()
+        .filter(|(set, _)| {
+            matches_all(
+                set,
+                &[(attrs::KIND, "tool_call"), (attrs::TRANSITION, transition)],
+            )
+        })
+        .map(|(_, value)| value)
+        .sum()
+}
+
 #[tokio::test]
-async fn effect_transitions_count_each_outcome_by_kind() -> Result<()> {
+async fn effect_signals_count_each_transition_by_kind() -> Result<()> {
     use agent_sdk_foundation::ToolReplay;
     use agent_server::journal::effect::{
         EffectIntent, EffectKey, EffectRun, EffectState, EffectSubject, run_effect,
@@ -764,24 +777,25 @@ async fn effect_transitions_count_each_outcome_by_kind() -> Result<()> {
 
     flush(&provider)?;
     let snapshots = collected(&exporter)?;
-    let counts = collect_u64_counter(&snapshots, "agent_server.effect.transitions");
-    for (outcome, expected) in [
-        ("started", 1),
-        ("completed", 1),
-        ("refused", 1),
-        ("abandoned", 1),
-    ] {
-        let seen: u64 = counts
-            .iter()
-            .filter(|(set, _)| {
-                matches_all(
-                    set,
-                    &[(attrs::EFFECT_KIND, "tool_call"), (attrs::OUTCOME, outcome)],
-                )
-            })
-            .map(|(_, value)| value)
-            .sum();
-        assert_eq!(seen, expected, "outcome {outcome}: {counts:?}");
+    let counts = collect_u64_counter(&snapshots, "agent_server.effects");
+    for transition in ["started", "finished", "refused", "abandoned"] {
+        assert_eq!(
+            tool_call_effects(&counts, transition),
+            1,
+            "transition {transition}: {counts:?}"
+        );
     }
+    let durations = collect_histogram_attrs(&snapshots, "agent_server.effect.duration");
+    assert!(
+        durations.iter().any(|set| matches_all(
+            set,
+            &[(attrs::KIND, "tool_call"), (attrs::OUTCOME, "completed")]
+        )),
+        "{durations:?}"
+    );
+    assert_eq!(
+        histogram_total_count(&snapshots, "agent_server.effect.duration"),
+        1
+    );
     Ok(())
 }

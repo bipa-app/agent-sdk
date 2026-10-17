@@ -91,6 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Crash safety, Phase 2: effects
 
+- `ToolContext::idempotency_key` (`agent-sdk-tools`, additive). The agent
+  server passes each tool call its effect key, `{child_task_id}:{tool_call_id}`,
+  which is the same on every attempt of the call. A tool that changes state
+  outside the agent can send it to the service it calls, so the service
+  recognises a repeated attempt. Hosts set it with `with_idempotency_key`.
+
 - **Breaking: tool calls run as effects** (design §6.3). An effect is work
   outside the store whose record commits before it runs, under its owner
   task's lease, and whose outcome commits in the same transaction as the
@@ -122,24 +128,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     finish, `cancel_tree` / `cancel_descendants_of_owned` while the call
     runs, and the lease sweep failing the owner closed.
     - The SQL backends do it where they write every task status
-      (`update_task_tx`); the in-memory store does it in the one place it
-      stores a task row.
+      (`update_task_tx`). The in-memory store does it in `Inner::put_row`,
+      the one place it stores a task row; a source test refuses any other
+      `by_id` insert.
     - A transition that finishes an effect and ends its owner must write
       the `Finish` first. `validate` refuses the other order, and
       `run_effect` puts the finish ahead of the caller's end writes.
     - Readers treat a `Started` record whose owner is already terminal (a
       row an earlier release left behind) as `Abandoned`, and never run
       it again.
-  - **Signals.** The new counter `agent_server.effect.transitions`
-    (`effect_kind`, `outcome`) counts effect records:
-    - `started` and `refused` (the claim did not commit) from `run_effect`;
-    - `completed` or `failed` when the end transition commits;
-    - `interrupted` from recovery;
-    - `abandoned` from the stores, counted inside the transaction that
-      ends the owner, so a rolled-back transaction can over-count it.
-
-    A refused claim logs a warning. An interrupted recovery and an abandon
-    log at info level, with the effect key and the task id.
+  - **Signals** (the obs spec for effects):
+    - **Counter** `agent_server.effects{kind, transition}`. `started` (the
+      claim and start commit as one transaction) and `refused` (the claim
+      did not commit) come from `run_effect`, and `finished` when its end
+      transition commits. `reclaimed` comes from recovery settling a
+      started call as interrupted, and `abandoned` from the stores.
+    - **Histogram** `agent_server.effect.duration{kind, outcome}`: started
+      to finished.
+    - **Span** `effect.run` around each run, with
+      `agent_server.effect.kind`, the effect and task ids, and
+      `agent_server.effect.state` at close.
+    - **Span event** `agent_server.effect.abandoned{reason}`, where the
+      reason is `owner_cancelled`, `lease_sweep` (failed closed at its
+      budget) or `owner_terminal`.
+    - **Logs.** A refused claim logs a warning. Each abandoned record logs
+      at info with its key, kind, owner task and reason, from the SQL
+      stores and the in-memory store alike.
+    - **Over-counting.** An abandon is counted inside the transaction that
+      ends its owner, so a rolled-back transaction, or a Postgres
+      lock-conflict retry, can over-count it.
 - **Breaking: the write and guard types.**
   - `Write::Effect(EffectWrite::{Start, Finish})` and `Guard::EffectFree`
     replace `Write::RecordIntent`.

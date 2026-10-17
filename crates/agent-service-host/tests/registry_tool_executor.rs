@@ -369,3 +369,59 @@ async fn execute_tool_call_uses_effective_input_and_parent_metadata() -> anyhow:
     assert_eq!(result.output, "effective:u-42");
     Ok(())
 }
+
+struct IdempotencyKeyEchoTool;
+
+impl Tool<()> for IdempotencyKeyEchoTool {
+    type Name = DynamicToolName;
+
+    fn name(&self) -> DynamicToolName {
+        DynamicToolName::new("key_echo")
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Key Echo"
+    }
+
+    fn description(&self) -> &'static str {
+        "Returns the idempotency key the host passed."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    async fn execute(&self, ctx: &ToolContext<()>, _input: Value) -> anyhow::Result<ToolResult> {
+        Ok(ToolResult::success(
+            ctx.idempotency_key().unwrap_or("none").to_owned(),
+        ))
+    }
+}
+
+/// The tool gets its call's effect key as an idempotency key: the same on
+/// every attempt of the call, so a service it calls can recognise a repeat.
+#[tokio::test]
+async fn a_tool_gets_its_effect_key_as_its_idempotency_key() -> anyhow::Result<()> {
+    let mut registry = ToolRegistry::<()>::new();
+    registry.register(IdempotencyKeyEchoTool);
+    let executor = RegistryToolExecutor::with_default_factory(Arc::new(registry), ());
+    let thread = ThreadId::from_string("t-idempotency-key");
+    let bootstrap = make_bootstrap(&thread, "key_echo", &json!({}));
+
+    let result = executor
+        .execute_tool_call(
+            &bootstrap,
+            ToolEventCollector::new(),
+            CancellationToken::new(),
+            None,
+        )
+        .await?;
+
+    assert!(result.success);
+    assert_eq!(
+        result.output,
+        agent_server::journal::effect::EffectKey::tool(&bootstrap.task_id, &bootstrap.tool_call.id)
+            .as_str()
+    );
+    Ok(())
+}

@@ -190,7 +190,7 @@ async fn interrupt_unsafe_replay(
         .await
         .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
     if prior.state.is_started() {
-        crate::journal::effect::record_effect(prior.kind(), "interrupted");
+        crate::journal::effect::record_effect(prior.kind(), "reclaimed");
     }
     log::info!(
         effect_key = prior.key.as_str(),

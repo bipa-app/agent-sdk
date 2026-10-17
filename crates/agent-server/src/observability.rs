@@ -105,8 +105,16 @@ pub mod attrs {
     pub const AUDIT_OUTCOME: &str = "outcome";
     /// Tool effect class on audit events.
     pub const EFFECT_CLASS: &str = "effect_class";
-    /// Kind of an effect (`tool_call`, `llm_request`, …), as its row stores it.
-    pub const EFFECT_KIND: &str = "effect_kind";
+    /// What happened to an effect (`agent_server.effects`).
+    pub const TRANSITION: &str = "transition";
+    /// Span-only: the kind of the effect an `effect.run` span runs.
+    pub const SPAN_EFFECT_KIND: &str = "agent_server.effect.kind";
+    /// Span-only: the state an `effect.run` span's effect ended in.
+    pub const SPAN_EFFECT_STATE: &str = "agent_server.effect.state";
+    /// Span-only: an effect's key.
+    pub const SPAN_EFFECT_ID: &str = "agent_server.effect.id";
+    /// Span-only: the owner task of an effect.
+    pub const SPAN_TASK_ID: &str = "agent_server.task.id";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -182,9 +190,11 @@ pub struct ServerMetrics {
     pub(crate) transition_duration: Histogram<f64>,
     pub(crate) transition_lock_conflict_retries: Counter<u64>,
     pub(crate) documents_written: Counter<u64>,
-    /// `agent_server.effect.transitions`: effect records written, by kind
-    /// and outcome.
-    pub(crate) effect_transitions: Counter<u64>,
+    /// `agent_server.effects`: effect transitions, by kind.
+    pub(crate) effects: Counter<u64>,
+    /// `agent_server.effect.duration`: started to finished, by kind and
+    /// the state it finished in.
+    pub(crate) effect_duration: Histogram<f64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -403,14 +413,58 @@ impl ServerMetrics {
 
     /// Record one `agent_server.tool_audit.outcome` increment for
     /// the given tool-audit event.
-    /// Count one effect record written with `outcome` (see
-    /// [`crate::journal::effect::EffectState::outcome_label`]).
-    pub fn record_effect(&self, kind: crate::journal::effect::EffectKind, outcome: &'static str) {
+    /// Count one effect transition (`started`, `refused`, `finished`,
+    /// `reclaimed`, `abandoned`) on `agent_server.effects`.
+    pub fn record_effect(
+        &self,
+        kind: crate::journal::effect::EffectKind,
+        transition: &'static str,
+    ) {
         let attrs = [
-            KeyValue::new(attrs::EFFECT_KIND, crate::journal::effect::kind_wire(kind)),
+            KeyValue::new(attrs::KIND, crate::journal::effect::kind_wire(kind)),
+            KeyValue::new(attrs::TRANSITION, transition),
+        ];
+        self.effects.add(1, &attrs);
+    }
+
+    /// Record how long an effect ran, started to finished, with the state it
+    /// finished in.
+    pub fn record_effect_duration(
+        &self,
+        kind: crate::journal::effect::EffectKind,
+        outcome: &'static str,
+        duration_secs: f64,
+    ) {
+        let attrs = [
+            KeyValue::new(attrs::KIND, crate::journal::effect::kind_wire(kind)),
             KeyValue::new(attrs::OUTCOME, outcome),
         ];
-        self.effect_transitions.add(1, &attrs);
+        self.effect_duration.record(duration_secs, &attrs);
+    }
+
+    /// Count an effect abandoned because its owner became terminal, and add
+    /// the `agent_server.effect.abandoned` event to the active span, which
+    /// alone carries the ids.
+    pub fn record_effect_abandoned(
+        &self,
+        kind: crate::journal::effect::EffectKind,
+        reason: &'static str,
+        effect_key: &str,
+        task_id: &str,
+    ) {
+        self.record_effect(kind, "abandoned");
+        let event = vec![
+            KeyValue::new(attrs::REASON, reason),
+            KeyValue::new(
+                attrs::SPAN_EFFECT_KIND,
+                crate::journal::effect::kind_wire(kind),
+            ),
+            KeyValue::new(attrs::SPAN_EFFECT_ID, effect_key.to_owned()),
+            KeyValue::new(attrs::SPAN_TASK_ID, task_id.to_owned()),
+        ];
+        opentelemetry::trace::get_active_span(|span| {
+            span.add_event("agent_server.effect.abandoned", event);
+        });
     }
 
     pub fn record_tool_audit(&self, event: &ToolAuditEvent) {
@@ -513,12 +567,18 @@ impl ServerMetrics {
             )
             .build();
 
-        let effect_transitions = meter
-            .u64_counter("agent_server.effect.transitions")
+        let effects = meter
+            .u64_counter("agent_server.effects")
             .with_description(
-                "Effect records written, by kind and outcome: started, refused (the claim \
-                 did not commit), completed, failed, interrupted, salvaged, abandoned.",
+                "Effect transitions by kind: started (its record committed), refused (the \
+                 claim did not commit), finished, reclaimed (recovery ended it without \
+                 running it again), abandoned (its owner became terminal first).",
             )
+            .build();
+        let effect_duration = meter
+            .f64_histogram("agent_server.effect.duration")
+            .with_unit("s")
+            .with_description("Effect run time, started to finished, by kind and outcome.")
             .build();
 
         Self {
@@ -534,7 +594,8 @@ impl ServerMetrics {
             transition_duration,
             transition_lock_conflict_retries,
             documents_written,
-            effect_transitions,
+            effects,
+            effect_duration,
             meter,
         }
     }

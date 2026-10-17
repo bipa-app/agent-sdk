@@ -11,7 +11,9 @@
 //! terminal (its settle, a cancel of its tree, a fail-closed lease sweep)
 //! also ends the task's still-`Started` records as `Abandoned`, in the same
 //! transaction. A transition that ends an owner and finishes its effect
-//! therefore writes the [`EffectWrite::Finish`] first. So recovery reads
+//! therefore writes the [`EffectWrite::Finish`] first. `validate` refuses
+//! the other order on every backend; on the SQL backends the finish's
+//! `WHERE status = 'started'` would also refuse it. So recovery reads
 //! committed state only and never infers from age: a `Started` record is an
 //! effect whose live owner may run it again, an `Abandoned` one ended
 //! without an outcome and is never run again. A row an earlier release left
@@ -40,12 +42,12 @@
 //! | `Salvaged` | `failed` | `salvaged: aborted response` | `salvaged` |
 //! | `Abandoned` | `failed` | `abandoned: its owner ended first` | `abandoned` |
 
-use agent_sdk_foundation::{ThreadId, ToolReplay};
+use agent_sdk_foundation::{TerminalReason, ThreadId, ToolReplay};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::task::AgentTaskId;
+use super::task::{AgentTask, AgentTaskId, TaskStatus};
 use super::transition::{Committed, DurableStore, Guard, Rejected, Transition, Write};
 
 /// Stable error prefix for a tool call that recovery did not run again.
@@ -160,15 +162,128 @@ impl EffectState {
     }
 }
 
-/// Count an effect record written with `outcome`.
-#[cfg(feature = "otel")]
-pub(crate) fn record_effect(kind: EffectKind, outcome: &'static str) {
-    crate::observability::ServerMetrics::global().record_effect(kind, outcome);
+/// Why an owner's started effects were abandoned, from the owner's terminal
+/// row: `owner_cancelled`, `lease_sweep` (failed closed at its budget by
+/// recovery) or `owner_terminal`.
+#[doc(hidden)]
+#[must_use]
+pub const fn abandon_reason(owner: &AgentTask) -> &'static str {
+    match (owner.status, &owner.terminal_reason) {
+        (TaskStatus::Cancelled, _) => "owner_cancelled",
+        (TaskStatus::Failed, Some(TerminalReason::Budget)) => "lease_sweep",
+        _ => "owner_terminal",
+    }
 }
 
-/// Without `otel` there is nothing to count.
+/// Count an effect transition on `agent_server.effects` (and, given a
+/// duration, `agent_server.effect.duration`).
+#[cfg(feature = "otel")]
+pub(crate) fn record_effect(kind: EffectKind, transition: &'static str) {
+    crate::observability::ServerMetrics::global().record_effect(kind, transition);
+}
+
 #[cfg(not(feature = "otel"))]
-pub(crate) const fn record_effect(_kind: EffectKind, _outcome: &'static str) {}
+pub(crate) const fn record_effect(_kind: EffectKind, _transition: &'static str) {}
+
+/// Report an effect its owner's end abandoned: the counter, the span event
+/// and a log line naming it.
+pub(crate) fn report_abandoned(record: &EffectRecord, owner: &AgentTask) {
+    let reason = abandon_reason(owner);
+    log::info!(
+        effect_key = record.key.as_str(),
+        effect_kind = kind_wire(record.kind()),
+        task_id = owner.id.as_str(),
+        reason = reason;
+        "an effect was abandoned because its owner ended first; it is never run again"
+    );
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global().record_effect_abandoned(
+        record.kind(),
+        reason,
+        record.key.as_str(),
+        owner.id.as_str(),
+    );
+}
+
+/// The signals of one [`run_effect`]: its `agent_server.effects`
+/// transitions and, with `otel`, the `effect.run` span and the
+/// `agent_server.effect.duration` of a finished run.
+struct RunSignals {
+    kind: EffectKind,
+    #[cfg(feature = "otel")]
+    span: opentelemetry::global::BoxedSpan,
+    #[cfg(feature = "otel")]
+    started: std::time::Instant,
+}
+
+impl RunSignals {
+    #[cfg(feature = "otel")]
+    fn begin(kind: EffectKind, key: &EffectKey, owner: &AgentTaskId) -> Self {
+        use crate::observability::attrs;
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{Span, Tracer};
+
+        let mut span = opentelemetry::global::tracer("agent-server").start("effect.run");
+        span.set_attribute(KeyValue::new(attrs::SPAN_EFFECT_KIND, kind_wire(kind)));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_EFFECT_ID,
+            key.as_str().to_owned(),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_ID,
+            owner.as_str().to_owned(),
+        ));
+        Self {
+            kind,
+            span,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn begin(kind: EffectKind, _key: &EffectKey, _owner: &AgentTaskId) -> Self {
+        Self { kind }
+    }
+
+    /// Set `agent_server.effect.state` on the span (no span without `otel`).
+    #[cfg(feature = "otel")]
+    fn state(&mut self, state: &'static str) {
+        use opentelemetry::trace::Span;
+
+        self.span.set_attribute(opentelemetry::KeyValue::new(
+            crate::observability::attrs::SPAN_EFFECT_STATE,
+            state,
+        ));
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn state(&mut self, _state: &'static str) {}
+
+    fn refused(mut self) {
+        record_effect(self.kind, "refused");
+        self.state("refused");
+    }
+
+    fn started(&mut self) {
+        record_effect(self.kind, "started");
+        self.state("started");
+        #[cfg(feature = "otel")]
+        {
+            self.started = std::time::Instant::now();
+        }
+    }
+
+    fn finished(mut self, outcome: &'static str) {
+        record_effect(self.kind, "finished");
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_effect_duration(
+            self.kind,
+            outcome,
+            self.started.elapsed().as_secs_f64(),
+        );
+        self.state(outcome);
+    }
+}
 
 /// An effect about to start: the row [`EffectWrite::Start`] inserts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -630,10 +745,11 @@ where
     let key = intent.key.clone();
     let owner = intent.owner.clone();
     let kind = intent.kind();
+    let mut signals = RunSignals::begin(kind, &key, &owner);
     start.guards.push(Guard::EffectFree { key: key.clone() });
     start.writes.push(Write::Effect(EffectWrite::Start(intent)));
     if let Err(rejected) = store.commit(start, now).await {
-        record_effect(kind, "refused");
+        signals.refused();
         log::warn!(
             effect_key = key.as_str(),
             effect_kind = kind_wire(kind),
@@ -642,7 +758,7 @@ where
         );
         return Ok(EffectRun::Refused(rejected));
     }
-    record_effect(kind, "started");
+    signals.started();
     crate::fail_point!("effect.after_start");
 
     let value = effect().await;
@@ -657,7 +773,7 @@ where
         .commit(end_transition, OffsetDateTime::now_utc())
         .await
         .map_err(anyhow::Error::from)?;
-    record_effect(kind, outcome);
+    signals.finished(outcome);
     Ok(EffectRun::Ran { value, committed })
 }
 
@@ -681,6 +797,18 @@ mod tests {
             journal_anchor: Some(7),
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips_through_its_wire_name() {
+        for kind in [EffectKind::ToolCall, EffectKind::LlmRequest] {
+            // A kind added to the enum fails to compile here until it is
+            // listed above, so the stores' abandon counts cannot drop it.
+            match kind {
+                EffectKind::ToolCall | EffectKind::LlmRequest => {}
+            }
+            assert_eq!(kind_from_wire(kind_wire(kind)), Some(kind));
         }
     }
 
