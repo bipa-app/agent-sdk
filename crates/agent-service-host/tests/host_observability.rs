@@ -329,7 +329,7 @@ async fn a_host_exports_its_janitor_cycles_without_a_custom_recorder() -> Result
 }
 
 #[tokio::test]
-async fn the_otel_recorder_maps_each_host_loop_signal() -> Result<()> {
+async fn the_otel_recorder_exports_relay_and_janitor_signals() -> Result<()> {
     use agent_service_host::metrics::MetricsRecorder;
     use agent_service_host::observability::OtelMetricsRecorder;
 
@@ -360,12 +360,23 @@ async fn the_otel_recorder_maps_each_host_loop_signal() -> Result<()> {
         counter_total(&snapshots, "agent_service_host.janitor.rows"),
         3
     );
-    assert!(
-        snapshots.iter().any(|r| r
+    let backlog = snapshots.iter().rev().take(1).find_map(|resource| {
+        resource
             .scope_metrics()
             .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-            .any(|m| m.name() == "agent_service_host.relay.backlog")),
-        "the backlog gauge is exported",
+            .find(|metric| metric.name() == "agent_service_host.relay.backlog")
+            .and_then(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => gauge
+                    .data_points()
+                    .next()
+                    .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value),
+                _ => None,
+            })
+    });
+    assert_eq!(
+        backlog,
+        Some(7),
+        "the backlog gauge holds the last pending count"
     );
     Ok(())
 }

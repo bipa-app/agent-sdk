@@ -1963,6 +1963,7 @@ impl AgentControlService for GrpcControlService {
             )
             .await
             .map_err(internal_status("answer-question idempotency lookup"))?;
+        observe_idempotency_claim(IdempotencyKind::AnswerQuestion, &claim);
         match &claim {
             IdempotencyClaim::Conflict => {
                 return Err(idempotency_conflict_status(
@@ -8676,25 +8677,13 @@ mod tests {
         Ok(compacted.messages)
     }
 
-    /// A retried fork records its claim kind on
+    /// Retried creates and forks record their claim kind on
     /// `agent_service_host.idempotency.claims`: the first `fresh`, the retry
-    /// `replay`. Assertions are lower bounds: other tests in this binary may
-    /// record into the same global meter.
+    /// `replay`.
     #[cfg(feature = "otel")]
     #[tokio::test]
-    async fn a_retried_fork_records_a_replay_claim() -> Result<()> {
-        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-        use opentelemetry_sdk::metrics::{
-            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
-        };
-
-        let exporter = InMemoryMetricExporter::default();
-        let provider = SdkMeterProvider::builder()
-            .with_reader(PeriodicReader::builder(exporter.clone()).build())
-            .build();
-        opentelemetry::global::set_meter_provider(provider.clone());
-        crate::observability::HostMetrics::reset_for_testing();
-
+    async fn retried_creates_and_forks_record_a_replay_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
             Vec::new(),
         )));
@@ -8709,6 +8698,8 @@ mod tests {
         let result = async {
             let (mut control, mut events) = connect_clients(&daemon.endpoint()).await?;
             let source = create_thread(&mut control, "claim-src").await?;
+            let again = create_thread(&mut control, "claim-src").await?;
+            anyhow::ensure!(again == source, "a replayed create returns the same thread");
             submit_text_work(&mut control, "claim-submit", &source, "first").await?;
             let mut stream =
                 open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
@@ -8721,42 +8712,61 @@ mod tests {
         daemon.stop().await?;
         result?;
 
-        provider.force_flush()?;
-        let count = |claim: &str| -> u64 {
-            let mut total = 0;
-            for resource in exporter
-                .get_finished_metrics()
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .take(1)
-            {
-                for scope in resource.scope_metrics() {
-                    for metric in scope
-                        .metrics()
-                        .filter(|m| m.name() == "agent_service_host.idempotency.claims")
-                    {
-                        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
-                            total += sum
-                                .data_points()
-                                .filter(|point| {
-                                    let labels: Vec<(String, String)> = point
-                                        .attributes()
-                                        .map(|kv| (kv.key.to_string(), kv.value.to_string()))
-                                        .collect();
-                                    labels.contains(&("kind".into(), "fork_thread".into()))
-                                        && labels.contains(&("claim".into(), claim.into()))
-                                })
-                                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
-                                .sum::<u64>();
-                        }
-                    }
-                }
-            }
-            total
+        // Lower bounds: under plain `cargo test` other tests in this binary
+        // record into the same global meter (nextest runs one per process).
+        let claims = |kind: &str, claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", kind), ("claim", claim)],
+            )
         };
-        assert!(count("fresh") >= 1, "the first fork claims fresh");
-        assert!(count("replay") >= 1, "the retry replays the recorded fork");
+        assert!(
+            claims("create_thread", "fresh") >= 1,
+            "create_thread, fresh"
+        );
+        assert!(
+            claims("create_thread", "replay") >= 1,
+            "create_thread, replay"
+        );
+        assert!(claims("fork_thread", "fresh") >= 1, "fork_thread, fresh");
+        assert!(claims("fork_thread", "replay") >= 1, "fork_thread, replay");
+        Ok(())
+    }
+
+    /// A re-sent answer (the crash matrix's S6 retry after a restart) records
+    /// `replay` for `answer_question`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_resent_answer_records_a_replay_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let (thread_id, task_id) = seed_pending_root(&service, "answer-claim").await?;
+        park_rpc_question(&shared, &thread_id, &task_id).await?;
+        let request = pb::AnswerQuestionRequest {
+            request_id: "answer-claim-1".into(),
+            thread_id,
+            task_id,
+            answers: vec![pb::QuestionAnswerEntry {
+                tool_call_id: "question-call-rpc".into(),
+                answer: "A".into(),
+            }],
+        };
+        service
+            .answer_question(Request::new(request.clone()))
+            .await?;
+        service.answer_question(Request::new(request)).await?;
+
+        let claims = |claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", "answer_question"), ("claim", claim)],
+            )
+        };
+        assert!(claims("fresh") >= 1, "fresh");
+        assert!(claims("replay") >= 1, "replay");
         Ok(())
     }
 

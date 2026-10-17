@@ -864,7 +864,6 @@ async fn settle_orphaned_descendants(
 
     let deps = stores.root_turn_deps();
     let mut settled = 0usize;
-    let mut failed = 0usize;
     for root_id in roots {
         match settle_live_descendants(&root_id, &deps, now).await {
             Ok(transitioned) => {
@@ -881,7 +880,6 @@ async fn settle_orphaned_descendants(
                 settled = settled.saturating_add(transitioned.len());
             }
             Err(err) => {
-                failed = failed.saturating_add(1);
                 warn!(
                     root = %root_id,
                     error = %err,
@@ -891,9 +889,7 @@ async fn settle_orphaned_descendants(
         }
     }
     #[cfg(feature = "otel")]
-    super::observability::HostMetrics::global().record_orphan_settlement(settled, failed);
-    #[cfg(not(feature = "otel"))]
-    let _ = failed;
+    super::observability::HostMetrics::global().record_orphan_settlement(settled);
     Ok(settled)
 }
 

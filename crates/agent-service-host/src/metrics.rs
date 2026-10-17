@@ -464,7 +464,7 @@ impl BacklogThreshold {
 // Stable label helpers
 // ─────────────────────────────────────────────────────────────────────
 
-pub(crate) const fn wakeup_source_label(source: WakeupSource) -> &'static str {
+const fn wakeup_source_label(source: WakeupSource) -> &'static str {
     match source {
         WakeupSource::Broker => "broker",
         WakeupSource::FallbackSweep => "fallback_sweep",
@@ -472,7 +472,7 @@ pub(crate) const fn wakeup_source_label(source: WakeupSource) -> &'static str {
     }
 }
 
-pub(crate) const fn wakeup_outcome_label(outcome: &TaskWakeupOutcome) -> &'static str {
+const fn wakeup_outcome_label(outcome: &TaskWakeupOutcome) -> &'static str {
     match outcome {
         TaskWakeupOutcome::Nudged { .. } => "nudged",
         TaskWakeupOutcome::NotRunnable { .. } => "not_runnable",
@@ -480,7 +480,7 @@ pub(crate) const fn wakeup_outcome_label(outcome: &TaskWakeupOutcome) -> &'stati
     }
 }
 
-pub(crate) const fn watch_outcome_label(outcome: &ThreadEventsWatchOutcome) -> &'static str {
+const fn watch_outcome_label(outcome: &ThreadEventsWatchOutcome) -> &'static str {
     match outcome {
         ThreadEventsWatchOutcome::Forwarded { .. } => "forwarded",
         ThreadEventsWatchOutcome::AlreadyCurrent { .. } => "already_current",

@@ -294,21 +294,11 @@ async fn sweep_tick_settles_children_of_a_root_failed_closed_on_lease_expiry() -
 }
 
 /// The startup orphan settlement is exported as
-/// `agent_service_host.orphans.settled`. A lower bound: other tests in this
-/// binary record into the same global meter.
+/// `agent_service_host.orphans.settled`.
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn startup_exports_the_orphans_it_settled() -> Result<()> {
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
-
-    let exporter = InMemoryMetricExporter::default();
-    let provider = SdkMeterProvider::builder()
-        .with_reader(PeriodicReader::builder(exporter.clone()).build())
-        .build();
-    opentelemetry::global::set_meter_provider(provider.clone());
-    crate::observability::HostMetrics::reset_for_testing();
-
+    let meter = crate::observability::test_meter::TestMeter::install().await;
     let config = ServiceConfig {
         worker: WorkerConfig {
             sweep_interval_secs: 3_600,
@@ -331,31 +321,21 @@ async fn startup_exports_the_orphans_it_settled() -> Result<()> {
     while !all_children_terminal(&stores, &tree).await? {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the sweep never settled"
+            "startup never settled"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     token.cancel();
     host_handle.await??;
 
-    provider.force_flush()?;
-    let settled: u64 = exporter
-        .get_finished_metrics()?
-        .iter()
-        .rev()
-        .take(1)
-        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
-        .filter(|metric| metric.name() == "agent_service_host.orphans.settled")
-        .map(|metric| match metric.data() {
-            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
-                .data_points()
-                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
-                .sum(),
-            _ => 0,
-        })
-        .sum();
-    assert!(settled >= 1, "the settled children are counted");
+    let settled = meter.counter("agent_service_host.orphans.settled", &[]);
+    drop(meter);
+    // A lower bound: under plain `cargo test` other tests record into the same
+    // global meter (nextest runs one per process).
+    assert!(
+        settled >= u64::try_from(tree.children.len())?,
+        "each settled child is counted"
+    );
     Ok(())
 }
 
