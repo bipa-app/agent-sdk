@@ -561,8 +561,8 @@ fn advertised_tools() -> Vec<llm::Tool> {
 
 /// Routes the subagent tool into a durable subagent invocation with a
 /// child thread named after its parent, as the host tests'
-/// `DeadlineSpawnSelector` does. Its deadline is far away: the matrix
-/// measures silence, not age.
+/// `DeadlineSpawnSelector` does. Its `timeout_ms` is a silence budget, not
+/// an age limit: S7 sets it to [`STALL_BUDGET`].
 struct MatrixSelector;
 
 #[async_trait]
@@ -606,7 +606,7 @@ fn subagent_spec() -> agent_server::worker::EffectiveSubagentSpec {
     };
     use std::collections::{BTreeMap, BTreeSet};
 
-    const TIMEOUT_MS: u64 = 3_600_000;
+    const TIMEOUT_MS: u64 = STALL_BUDGET.as_secs() * 1_000;
     let capabilities = BTreeSet::from(["read_file".to_owned()]);
     EffectiveSubagentSpec {
         task: SUBAGENT_TASK.to_owned(),
@@ -1856,9 +1856,7 @@ const STALL_BUDGET: Duration = Duration::from_secs(10);
 /// S7: a child that never returns while its lease keeps beating. The
 /// parent must continue, with a typed partial result, once the child's
 /// stall budget ends (D-5). No process is killed.
-/// `expected_failure`: assert that the parent still waits, as a known
-/// failure does (see the module docs), rather than the pass condition.
-async fn s7_hung(backend: Backend, scenario: Scenario, expected_failure: bool) -> Result<()> {
+async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let dir = Arc::new(CaseDir(temp.path().to_owned()));
     let Some(db) = CaseDb::create(backend, temp.path()).await? else {
@@ -1884,35 +1882,15 @@ async fn s7_hung(backend: Backend, scenario: Scenario, expected_failure: bool) -
     })
     .await?;
     let root = AgentTaskId::from_string(&root);
-    // As an expected failure, the parent must still wait well past the
-    // budget; the full `WAIT` is only for the real pass condition.
-    let wait = if expected_failure {
-        STALL_BUDGET + Duration::from_secs(5)
-    } else {
-        WAIT
-    };
     let continued = wait_for_task_within(
         &stores,
         &root,
         "continued past its hung child",
-        wait,
+        WAIT,
         |task| task.status.is_terminal(),
     )
     .await;
     daemon.report(scenario.name());
-    if expected_failure {
-        ensure!(
-            continued.is_err(),
-            "S7 ({}) no longer fails: the parent continued past its silent child. Remove its \
-             #[ignore] and its expected-failure branch",
-            scenario.name()
-        );
-        println!(
-            "expected failure S7 {backend:?} {}: the parent still waits {wait:?} after its child went silent",
-            scenario.name()
-        );
-        return Ok(());
-    }
     let root_row = continued.with_context(|| {
         format!("the parent is still waiting {WAIT:?} after its child went silent (budget {STALL_BUDGET:?})")
     })?;
@@ -1931,11 +1909,11 @@ async fn s7_hung(backend: Backend, scenario: Scenario, expected_failure: bool) -
 }
 
 async fn s7_hung_tool(backend: Backend) -> Result<()> {
-    s7_hung(backend, Scenario::HungTool, false).await
+    s7_hung(backend, Scenario::HungTool).await
 }
 
 async fn s7_hung_subagent(backend: Backend) -> Result<()> {
-    s7_hung(backend, Scenario::HungSubagent, !known_failure_enabled()).await
+    s7_hung(backend, Scenario::HungSubagent).await
 }
 
 /// S8 (Postgres): a new host starts while the old one still runs a turn,
@@ -2119,11 +2097,11 @@ matrix!(
         s6_confirmation_single_host,
         s7_hung_tool,
         s9_merge_back,
+        s7_hung_subagent,
     ],
     [s4_fork: "failpoints"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_subagent: "expected failure, S7: a subagent child that goes silent never ends its parent's wait (D-5, prim-wait W2); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
 
@@ -2139,10 +2117,10 @@ matrix!(
         s6_confirmation_single_host,
         s7_hung_tool,
         s9_merge_back,
+        s7_hung_subagent,
     ],
     [s4_fork: "failpoints", s8_overlap: "postgres"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_subagent: "expected failure, S7: a subagent child that goes silent never ends its parent's wait (D-5, prim-wait W2); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );

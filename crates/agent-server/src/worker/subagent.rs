@@ -579,8 +579,8 @@ pub struct EffectiveSubagentSpec {
     /// Each leg carries up to one tick/sweep interval of slack. Not
     /// covered: a steering-resume exchange, which runs unbounded until
     /// the task's next ordinary acquisition. On expiry the child root
-    /// turn is transitioned to FAILED with `subagent timed out after
-    /// {timeout_ms}ms` — not Cancelled — so the parent's fan-in resumes
+    /// turn is transitioned to FAILED with `subagent stalled: no progress
+    /// for its stall budget of {budget}` — not Cancelled — so the parent's fan-in resumes
     /// with a failed child result the parent LLM can react to.
     ///
     /// # History

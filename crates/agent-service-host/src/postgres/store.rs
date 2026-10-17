@@ -5571,22 +5571,45 @@ ORDER BY created_at, id
         .with_context(|| format!("probe child activity for {parent_id}"))?;
 
         let limit = i64::try_from(live_limit).unwrap_or(i64::MAX);
-        let records = sqlx::query_as::<_, TaskRecord>(
+        let records = sqlx::query_as!(
+            TaskRecord,
             r"
 SELECT
-    id, kind, status, parent_id, root_id, depth, thread_id,
-    submitted_input_json, caller_metadata_json, worker_id, lease_id,
-    lease_expires_at, last_heartbeat_at, state_json, attempt, max_attempts,
-    last_error, terminal_reason_json, pending_child_count, spawn_index, result_payload,
-    otel_traceparent, created_at, updated_at, completed_at, last_activity_at
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
 FROM agent_sdk_tasks
 WHERE parent_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
 ORDER BY created_at, id
 LIMIT $2
 ",
+            parent_id.as_str(),
+            limit,
         )
-        .bind(parent_id.as_str())
-        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("probe live children for {parent_id}"))?;

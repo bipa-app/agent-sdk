@@ -32,7 +32,7 @@ use agent_server::journal::tool_audit::{
     InMemoryToolAuditEventStore, ToolAuditEvent, ToolAuditEventKind, ToolAuditEventParams,
     ToolAuditEventStore,
 };
-use agent_server::observability::{ServerMetrics, ToolStallSignal, attrs};
+use agent_server::observability::{ServerMetrics, SubagentStallSignal, ToolStallSignal, attrs};
 
 // ─────────────────────────────────────────────────────────────────────
 // Test helpers
@@ -1965,6 +1965,47 @@ async fn a_lease_reclaim_is_counted_with_its_scope() -> Result<()> {
         reclaimed("foreign_epoch", "failed_interrupted"),
         1,
         "{reclaims:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn subagent_stall_signals_count_by_leg_without_the_ids() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+
+    let stall = |task_id: &'static str, invocation_id: Option<&'static str>| SubagentStallSignal {
+        task_id,
+        invocation_id,
+        traceparent: None,
+        budget_ms: 600_000,
+    };
+    metrics.record_subagent_stall(
+        attrs::SUBAGENT_STALL_RUNNING,
+        &stall("child-1", Some("invocation-1")),
+    );
+    metrics.record_subagent_stall(attrs::SUBAGENT_STALL_PARKED, &stall("child-2", None));
+    metrics.record_subagent_stall(
+        attrs::SUBAGENT_STALL_PARKED,
+        &stall("child-3", Some("invocation-3")),
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let stalls = collect_u64_counter(&snapshots, "agent_server.subagent.stalls");
+    let by_leg = |leg: &str| -> u64 {
+        stalls
+            .iter()
+            .filter(|(set, _)| matches_all(set, &[(attrs::LEG, leg)]))
+            .map(|(_, count)| count)
+            .sum()
+    };
+    assert_eq!(by_leg(attrs::SUBAGENT_STALL_RUNNING), 1);
+    assert_eq!(by_leg(attrs::SUBAGENT_STALL_PARKED), 2);
+    assert!(
+        stalls.iter().all(|(set, _)| set.len() == 1),
+        "the counter carries only its bounded leg: {stalls:?}"
     );
     Ok(())
 }

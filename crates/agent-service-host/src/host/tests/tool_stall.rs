@@ -1,7 +1,7 @@
 //! A stalled tool call's settle across a crash: the settle, its effect's
 //! finish and its `ToolCallEnd` commit together or not at all, and a
 //! restart after either outcome resumes the parent exactly once.
-#![cfg(feature = "sqlite")]
+#![cfg(any(feature = "sqlite", all(feature = "postgres", feature = "failpoints")))]
 
 #[cfg(feature = "failpoints")]
 use std::sync::{Arc, Mutex};
@@ -11,14 +11,18 @@ use anyhow::{Context, Result};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
-use agent_sdk_foundation::{AgentEvent, TerminalReason, ThreadId, ToolResult, ToolTier};
+#[cfg(feature = "sqlite")]
+use agent_sdk_foundation::TerminalReason;
+use agent_sdk_foundation::{AgentEvent, ThreadId, ToolResult, ToolTier};
 use agent_server::journal::SpawnChildrenExt;
 use agent_server::journal::effect::{EffectKey, EffectState};
 use agent_server::journal::task::{
     AgentTask, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskStatus, WorkerId,
 };
+#[cfg(feature = "sqlite")]
+use agent_server::worker::ToolStallReport;
 use agent_server::worker::{
-    ActivityBeacon, StallSignal, StallTrip, ToolEventCollector, ToolStallReport, ToolTaskBootstrap,
+    ActivityBeacon, StallSignal, StallTrip, ToolEventCollector, ToolTaskBootstrap,
     resolve_tool_bootstrap, run_tool_effect,
 };
 
@@ -27,6 +31,7 @@ use crate::stores::StoreRegistry;
 
 const TOOL: &str = "probe";
 
+#[cfg(feature = "sqlite")]
 fn storage(path: &std::path::Path) -> StorageConfig {
     StorageConfig {
         backend: StorageBackend::Sqlite {
@@ -37,8 +42,8 @@ fn storage(path: &std::path::Path) -> StorageConfig {
     }
 }
 
-async fn open(path: &std::path::Path) -> Result<StoreRegistry> {
-    let stores = StoreRegistry::from_config(&storage(path), super::sample_registry())?;
+async fn open(storage: &StorageConfig) -> Result<StoreRegistry> {
+    let stores = StoreRegistry::from_config(storage, super::sample_registry())?;
     stores.initialize().await?;
     Ok(stores)
 }
@@ -154,6 +159,7 @@ async fn run_stalling_probe(
 /// The stalled settle commits; a process that starts afterwards finds the
 /// tool child failed with its stall report, the parent runnable, and one
 /// `ToolCallEnd`.
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn a_committed_stall_survives_a_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -161,7 +167,7 @@ async fn a_committed_stall_survives_a_restart() -> Result<()> {
     let thread = ThreadId::from_string("t-stall-restart");
     let signal = StallSignal::new();
     let (parent, child_id) = {
-        let stores = open(&path).await?;
+        let stores = open(&storage(&path)).await?;
         let (parent, bootstrap) =
             running_probe(&stores, &thread, &signal, OffsetDateTime::now_utc()).await?;
         let child_id = bootstrap.task_id.clone();
@@ -169,7 +175,7 @@ async fn a_committed_stall_survives_a_restart() -> Result<()> {
         (parent, child_id)
     };
 
-    let restarted = open(&path).await?;
+    let restarted = open(&storage(&path)).await?;
     let child = restarted
         .task_store
         .get(&child_id)
@@ -333,15 +339,54 @@ async fn recover_like_a_host(
 /// committed, so they see only the stalled settle's transaction. Nothing of
 /// the settle survives the crash. A host-style recovery then interrupts the
 /// call instead of running it again, and the parent resumes once.
-#[cfg(feature = "failpoints")]
+#[cfg(all(feature = "failpoints", feature = "sqlite"))]
 #[tokio::test]
 async fn tool_stall_failpoint_before_commit_leaves_nothing_and_recovers_once() -> Result<()> {
     let _scenario = fail::FailScenario::setup();
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("stall-crash.db");
+    assert_stall_failpoint_before_commit(&storage(&dir.path().join("stall-crash.db"))).await
+}
+
+/// [`tool_stall_failpoint_before_commit_leaves_nothing_and_recovers_once`] on
+/// Postgres, in a throwaway schema, so its `transition.settle_written` marker
+/// is the one that fires. Skips without `TEST_DATABASE_URL`.
+#[cfg(all(feature = "failpoints", feature = "postgres"))]
+#[tokio::test]
+async fn tool_stall_failpoint_before_commit_on_postgres_leaves_nothing_and_recovers_once()
+-> Result<()> {
+    use sqlx::Connection;
+
+    let _scenario = fail::FailScenario::setup();
+    let Ok(database_url) =
+        std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+    else {
+        return Ok(());
+    };
+    let schema = format!("stall_fp_pg_{}", uuid::Uuid::new_v4().simple());
+    let mut admin = sqlx::postgres::PgConnection::connect(&database_url).await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&mut admin)
+        .await?;
+    let storage = StorageConfig {
+        backend: StorageBackend::Postgres,
+        postgres: crate::config::PostgresStorageConfig {
+            database_url: Some(database_url.clone()),
+            schema: Some(schema.clone()),
+            max_connections: 8,
+        },
+    };
+    let outcome = assert_stall_failpoint_before_commit(&storage).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&mut admin)
+        .await?;
+    outcome
+}
+
+#[cfg(feature = "failpoints")]
+async fn assert_stall_failpoint_before_commit(storage: &StorageConfig) -> Result<()> {
     let thread = ThreadId::from_string("t-stall-crash");
     let signal = StallSignal::new();
-    let stores = open(&path).await?;
+    let stores = open(storage).await?;
     let (parent, bootstrap) =
         running_probe(&stores, &thread, &signal, OffsetDateTime::now_utc()).await?;
     let child_id = bootstrap.task_id.clone();
@@ -388,7 +433,7 @@ async fn tool_stall_failpoint_before_commit_leaves_nothing_and_recovers_once() -
     );
     drop(stores);
 
-    let restarted = open(&path).await?;
+    let restarted = open(storage).await?;
     let child = restarted
         .task_store
         .get(&child_id)

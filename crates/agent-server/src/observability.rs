@@ -156,6 +156,15 @@ pub mod attrs {
     /// end state (`completed`, `failed`, `salvaged`, ...), `no_effect`,
     /// `refused` or `error`.
     pub const SPAN_COMPLETION_HOOK_OUTCOME: &str = "agent_server.completion_hook.outcome";
+    /// Which leg of the subagent stall budget failed a child root
+    /// (`agent_server.subagent.stalls`).
+    pub const LEG: &str = "leg";
+    /// `leg`: the child root's own heartbeat, while it runs.
+    pub const SUBAGENT_STALL_RUNNING: &str = "running";
+    /// `leg`: the parked sweep, while the child root waits on its children.
+    pub const SUBAGENT_STALL_PARKED: &str = "parked";
+    /// Span-only: the subagent invocation a stalled child root answers.
+    pub const SPAN_SUBAGENT_INVOCATION_ID: &str = "agent_server.subagent.invocation_id";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -243,33 +252,55 @@ pub struct ToolStallSignal<'a> {
 }
 
 impl ToolStallSignal<'_> {
-    fn emit(&self, event: &'static str, mut attributes: Vec<KeyValue>) {
-        use opentelemetry::trace::{Span, Tracer};
-
-        let parent = self
-            .traceparent
-            .map_or_else(opentelemetry::Context::new, |traceparent| {
-                let carrier = std::collections::HashMap::from([(
-                    "traceparent".to_owned(),
-                    traceparent.to_owned(),
-                )]);
-                global::get_text_map_propagator(|propagator| propagator.extract(&carrier))
-            });
-        let mut span =
-            global::tracer("agent-server").start_with_context("agent_server.tool.stall", &parent);
-        span.set_attribute(KeyValue::new(
-            attrs::SPAN_TOOL_NAME,
-            self.tool_name.to_owned(),
-        ));
-        span.set_attribute(KeyValue::new(attrs::SPAN_TASK_ID, self.task_id.to_owned()));
-        attributes.push(KeyValue::new(
-            attrs::SPAN_TOOL_NAME,
-            self.tool_name.to_owned(),
-        ));
-        attributes.push(KeyValue::new(attrs::SPAN_TASK_ID, self.task_id.to_owned()));
-        span.add_event(event, attributes);
-        span.end();
+    fn emit(&self, event: &'static str, attributes: Vec<KeyValue>) {
+        record_on_own_span(
+            "agent_server.tool.stall",
+            self.traceparent,
+            vec![
+                KeyValue::new(attrs::SPAN_TOOL_NAME, self.tool_name.to_owned()),
+                KeyValue::new(attrs::SPAN_TASK_ID, self.task_id.to_owned()),
+            ],
+            event,
+            attributes,
+        );
     }
+}
+
+/// The ids a subagent-stall signal carries on its span (never on a metric).
+#[derive(Clone, Copy, Debug)]
+pub struct SubagentStallSignal<'a> {
+    /// The stalled child root.
+    pub task_id: &'a str,
+    /// The invocation the child root answers, when it was read.
+    pub invocation_id: Option<&'a str>,
+    /// The W3C `traceparent` the span nests under.
+    pub traceparent: Option<&'a str>,
+    pub budget_ms: u64,
+}
+
+/// Record `event` on a short span named `span_name`. Paths that run under no
+/// span of their own (a heartbeat, a sweep) use it; the span is parented on
+/// `traceparent` when it decodes. `ids` go on both the span and the event.
+fn record_on_own_span(
+    span_name: &'static str,
+    traceparent: Option<&str>,
+    ids: Vec<KeyValue>,
+    event: &'static str,
+    mut attributes: Vec<KeyValue>,
+) {
+    use agent_sdk::observability::loop_instrument::context_from_traceparent;
+    use opentelemetry::trace::{Span, Tracer};
+
+    let parent = traceparent
+        .and_then(context_from_traceparent)
+        .unwrap_or_default();
+    let mut span = global::tracer("agent-server").start_with_context(span_name, &parent);
+    for id in &ids {
+        span.set_attribute(id.clone());
+    }
+    attributes.extend(ids);
+    span.add_event(event, attributes);
+    span.end();
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -329,6 +360,9 @@ pub struct ServerMetrics {
     /// `agent_server.subagent.completion_hook.refused`: hook outputs the
     /// SDK refused, by `reason`.
     pub(crate) completion_hook_refused: Counter<u64>,
+    /// `agent_server.subagent.stalls`: subagent child roots failed for
+    /// silence, by leg.
+    pub(crate) subagent_stalls: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -783,6 +817,35 @@ impl ServerMetrics {
         stall.emit("agent_server.tool.stall_budget_unbounded", Vec::new());
     }
 
+    /// Count a subagent child root failed for silence on `leg`
+    /// ([`attrs::SUBAGENT_STALL_RUNNING`] or [`attrs::SUBAGENT_STALL_PARKED`]),
+    /// and record the `agent_server.subagent.stalled` event, which alone
+    /// carries the ids, on a short `agent_server.subagent.stall` span.
+    pub fn record_subagent_stall(&self, leg: &'static str, stall: &SubagentStallSignal<'_>) {
+        self.subagent_stalls
+            .add(1, &[KeyValue::new(attrs::LEG, leg)]);
+        let mut ids = vec![KeyValue::new(attrs::SPAN_TASK_ID, stall.task_id.to_owned())];
+        if let Some(invocation_id) = stall.invocation_id {
+            ids.push(KeyValue::new(
+                attrs::SPAN_SUBAGENT_INVOCATION_ID,
+                invocation_id.to_owned(),
+            ));
+        }
+        record_on_own_span(
+            "agent_server.subagent.stall",
+            stall.traceparent,
+            ids,
+            "agent_server.subagent.stalled",
+            vec![
+                KeyValue::new(attrs::LEG, leg),
+                KeyValue::new(
+                    attrs::SPAN_STALL_BUDGET_MS,
+                    i64::try_from(stall.budget_ms).unwrap_or(i64::MAX),
+                ),
+            ],
+        );
+    }
+
     pub fn record_tool_audit(&self, event: &ToolAuditEvent) {
         let attrs = [
             KeyValue::new(attrs::AUDIT_OUTCOME, event.kind.as_str()),
@@ -878,7 +941,8 @@ impl ServerMetrics {
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
         let (invocation_attempts, invocation_failed_closed, completion_hook_refused) =
             invocation_instruments(&meter);
-        let (tool_stalls, tool_stall_unbounded) = Self::build_tool_stall_instruments(&meter);
+        let (tool_stalls, tool_stall_unbounded, subagent_stalls) =
+            Self::build_stall_instruments(&meter);
         let fence_refused = fence_refused_counter(&meter);
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
@@ -911,13 +975,14 @@ impl ServerMetrics {
             tool_stall_unbounded,
             fence_refused,
             completion_hook_refused,
+            subagent_stalls,
             meter,
         }
     }
 
-    fn build_tool_stall_instruments(
+    fn build_stall_instruments(
         meter: &opentelemetry::metrics::Meter,
-    ) -> (Counter<u64>, Counter<u64>) {
+    ) -> (Counter<u64>, Counter<u64>, Counter<u64>) {
         let tool_stalls = meter
             .u64_counter("agent_server.tool.stalls")
             .with_description(
@@ -930,7 +995,16 @@ impl ServerMetrics {
             .u64_counter("agent_server.tool.stall_budget.unbounded")
             .with_description("Tool calls started with no stall budget.")
             .build();
-        (tool_stalls, tool_stall_unbounded)
+        let subagent_stalls = meter
+            .u64_counter("agent_server.subagent.stalls")
+            .with_description(
+                "Subagent child roots failed because their subtree showed no progress for the \
+                 stall budget, by leg: running (the child root's heartbeat), parked (the sweep, \
+                 while the child root waits on its children). A fail the still-owned guard \
+                 skipped because another actor took the row also counts.",
+            )
+            .build();
+        (tool_stalls, tool_stall_unbounded, subagent_stalls)
     }
 }
 
