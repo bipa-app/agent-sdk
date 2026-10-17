@@ -10,12 +10,17 @@
 -- agent_sdk_threads would take SHARE ROW EXCLUSIVE on that hot table while
 -- this migration runs. The thread purge retires thread and task documents
 -- itself. The new table and index lock only themselves.
+--
+-- The key columns use the "C" collation, so keys sort byte-wise as they do
+-- on SQLite and in memory, whatever the database's default collation. The
+-- scope CHECK names no scope kinds: Rust refuses an unknown kind on read,
+-- and SQLite could not widen such a list without a table rebuild.
 
 CREATE TABLE agent_sdk_documents (
-    scope_kind     TEXT        NOT NULL,
-    scope_id       TEXT        NOT NULL,
-    kind           TEXT        NOT NULL,
-    doc_key        TEXT        NOT NULL,
+    scope_kind     TEXT        COLLATE "C" NOT NULL,
+    scope_id       TEXT        COLLATE "C" NOT NULL,
+    kind           TEXT        COLLATE "C" NOT NULL,
+    doc_key        TEXT        COLLATE "C" NOT NULL,
     schema_version BIGINT      NOT NULL,
     revision       BIGINT      NOT NULL,
     value_json     JSONB       NOT NULL,
@@ -25,8 +30,8 @@ CREATE TABLE agent_sdk_documents (
     PRIMARY KEY (scope_kind, scope_id, kind, doc_key),
 
     CONSTRAINT agent_sdk_documents_scope_check CHECK (
-        (scope_kind = 'host' AND scope_id = '')
-        OR (scope_kind IN ('thread', 'task') AND scope_id <> '')
+        scope_kind <> ''
+        AND ((scope_kind = 'host') = (scope_id = ''))
     ),
     CONSTRAINT agent_sdk_documents_revision_check CHECK (revision >= 1),
     CONSTRAINT agent_sdk_documents_schema_version_check CHECK (schema_version >= 0)

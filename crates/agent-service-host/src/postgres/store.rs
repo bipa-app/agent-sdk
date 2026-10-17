@@ -4085,7 +4085,6 @@ impl PostgresDurableStore {
             }
             stored.insert(row.id.clone(), row);
         }
-        Self::lock_host_documents_tx(tx, &locks).await?;
         for (index, guard) in transition.guards.iter().enumerate() {
             guard.check(index, stored.get(guard.task()))?;
         }
@@ -4122,7 +4121,13 @@ impl PostgresDurableStore {
         let mut tx = self.begin().await?;
         Self::lock_and_check_guards_tx(&mut tx, transition, now).await?;
         let mut committed = Committed::default();
-        for (index, write) in transition.writes.iter().cloned().enumerate() {
+        let mut host_documents_locked = false;
+        for (index, write) in agent_server::journal::writes_in_apply_order(transition) {
+            if !host_documents_locked && matches!(write, agent_server::journal::Write::Document(_))
+            {
+                Self::lock_host_documents_tx(&mut tx, &transition.locks()).await?;
+                host_documents_locked = true;
+            }
             Self::apply_write_tx(&mut tx, transition, write, now, &mut committed)
                 .await
                 .map_err(|error| {

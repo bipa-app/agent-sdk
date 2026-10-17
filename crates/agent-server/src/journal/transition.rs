@@ -105,7 +105,9 @@ pub enum Write {
     },
     /// Put or retire one document (see [`super::document`]). Its
     /// [`DocExpect`](super::document::DocExpect) is checked against the
-    /// row as locked; a failed one rejects the transition like a guard.
+    /// row as locked; a failed one rejects the transition like a guard. A
+    /// task document needs its task to exist. Backends apply document
+    /// writes after the transition's other writes, in their given order.
     Document(DocumentWrite),
 }
 
@@ -312,9 +314,12 @@ pub enum Lock {
     },
     /// A task row.
     Task(AgentTaskId),
-    /// A [`DocScope::Host`] document row, locked after every task row in
-    /// key order. Thread and task documents need no lock of their own: the
-    /// thread or task row they belong to is locked first.
+    /// A [`DocScope::Host`] document row, locked in key order after every
+    /// other row the transition writes: a backend applies a transition's
+    /// document writes after all its other writes, so a settle's parent row
+    /// is never taken after a host document. Thread and task documents need
+    /// no lock of their own: their thread row (and a task document's task
+    /// row) is locked first, with the append fence.
     Document(DocumentKey),
 }
 
@@ -896,7 +901,13 @@ impl Write {
                     fence: Some(Fence::APPEND),
                     create: false,
                 }],
-                DocScope::Task(task) => vec![Lock::Task(task.clone())],
+                DocScope::Task(task) => vec![
+                    Lock::ThreadOf {
+                        task: task.clone(),
+                        fence: Some(Fence::APPEND),
+                    },
+                    Lock::Task(task.clone()),
+                ],
             },
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
@@ -905,6 +916,19 @@ impl Write {
             | Self::RecordIntent(_) => Vec::new(),
         }
     }
+}
+
+/// A transition's writes in the order every backend applies them.
+///
+/// Each write keeps its index in the transition. The non-document writes
+/// come first and the document writes last, each group in transition order,
+/// so a document row is the last row a transition locks (see
+/// [`Lock::Document`]).
+#[must_use]
+pub fn writes_in_apply_order(transition: &Transition) -> Vec<(usize, Write)> {
+    let mut writes: Vec<(usize, Write)> = transition.writes.iter().cloned().enumerate().collect();
+    writes.sort_by_key(|(_, write)| matches!(write, Write::Document(_)));
+    writes
 }
 
 /// How a guard names the status it expects, in the words the store's own

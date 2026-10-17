@@ -5234,7 +5234,7 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
         let mut document_plans = self.check_locked(&lock.inner, &transition).await?;
         let mut committed = Committed::default();
-        for write in transition.writes.iter().cloned() {
+        for (_, write) in super::transition::writes_in_apply_order(&transition) {
             let inner = &mut *lock.inner;
             match write {
                 Write::Document(document) => committed.documents.push(apply_document_locked(
@@ -5426,14 +5426,21 @@ fn apply_document_locked(
                 },
             );
         }
-        (DocPlan::Retire { revision }, _) => {
+        (DocPlan::Retire { revision }, DocOp::Retire) => {
             if let Some(row) = documents.get_mut(&key) {
                 row.revision = revision;
                 row.value = None;
                 row.updated_at = now;
             }
         }
-        (DocPlan::Put { .. } | DocPlan::Unchanged, _) => {}
+        (DocPlan::Unchanged, DocOp::Retire) => {}
+        (DocPlan::Put { .. } | DocPlan::Unchanged, DocOp::Retire | DocOp::Put(_))
+        | (DocPlan::Retire { .. }, DocOp::Put(_)) => {
+            return Err(anyhow!(
+                "document {} planned {plan:?} for its operation",
+                document.key
+            ));
+        }
     }
     Ok(DocumentOutcome {
         key: document.key,
@@ -5454,7 +5461,40 @@ impl InMemoryAgentTaskStore {
             guard.check(index, inner.by_id.get(guard.task()))?;
         }
         self.require_appendable_threads(transition).await?;
+        self.require_document_tasks(inner, transition).await?;
         Ok(plan_documents_locked(&inner.documents, transition)?.into_iter())
+    }
+
+    /// Refuse a task document whose task does not exist, or whose task's
+    /// thread is purged: the same refusals the durable backends give
+    /// through the task's thread lock and its append fence.
+    async fn require_document_tasks(
+        &self,
+        inner: &Inner,
+        transition: &super::transition::Transition,
+    ) -> Result<()> {
+        use super::document::DocScope;
+
+        for write in &transition.writes {
+            let super::transition::Write::Document(document) = write else {
+                continue;
+            };
+            let DocScope::Task(task_id) = &document.key.scope else {
+                continue;
+            };
+            let task = inner.by_id.get(task_id).ok_or_else(|| {
+                anyhow!(
+                    "document {} names task {task_id}, which does not exist",
+                    document.key
+                )
+            })?;
+            if let Some(sink) = &self.marker_sink
+                && let Some(thread) = sink.thread_store.get(&task.thread_id).await?
+            {
+                thread.require_active(super::thread::ThreadOperation::Append)?;
+            }
+        }
+        Ok(())
     }
 
     /// Up to `limit` live rows `keep` selects, in key order, each with the

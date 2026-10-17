@@ -3316,7 +3316,7 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
         }
         Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
-        for (index, write) in transition.writes.iter().cloned().enumerate() {
+        for (index, write) in agent_server::journal::writes_in_apply_order(&transition) {
             Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed)
                 .await
                 .map_err(|error| {

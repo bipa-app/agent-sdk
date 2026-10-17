@@ -704,6 +704,7 @@ pub use tool_audit::{
 pub use transition::{
     ChildSpawn, Committed, DurableStore, Fence, Guard, Lock, MissingThread, Rejected, Settle,
     SpawnedChildren, SubagentSpawn, ThreadTier, ToolChildrenSpawn, Transition, Write,
+    writes_in_apply_order,
 };
 pub use turn_attempt::{
     CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId, TurnAttemptOutcome,

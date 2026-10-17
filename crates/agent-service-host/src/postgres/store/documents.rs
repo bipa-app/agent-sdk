@@ -10,10 +10,10 @@
 
 use agent_server::journal::Lock;
 use agent_server::journal::document::{
-    DocKind, DocOp, DocPlan, DocScope, Document, DocumentKey, DocumentOutcome, DocumentStore,
-    DocumentWrite, ExpectationFailed, StoredRevision,
+    DocExpect, DocKind, DocOp, DocPlan, DocScope, Document, DocumentKey, DocumentOutcome,
+    DocumentStore, DocumentWrite, ExpectationFailed, StoredRevision,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use sqlx::{Postgres, Transaction};
 use time::OffsetDateTime;
@@ -90,12 +90,20 @@ impl PostgresDurableStore {
         Ok(())
     }
 
-    /// Apply one document write inside its transition's transaction.
+    /// Apply one document write inside its transition's transaction. A
+    /// task document's task row is already locked, and must exist.
     pub(super) async fn apply_document_tx(
         tx: &mut Transaction<'_, Postgres>,
         document: DocumentWrite,
         now: OffsetDateTime,
     ) -> Result<DocumentOutcome> {
+        if let DocScope::Task(task) = &document.key.scope {
+            ensure!(
+                Self::load_task_tx(tx, task, false).await?.is_some(),
+                "document {} names task {task}, which does not exist",
+                document.key
+            );
+        }
         let (scope_kind, scope_id, kind, key) = document.key.stored();
         let stored = sqlx::query!(
             r#"SELECT revision, retired_at IS NULL AS "live!"
@@ -118,7 +126,7 @@ impl PostgresDurableStore {
         })
         .transpose()?;
         let plan = document.plan(stored).map_err(anyhow::Error::new)?;
-        match (plan, &document.op) {
+        let revision = match (plan, &document.op) {
             (DocPlan::Put { revision }, DocOp::Put(value)) => {
                 let revision = i64::try_from(revision).context("document revision out of range")?;
                 let schema_version = i64::from(document.schema_version);
@@ -141,11 +149,12 @@ impl PostgresDurableStore {
                     .execute(&mut **tx)
                     .await
                     .with_context(|| format!("put document {}", document.key))?;
+                    Some(u64::try_from(revision).context("document revision out of range")?)
                 } else {
-                    Self::insert_document_tx(tx, &document, schema_version, value, now).await?;
+                    Some(Self::insert_document_tx(tx, &document, schema_version, value, now).await?)
                 }
             }
-            (DocPlan::Retire { revision }, _) => {
+            (DocPlan::Retire { revision }, DocOp::Retire) => {
                 let revision = i64::try_from(revision).context("document revision out of range")?;
                 sqlx::query!(
                     r#"UPDATE agent_sdk_documents
@@ -161,54 +170,100 @@ impl PostgresDurableStore {
                 .execute(&mut **tx)
                 .await
                 .with_context(|| format!("retire document {}", document.key))?;
+                None
             }
-            (DocPlan::Put { .. } | DocPlan::Unchanged, _) => {}
-        }
+            (DocPlan::Unchanged, DocOp::Retire) => None,
+            (DocPlan::Put { .. } | DocPlan::Unchanged, DocOp::Retire | DocOp::Put(_))
+            | (DocPlan::Retire { .. }, DocOp::Put(_)) => {
+                bail!(
+                    "document {} planned {plan:?} for its operation",
+                    document.key
+                )
+            }
+        };
         Ok(DocumentOutcome {
             key: document.key,
-            revision: plan.live_revision(),
+            revision,
         })
     }
 
-    /// Insert the first row of `document`'s key at revision 1. A concurrent
-    /// first write that commits first makes this a failed expectation.
+    /// Insert the first row of `document`'s key, which had no row when it
+    /// was read. Two first writes can race on the primary key: under
+    /// `Absent` the loser's expectation failed; under `Any` it writes over
+    /// the winner's row, as it would have after the winner committed. The
+    /// live revision is returned.
     async fn insert_document_tx(
         tx: &mut Transaction<'_, Postgres>,
         document: &DocumentWrite,
         schema_version: i64,
         value: &serde_json::Value,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let (scope_kind, scope_id, kind, key) = document.key.stored();
-        let inserted = sqlx::query!(
-            r#"INSERT INTO agent_sdk_documents
-                   (scope_kind, scope_id, kind, doc_key, schema_version, revision,
-                    value_json, retired_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, 1, $6, NULL, $7)"#,
-            scope_kind,
-            scope_id,
-            kind,
-            key,
-            schema_version,
-            value,
-            now,
-        )
-        .execute(&mut **tx)
-        .await;
-        match inserted {
-            Ok(_) => Ok(()),
-            Err(error) if is_unique_violation(&error) => {
-                Err(anyhow::Error::new(ExpectationFailed {
-                    reason: format!(
-                        "document {} was first written by a concurrent transition",
-                        document.key
-                    ),
-                }))
+        let revision = match document.expect {
+            DocExpect::Absent => {
+                let inserted = sqlx::query!(
+                    r#"INSERT INTO agent_sdk_documents
+                           (scope_kind, scope_id, kind, doc_key, schema_version, revision,
+                            value_json, retired_at, updated_at)
+                       VALUES ($1, $2, $3, $4, $5, 1, $6, NULL, $7)"#,
+                    scope_kind,
+                    scope_id,
+                    kind,
+                    key,
+                    schema_version,
+                    value,
+                    now,
+                )
+                .execute(&mut **tx)
+                .await;
+                match inserted {
+                    Ok(_) => 1,
+                    Err(error) if is_unique_violation(&error) => {
+                        return Err(anyhow::Error::new(ExpectationFailed {
+                            reason: format!(
+                                "document {} was first written by a concurrent transition",
+                                document.key
+                            ),
+                        }));
+                    }
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("put document {}", document.key)));
+                    }
+                }
             }
-            Err(error) => {
-                Err(anyhow::Error::new(error).context(format!("put document {}", document.key)))
+            DocExpect::Any => sqlx::query_scalar!(
+                r#"INSERT INTO agent_sdk_documents
+                       (scope_kind, scope_id, kind, doc_key, schema_version, revision,
+                        value_json, retired_at, updated_at)
+                   VALUES ($1, $2, $3, $4, $5, 1, $6, NULL, $7)
+                   ON CONFLICT (scope_kind, scope_id, kind, doc_key) DO UPDATE SET
+                       schema_version = EXCLUDED.schema_version,
+                       revision = agent_sdk_documents.revision + 1,
+                       value_json = EXCLUDED.value_json,
+                       retired_at = NULL,
+                       updated_at = EXCLUDED.updated_at
+                   RETURNING revision"#,
+                scope_kind,
+                scope_id,
+                kind,
+                key,
+                schema_version,
+                value,
+                now,
+            )
+            .fetch_one(&mut **tx)
+            .await
+            .with_context(|| format!("put document {}", document.key))?,
+            DocExpect::Revision(_) => {
+                bail!(
+                    "document {} expects a revision but has no row",
+                    document.key
+                )
             }
-        }
+        };
+        u64::try_from(revision).context("document revision out of range")
     }
 
     /// Retire every live document of `thread_id` and of its tasks, in the

@@ -217,7 +217,8 @@ impl DocumentWrite {
     /// Check the shape every backend relies on: a key within
     /// [`MAX_DOCUMENT_KEY_BYTES`] and without NUL, a non-empty id for a
     /// thread or task scope, and a value within
-    /// [`MAX_DOCUMENT_VALUE_BYTES`].
+    /// [`MAX_DOCUMENT_VALUE_BYTES`] with no NUL in any string or object key
+    /// (Postgres `jsonb` cannot store one, so no backend accepts one).
     ///
     /// # Errors
     /// Names the first broken rule.
@@ -236,6 +237,10 @@ impl DocumentWrite {
             anyhow::ensure!(
                 bytes <= MAX_DOCUMENT_VALUE_BYTES,
                 "document {key} value is {bytes} bytes, over {MAX_DOCUMENT_VALUE_BYTES}"
+            );
+            anyhow::ensure!(
+                !holds_nul(value),
+                "document {key} value holds a NUL character"
             );
         }
         Ok(())
@@ -273,6 +278,20 @@ impl DocumentWrite {
             (DocOp::Retire, Some(_)) => DocPlan::Retire { revision: next },
             (DocOp::Retire, None) => DocPlan::Unchanged,
         })
+    }
+}
+
+/// Whether any string or object key in `value` holds a NUL character.
+fn holds_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(holds_nul),
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .any(|(name, field)| name.contains('\0') || holds_nul(field)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
     }
 }
 
@@ -372,16 +391,23 @@ pub trait DocumentStore: Send + Sync {
 mod tests {
     use super::*;
 
-    fn key() -> DocumentKey {
-        DocumentKey::new(
+    type TestResult = anyhow::Result<()>;
+
+    fn key() -> anyhow::Result<DocumentKey> {
+        Ok(DocumentKey::new(
             DocScope::Thread(ThreadId::from_string("t1")),
-            DocKind::new("owner.kind").expect("kind"),
+            DocKind::new("owner.kind")?,
             "",
-        )
+        ))
     }
 
-    fn put(expect: DocExpect) -> DocumentWrite {
-        DocumentWrite::put(key(), 1, expect, serde_json::json!({"a": 1}))
+    fn put(expect: DocExpect) -> anyhow::Result<DocumentWrite> {
+        Ok(DocumentWrite::put(
+            key()?,
+            1,
+            expect,
+            serde_json::json!({"a": 1}),
+        ))
     }
 
     const LIVE_3: StoredRevision = StoredRevision {
@@ -412,72 +438,94 @@ mod tests {
     }
 
     #[test]
-    fn expectations_read_only_the_live_revision() {
+    fn expectations_read_only_the_live_revision() -> TestResult {
         assert_eq!(
-            put(DocExpect::Absent).plan(None),
+            put(DocExpect::Absent)?.plan(None),
             Ok(DocPlan::Put { revision: 1 })
         );
         assert_eq!(
-            put(DocExpect::Absent).plan(Some(RETIRED_3)),
+            put(DocExpect::Absent)?.plan(Some(RETIRED_3)),
             Ok(DocPlan::Put { revision: 4 }),
             "a retired document is absent, and its revision keeps rising"
         );
-        assert!(put(DocExpect::Absent).plan(Some(LIVE_3)).is_err());
+        assert!(put(DocExpect::Absent)?.plan(Some(LIVE_3)).is_err());
         assert_eq!(
-            put(DocExpect::Revision(3)).plan(Some(LIVE_3)),
+            put(DocExpect::Revision(3))?.plan(Some(LIVE_3)),
             Ok(DocPlan::Put { revision: 4 })
         );
-        assert!(put(DocExpect::Revision(2)).plan(Some(LIVE_3)).is_err());
-        assert!(put(DocExpect::Revision(3)).plan(Some(RETIRED_3)).is_err());
+        assert!(put(DocExpect::Revision(2))?.plan(Some(LIVE_3)).is_err());
+        assert!(put(DocExpect::Revision(3))?.plan(Some(RETIRED_3)).is_err());
         assert_eq!(
-            put(DocExpect::Any).plan(Some(LIVE_3)),
+            put(DocExpect::Any)?.plan(Some(LIVE_3)),
             Ok(DocPlan::Put { revision: 4 })
         );
+        Ok(())
     }
 
     #[test]
-    fn retiring_nothing_writes_nothing() {
-        let retire = DocumentWrite::retire(key(), DocExpect::Any);
+    fn retiring_nothing_writes_nothing() -> TestResult {
+        let retire = DocumentWrite::retire(key()?, DocExpect::Any);
         assert_eq!(retire.plan(None), Ok(DocPlan::Unchanged));
         assert_eq!(retire.plan(Some(RETIRED_3)), Ok(DocPlan::Unchanged));
         assert_eq!(
             retire.plan(Some(LIVE_3)),
             Ok(DocPlan::Retire { revision: 4 })
         );
+        Ok(())
     }
 
     #[test]
-    fn validation_bounds_the_key_and_value() {
-        assert!(put(DocExpect::Any).validate().is_ok());
-        let mut long_key = put(DocExpect::Any);
+    fn validation_bounds_the_key_and_value() -> TestResult {
+        assert!(put(DocExpect::Any)?.validate().is_ok());
+        let mut long_key = put(DocExpect::Any)?;
         long_key.key.key = "k".repeat(MAX_DOCUMENT_KEY_BYTES + 1);
         assert!(long_key.validate().is_err());
-        let mut empty_scope = put(DocExpect::Any);
+        let mut empty_scope = put(DocExpect::Any)?;
         empty_scope.key.scope = DocScope::Thread(ThreadId::from_string(""));
         assert!(empty_scope.validate().is_err());
         let big = DocumentWrite::put(
-            key(),
+            key()?,
             1,
             DocExpect::Any,
             serde_json::Value::String("x".repeat(MAX_DOCUMENT_VALUE_BYTES)),
         );
         assert!(big.validate().is_err());
+        Ok(())
     }
 
     #[test]
-    fn stored_scopes_round_trip() {
+    fn stored_scopes_round_trip() -> TestResult {
         for scope in [
             DocScope::Host,
             DocScope::Thread(ThreadId::from_string("t")),
             DocScope::Task(AgentTaskId::from_string("k")),
         ] {
             assert_eq!(
-                DocScope::from_stored(scope.kind_str(), scope.id_str()).expect("scope"),
+                DocScope::from_stored(scope.kind_str(), scope.id_str())?,
                 scope
             );
         }
         assert!(DocScope::from_stored("host", "x").is_err());
         assert!(DocScope::from_stored("thread", "").is_err());
         assert!(DocScope::from_stored("session", "s").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn values_with_nul_are_refused() -> TestResult {
+        for value in [
+            serde_json::json!("a\u{0}b"),
+            serde_json::json!({"a\u{0}": 1}),
+            serde_json::json!([{"deep": ["x\u{0}"]}]),
+        ] {
+            let write = DocumentWrite::put(key()?, 1, DocExpect::Any, value.clone());
+            assert!(write.validate().is_err(), "{value}");
+        }
+        assert!(
+            DocumentWrite::put(key()?, 1, DocExpect::Any, serde_json::json!({"a": "b"}))
+                .validate()
+                .is_ok()
+        );
+        Ok(())
     }
 }

@@ -23,9 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and a later put.
 - Breaking changes for code that matches these types exhaustively:
   - `Committed.documents` reports each write's live revision.
-  - `Lock::Document` locks a host document by key, after every task row.
-    Thread and task documents are locked through their thread or task row.
-    A thread document obeys the purge fence.
+  - `Lock::Document` locks a host document by key.
+  - Every backend applies a transition's document writes after its other
+    writes, so a document row is the last row a transition locks, after a
+    settle's parent row too.
+  - Thread documents are locked through their thread row, and task
+    documents through their task's thread row and their task row. Both
+    obey the purge fence: no document can be written on a thread that is
+    being purged or was purged.
+  - A task document needs its task to exist.
   - `Rejected::from_write_error` maps an apply-time `ExpectationFailed`
     to that guard rejection.
 - `DocumentStore` (`get_document`, `list_documents`,
@@ -33,10 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SQLite, Postgres and in-memory task stores, and exposed as
   `StoreRegistry::document_store`.
 - `finish_purge` retires the purged thread's documents and its tasks'
-  documents in the same transaction. The in-memory store reads a purged
-  thread's documents as retired.
+  documents in the same transaction.
+  - The in-memory store reads a purged thread's documents as retired.
+  - The fence keeps every later write away from them, so all three backends
+    give the same answers.
+  - In-memory caveat: it still cannot roll back a document if a later
+    non-document write fails at apply time. Documents are applied last,
+    which narrows this to a failing document write after an earlier one.
+- Behaviour every backend shares:
+  - a value holding a NUL character, in any string or object key, is
+    refused before the transaction opens, because Postgres `jsonb` cannot
+    store one;
+  - keys list in byte order;
+  - two racing first writes of a key under `Any` both commit, at revisions
+    1 and 2. Under `Absent` the loser is a guard rejection.
 - **Migration 0030** (Postgres and SQLite) adds `agent_sdk_documents`:
   - primary key `(scope_kind, scope_id, kind, doc_key)`;
+  - on Postgres, the key columns declared `COLLATE "C"`;
+  - a scope CHECK that names no kinds (host ⇔ empty id), because SQLite
+    could not widen a kind list without a rebuild;
   - the partial index `agent_sdk_documents_kind_idx` on live rows;
   - no foreign key, so it takes no lock on any existing table.
 - **Locks.** Measured on Postgres 18 with 1M task rows and 100k threads, a
@@ -56,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The rollback is valid whichever of 0027–0029 or 0035 are also applied.
   - In a rolling deploy, an old binary never touches the table and runs
     beside a new one.
+  - **Compile impact for downstream stores and decorators:** an exhaustive
+    match on `Write` or `Lock`, or a struct literal of `Committed` or
+    `StoreRegistry`, needs the new variants or fields. satoshi itself
+    writes no documents.
 
 ### Added
 

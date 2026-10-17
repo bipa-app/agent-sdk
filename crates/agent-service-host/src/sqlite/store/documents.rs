@@ -6,7 +6,7 @@ use agent_server::journal::document::{
     DocKind, DocOp, DocPlan, DocScope, Document, DocumentKey, DocumentOutcome, DocumentStore,
     DocumentWrite, StoredRevision,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use sqlx::{FromRow, Sqlite, Transaction};
 use time::OffsetDateTime;
@@ -51,6 +51,13 @@ impl SqliteDurableStore {
         document: DocumentWrite,
         now: OffsetDateTime,
     ) -> Result<DocumentOutcome> {
+        if let DocScope::Task(task) = &document.key.scope {
+            ensure!(
+                Self::load_task_tx(tx, task).await?.is_some(),
+                "document {} names task {task}, which does not exist",
+                document.key
+            );
+        }
         let (scope_kind, scope_id, kind, key) = document.key.stored();
         let stored = sqlx::query!(
             r#"SELECT revision, retired_at IS NULL AS "live!: bool"
@@ -101,7 +108,7 @@ impl SqliteDurableStore {
                 .await
                 .with_context(|| format!("put document {}", document.key))?;
             }
-            (DocPlan::Retire { revision }, _) => {
+            (DocPlan::Retire { revision }, DocOp::Retire) => {
                 let revision = i64::try_from(revision).context("document revision out of range")?;
                 sqlx::query!(
                     r#"UPDATE agent_sdk_documents
@@ -118,7 +125,14 @@ impl SqliteDurableStore {
                 .await
                 .with_context(|| format!("retire document {}", document.key))?;
             }
-            (DocPlan::Put { .. } | DocPlan::Unchanged, _) => {}
+            (DocPlan::Unchanged, DocOp::Retire) => {}
+            (DocPlan::Put { .. } | DocPlan::Unchanged, DocOp::Retire | DocOp::Put(_))
+            | (DocPlan::Retire { .. }, DocOp::Put(_)) => {
+                bail!(
+                    "document {} planned {plan:?} for its operation",
+                    document.key
+                )
+            }
         }
         Ok(DocumentOutcome {
             key: document.key,

@@ -9,6 +9,10 @@
 -- No foreign key: a host document has no parent row, and a reference to
 -- agent_sdk_threads is not needed for the purge, which retires thread and task
 -- documents itself.
+--
+-- The scope CHECK names no scope kinds: Rust refuses an unknown kind on
+-- read, and SQLite cannot widen such a list without a table rebuild. TEXT
+-- compares byte-wise here, as the Postgres key columns do under "C".
 
 CREATE TABLE agent_sdk_documents (
     scope_kind     TEXT        NOT NULL,
@@ -24,8 +28,8 @@ CREATE TABLE agent_sdk_documents (
     PRIMARY KEY (scope_kind, scope_id, kind, doc_key),
 
     CONSTRAINT agent_sdk_documents_scope_check CHECK (
-        (scope_kind = 'host' AND scope_id = '')
-        OR (scope_kind IN ('thread', 'task') AND scope_id <> '')
+        scope_kind <> ''
+        AND ((scope_kind = 'host') = (scope_id = ''))
     ),
     CONSTRAINT agent_sdk_documents_revision_check CHECK (revision >= 1),
     CONSTRAINT agent_sdk_documents_schema_version_check CHECK (schema_version >= 0)

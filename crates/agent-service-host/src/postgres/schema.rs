@@ -927,7 +927,7 @@ const AGENT_SDK_DOCUMENT_COLUMNS: &[ColumnContract] = &[
 const AGENT_SDK_DOCUMENT_CONSTRAINTS: &[ConstraintContract] = &[
     ConstraintContract {
         name: "agent_sdk_documents_scope_check",
-        invariant: "A host document has an empty scope id; a thread or task document has one.",
+        invariant: "A scope kind is not empty; the host scope, and only it, has an empty scope id. No kind list: SQLite could not widen it without a rebuild.",
     },
     ConstraintContract {
         name: "agent_sdk_documents_revision_check",

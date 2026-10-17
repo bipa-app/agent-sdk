@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_sdk_documents\n                       (scope_kind, scope_id, kind, doc_key, schema_version, revision,\n                        value_json, retired_at, updated_at)\n                   VALUES ($1, $2, $3, $4, $5, 1, $6, NULL, $7)\n                   ON CONFLICT (scope_kind, scope_id, kind, doc_key) DO UPDATE SET\n                       schema_version = EXCLUDED.schema_version,\n                       revision = agent_sdk_documents.revision + 1,\n                       value_json = EXCLUDED.value_json,\n                       retired_at = NULL,\n                       updated_at = EXCLUDED.updated_at\n                   RETURNING revision",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revision",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_documents",
+            "name": "revision"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "488cf345169d790985027f509b9bea9db924ff87cbb4f1c777d50538837d6f14"
+}
