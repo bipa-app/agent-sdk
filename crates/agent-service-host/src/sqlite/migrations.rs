@@ -121,11 +121,15 @@ const TASK_AFTER_SIBLINGS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/sqlite/0026_task_after_siblings.sql"
 ));
+const EFFECTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/sqlite/0027_effects.sql"
+));
 
 /// `sqlx`-managed migration bundle for the `SQLite` durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-const MIGRATIONS: [SqliteMigration; 24] = [
+const MIGRATIONS: [SqliteMigration; 25] = [
     SqliteMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -246,6 +250,11 @@ const MIGRATIONS: [SqliteMigration; 24] = [
         summary: "earlier batch siblings a pending tool child waits for",
         sql: TASK_AFTER_SIBLINGS_SQL,
     },
+    SqliteMigration {
+        version: "0027",
+        summary: "execution intents record every effect kind",
+        sql: EFFECTS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -284,6 +293,11 @@ pub(crate) const HISTORY_GENERATION_MIGRATION_VERSION: i64 = 22;
 /// pending tool child waits for.
 #[cfg(test)]
 pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
+
+/// Version of the migration that makes the execution intents the record
+/// of every effect kind.
+#[cfg(test)]
+pub(crate) const EFFECTS_MIGRATION_VERSION: i64 = 27;
 
 /// The reviewable SQL of the after-siblings column migration.
 #[cfg(test)]

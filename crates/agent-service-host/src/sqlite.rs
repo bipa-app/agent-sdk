@@ -45,7 +45,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::migrations::{
-        AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
+        AWAITING_QUESTION_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR, EFFECTS_MIGRATION_VERSION,
         HISTORY_GENERATION_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
         PURGE_SEED_MIGRATION_VERSION, TASK_AFTER_SIBLINGS_MIGRATION_VERSION,
         TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
@@ -142,6 +142,11 @@ mod tests {
             versions.contains(&TASK_AFTER_SIBLINGS_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {TASK_AFTER_SIBLINGS_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&EFFECTS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {EFFECTS_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }

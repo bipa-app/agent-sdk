@@ -136,11 +136,19 @@ const TASK_AFTER_SIBLINGS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0026_task_after_siblings.sql"
 ));
+const EFFECTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0027_effects.sql"
+));
+const VALIDATE_EFFECTS_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0029_validate_effects.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 24] = [
+const MIGRATIONS: [PostgresMigration; 26] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -261,6 +269,16 @@ const MIGRATIONS: [PostgresMigration; 24] = [
         summary: "earlier batch siblings a pending tool child waits for",
         sql: TASK_AFTER_SIBLINGS_SQL,
     },
+    PostgresMigration {
+        version: "0027",
+        summary: "execution intents record every effect kind",
+        sql: EFFECTS_SQL,
+    },
+    PostgresMigration {
+        version: "0029",
+        summary: "validate the effect checks outside the column migration",
+        sql: VALIDATE_EFFECTS_SQL,
+    },
 ];
 
 /// Version of the migration this PR introduces: the typed terminal
@@ -304,6 +322,16 @@ pub(crate) const HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION: i64 = 23;
 /// pending tool child waits for.
 #[cfg(test)]
 pub(crate) const TASK_AFTER_SIBLINGS_MIGRATION_VERSION: i64 = 26;
+
+/// Version of the migration that makes the execution intents the record
+/// of every effect kind.
+#[cfg(test)]
+pub(crate) const EFFECTS_MIGRATION_VERSION: i64 = 27;
+
+/// Version of the migration that validates the effect checks outside the
+/// column migration's ACCESS EXCLUSIVE lock.
+#[cfg(test)]
+pub(crate) const EFFECTS_VALIDATION_MIGRATION_VERSION: i64 = 29;
 
 /// The reviewable executable migration bundle for the current durable core.
 #[must_use]
@@ -394,7 +422,7 @@ mod tests {
     use sqlx::postgres::PgConnection;
 
     use super::{
-        DURABLE_CORE_MIGRATOR, PostgresMigration, TASK_AFTER_SIBLINGS_SQL,
+        DURABLE_CORE_MIGRATOR, EFFECTS_SQL, PostgresMigration, TASK_AFTER_SIBLINGS_SQL,
         TURN_ATTEMPT_EVIDENCE_SQL, durable_core_migrations,
     };
 
@@ -440,6 +468,78 @@ mod tests {
             "a later migration must validate the history_generation check",
         );
         Ok(())
+    }
+
+    async fn effect_checks_validated(conn: &mut PgConnection) -> Result<Vec<bool>> {
+        let rows: Vec<(bool,)> = sqlx::query_as(
+            "SELECT convalidated FROM pg_constraint
+             WHERE conname IN ('agent_sdk_execution_intents_kind_check',
+                               'agent_sdk_execution_intents_resolution_check',
+                               'agent_sdk_execution_intents_attempt_check')
+               AND conrelid = 'agent_sdk_execution_intents'::regclass
+             ORDER BY conname",
+        )
+        .fetch_all(conn)
+        .await
+        .context("read the effect checks")?;
+        Ok(rows.into_iter().map(|(validated,)| validated).collect())
+    }
+
+    async fn assert_effect_checks_validate_separately(conn: &mut PgConnection) -> Result<()> {
+        let (through_columns, later): (Vec<&PostgresMigration>, Vec<&PostgresMigration>) =
+            durable_core_migrations()
+                .iter()
+                .partition(|migration| migration.version <= "0027");
+        for migration in through_columns {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("apply migration {}", migration.version))?;
+        }
+        ensure!(
+            effect_checks_validated(conn).await? == [false; 3],
+            "0027 must add its three checks NOT VALID: validating them there scans every \
+             intent under the ACCESS EXCLUSIVE lock its ALTERs hold until commit",
+        );
+        for migration in later {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| format!("apply migration {}", migration.version))?;
+        }
+        ensure!(
+            effect_checks_validated(conn).await? == [true; 3],
+            "a later migration must validate the three effect checks",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn effect_checks_are_validated_outside_the_column_migration() -> Result<()> {
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(());
+        };
+        let schema = format!("effect_checks_{}", uuid::Uuid::new_v4().simple());
+        let mut conn = PgConnection::connect(&database_url)
+            .await
+            .context("connect postgres for the migration test")?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("create test schema {schema}"))?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+            .execute(&mut conn)
+            .await
+            .context("scope the connection to the test schema")?;
+
+        let outcome = assert_effect_checks_validate_separately(&mut conn).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut conn)
+            .await
+            .with_context(|| format!("drop test schema {schema}"))?;
+        outcome
     }
 
     #[tokio::test]
@@ -597,6 +697,31 @@ WHERE indexrelid = to_regclass('agent_sdk_tasks_subagent_child_root_idx')
                 "{version} must not build or drop concurrently",
             );
         }
+        Ok(())
+    }
+
+    /// 0027's `SET LOCAL lock_timeout` lasts only as long as the
+    /// migration's own transaction: outside one it would warn and do
+    /// nothing, and its ALTERs could queue every intent query behind a
+    /// waiting ACCESS EXCLUSIVE lock.
+    #[test]
+    fn effects_migrations_run_inside_their_transaction() -> Result<()> {
+        for version in ["0027", "0029"] {
+            let executable = DURABLE_CORE_MIGRATOR
+                .migrations
+                .iter()
+                .find(|migration| format!("{:04}", migration.version) == version)
+                .with_context(|| format!("migration {version} must be in the bundle"))?;
+            ensure!(!executable.no_tx, "{version} must run inside a transaction");
+        }
+        ensure!(
+            EFFECTS_SQL.contains("SET LOCAL lock_timeout"),
+            "0027 must bound how long it waits for its ACCESS EXCLUSIVE lock",
+        );
+        ensure!(
+            EFFECTS_SQL.matches(") NOT VALID").count() == 3,
+            "0027 must add its three checks NOT VALID",
+        );
         Ok(())
     }
 
