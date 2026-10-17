@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests: the crash matrix
+
+- `agent-service-host/tests/crash_matrix.rs` kills a real `LocalDaemon`
+  with SIGKILL at a named point in eight scenarios (architecture review
+  §6: unsafe tool, safe tool, LLM stream, fork, cancel tree, human waits,
+  hung child, two overlapping hosts), boots a fresh daemon on the same
+  database, and checks what recovery did. Each scenario runs on SQLite and
+  on Postgres (`TEST_DATABASE_URL`). Scenarios that fail today (S3: the
+  crashed LLM attempt stays open; S7: a wait on a silent child never ends)
+  are ignored and run as expected failures: they pass while the documented
+  failure still reproduces, and fail once it is fixed, so the fix must
+  un-ignore them. With `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` set they
+  assert the real pass condition instead.
+- A `fork.after_commit` fail point (the `failpoints` feature) sits between
+  a fork's commit and its idempotency record. Without the feature it
+  compiles to nothing.
+
 ### Crash-safety Phase 4: the session view, folded at read time
 
 - `agent.service.v1.AgentEventService` gains `GetThreadView` (status and the
