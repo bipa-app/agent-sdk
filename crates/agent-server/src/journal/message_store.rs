@@ -231,7 +231,10 @@ impl PurgeFencedMessageProjectionStore {
 
     async fn require_appendable(&self, thread_id: &ThreadId) -> Result<()> {
         let thread = self.threads.get(thread_id).await?;
-        super::transition::Fence::APPEND.check(thread_id, thread.as_ref())
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::MessageHead,
+            super::transition::Fence::APPEND.check(thread_id, thread.as_ref()),
+        )
     }
 }
 

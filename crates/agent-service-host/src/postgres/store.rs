@@ -468,9 +468,13 @@ FOR UPDATE
     async fn require_appendable_thread_tx(
         tx: &mut Transaction<'_, Postgres>,
         thread_id: &ThreadId,
+        writer: agent_server::journal::thread::FencedWriter,
     ) -> Result<()> {
         let thread = Self::lock_thread_tx(tx, thread_id).await?;
-        agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref())
+        crate::fence_signal::fence_refused(
+            writer,
+            agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref()),
+        )
     }
 
     async fn bootstrap_appendable_thread_tx(
@@ -479,8 +483,12 @@ FOR UPDATE
         now: OffsetDateTime,
     ) -> Result<()> {
         Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
-        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
-        Ok(())
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::MessageHead,
+            Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append)
+                .await
+                .map(|_| ()),
+        )
     }
 
     async fn require_active_thread_tx(
@@ -3436,8 +3444,11 @@ FOR UPDATE
         let mut tx = self.begin().await?;
 
         let source = Self::lock_thread_tx(&mut tx, &params.source_thread_id).await?;
-        agent_server::journal::Fence::FORK_SOURCE
-            .check(&params.source_thread_id, source.as_ref())?;
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::ForkSource,
+            agent_server::journal::Fence::FORK_SOURCE
+                .check(&params.source_thread_id, source.as_ref()),
+        )?;
 
         // Claim caller-minted destinations by primary key inside the same
         // transaction as the fork copy. Matching retries are no-ops; a
@@ -5781,7 +5792,12 @@ FOR UPDATE SKIP LOCKED
         // allocation re-locks the thread row held above — no new lock
         // edge.
         if let Some(event) = boundary {
-            Self::require_appendable_thread_tx(&mut tx, &old.thread_id).await?;
+            Self::require_appendable_thread_tx(
+                &mut tx,
+                &old.thread_id,
+                agent_server::journal::thread::FencedWriter::RequeueOwnedTask,
+            )
+            .await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
             let committed =
                 Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
@@ -5955,7 +5971,12 @@ FOR UPDATE SKIP LOCKED
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
-        Self::require_appendable_thread_tx(&mut tx, &paused.thread_id).await?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            &paused.thread_id,
+            agent_server::journal::thread::FencedWriter::PauseOnQuestion,
+        )
+        .await?;
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
@@ -6611,7 +6632,12 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<Option<MessageProjection>> {
         let mut tx = self.begin().await?;
-        Self::require_appendable_thread_tx(&mut tx, thread_id).await?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            thread_id,
+            agent_server::journal::thread::FencedWriter::MessageHead,
+        )
+        .await?;
         let record = sqlx::query_as::<_, MessageHeadRecord>(
             r"
 SELECT

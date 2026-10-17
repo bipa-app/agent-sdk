@@ -203,6 +203,7 @@ inventory covers the whole observability surface.
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
 | event `agent_server.effect.abandoned` | Span event | `reason` (`owner_cancelled`, `lease_sweep`, `owner_terminal`), kind; span-only effect id, task id | `[agent-server]`, `[agent-service-host]` | Phase 2 |
+| `agent_server.fence.refused` | Counter | `writer`, `thread_status` | `[agent-server]` (+ the `agent_server.fence.refused` tracing event with `thread.id` from the SQL backends) | crash-safety P2-1 |
 
 ### 4.4 Agent-service-host metrics
 
