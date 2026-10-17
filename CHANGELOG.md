@@ -53,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - keys list in byte order;
   - two racing first writes of a key under `Any` both commit, at revisions
     1 and 2. Under `Absent` the loser is a guard rejection.
+- **Signals** (feature `otel`). Every store's `commit` records
+  `agent_server.journal.transition.duration`, by `backend` and `outcome`
+  (`committed`, `guard`, `expectation`, `store`), and
+  `agent_server.journal.documents.written`, by `backend`, `scope` and `op`.
+  Postgres counts its lock-conflict retries on
+  `agent_server.journal.transition.lock_conflict_retries`. Attribute values
+  are fixed names; no key or value of a document is recorded.
 - **Migration 0030** (Postgres and SQLite) adds `agent_sdk_documents`:
   - primary key `(scope_kind, scope_id, kind, doc_key)`;
   - on Postgres, the key columns declared `COLLATE "C"`;

@@ -128,6 +128,31 @@ pub mod attrs {
 
     pub const REASON_REQUEUED: &str = "requeued";
 
+    /// Store backend of a transition: `memory` / `sqlite` / `postgres`.
+    pub const BACKEND: &str = "backend";
+    /// Document scope kind: `host` / `thread` / `task`.
+    pub const SCOPE: &str = "scope";
+    /// Document operation as committed: `put`, or `retire` (a retire of a
+    /// document that was not live included).
+    pub const OP: &str = "op";
+
+    pub const BACKEND_MEMORY: &str = "memory";
+    pub const BACKEND_SQLITE: &str = "sqlite";
+    pub const BACKEND_POSTGRES: &str = "postgres";
+
+    /// Transition outcome: committed.
+    pub const OUTCOME_COMMITTED: &str = "committed";
+    /// Transition outcome: a task guard did not hold.
+    pub const OUTCOME_GUARD: &str = "guard";
+    /// Transition outcome: a write's own expectation (a document's
+    /// `DocExpect`) did not hold.
+    pub const OUTCOME_EXPECTATION: &str = "expectation";
+    /// Transition outcome: malformed, refused, or the store failed.
+    pub const OUTCOME_STORE: &str = "store";
+
+    pub const OP_PUT: &str = "put";
+    pub const OP_RETIRE: &str = "retire";
+
     pub const COMMIT_KIND_ATOMIC: &str = "atomic";
     pub const COMMIT_KIND_NON_ATOMIC: &str = "non_atomic";
 }
@@ -152,6 +177,9 @@ pub struct ServerMetrics {
     pub(crate) wakeup_fallback_sweep: Counter<u64>,
     pub(crate) thread_events_watch_lag_ms: Histogram<f64>,
     pub(crate) tool_audit_outcome: Counter<u64>,
+    pub(crate) transition_duration: Histogram<f64>,
+    pub(crate) transition_lock_conflict_retries: Counter<u64>,
+    pub(crate) documents_written: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -282,6 +310,60 @@ impl ServerMetrics {
         );
     }
 
+    /// Record one [`DurableStore::commit`](crate::journal::DurableStore::commit):
+    /// its duration and outcome on `agent_server.journal.transition.duration`,
+    /// and each committed document write on
+    /// `agent_server.journal.documents.written`. `guard_count` is the
+    /// transition's number of guards, which tells a guard rejection from a
+    /// write's own failed expectation.
+    pub fn record_transition(
+        &self,
+        backend: &'static str,
+        guard_count: usize,
+        result: &Result<crate::journal::Committed, crate::journal::Rejected>,
+        duration_secs: f64,
+    ) {
+        let outcome = match result {
+            Ok(_) => attrs::OUTCOME_COMMITTED,
+            Err(crate::journal::Rejected::Guard { index, .. }) if *index >= guard_count => {
+                attrs::OUTCOME_EXPECTATION
+            }
+            Err(crate::journal::Rejected::Guard { .. }) => attrs::OUTCOME_GUARD,
+            Err(crate::journal::Rejected::Store(_)) => attrs::OUTCOME_STORE,
+        };
+        self.transition_duration.record(
+            duration_secs,
+            &[
+                KeyValue::new(attrs::BACKEND, backend),
+                KeyValue::new(attrs::OUTCOME, outcome),
+            ],
+        );
+        let Ok(committed) = result else {
+            return;
+        };
+        for document in &committed.documents {
+            let op = if document.revision.is_some() {
+                attrs::OP_PUT
+            } else {
+                attrs::OP_RETIRE
+            };
+            self.documents_written.add(
+                1,
+                &[
+                    KeyValue::new(attrs::BACKEND, backend),
+                    KeyValue::new(attrs::SCOPE, document.key.scope.kind_str()),
+                    KeyValue::new(attrs::OP, op),
+                ],
+            );
+        }
+    }
+
+    /// Count one transition a store retried after a lock conflict.
+    pub fn record_transition_lock_conflict_retry(&self, backend: &'static str) {
+        self.transition_lock_conflict_retries
+            .add(1, &[KeyValue::new(attrs::BACKEND, backend)]);
+    }
+
     /// Fan out a [`RelayTick`]'s counters onto
     /// `agent_server.relay.tick`.
     ///
@@ -395,6 +477,26 @@ impl ServerMetrics {
             .u64_counter("agent_server.tool_audit.outcome")
             .with_description("Tool audit events recorded, attributed by lifecycle outcome.")
             .build();
+        let transition_duration = meter
+            .f64_histogram("agent_server.journal.transition.duration")
+            .with_unit("s")
+            .with_description(
+                "Duration of DurableStore::commit, attributed by backend and outcome.",
+            )
+            .with_boundaries(COMMIT_DURATION_BUCKETS_S.to_vec())
+            .build();
+        let transition_lock_conflict_retries = meter
+            .u64_counter("agent_server.journal.transition.lock_conflict_retries")
+            .with_description(
+                "Transitions the store retried after a deadlock or serialization failure.",
+            )
+            .build();
+        let documents_written = meter
+            .u64_counter("agent_server.journal.documents.written")
+            .with_description(
+                "Document writes committed, attributed by backend, scope and operation.",
+            )
+            .build();
 
         Self {
             workers_active,
@@ -406,6 +508,9 @@ impl ServerMetrics {
             wakeup_fallback_sweep,
             thread_events_watch_lag_ms,
             tool_audit_outcome,
+            transition_duration,
+            transition_lock_conflict_retries,
+            documents_written,
             meter,
         }
     }

@@ -5225,6 +5225,26 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
         transition: super::transition::Transition,
         now: OffsetDateTime,
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
+        #[cfg(feature = "otel")]
+        let (started, guard_count) = (std::time::Instant::now(), transition.guards.len());
+        let result = self.commit_transition(transition, now).await;
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_transition(
+            crate::observability::attrs::BACKEND_MEMORY,
+            guard_count,
+            &result,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+}
+
+impl InMemoryAgentTaskStore {
+    async fn commit_transition(
+        &self,
+        transition: super::transition::Transition,
+        now: OffsetDateTime,
+    ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
         self.require_spawn_event_sink(&transition)?;

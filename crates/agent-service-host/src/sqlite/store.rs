@@ -3307,6 +3307,26 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        #[cfg(feature = "otel")]
+        let (started, guard_count) = (std::time::Instant::now(), transition.guards.len());
+        let result = self.commit_transition(transition, now).await;
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_transition(
+            agent_server::observability::attrs::BACKEND_SQLITE,
+            guard_count,
+            &result,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+}
+
+impl SqliteDurableStore {
+    async fn commit_transition(
+        &self,
+        transition: agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut tx = self.begin().await?;
         Self::check_declared_threads_tx(&mut tx, &transition, true, now).await?;

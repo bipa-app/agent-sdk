@@ -3951,6 +3951,26 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        #[cfg(feature = "otel")]
+        let (started, guard_count) = (std::time::Instant::now(), transition.guards.len());
+        let result = self.commit_transition(transition, now).await;
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_transition(
+            agent_server::observability::attrs::BACKEND_POSTGRES,
+            guard_count,
+            &result,
+            started.elapsed().as_secs_f64(),
+        );
+        result
+    }
+}
+
+impl PostgresDurableStore {
+    async fn commit_transition(
+        &self,
+        transition: agent_server::journal::Transition,
+        now: OffsetDateTime,
+    ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         transition.validate()?;
         let mut attempt = 0;
         loop {
@@ -3960,6 +3980,11 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
                 {
                     attempt += 1;
                     self.lock_conflict_retries.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "otel")]
+                    agent_server::observability::ServerMetrics::global()
+                        .record_transition_lock_conflict_retry(
+                            agent_server::observability::attrs::BACKEND_POSTGRES,
+                        );
                     tracing::warn!(attempt, %error, "retrying a transition after a lock conflict");
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
