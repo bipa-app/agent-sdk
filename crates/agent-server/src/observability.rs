@@ -180,6 +180,9 @@ pub mod attrs {
     pub const OUTCOME_EXPECTATION: &str = "expectation";
     /// Transition outcome: malformed, refused, or the store failed.
     pub const OUTCOME_STORE: &str = "store";
+    /// A store error that is a lock conflict the store stopped retrying
+    /// ([`crate::journal::LockConflict`]).
+    pub const OUTCOME_LOCK_CONFLICT: &str = "lock_conflict";
 
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
@@ -497,7 +500,7 @@ impl ServerMetrics {
     /// The outcome label of a commit result, as
     /// [`Self::record_transition`] attributes it.
     #[must_use]
-    pub const fn commit_outcome(
+    pub fn commit_outcome(
         guard_count: usize,
         result: &Result<crate::journal::Committed, crate::journal::Rejected>,
     ) -> &'static str {
@@ -507,6 +510,13 @@ impl ServerMetrics {
                 attrs::OUTCOME_EXPECTATION
             }
             Err(crate::journal::Rejected::Guard { .. }) => attrs::OUTCOME_GUARD,
+            Err(crate::journal::Rejected::Store(error))
+                if error
+                    .downcast_ref::<crate::journal::LockConflict>()
+                    .is_some() =>
+            {
+                attrs::OUTCOME_LOCK_CONFLICT
+            }
             Err(crate::journal::Rejected::Store(_)) => attrs::OUTCOME_STORE,
         }
     }

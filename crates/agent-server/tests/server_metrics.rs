@@ -681,6 +681,50 @@ async fn a_commit_records_its_outcome_and_its_documents() -> Result<()> {
     Ok(())
 }
 
+/// A store error marked [`LockConflict`](agent_server::journal::LockConflict)
+/// is recorded as `outcome=lock_conflict`; any other store error stays
+/// `outcome=store`.
+#[tokio::test]
+async fn a_lock_conflict_the_store_gave_up_on_is_its_own_outcome() -> Result<()> {
+    use agent_server::journal::{LockConflict, Rejected};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+    let gave_up = Err(Rejected::Store(
+        anyhow::anyhow!("deadlock detected").context(LockConflict { retries: 3 }),
+    ));
+    let other = Err(Rejected::Store(anyhow::anyhow!("connection reset")));
+    // Different backends, so the test sees which error got which outcome.
+    metrics.record_transition(attrs::BACKEND_POSTGRES, 0, &gave_up, 0.03);
+    metrics.record_transition(attrs::BACKEND_SQLITE, 0, &other, 0.01);
+
+    flush(&provider)?;
+    let points = collect_histogram_attrs(
+        &collected(&exporter)?,
+        "agent_server.journal.transition.duration",
+    );
+    let recorded = |backend: &str, outcome: &str| {
+        points
+            .iter()
+            .any(|p| matches_all(p, &[(attrs::BACKEND, backend), (attrs::OUTCOME, outcome)]))
+    };
+    assert!(
+        recorded(attrs::BACKEND_POSTGRES, attrs::OUTCOME_LOCK_CONFLICT),
+        "the marked error is a lock conflict: {points:?}"
+    );
+    assert!(
+        recorded(attrs::BACKEND_SQLITE, attrs::OUTCOME_STORE),
+        "an unmarked store error stays a store failure: {points:?}"
+    );
+    assert!(
+        !recorded(attrs::BACKEND_POSTGRES, attrs::OUTCOME_STORE)
+            && !recorded(attrs::BACKEND_SQLITE, attrs::OUTCOME_LOCK_CONFLICT),
+        "{points:?}"
+    );
+    Ok(())
+}
+
 fn tool_call_effects(counts: &[(Vec<(String, String)>, u64)], transition: &str) -> u64 {
     counts
         .iter()

@@ -561,6 +561,7 @@ pub mod idempotency;
 pub mod live_tail;
 #[cfg(test)]
 mod live_tail_test;
+pub mod lock_conflict;
 pub mod message;
 pub mod message_store;
 pub mod outbox;
@@ -617,6 +618,7 @@ pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
+pub use lock_conflict::LockConflict;
 pub use message::{CompactionEntry, MessageProjection, MessageProjectionError};
 pub use message_store::{InMemoryMessageProjectionStore, MessageProjectionStore};
 pub use outbox::{
