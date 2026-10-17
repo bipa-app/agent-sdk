@@ -112,6 +112,10 @@ pub mod attrs {
     pub const AUDIT_OUTCOME: &str = "outcome";
     /// Tool effect class on audit events.
     pub const EFFECT_CLASS: &str = "effect_class";
+    /// A write the purge fence refused: the label of a [`FencedWriter`](crate::journal::thread::FencedWriter).
+    pub const WRITER: &str = "writer";
+    /// Thread lifecycle status: the label of a [`ThreadStatus`](crate::journal::thread::ThreadStatus).
+    pub const THREAD_STATUS: &str = "thread_status";
     /// What happened to an effect (`agent_server.effects`).
     pub const TRANSITION: &str = "transition";
     /// Span-only: the kind of the effect an `effect.run` span runs.
@@ -278,6 +282,9 @@ pub struct ServerMetrics {
     /// `agent_server.tool.stall_budget.unbounded`: tool calls that run
     /// with no stall budget.
     pub(crate) tool_stall_unbounded: Counter<u64>,
+    /// `agent_server.fence.refused`: writes outside a transition the purge
+    /// fence refused, by writer and thread status.
+    pub(crate) fence_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -397,6 +404,23 @@ impl ServerMetrics {
             self.tasks_lease_expired
                 .add(1, &[KeyValue::new(attrs::REASON, reason)]);
         }
+    }
+
+    /// Record one `agent_server.fence.refused` increment for `writer`
+    /// refused on `conflict`'s thread status. The thread id is not a label
+    /// (unbounded cardinality).
+    pub fn record_fence_refusal(
+        &self,
+        writer: crate::journal::thread::FencedWriter,
+        conflict: &crate::journal::thread::ThreadStateConflict,
+    ) {
+        self.fence_refused.add(
+            1,
+            &[
+                KeyValue::new(attrs::WRITER, writer.as_str()),
+                KeyValue::new(attrs::THREAD_STATUS, conflict.status.as_str()),
+            ],
+        );
     }
 
     /// Record a single `agent_server.journal.commit.duration` sample
@@ -738,6 +762,7 @@ impl ServerMetrics {
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
         let (tool_stalls, tool_stall_unbounded) = Self::build_tool_stall_instruments(&meter);
+        let fence_refused = fence_refused_counter(&meter);
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
 
@@ -763,6 +788,7 @@ impl ServerMetrics {
             prompts,
             tool_stalls,
             tool_stall_unbounded,
+            fence_refused,
             meter,
         }
     }
@@ -784,6 +810,17 @@ impl ServerMetrics {
             .build();
         (tool_stalls, tool_stall_unbounded)
     }
+}
+
+/// `agent_server.fence.refused`.
+fn fence_refused_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.fence.refused")
+        .with_description(
+            "Writes outside a transition the purge fence refused, attributed by writer and \
+             thread status.",
+        )
+        .build()
 }
 
 /// The crash-safety instruments: effect transitions, effect run time and

@@ -1077,3 +1077,60 @@ async fn tool_stall_signals_count_by_outcome_without_the_tool_name() -> Result<(
     assert!(unbounded.iter().all(|(set, _)| set.is_empty()));
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// fence.refused counts each refused writer by thread status
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_fence_refusal_is_counted_by_writer_and_status() -> Result<()> {
+    use agent_server::journal::Fence;
+    use agent_server::journal::thread::{
+        FencedWriter, PurgeScope, PurgeSeed, Thread, record_fence_refusal,
+    };
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let thread_id = ThreadId::from_string("fenced-thread");
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let deleting = Thread::new(thread_id.clone(), now).begin_purge(PurgeSeed {
+        root_thread_id: thread_id.clone(),
+        scope: PurgeScope::Thread,
+        started_at: now,
+    });
+
+    for writer in [FencedWriter::MessageHead, FencedWriter::PauseOnQuestion] {
+        let refused = Fence::APPEND.check(&thread_id, Some(&deleting));
+        assert!(record_fence_refusal(writer, refused).is_err());
+    }
+    assert!(
+        record_fence_refusal(
+            FencedWriter::ForkSource,
+            Fence::FORK_SOURCE.check(&thread_id, None)
+        )
+        .is_ok()
+    );
+    assert!(
+        record_fence_refusal(
+            FencedWriter::RequeueOwnedTask,
+            Err(anyhow::anyhow!("not a fence"))
+        )
+        .is_err()
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.fence.refused");
+    let total: u64 = counts.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, 2, "only the fence's own refusals count: {counts:?}");
+    for writer in ["message_head", "pause_on_question"] {
+        assert!(
+            counts
+                .iter()
+                .any(|(s, _)| has_label(s, attrs::WRITER, writer)
+                    && has_label(s, attrs::THREAD_STATUS, "deleting")),
+            "{writer}: {counts:?}"
+        );
+    }
+    Ok(())
+}

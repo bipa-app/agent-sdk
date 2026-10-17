@@ -440,9 +440,12 @@ impl ThreadStore for InMemoryThreadStore {
     async fn commit_fork(&self, params: ForkCommitParams) -> Result<ThreadCreationOutcome> {
         let sink = self.journal()?;
         let mut inner = self.inner.write().await;
-        super::transition::Fence::FORK_SOURCE.check(
-            &params.source_thread_id,
-            inner.by_id.get(&params.source_thread_id),
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::ForkSource,
+            super::transition::Fence::FORK_SOURCE.check(
+                &params.source_thread_id,
+                inner.by_id.get(&params.source_thread_id),
+            ),
         )?;
         let existing = inner.by_id.get(&params.new_thread_id);
         if let (Some(_), Some(creation)) = (existing, params.creation.as_ref()) {

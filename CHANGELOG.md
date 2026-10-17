@@ -715,6 +715,13 @@ long as it needs. No migration, table, `Write` variant or protocol change.
   - `get_or_create` still adds an empty message head to a purged thread
     with none, on every backend. It writes no history, and readers of a
     deleted thread call it.
+  - Each of these refusals is counted on the new `agent_server.fence.refused`
+    counter (`otel`), by `writer` (`requeue_owned_task`, `pause_on_question`,
+    `message_head`, `fork_source`; `FencedWriter`) and `thread_status`. It is
+    also logged at debug with the thread id, and on SQLite and Postgres
+    emitted as an `agent_server.fence.refused` tracing event with `thread.id`
+    on the current span. `journal::thread::record_fence_refusal` records one
+    refusal. `ThreadOperation` and `ThreadStatus` gain `as_str`.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).

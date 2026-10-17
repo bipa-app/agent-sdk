@@ -7072,7 +7072,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // successor emits, and a failure here leaves the row Running
         // under the caller's lease (nothing released yet).
         if let Some(event) = boundary {
-            self.require_appendable_thread(&old.thread_id).await?;
+            super::thread::record_fence_refusal(
+                super::thread::FencedWriter::RequeueOwnedTask,
+                self.require_appendable_thread(&old.thread_id).await,
+            )?;
             if let Some(sink) = &self.marker_sink {
                 let committed = sink
                     .event_repo
@@ -7282,7 +7285,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .cloned()
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
-        self.require_appendable_thread(&paused.thread_id).await?;
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::PauseOnQuestion,
+            self.require_appendable_thread(&paused.thread_id).await,
+        )?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.put_row(paused.id.clone(), paused.clone());
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
