@@ -206,3 +206,69 @@ async fn service_host_registers_postgres_pool_gauges() -> Result<()> {
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 3. ServiceHost::run balances agent_server.workers.active
+// ─────────────────────────────────────────────────────────────────────
+
+/// The latest `agent_server.workers.active` value, from the newest snapshot.
+fn workers_active(snapshots: &[ResourceMetrics]) -> Option<i64> {
+    let mut latest = None;
+    for resource in snapshots {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                if metric.name() != "agent_server.workers.active" {
+                    continue;
+                }
+                if let AggregatedMetrics::I64(MetricData::Sum(sum)) = metric.data() {
+                    latest = Some(
+                        sum.data_points()
+                            .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                            .sum(),
+                    );
+                }
+            }
+        }
+    }
+    latest
+}
+
+#[tokio::test]
+async fn service_host_counts_its_running_workers_and_returns_to_zero() -> Result<()> {
+    let _guard = acquire_lock().await;
+    let (provider, exporter) = install_in_memory_meter();
+    agent_server::observability::ServerMetrics::reset_for_testing();
+
+    let mut config = ServiceConfig::default();
+    config.worker.pool_size = 3;
+    config.transport.grpc_enabled = false;
+    config.transport.http_enabled = false;
+    let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(sample_definition()));
+    let host = ServiceHost::new(config, registry, sample_runtime()).context("construct host")?;
+    let token = host.shutdown_token();
+    let running = tokio::spawn(async move { host.run().await });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        flush(&provider)?;
+        if workers_active(&collected(&exporter)?) == Some(3) {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "workers.active never reached the pool size: {:?}",
+            workers_active(&collected(&exporter)?),
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    token.cancel();
+    running.await.context("join host")??;
+    flush(&provider)?;
+    assert_eq!(
+        workers_active(&collected(&exporter)?),
+        Some(0),
+        "every worker that stopped must decrement the gauge",
+    );
+    Ok(())
+}

@@ -31,6 +31,14 @@ const DEFAULT_DEPLOYMENT_ENVIRONMENT: &str = "unknown_deployment";
 /// caller knows the resource is unattributed.
 const DEFAULT_SERVICE_NAME_FALLBACK: &str = "agent-sdk";
 
+fn read_env(key: &str) -> Result<Option<String>> {
+    match env::var(key) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("{key} is not valid Unicode")),
+    }
+}
+
 /// Configuration for the `OTel` bootstrap helper.
 ///
 /// Construct via [`OtelConfig::builder`] (programmatic) or
@@ -108,11 +116,17 @@ impl OtelConfig {
     /// - `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_EXPORTER_OTLP_HEADERS` entries
     ///   missing the `=` separator
     pub fn from_env() -> Result<Self> {
-        Self::from_env_with(|key| match env::var(key) {
-            Ok(raw) => Ok(Some(raw)),
-            Err(env::VarError::NotPresent) => Ok(None),
-            Err(err) => Err(err).with_context(|| format!("{key} is not valid Unicode")),
-        })
+        Self::from_env_with(read_env)
+    }
+
+    /// [`Self::from_env`] for a host that names its own service: when
+    /// `OTEL_SERVICE_NAME` is unset, `service.name` is `default_service_name`
+    /// and nothing is logged. `OTEL_SERVICE_NAME` still wins when set.
+    ///
+    /// # Errors
+    /// The same as [`Self::from_env`].
+    pub fn from_env_or_service_name(default_service_name: &str) -> Result<Self> {
+        Self::from_env_with_default(read_env, Some(default_service_name))
     }
 
     /// Internal hook used by [`Self::from_env`] and tests. The getter is
@@ -122,9 +136,23 @@ impl OtelConfig {
     where
         F: Fn(&str) -> Result<Option<String>>,
     {
-        let service_name = match optional_value(&getter, "OTEL_SERVICE_NAME")? {
-            Some(name) => name,
-            None => {
+        Self::from_env_with_default(getter, None)
+    }
+
+    pub(crate) fn from_env_with_default<F>(
+        getter: F,
+        default_service_name: Option<&str>,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Result<Option<String>>,
+    {
+        let service_name = match (
+            optional_value(&getter, "OTEL_SERVICE_NAME")?,
+            default_service_name,
+        ) {
+            (Some(name), _) => name,
+            (None, Some(name)) => name.to_owned(),
+            (None, None) => {
                 log::warn!(
                     target: "agent_sdk_otel",
                     "OTEL_SERVICE_NAME is unset; falling back to `{DEFAULT_SERVICE_NAME_FALLBACK}`"
@@ -511,6 +539,18 @@ mod tests {
         assert!(cfg.otlp_endpoint.is_none());
         assert_eq!(cfg.otlp_headers, [] as [(String, String); 0]);
         assert!(!cfg.exporter_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn a_host_default_service_name_applies_only_when_the_env_is_unset() -> Result<()> {
+        let cfg = OtelConfig::from_env_with_default(|_| Ok(None), Some("bip"))?;
+        assert_eq!(cfg.service_name, "bip");
+        let cfg = OtelConfig::from_env_with_default(
+            fake_getter(vec![("OTEL_SERVICE_NAME", "svc")]),
+            Some("bip"),
+        )?;
+        assert_eq!(cfg.service_name, "svc");
         Ok(())
     }
 
