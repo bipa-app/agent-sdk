@@ -94,6 +94,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     wires both. Fixtures that compact must wire them too.
   - `Transition::validate` refuses a guard on a re-parked task: its lock
     would come before the re-attached children's.
+- **Breaking: every spawn commits through `DurableStore::commit`.**
+  `spawn_tool_children`, `spawn_subagent_invocation`, `spawn_subagent_batch`,
+  `spawn_mixed_children` and `commit_subagent_spawn` are no longer
+  `AgentTaskStore` methods: they are provided by the new `SpawnChildrenExt`
+  (implemented for every task store; `use agent_server::journal::SpawnChildrenExt`)
+  as wrappers that commit one `Write::SpawnChildren { parent, spawn: ChildSpawn }`
+  under a `Guard::TaskIs` on the running parent. Their signatures, rows,
+  events and error text are unchanged. A store that wraps another must
+  delete its spawn forwards and add any spawn behaviour to its `commit`.
+  `Committed::spawned` returns each spawn's rows (`SpawnedChildren`).
+  - Transitions declare the rows they lock (`Transition::locks`,
+    `Write::locks`, `Lock`, `ThreadTier`). Postgres locks the declared
+    threads in tree order (the transition's own threads, then the threads
+    of the subagents it spawns, each by key), the order `cancel_tree`
+    takes them in, then the declared tasks children first, so a spawn's
+    re-attached children lock before its parent. A spawn's purge fence is
+    checked in that lock phase.
 - **Breaking: a completed turn commits through a required store method,
   and the last committer traits are gone.** `AgentTaskStore::commit_completed_turn`
   has no default, and `journal::commit::commit_completed_turn(params, task_store)`

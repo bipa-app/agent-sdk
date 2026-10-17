@@ -38,6 +38,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::journal::SpawnChildrenExt;
 use crate::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::{SubagentBatchSpawn, validate_reattached_slot_coverage};
@@ -1375,7 +1376,7 @@ async fn execute_subagent_task_inner(
 /// The parent parks in `waiting_on_children`, the invocation, the child
 /// thread and its runnable root turn are created with their durable
 /// linkage, and the start event and the child's `ThreadCreated` are
-/// journaled, all in one [`AgentTaskStore::commit_subagent_spawn`].
+/// journaled, all in one [`SpawnChildrenExt::commit_subagent_spawn`].
 ///
 /// `child_thread_id` must be pre-allocated by the caller and reused
 /// across retries.
@@ -1460,7 +1461,7 @@ pub struct SpawnedSubagentBatch {
 /// `SuspensionPayload`: every entry in a batch shares the *same* parent
 /// suspension, so it is passed exactly once to
 /// [`spawn_subagent_batch_invocations`] — mirroring the store primitive
-/// [`AgentTaskStore::spawn_subagent_batch`], which already takes the shared
+/// [`SpawnChildrenExt::spawn_subagent_batch`], which already takes the shared
 /// payload explicitly. Removing the
 /// per-entry payload makes the previously-implicit "every entry's
 /// payload equals `spawns[0]`" assumption unrepresentable, so a

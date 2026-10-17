@@ -5,9 +5,12 @@
 use anyhow::{Context, Result};
 
 use agent_sdk_foundation::TerminalReason;
+use agent_server::journal::SpawnChildrenExt;
+use agent_server::journal::SubagentInvocationSpawn;
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::recovery::{FailureReason, RecoveryAction, RecoveryRecord};
 use agent_server::journal::store::{AgentTaskStore, SubmitDisposition, SubmitRootTurnParams};
+use agent_server::journal::subagent_spawn_transaction::{SubagentSpawnCommit, SubagentSpawnEvent};
 use agent_server::journal::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, TaskKind, TaskStatus,
     WorkerId,
@@ -17,7 +20,8 @@ use agent_server::journal::thread::{PurgeScope, PurgeSeed};
 use agent_server::journal::thread_store::ThreadStore;
 
 use super::{
-    cancelled_marker_count, spawn_subagent_fixture, suspension_payload, t_plus, thread_id,
+    cancelled_marker_count, sample_subagent_input, sample_subagent_spec, spawn_subagent_fixture,
+    suspension_payload, t_plus, thread_id,
 };
 
 /// Live states a cancelled child can be caught in.
@@ -766,6 +770,113 @@ const fn live_descendant_in(status: TaskStatus) -> Option<LiveDescendant> {
     }
 }
 
+/// A one-subagent spawn under `parent` onto `child_thread`.
+fn subagent_spawn(
+    parent: AgentTaskId,
+    (worker, lease): (WorkerId, LeaseId),
+    parent_thread: &str,
+    child_thread: &str,
+    at: i64,
+) -> SubagentSpawnCommit {
+    SubagentSpawnCommit {
+        delivered_injection_ids: Vec::new(),
+        parent_id: parent,
+        worker,
+        lease,
+        spawn: SubagentInvocationSpawn {
+            child_thread_id: thread_id(child_thread),
+            spec: sample_subagent_spec(),
+            child_root_input: sample_subagent_input(),
+            spawn_index: 0,
+            payload: suspension_payload(parent_thread),
+            child_caller_metadata: None,
+        },
+        event: SubagentSpawnEvent {
+            subagent_id: "call-0".into(),
+            subagent_name: "explore".into(),
+        },
+        outbox_max_attempts: 3,
+        now: t_plus(at),
+    }
+}
+
+/// A subagent's running child root spawns a subagent of its own while a
+/// cancel stops the whole tree, on `{tid}-p` (the root), `{tid}-c1` (the
+/// child) and `{tid}-c2` (the grandchild). The spawn locks `c1` and then
+/// `c2`; the cancel locks `p`, then `c1`, then `c2` once it finds it.
+///
+/// Both must commit or be refused for the race they lost, never fail for
+/// the race itself, and no row on the three threads may stay live: a spawn
+/// that commits first is found and cancelled by the cancel's next walk, and
+/// one that comes second finds its parent cancelled.
+pub(super) async fn race_nested_spawn_against_cancel(
+    task_store: &dyn AgentTaskStore,
+    tid: &str,
+    round: i64,
+) -> Result<()> {
+    let at = round * 100;
+    let (root_thread, child_thread, grandchild_thread) =
+        (format!("{tid}-p"), format!("{tid}-c1"), format!("{tid}-c2"));
+    let (root, worker, lease) = running_root(task_store, &root_thread, at).await?;
+    let child = task_store
+        .commit_subagent_spawn(subagent_spawn(
+            root.id.clone(),
+            (worker, lease),
+            &root_thread,
+            &child_thread,
+            at + 2,
+        ))
+        .await?;
+    let (child_worker, child_lease) = (WorkerId::new(), LeaseId::new());
+    task_store
+        .try_acquire_task(
+            &child.child_root_task.id,
+            child_worker.clone(),
+            child_lease.clone(),
+            t_plus(at + 10_000),
+            t_plus(at + 3),
+        )
+        .await?
+        .context("the child root must acquire")?;
+
+    let spawning = task_store.commit_subagent_spawn(subagent_spawn(
+        child.child_root_task.id.clone(),
+        (child_worker, child_lease),
+        &child_thread,
+        &grandchild_thread,
+        at + 5,
+    ));
+    let cancelling = task_store.cancel_tree(&root.id, t_plus(at + 5));
+    let (spawned, cancelled) = if round % 2 == 0 {
+        tokio::join!(spawning, cancelling)
+    } else {
+        let (cancelled, spawned) = tokio::join!(cancelling, spawning);
+        (spawned, cancelled)
+    };
+    cancelled.with_context(|| format!("round {round}: the cancel must commit"))?;
+    if let Err(error) = spawned {
+        let error = format!("{error:#}");
+        anyhow::ensure!(
+            error.contains("spawn rejected"),
+            "round {round}: the spawn failed for a reason other than the cancel: {error}"
+        );
+    }
+    for thread in [&root_thread, &child_thread, &grandchild_thread] {
+        let live: Vec<AgentTaskId> = task_store
+            .list_by_thread(&thread_id(thread))
+            .await?
+            .into_iter()
+            .filter(|task| !task.status.is_terminal())
+            .map(|task| task.id)
+            .collect();
+        anyhow::ensure!(
+            live.is_empty(),
+            "round {round}: rows left live on {thread} after the cancel: {live:?}"
+        );
+    }
+    Ok(())
+}
+
 async fn running_root(
     task_store: &dyn AgentTaskStore,
     tid: &str,
@@ -1493,6 +1604,20 @@ mod in_memory {
     use super::super::fresh_in_memory_stores;
 
     #[tokio::test]
+    async fn settlement_in_memory_nested_spawn_racing_a_cancel_leaves_nothing_live() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        for round in 0..8 {
+            super::race_nested_spawn_against_cancel(
+                s.task.as_ref(),
+                &format!("mem-spawn-cancel-{round}"),
+                round,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn settlement_in_memory_cancel_child_in_every_live_state_wakes_parent() -> Result<()> {
         let s = fresh_in_memory_stores();
         super::test_cancel_child_in_every_live_state_wakes_parent(s.task.as_ref()).await
@@ -1609,6 +1734,20 @@ mod sqlite {
 
     async fn store() -> Result<SqliteDurableStore> {
         SqliteDurableStore::connect("sqlite::memory:").await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_sqlite_nested_spawn_racing_a_cancel_leaves_nothing_live() -> Result<()> {
+        let store = store().await?;
+        for round in 0..8 {
+            super::race_nested_spawn_against_cancel(
+                &store,
+                &format!("sqlite-spawn-cancel-{round}"),
+                round,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1750,6 +1889,7 @@ mod sqlite {
 
 #[cfg(feature = "postgres")]
 mod postgres {
+    use agent_server::journal::SpawnChildrenExt;
     use anyhow::{Context, Result};
     use time::OffsetDateTime;
 
@@ -2043,6 +2183,110 @@ SELECT count(*) AS "blocked!" FROM blocked
             }
         })
         .await
+    }
+
+    /// A nested spawn and a cancel of the whole tree, round after round:
+    /// neither may deadlock (no transition is retried for a lock conflict,
+    /// and the cancel, which is not retried, commits), and nothing stays
+    /// live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_nested_spawn_racing_a_cancel_never_deadlocks() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        for round in 0..RACE_ROUNDS {
+            super::race_nested_spawn_against_cancel(
+                &store,
+                &format!("pg-spawn-cancel-{round}"),
+                round,
+            )
+            .await?;
+        }
+        anyhow::ensure!(
+            store.lock_conflict_retries() == 0,
+            "{} transitions were retried after a lock conflict",
+            store.lock_conflict_retries()
+        );
+        Ok(())
+    }
+
+    /// A spawn retried onto the child thread its first attempt created,
+    /// while a cancel stops the tree. The retry locks the parent's thread
+    /// and that child's; the cancel locks the parent's, walks the tree,
+    /// then locks the child's. The child's thread key sorts before the
+    /// parent's, so a spawn that took its threads in key order would hold
+    /// the child's while it waited for the parent's, which the cancel holds
+    /// while it waits for the child's. Locking the parent's thread first,
+    /// in tree order, the retry queues behind the cancel and is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settlement_postgres_a_spawn_locks_its_parent_thread_before_its_child_threads()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        for round in 0..5 {
+            let parent_thread = format!("pg-tree-order-z-{round}");
+            let child_thread = format!("pg-tree-order-a-{round}");
+            let at = round * 100;
+            let (root, worker, lease) = super::running_root(&store, &parent_thread, at).await?;
+            store
+                .commit_subagent_spawn(super::subagent_spawn(
+                    root.id.clone(),
+                    (worker.clone(), lease.clone()),
+                    &parent_thread,
+                    &child_thread,
+                    at + 2,
+                ))
+                .await?;
+
+            let mut holder = store.pool().begin().await?;
+            let holder_pid = backend_pid(&mut holder).await?;
+            sqlx::query("SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+                .bind(&parent_thread)
+                .fetch_one(&mut *holder)
+                .await?;
+            let cancelling = {
+                let store = store.clone();
+                let root = root.id.clone();
+                tokio::spawn(async move { store.cancel_tree(&root, t_plus(at + 10)).await })
+            };
+            until_sessions_blocked_by(&store, holder_pid, 1).await?;
+            let retrying = {
+                let store = store.clone();
+                let retry = super::subagent_spawn(
+                    root.id.clone(),
+                    (worker, lease),
+                    &parent_thread,
+                    &child_thread,
+                    at + 11,
+                );
+                tokio::spawn(async move { store.commit_subagent_spawn(retry).await })
+            };
+            until_sessions_blocked_by(&store, holder_pid, 2).await?;
+            holder.commit().await?;
+
+            let cancelled = cancelling.await?;
+            let retried = retrying.await?;
+            anyhow::ensure!(
+                cancelled.is_ok(),
+                "round {round}: the cancel failed: {:?}",
+                cancelled.map(|_| ())
+            );
+            let refusal = retried
+                .err()
+                .map(|error| format!("{error:#}"))
+                .context("the retried spawn must be refused")?;
+            anyhow::ensure!(
+                refusal.contains("spawn rejected"),
+                "round {round}: the retry failed for another reason: {refusal}"
+            );
+        }
+        anyhow::ensure!(
+            store.lock_conflict_retries() == 0,
+            "{} transitions were retried after a lock conflict",
+            store.lock_conflict_retries()
+        );
+        Ok(())
     }
 
     /// A suspension waiting on `count` tool calls.

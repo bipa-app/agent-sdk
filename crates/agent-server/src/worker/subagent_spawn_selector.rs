@@ -5,7 +5,7 @@
 //! task plus one child thread. It is exposed as a public helper but
 //! the worker's own root-turn loop never calls it — every tool call
 //! in a turn flows through
-//! [`AgentTaskStore::spawn_tool_children`](crate::journal::store::AgentTaskStore::spawn_tool_children),
+//! [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children),
 //! which always produces [`TaskKind::ToolRuntime`](crate::journal::task::TaskKind::ToolRuntime)
 //! children regardless of the tool name.
 //!
@@ -76,7 +76,7 @@ use crate::journal::task::SubmittedInputItem;
 pub enum SubagentSpawnDecision {
     /// Treat the call as a regular tool-runtime child. The worker
     /// will route it through
-    /// [`AgentTaskStore::spawn_tool_children`](crate::journal::store::AgentTaskStore::spawn_tool_children).
+    /// [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children).
     /// This is the default for every primitive and policy tool.
     SpawnAsTool,
 

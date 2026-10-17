@@ -1,5 +1,5 @@
 //! The write set of one durable subagent spawn, committed by
-//! [`super::store::AgentTaskStore::commit_subagent_spawn`].
+//! [`SpawnChildrenExt::commit_subagent_spawn`](crate::journal::SpawnChildrenExt::commit_subagent_spawn).
 
 use agent_sdk_foundation::events::AgentEvent;
 use anyhow::Result;
@@ -25,6 +25,7 @@ pub struct SubagentSpawnCommit {
 }
 
 /// Event fields known before the store mints the invocation and child-root ids.
+#[derive(Clone, Debug)]
 pub struct SubagentSpawnEvent {
     pub subagent_id: String,
     pub subagent_name: String,

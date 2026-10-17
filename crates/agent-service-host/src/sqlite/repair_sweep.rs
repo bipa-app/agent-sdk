@@ -724,19 +724,18 @@ mod tests {
         store: &SqliteDurableStore,
         seeded: &SeededTurn,
     ) -> Result<agent_server::journal::task::AgentTask> {
-        let (_parent, children) =
-            agent_server::journal::store::AgentTaskStore::spawn_tool_children(
-                store,
-                &seeded.root_id,
-                &worker(),
-                &lease(),
-                vec![agent_server::journal::task::ChildSpawnSpec::new(3)],
-                suspension_payload(&seeded.thread_id, "bash"),
-                None,
-                Vec::new(),
-                t0(),
-            )
-            .await?;
+        let (_parent, children) = agent_server::journal::SpawnChildrenExt::spawn_tool_children(
+            store,
+            &seeded.root_id,
+            &worker(),
+            &lease(),
+            vec![agent_server::journal::task::ChildSpawnSpec::new(3)],
+            suspension_payload(&seeded.thread_id, "bash"),
+            None,
+            Vec::new(),
+            t0(),
+        )
+        .await?;
         children.into_iter().next().context("spawned tool child")
     }
 

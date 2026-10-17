@@ -20,7 +20,7 @@
 //! Child tasks are spawned in the same order as the parent's
 //! [`AgentContinuation::pending_tool_calls`](agent_sdk_foundation::AgentContinuation::pending_tool_calls) array. Each child
 //! carries a `spawn_index` field set during
-//! [`AgentTaskStore::spawn_tool_children`] that records its position
+//! [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children) that records its position
 //! within the batch. The bootstrap step reads this index directly
 //! instead of relying on sibling sort order, making the mapping
 //! correct regardless of the store's `list_children` return order.
@@ -42,7 +42,6 @@
 //! [`TaskState`]: crate::journal::task_state::TaskState
 //! [`PendingToolCallInfo`]: agent_sdk_foundation::PendingToolCallInfo
 //! [`AgentContinuation`]: agent_sdk_foundation::AgentContinuation
-//! [`AgentTaskStore::spawn_tool_children`]: crate::journal::store::AgentTaskStore::spawn_tool_children
 //! [`AgentTaskStore::cancel_tree`]: crate::journal::store::AgentTaskStore::cancel_tree
 //! [`CancellationToken`]: tokio_util::sync::CancellationToken
 
@@ -192,7 +191,7 @@ pub struct ToolTaskBootstrap {
 ///
 /// The child's `spawn_index` field determines which
 /// `PendingToolCallInfo` it owns. This index is set during
-/// [`AgentTaskStore::spawn_tool_children`] and read directly,
+/// [`SpawnChildrenExt::spawn_tool_children`](crate::journal::SpawnChildrenExt::spawn_tool_children) and read directly,
 /// making the mapping independent of `list_children` ordering.
 /// # Errors
 ///

@@ -64,6 +64,7 @@ use super::checkpoint_store::CheckpointStore;
 use super::commit::{CompletedTurnCommit, commit_completed_turn};
 use super::event_repository::EventRepository;
 use super::message_store::MessageProjectionStore;
+use super::spawn_children::SpawnChildrenExt;
 use super::store::AgentTaskStore;
 use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SubmittedInputItem, SuspensionPayload,
@@ -193,11 +194,9 @@ mod in_memory_bundle {
     use crate::journal::message::MessageProjection;
     use crate::journal::recovery::RecoveryRecord;
     use crate::journal::store::{
-        MixedChildrenSpawn, QuestionPause, SpawnedMixedChildren, SubagentInvocationSpawn,
-        SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
+        QuestionPause, SubmitRootTurnError, SubmitRootTurnOutcome, SubmitRootTurnParams,
     };
-    use crate::journal::subagent_spawn_transaction::SubagentSpawnEvent;
-    use crate::journal::task::{ChildSpawnSpec, SuspensionPayload, TaskStatus};
+    use crate::journal::task::{SuspensionPayload, TaskStatus};
     use crate::journal::thread::Thread;
     use crate::journal::turn_attempt::{
         CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId,
@@ -221,12 +220,6 @@ mod in_memory_bundle {
 
     #[async_trait]
     impl AgentTaskStore for InMemoryJournalStore {
-        async fn commit_subagent_spawn(
-            &self,
-            params: crate::journal::SubagentSpawnCommit,
-        ) -> Result<crate::journal::SubagentSpawnOutcome> {
-            self.task.commit_subagent_spawn(params).await
-        }
         async fn commit_completed_turn(
             &self,
             params: crate::journal::CompletedTurnCommit,
@@ -424,76 +417,6 @@ mod in_memory_bundle {
         ) -> Result<AgentTask> {
             self.task
                 .answer_question(task_id, receipt_id, answers, now)
-                .await
-        }
-        #[allow(clippy::too_many_arguments)]
-        async fn spawn_tool_children(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            specs: Vec<ChildSpawnSpec>,
-            payload: SuspensionPayload,
-            child_otel_traceparent: Option<String>,
-            delivered_injection_ids: Vec<AgentTaskId>,
-            now: OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<AgentTask>)> {
-            self.task
-                .spawn_tool_children(
-                    parent_id,
-                    worker,
-                    lease,
-                    specs,
-                    payload,
-                    child_otel_traceparent,
-                    delivered_injection_ids,
-                    now,
-                )
-                .await
-        }
-        async fn spawn_subagent_invocation(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            spawn: SubagentInvocationSpawn,
-            delivered_injection_ids: Vec<AgentTaskId>,
-            now: OffsetDateTime,
-        ) -> Result<(AgentTask, AgentTask, AgentTask)> {
-            self.task
-                .spawn_subagent_invocation(
-                    parent_id,
-                    worker,
-                    lease,
-                    spawn,
-                    delivered_injection_ids,
-                    now,
-                )
-                .await
-        }
-        async fn spawn_subagent_batch(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            batch: crate::journal::store::SubagentBatchSpawn,
-            now: OffsetDateTime,
-        ) -> Result<(AgentTask, Vec<(AgentTask, AgentTask)>, Vec<CommittedEvent>)> {
-            self.task
-                .spawn_subagent_batch(parent_id, worker, lease, batch, now)
-                .await
-        }
-        async fn spawn_mixed_children(
-            &self,
-            parent_id: &AgentTaskId,
-            worker: &WorkerId,
-            lease: &LeaseId,
-            spawn: MixedChildrenSpawn,
-            events: Vec<SubagentSpawnEvent>,
-            now: OffsetDateTime,
-        ) -> Result<SpawnedMixedChildren> {
-            self.task
-                .spawn_mixed_children(parent_id, worker, lease, spawn, events, now)
                 .await
         }
         async fn find_subagent_invocation_for_child_root(
@@ -1182,7 +1105,7 @@ async fn case_mixed_batch_orders_boundary_starts_then_trailing<S: JournalStore>(
         agent_sdk_foundation::ToolTier::Confirm,
     )];
 
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1243,7 +1166,7 @@ async fn case_mixed_batch_orders_boundary_starts_then_trailing<S: JournalStore>(
 async fn case_tool_spawn_rejects_precompleted_spec<S: JournalStore>(store: &S) -> Result<()> {
     let thread = tid("conf-tool-precompleted-rejected");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
-    let rejected = AgentTaskStore::spawn_tool_children(
+    let rejected = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1298,7 +1221,7 @@ async fn case_mixed_batch_spawns_subagents_and_tools<S: JournalStore>(store: &S)
     let payload = suspension_with_pending_tools(&thread, 4);
     let spawn = mixed_batch_spawn(&fixture, payload, &[0, 1], &[2, 3])?;
 
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1413,7 +1336,7 @@ async fn case_precompleted_boundary_is_published_before_spawn_returns<S: Journal
         "call_0", "tool_0", "Tool 0", preflight,
     ));
 
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1457,7 +1380,7 @@ async fn case_precompleted_mixed_child_requires_matching_boundary<S: JournalStor
     spawn.tool_children[0].spec =
         ChildSpawnSpec::new(1).with_precompleted_result(serde_json::to_value(&preflight)?);
 
-    let error = AgentTaskStore::spawn_mixed_children(
+    let error = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1507,7 +1430,7 @@ async fn case_mixed_batch_child_ids_follow_slot_order<S: JournalStore>(store: &S
     let payload = suspension_with_pending_tools(&thread, 4);
     let spawn = mixed_batch_spawn(&fixture, payload, &[1, 3], &[0, 2])?;
 
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1577,7 +1500,7 @@ async fn case_mixed_batch_losing_cas_spawns_nothing<S: JournalStore>(store: &S) 
     let stale_lease = LeaseId::new();
     let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
 
-    let rejected = AgentTaskStore::spawn_mixed_children(
+    let rejected = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1628,7 +1551,7 @@ async fn case_mixed_batch_rejects_cancelled_parent<S: JournalStore>(store: &S) -
     AgentTaskStore::cancel_tree(store, &fixture.parent_id, t_plus(2)).await?;
 
     let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
-    let rejected = AgentTaskStore::spawn_mixed_children(
+    let rejected = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1674,7 +1597,7 @@ async fn case_mixed_batch_rejects_uncovered_slot<S: JournalStore>(store: &S) -> 
     let payload = suspension_with_pending_tools(&thread, 3);
     let spawn = mixed_batch_spawn(&fixture, payload, &[0], &[1])?;
 
-    let rejected = AgentTaskStore::spawn_mixed_children(
+    let rejected = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1719,7 +1642,7 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
     let mut first_suspension = empty_suspension(&thread);
     first_suspension.child_join_policy = crate::ChildJoinPolicy::Any;
-    let (_parked, first_children) = AgentTaskStore::spawn_tool_children(
+    let (_parked, first_children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -1782,7 +1705,7 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
         payload: suspension_with_pending_tools(&thread, 2),
         child_otel_traceparent: None,
     };
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &resumed_worker,
@@ -2032,7 +1955,7 @@ async fn finish_claimed<S: AgentTaskStore + ?Sized>(
 async fn case_ordered_tool_children_run_in_batch_order<S: JournalStore>(store: &S) -> Result<()> {
     let thread = tid("conf-ordered-tool-children");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2124,7 +2047,7 @@ async fn case_ordered_mixed_batch_holds_only_tool_children<S: JournalStore>(
             tool.spec = ChildSpawnSpec::new(3).after_siblings(vec![0]);
         }
     }
-    let spawned = AgentTaskStore::spawn_mixed_children(
+    let spawned = SpawnChildrenExt::spawn_mixed_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2173,7 +2096,7 @@ async fn case_ordered_mixed_batch_holds_only_tool_children<S: JournalStore>(
 async fn case_a_waiting_child_needs_no_release_write<S: JournalStore>(store: &S) -> Result<()> {
     let thread = tid("conf-ordered-no-release-write");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2237,7 +2160,7 @@ async fn park_held_behind_running_sibling<S: JournalStore>(
     at: OffsetDateTime,
 ) -> Result<(AgentTaskId, AgentTask, AgentTask)> {
     let fixture = mixed_batch_fixture(store, thread, 0).await?;
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2290,7 +2213,7 @@ async fn case_a_held_backlog_never_hides_ready_work<S: JournalStore>(store: &S) 
 
     let thread = tid("conf-held-backlog-ready");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
-    let (_parent, ready) = AgentTaskStore::spawn_tool_children(
+    let (_parent, ready) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2357,7 +2280,7 @@ async fn case_a_held_backlog_never_hides_ready_work<S: JournalStore>(store: &S) 
 async fn case_cancel_tree_cancels_held_tool_children<S: JournalStore>(store: &S) -> Result<()> {
     let thread = tid("conf-ordered-cancel");
     let fixture = mixed_batch_fixture(store, &thread, 0).await?;
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &fixture.parent_id,
         &fixture.worker,
@@ -2556,7 +2479,7 @@ async fn case_delete_cascades_main_to_subkeys<S: JournalStore>(store: &S) -> Res
     )
     .await?;
 
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &root.id,
         &worker,
@@ -2639,7 +2562,7 @@ async fn case_subkey_vs_main_count_separation<S: JournalStore>(store: &S) -> Res
         t_plus(2),
     )
     .await?;
-    let (_parent, children) = AgentTaskStore::spawn_tool_children(
+    let (_parent, children) = SpawnChildrenExt::spawn_tool_children(
         store,
         &root.id,
         &worker,

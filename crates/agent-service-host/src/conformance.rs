@@ -41,6 +41,7 @@
 
 #[cfg(test)]
 mod tests {
+    use agent_server::journal::SpawnChildrenExt;
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
