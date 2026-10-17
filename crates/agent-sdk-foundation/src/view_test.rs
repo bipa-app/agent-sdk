@@ -270,7 +270,7 @@ fn view_of(events: &[AgentEvent]) -> ThreadView {
         events
             .iter()
             .enumerate()
-            .map(|(i, event)| (i as u64 + 1, at, event)),
+            .map(|(i, event)| (i as u64, at, event)),
         &config(),
     )
 }
@@ -293,7 +293,7 @@ fn tool_state(view: &ThreadView, key: &str) -> Result<ToolState, String> {
 fn every_variant_advances_the_sequence_and_ends_with_the_status() -> Result<(), String> {
     let mut status = ThreadViewStatus::default();
     for (i, event) in every_variant().iter().enumerate() {
-        let sequence = i as u64 + 1;
+        let sequence = i as u64;
         let (next, ops) = fold(
             &status,
             sequence,
@@ -301,7 +301,7 @@ fn every_variant_advances_the_sequence_and_ends_with_the_status() -> Result<(), 
             event,
             &config(),
         );
-        assert_eq!(next.sequence, sequence);
+        assert_eq!(next.sequence, Some(sequence));
         assert_eq!(next.schema, VIEW_SCHEMA);
         match ops.last() {
             Some(ViewOp::SetStatus { status: last }) => assert_eq!(**last, next),
@@ -802,7 +802,7 @@ proptest! {
             serde_json::from_str(&snapshot_json).map_err(|e| TestCaseError::fail(e.to_string()))?;
         let mut store = prefix;
         for (offset, event) in events[split..].iter().enumerate() {
-            let sequence = (split + offset) as u64 + 1;
+            let sequence = (split + offset) as u64;
             let was_running = store.status.turn != TurnState::Idle;
             let ops = store.fold(sequence, at, event, &config);
             let wire = serde_json::to_string(&ops).map_err(|e| TestCaseError::fail(e.to_string()))?;
@@ -852,7 +852,7 @@ proptest! {
         }
         let mut store = prefix;
         for (offset, event) in events[split..].iter().enumerate() {
-            let sequence = (split + offset) as u64 + 1;
+            let sequence = (split + offset) as u64;
             for op in store.fold(sequence, at, event, &config) {
                 client.apply(&op);
             }
@@ -893,7 +893,7 @@ proptest! {
         let full = view_of(&events);
         let mut again = full.clone();
         for (offset, event) in events[replay_from..].iter().enumerate() {
-            let sequence = (replay_from + offset) as u64 + 1;
+            let sequence = (replay_from + offset) as u64;
             let ops = again.fold(sequence, OffsetDateTime::UNIX_EPOCH, event, &config());
             prop_assert_eq!(ops.len(), 0);
         }
@@ -916,7 +916,7 @@ fn a_view_without_its_oldest_item_gives_a_new_item_the_next_index() {
         text("m3", "c"),
     ]);
     view.items.remove("msg:m1");
-    view.fold(5, OffsetDateTime::UNIX_EPOCH, &text("m4", "d"), &config());
+    view.fold(4, OffsetDateTime::UNIX_EPOCH, &text("m4", "d"), &config());
     let index = |key: &str| view.items.get(key).map(|indexed| indexed.index);
     assert_eq!(index("msg:m3"), Some(2));
     assert_eq!(index("msg:m4"), Some(3));
@@ -928,11 +928,11 @@ fn an_event_at_or_below_the_folded_sequence_is_a_no_op() {
     let at = OffsetDateTime::UNIX_EPOCH;
     let mut view = view_of(&[start("root-a"), delta("m1", "ab"), done()]);
     let before = view.clone();
-    assert_eq!(view.fold(2, at, &delta("m1", "ab"), &config()).len(), 0);
-    assert_eq!(view.fold(1, at, &start("root-a"), &config()).len(), 0);
-    assert_eq!(view.fold(3, at, &done(), &config()).len(), 0);
+    assert_eq!(view.fold(1, at, &delta("m1", "ab"), &config()).len(), 0);
+    assert_eq!(view.fold(0, at, &start("root-a"), &config()).len(), 0);
+    assert_eq!(view.fold(2, at, &done(), &config()).len(), 0);
     assert_eq!(view, before);
-    assert_eq!(view.status.sequence, 3);
+    assert_eq!(view.status.sequence, Some(2));
     assert_eq!(view.status.turn, TurnState::Idle);
 }
 
@@ -941,7 +941,7 @@ fn a_gap_in_the_sequence_is_folded() {
     let mut view = view_of(&[start("root-a")]);
     let ops = view.fold(9, OffsetDateTime::UNIX_EPOCH, &done(), &config());
     assert!(matches!(ops.last(), Some(ViewOp::SetStatus { .. })));
-    assert_eq!(view.status.sequence, 9);
+    assert_eq!(view.status.sequence, Some(9));
     assert_eq!(view.status.turn, TurnState::Idle);
 }
 
@@ -963,7 +963,7 @@ fn a_terminal_error_after_the_turn_ended_keeps_the_outcome() {
             .count(),
         1
     );
-    assert!(view.items.contains_key("error:3"));
+    assert!(view.items.contains_key("error:2"));
 }
 
 #[test]
@@ -1013,4 +1013,22 @@ fn questions_and_refusals_stay_out_of_the_closed_window() {
         },
     ]);
     assert_eq!(view.status.recently_closed.len(), 0);
+}
+
+#[test]
+fn the_first_committed_sequence_is_zero_and_folds_once() {
+    let at = OffsetDateTime::UNIX_EPOCH;
+    let mut view = ThreadView::default();
+    view.fold(0, at, &start("root-a"), &config());
+    let after_first = view.clone();
+    assert_eq!(view.fold(0, at, &start("root-a"), &config()).len(), 0);
+    assert_eq!(view, after_first);
+    view.fold(1, at, &delta("m1", "ab"), &config());
+    assert_eq!(view.fold(0, at, &start("root-a"), &config()).len(), 0);
+    assert_eq!(view.fold(1, at, &delta("m1", "ab"), &config()).len(), 0);
+    assert!(matches!(
+        view.items.get("msg:m1").map(|indexed| &indexed.item),
+        Some(ViewItem::Text { text, open: true, .. }) if text == "ab"
+    ));
+    assert_eq!(view.status.sequence, Some(1));
 }

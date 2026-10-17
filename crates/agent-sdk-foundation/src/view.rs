@@ -161,8 +161,10 @@ pub struct PendingConfirmation {
 pub struct ThreadViewStatus {
     /// The [`VIEW_SCHEMA`] the status was folded with.
     pub schema: u32,
-    /// Sequence of the last event folded.
-    pub sequence: u64,
+    /// Sequence of the last event folded; `None` before the first.
+    /// Committed sequences start at 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
     pub turn: TurnState,
     /// How the last turn ended; cleared when the next one starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,7 +199,7 @@ impl Default for ThreadViewStatus {
     fn default() -> Self {
         Self {
             schema: VIEW_SCHEMA,
-            sequence: 0,
+            sequence: None,
             turn: TurnState::Idle,
             last_outcome: None,
             open_messages: Vec::new(),
@@ -465,7 +467,7 @@ pub fn fold(
     event: &AgentEvent,
     config: &ViewConfig,
 ) -> (ThreadViewStatus, Vec<ViewOp>) {
-    if status.sequence > 0 && sequence <= status.sequence {
+    if status.sequence.is_some_and(|folded| sequence <= folded) {
         return (status.clone(), Vec::new());
     }
     let mut step = Step {
@@ -474,7 +476,7 @@ pub fn fold(
         sequence,
     };
     step.status.schema = VIEW_SCHEMA;
-    step.status.sequence = sequence;
+    step.status.sequence = Some(sequence);
     step.status.stalled = false;
     step.apply(at, event, config);
     let status = step.status;
