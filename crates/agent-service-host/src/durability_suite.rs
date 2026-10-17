@@ -410,7 +410,10 @@ mod tests {
         // The orphaned child lease must be reclaimed: the recovery matrix
         // requeues it (budget remains) so a fresh worker can finish it.
         let records = store
-            .release_expired_leases(t_plus(100))
+            .release_expired_leases(
+                t_plus(100),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
             .await
             .context("lease-expiry sweep after reopen")?;
         let child_record = records
@@ -611,7 +614,12 @@ mod tests {
             .context("child must survive restart")?;
         assert_eq!(recovered_child.status, TaskStatus::Running);
 
-        let records = store.release_expired_leases(t_plus(100)).await?;
+        let records = store
+            .release_expired_leases(
+                t_plus(100),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         let child_record = records
             .iter()
             .find(|r| r.id == child_id)

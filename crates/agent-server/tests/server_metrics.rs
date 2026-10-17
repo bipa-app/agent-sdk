@@ -799,3 +799,118 @@ async fn effect_signals_count_each_transition_by_kind() -> Result<()> {
     );
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// fence.refused counts each refused writer by thread status
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_fence_refusal_is_counted_by_writer_and_status() -> Result<()> {
+    use agent_server::journal::Fence;
+    use agent_server::journal::thread::{
+        FencedWriter, PurgeScope, PurgeSeed, Thread, record_fence_refusal,
+    };
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let thread_id = ThreadId::from_string("fenced-thread");
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let deleting = Thread::new(thread_id.clone(), now).begin_purge(PurgeSeed {
+        root_thread_id: thread_id.clone(),
+        scope: PurgeScope::Thread,
+        started_at: now,
+    });
+
+    for writer in [FencedWriter::MessageHead, FencedWriter::PauseOnQuestion] {
+        let refused = Fence::APPEND.check(&thread_id, Some(&deleting));
+        assert!(record_fence_refusal(writer, refused).is_err());
+    }
+    assert!(
+        record_fence_refusal(
+            FencedWriter::ForkSource,
+            Fence::FORK_SOURCE.check(&thread_id, None)
+        )
+        .is_ok()
+    );
+    assert!(
+        record_fence_refusal(
+            FencedWriter::RequeueOwnedTask,
+            Err(anyhow::anyhow!("not a fence"))
+        )
+        .is_err()
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.fence.refused");
+    let total: u64 = counts.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, 2, "only the fence's own refusals count: {counts:?}");
+    for writer in ["message_head", "pause_on_question"] {
+        assert!(
+            counts
+                .iter()
+                .any(|(s, _)| has_label(s, attrs::WRITER, writer)
+                    && has_label(s, attrs::THREAD_STATUS, "deleting")),
+            "{writer}: {counts:?}"
+        );
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// tasks.lease_expired carries the reclaim scope
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_lease_reclaim_is_counted_with_its_scope() -> Result<()> {
+    use agent_server::journal::{EpochId, LeaseRecoveryScope};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+    metrics.record_lease_expiry_outcomes(&[RecoveryRecord::requeued(AgentTaskId::from_string(
+        "swept",
+    ))]);
+    metrics.record_lease_reclaim(
+        &[
+            RecoveryRecord::requeued(AgentTaskId::from_string("reclaimed")),
+            RecoveryRecord::failed_closed(
+                AgentTaskId::from_string("at-budget"),
+                FailureReason::LeaseExpiredBudgetExhausted,
+            ),
+        ],
+        &LeaseRecoveryScope::ForeignEpoch(EpochId::from_string("epoch-b")),
+    );
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.tasks.lease_expired");
+    let scoped = |scope: &str| -> u64 {
+        counts
+            .iter()
+            .filter(|(s, _)| has_label(s, attrs::SCOPE, scope))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    assert_eq!(scoped("expired"), 1, "{counts:?}");
+    assert_eq!(scoped("foreign_epoch"), 2, "{counts:?}");
+
+    let reclaims = collect_u64_counter(&snapshots, "agent_server.epoch.reclaims");
+    let reclaimed = |scope: &str, action: &str| -> u64 {
+        reclaims
+            .iter()
+            .filter(|(s, _)| {
+                has_label(s, attrs::SCOPE, scope) && has_label(s, attrs::ACTION, action)
+            })
+            .map(|(_, v)| v)
+            .sum()
+    };
+    assert_eq!(reclaimed("expired", "requeued"), 1, "{reclaims:?}");
+    assert_eq!(reclaimed("foreign_epoch", "requeued"), 1, "{reclaims:?}");
+    assert_eq!(
+        reclaimed("foreign_epoch", "failed_interrupted"),
+        1,
+        "{reclaims:?}"
+    );
+    Ok(())
+}

@@ -231,6 +231,10 @@ pub enum RecoveryContext {
     /// to release the row's lease and has to decide whether to
     /// requeue it or fail it closed.
     ExpiredLease,
+    /// A host that is the sole process on its store started a new epoch
+    /// and reclaims a lease an older process granted. The process that
+    /// held it is gone, so the row is decided as an expired lease is.
+    EpochChanged,
 }
 
 /// What Phase 2.5 has decided to do with a row after consulting
@@ -408,7 +412,7 @@ pub fn classify_recovery(task: &AgentTask, context: RecoveryContext) -> Recovery
         // does not break the row's invariants) eventually exhausts the
         // budget and gets a deterministic fail-closed transition
         // instead of bouncing through requeue → re-acquire forever.
-        (RecoveryContext::ExpiredLease, TaskStatus::Running) => {
+        (RecoveryContext::ExpiredLease | RecoveryContext::EpochChanged, TaskStatus::Running) => {
             if task.is_budget_exhausted() {
                 RecoveryAction::FailClosed(FailureReason::LeaseExpiredBudgetExhausted)
             } else {
@@ -813,6 +817,39 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// A lease an older epoch granted is decided exactly as an expired
+    /// one, for every row the matrix knows.
+    #[test]
+    fn an_epoch_change_classifies_every_row_as_an_expired_lease() -> Result<()> {
+        let mut rows = vec![
+            root_in_status(TaskStatus::Pending, 2, 2)?,
+            root_in_status(TaskStatus::Running, 3, 0)?,
+            root_in_status(TaskStatus::Running, 1, 0)?,
+            root_in_status(TaskStatus::AwaitingConfirmation, 3, 0)?,
+            root_in_status(TaskStatus::WaitingOnChildren, 3, 0)?,
+            root_in_status(TaskStatus::Queued, 3, 0)?,
+            tool_child_in_awaiting_confirmation(Some(sample_prepared_op())),
+            tool_child_in_awaiting_confirmation(None),
+        ];
+        for status in [
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            rows.push(root_in_status(status, 3, 0)?);
+        }
+        for row in &rows {
+            assert_eq!(
+                classify_recovery(row, RecoveryContext::EpochChanged),
+                classify_recovery(row, RecoveryContext::ExpiredLease),
+                "{:?} {:?}",
+                row.kind,
+                row.status,
+            );
+        }
         Ok(())
     }
 

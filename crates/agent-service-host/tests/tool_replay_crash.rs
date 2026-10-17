@@ -320,7 +320,9 @@ async fn recover(
     task_id: &AgentTaskId,
     runs: &AtomicUsize,
 ) -> Result<ToolTaskOutcome> {
-    let records = store.release_expired_leases(at(601)).await?;
+    let records = store
+        .release_expired_leases(at(601), agent_server::journal::LeaseRecoveryScope::Expired)
+        .await?;
     ensure!(
         records
             .iter()

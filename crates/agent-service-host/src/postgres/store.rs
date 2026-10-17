@@ -38,6 +38,7 @@ use agent_server::journal::commit::{
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::effect::{EffectKey, EffectRecord, EffectRow, EffectState, EffectWrite};
+use agent_server::journal::epoch::{EpochId, LeaseRecoveryScope};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -148,6 +149,9 @@ pub struct PostgresDurableStore {
     pool: PgPool,
     held_probe: HeldProbe<HeldKey>,
     lock_conflict_retries: Arc<AtomicU64>,
+    /// The epoch the newest committed `Write::BeginEpoch` began; every
+    /// lease this store grants after it records it.
+    current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
 }
 
 impl PostgresDurableStore {
@@ -187,6 +191,7 @@ impl PostgresDurableStore {
             pool,
             held_probe: HeldProbe::default(),
             lock_conflict_retries: Arc::default(),
+            current_epoch: Arc::default(),
         }
     }
 
@@ -360,11 +365,7 @@ RETURNING thread_id
         retained_message_count: usize,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
-        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
-        Self::lock_thread_tx(tx, thread_id)
-            .await?
-            .context("thread missing after compaction bootstrap")?
-            .require_active(ThreadOperation::Append)?;
+        Self::bootstrap_appendable_thread_tx(tx, thread_id, now).await?;
         let projection = Self::lock_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -467,6 +468,196 @@ FOR UPDATE
         .await
         .with_context(|| format!("lock thread {thread_id}"))?;
         record.map(TryInto::try_into).transpose()
+    }
+
+    /// Up to [`agent_server::journal::store::LEASE_RELEASE_BATCH`] running
+    /// rows `scope` reclaims at `now`, in expiry order, locked and skipping
+    /// rows another sweep holds.
+    async fn load_reclaimable_leases_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        scope: &LeaseRecoveryScope,
+        now: OffsetDateTime,
+    ) -> Result<Vec<TaskRecord>> {
+        let batch =
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX);
+        let rows = match scope {
+            LeaseRecoveryScope::Expired => sqlx::query_as!(
+                TaskRecord,
+                r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
+FROM agent_sdk_tasks
+WHERE status = 'running'
+  AND lease_expires_at <= $1
+ORDER BY lease_expires_at, id
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+",
+                now,
+                batch,
+            )
+            .fetch_all(&mut **tx)
+            .await
+            .context("load expired leases")?,
+            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as::<_, TaskRecord>(
+                r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
+FROM agent_sdk_tasks
+WHERE status = 'running'
+  AND lease_epoch IS DISTINCT FROM $1
+ORDER BY lease_expires_at, id
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+",
+            )
+            .bind(epoch.as_str())
+            .bind(batch)
+            .fetch_all(&mut **tx)
+            .await
+            .context("load leases of older epochs")?,
+        };
+        Ok(rows)
+    }
+
+    /// The epoch new leases record, if one has begun.
+    fn current_epoch(&self) -> Option<EpochId> {
+        self.current_epoch.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |epoch| epoch.clone(),
+        )
+    }
+
+    fn set_current_epoch(&self, epoch: EpochId) {
+        let mut current = self
+            .current_epoch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(epoch);
+    }
+
+    async fn insert_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        record: &agent_server::journal::EpochRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES ($1, $2, $3)",
+        )
+        .bind(record.id.as_str())
+        .bind(record.started_at)
+        .bind(record.label.as_deref())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("begin epoch {}", record.id))?;
+        Ok(())
+    }
+
+    /// The epoch `task`'s lease was granted under, read under the row's
+    /// lock.
+    async fn load_lease_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTaskId,
+    ) -> Result<Option<EpochId>> {
+        let epoch: Option<Option<String>> =
+            sqlx::query_scalar("SELECT lease_epoch FROM agent_sdk_tasks WHERE id = $1")
+                .bind(task.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .with_context(|| format!("load the lease epoch of {task}"))?;
+        Ok(epoch.flatten().map(EpochId::from_string))
+    }
+
+    /// Record that `task`'s new lease was granted under `epoch`.
+    async fn stamp_lease_epoch_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTaskId,
+        epoch: Option<&EpochId>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = $1 WHERE id = $2")
+            .bind(epoch.map(EpochId::as_str))
+            .bind(task.as_str())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("stamp the lease epoch of {task}"))?;
+        Ok(())
+    }
+
+    async fn require_appendable_thread_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        writer: agent_server::journal::thread::FencedWriter,
+    ) -> Result<()> {
+        let thread = Self::lock_thread_tx(tx, thread_id).await?;
+        crate::fence_signal::fence_refused(
+            writer,
+            agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref()),
+        )
+    }
+
+    async fn bootstrap_appendable_thread_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::MessageHead,
+            Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append)
+                .await
+                .map(|_| ()),
+        )
     }
 
     async fn require_active_thread_tx(
@@ -1883,6 +2074,8 @@ WHERE id = ANY($1::text[])
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
                     Self::update_task_tx(&mut tx, &claimed).await?;
+                    Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref())
+                        .await?;
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
@@ -2542,17 +2735,13 @@ WHERE parent_id = $1
     async fn fail_close_expired_roots(
         &self,
         roots: Vec<AgentTaskId>,
+        scope: &LeaseRecoveryScope,
         now: OffsetDateTime,
         released: &mut Vec<RecoveryRecord>,
     ) {
         for id in roots {
             match self
-                .fail_closed_root_thread_first(
-                    &id,
-                    RecoveryContext::ExpiredLease,
-                    now,
-                    "release_expired_leases",
-                )
+                .fail_closed_root_thread_first(&id, scope.context(), now, "release_expired_leases")
                 .await
             {
                 Ok(Some((reason, settled))) => {
@@ -2623,6 +2812,10 @@ WHERE parent_id = $1
             RecoveryContext::ExpiredLease => {
                 old.status == TaskStatus::Running
                     && old.lease_expires_at.is_some_and(|expiry| expiry <= now)
+            }
+            RecoveryContext::EpochChanged => {
+                old.status == TaskStatus::Running
+                    && Self::load_lease_epoch_tx(&mut tx, &old.id).await? != self.current_epoch()
             }
         };
         let action = if still_eligible {
@@ -3421,6 +3614,13 @@ FOR UPDATE
     ) -> Result<ThreadCreationOutcome> {
         let mut tx = self.begin().await?;
 
+        let source = Self::lock_thread_tx(&mut tx, &params.source_thread_id).await?;
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::ForkSource,
+            agent_server::journal::Fence::FORK_SOURCE
+                .check(&params.source_thread_id, source.as_ref()),
+        )?;
+
         // Claim caller-minted destinations by primary key inside the same
         // transaction as the fork copy. Matching retries are no-ops; a
         // conflicting origin is typed and rolls back without mutation.
@@ -4143,7 +4343,14 @@ impl PostgresDurableStore {
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
                 }
-                result => return result,
+                result => {
+                    if result.is_ok()
+                        && let Some(record) = transition.begun_epochs().last()
+                    {
+                        self.set_current_epoch(record.id.clone());
+                    }
+                    return result;
+                }
             }
         }
     }
@@ -4406,6 +4613,7 @@ impl PostgresDurableStore {
                 Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
                 agent_server::fail_point!("effect.finish_written");
             }
+            Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
@@ -5476,6 +5684,7 @@ ORDER BY created_at, id
             .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
+        Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref()).await?;
         tx.commit().await.context("commit try_acquire_task")?;
         Ok(Some(claimed))
     }
@@ -5621,52 +5830,19 @@ RETURNING
         })
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>> {
+        if let LeaseRecoveryScope::ForeignEpoch(epoch) = &scope {
+            ensure!(
+                self.current_epoch().as_ref() == Some(epoch),
+                "release_expired_leases: epoch {epoch} is not the epoch this store began"
+            );
+        }
         let mut tx = self.begin().await?;
-        let expired = sqlx::query_as!(
-            TaskRecord,
-            r"
-SELECT
-    id,
-    kind,
-    status,
-    parent_id,
-    root_id,
-    depth,
-    thread_id,
-    submitted_input_json,
-    caller_metadata_json,
-    worker_id,
-    lease_id,
-    lease_expires_at,
-    last_heartbeat_at,
-    state_json,
-    attempt,
-    max_attempts,
-    last_error,
-    terminal_reason_json,
-    pending_child_count,
-    spawn_index,
-    result_payload,
-    otel_traceparent,
-    created_at,
-    updated_at,
-    completed_at,
-    last_activity_at,
-    after_siblings_json
-FROM agent_sdk_tasks
-WHERE status = 'running'
-  AND lease_expires_at <= $1
-ORDER BY lease_expires_at, id
-LIMIT $2
-FOR UPDATE SKIP LOCKED
-",
-            now,
-            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX),
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .context("load expired leases")?;
+        let expired = Self::load_reclaimable_leases_tx(&mut tx, &scope, now).await?;
 
         let mut released = Vec::with_capacity(expired.len());
         let mut exhausted_roots = Vec::new();
@@ -5679,7 +5855,7 @@ FOR UPDATE SKIP LOCKED
                     old.id
                 ));
             }
-            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+            let record = match classify_recovery(&old, scope.context()) {
                 RecoveryAction::Requeue => {
                     let released_row = old
                         .clone()
@@ -5713,7 +5889,7 @@ FOR UPDATE SKIP LOCKED
 
         // The batch locked these roots before their threads; journaling
         // their terminal events needs thread → task order.
-        self.fail_close_expired_roots(exhausted_roots, now, &mut released)
+        self.fail_close_expired_roots(exhausted_roots, &scope, now, &mut released)
             .await;
         Ok(released)
     }
@@ -5763,6 +5939,12 @@ FOR UPDATE SKIP LOCKED
         // allocation re-locks the thread row held above — no new lock
         // edge.
         if let Some(event) = boundary {
+            Self::require_appendable_thread_tx(
+                &mut tx,
+                &old.thread_id,
+                agent_server::journal::thread::FencedWriter::RequeueOwnedTask,
+            )
+            .await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
             let committed =
                 Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
@@ -5936,6 +6118,12 @@ FOR UPDATE SKIP LOCKED
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            &paused.thread_id,
+            agent_server::journal::thread::FencedWriter::PauseOnQuestion,
+        )
+        .await?;
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
@@ -6504,7 +6692,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_committed(messages, now)?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -6519,7 +6707,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -6557,7 +6745,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_repair(
             repair_messages,
@@ -6577,7 +6765,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::lock_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.set_draft(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -6590,14 +6778,41 @@ impl MessageProjectionStore for PostgresDurableStore {
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<Option<MessageProjection>> {
-        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+        let mut tx = self.begin().await?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            thread_id,
+            agent_server::journal::thread::FencedWriter::MessageHead,
+        )
+        .await?;
+        let record = sqlx::query_as::<_, MessageHeadRecord>(
+            r"
+SELECT
+    thread_id,
+    history_json,
+    draft_messages_json,
+    compactions_json,
+    history_generation,
+    version,
+    created_at,
+    updated_at
+FROM agent_sdk_message_heads
+WHERE thread_id = $1
+FOR UPDATE
+",
+        )
+        .bind(thread_key(thread_id))
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| format!("lock message head {thread_id} to clear its draft"))?;
+        let Some(record) = record else {
             // No projection row exists yet — nothing to clear.
             // Mirror the SQLite path: the commit helper short-
             // circuits on first-turn happy paths.
             return Ok(None);
         };
+        let projection: MessageProjection = record.try_into()?;
         let updated = projection.clear_draft(now);
-        let mut tx = self.begin().await?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit clear_draft")?;
         Ok(Some(updated))
@@ -9293,7 +9508,12 @@ INSERT INTO agent_sdk_turn_attempts (
         let _scenario = fail::FailScenario::setup();
         fail::cfg("fail_closed_root_thread_first", "1*off->return")
             .map_err(|error| anyhow::anyhow!("configure fail-close failpoint: {error}"))?;
-        let swept = store.release_expired_leases(t_plus(100)).await;
+        let swept = store
+            .release_expired_leases(
+                t_plus(100),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await;
         fail::remove("fail_closed_root_thread_first");
 
         let swept = swept?;
@@ -9312,7 +9532,12 @@ INSERT INTO agent_sdk_turn_attempts (
         assert_eq!(status(first.clone()).await?, TaskStatus::Failed);
         assert_eq!(status(second.clone()).await?, TaskStatus::Running);
 
-        let retried = store.release_expired_leases(t_plus(101)).await?;
+        let retried = store
+            .release_expired_leases(
+                t_plus(101),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         let ids: Vec<&AgentTaskId> = retried.iter().map(|record| &record.id).collect();
         assert_eq!(
             ids,
@@ -10971,6 +11196,7 @@ ON CONFLICT (thread_id) DO UPDATE SET
             .map_err(|error| anyhow::anyhow!("configure fork failpoint: {error}"))?;
         let forked = thread_id("00000000-0000-4000-8000-0000000fa1c1");
         let crashed = std::panic::AssertUnwindSafe(store.commit_fork(ForkCommitParams {
+            source_thread_id: thread_id("00000000-0000-4000-8000-0000000fa1c0"),
             creation: None,
             new_thread_id: forked.clone(),
             now: t_plus(1),

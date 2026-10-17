@@ -101,10 +101,19 @@ pub mod attrs {
     pub const RELAY_OUTCOME: &str = "outcome";
     /// Lease-expiry reason: `requeued` / `<failure_reason>`.
     pub const REASON: &str = "reason";
+    /// What a lease reclaim did with a row: `requeued` or
+    /// `failed_interrupted` (failed closed).
+    pub const ACTION: &str = "action";
+    pub const ACTION_REQUEUED: &str = "requeued";
+    pub const ACTION_FAILED_INTERRUPTED: &str = "failed_interrupted";
     /// Tool audit event outcome: discriminant of [`ToolAuditEventKind`](crate::journal::tool_audit::ToolAuditEventKind).
     pub const AUDIT_OUTCOME: &str = "outcome";
     /// Tool effect class on audit events.
     pub const EFFECT_CLASS: &str = "effect_class";
+    /// A write the purge fence refused: the label of a [`FencedWriter`](crate::journal::thread::FencedWriter).
+    pub const WRITER: &str = "writer";
+    /// Thread lifecycle status: the label of a [`ThreadStatus`](crate::journal::thread::ThreadStatus).
+    pub const THREAD_STATUS: &str = "thread_status";
     /// What happened to an effect (`agent_server.effects`).
     pub const TRANSITION: &str = "transition";
     /// Span-only: the kind of the effect an `effect.run` span runs.
@@ -140,7 +149,9 @@ pub mod attrs {
 
     /// Store backend of a transition: `memory` / `sqlite` / `postgres`.
     pub const BACKEND: &str = "backend";
-    /// Document scope kind: `host` / `thread` / `task`.
+    /// Document scope kind: `host` / `thread` / `task`; on lease reclaims,
+    /// which leases were taken: `expired` (the sweep) or `foreign_epoch`
+    /// (a single host's start-up reclaim).
     pub const SCOPE: &str = "scope";
     /// Document operation as committed: `put`, or `retire` (a retire of a
     /// document that was not live included).
@@ -182,6 +193,7 @@ pub struct ServerMetrics {
     pub(crate) tasks_acquired: Counter<u64>,
     pub(crate) tasks_execution_duration: Histogram<f64>,
     pub(crate) tasks_lease_expired: Counter<u64>,
+    pub(crate) epoch_reclaims: Counter<u64>,
     pub(crate) journal_commit_duration: Histogram<f64>,
     pub(crate) relay_tick: Counter<u64>,
     pub(crate) wakeup_fallback_sweep: Counter<u64>,
@@ -195,6 +207,9 @@ pub struct ServerMetrics {
     /// `agent_server.effect.duration`: started to finished, by kind and
     /// the state it finished in.
     pub(crate) effect_duration: Histogram<f64>,
+    /// `agent_server.fence.refused`: writes outside a transition the purge
+    /// fence refused, by writer and thread status.
+    pub(crate) fence_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -305,15 +320,60 @@ impl ServerMetrics {
     /// (`error_prefix` from [`FailureReason`]). `NoAction` rows are
     /// not counted because the sweep does not actually touch them.
     pub fn record_lease_expiry_outcomes(&self, records: &[RecoveryRecord]) {
+        self.record_lease_reclaim(records, &crate::journal::LeaseRecoveryScope::Expired);
+    }
+
+    /// [`Self::record_lease_expiry_outcomes`] for the rows one
+    /// `release_expired_leases(.., scope)` call reclaimed, with the
+    /// `scope` label (`expired` or `foreign_epoch`).
+    pub fn record_lease_reclaim(
+        &self,
+        records: &[RecoveryRecord],
+        scope: &crate::journal::LeaseRecoveryScope,
+    ) {
         for record in records {
             let reason = match record.action {
                 RecoveryAction::Requeue => attrs::REASON_REQUEUED,
                 RecoveryAction::FailClosed(reason) => failure_reason_label(reason),
                 RecoveryAction::NoAction => continue,
             };
-            self.tasks_lease_expired
-                .add(1, &[KeyValue::new(attrs::REASON, reason)]);
+            self.tasks_lease_expired.add(
+                1,
+                &[
+                    KeyValue::new(attrs::REASON, reason),
+                    KeyValue::new(attrs::SCOPE, scope.as_str()),
+                ],
+            );
+            let action = match record.action {
+                RecoveryAction::Requeue => attrs::ACTION_REQUEUED,
+                RecoveryAction::FailClosed(_) => attrs::ACTION_FAILED_INTERRUPTED,
+                RecoveryAction::NoAction => continue,
+            };
+            self.epoch_reclaims.add(
+                1,
+                &[
+                    KeyValue::new(attrs::SCOPE, scope.as_str()),
+                    KeyValue::new(attrs::ACTION, action),
+                ],
+            );
         }
+    }
+
+    /// Record one `agent_server.fence.refused` increment for `writer`
+    /// refused on `conflict`'s thread status. The thread id is not a label
+    /// (unbounded cardinality).
+    pub fn record_fence_refusal(
+        &self,
+        writer: crate::journal::thread::FencedWriter,
+        conflict: &crate::journal::thread::ThreadStateConflict,
+    ) {
+        self.fence_refused.add(
+            1,
+            &[
+                KeyValue::new(attrs::WRITER, writer.as_str()),
+                KeyValue::new(attrs::THREAD_STATUS, conflict.status.as_str()),
+            ],
+        );
     }
 
     /// Record a single `agent_server.journal.commit.duration` sample
@@ -519,9 +579,11 @@ impl ServerMetrics {
         let tasks_lease_expired = meter
             .u64_counter("agent_server.tasks.lease_expired")
             .with_description(
-                "Leases released by the expiry sweep, attributed by recovery outcome.",
+                "Leases reclaimed by the expiry sweep or a start-up epoch reclaim, \
+                 attributed by recovery outcome and scope.",
             )
             .build();
+        let epoch_reclaims = epoch_reclaims_counter(&meter);
         let journal_commit_duration = meter
             .f64_histogram("agent_server.journal.commit.duration")
             .with_unit("s")
@@ -580,12 +642,14 @@ impl ServerMetrics {
             .with_unit("s")
             .with_description("Effect run time, started to finished, by kind and outcome.")
             .build();
+        let fence_refused = fence_refused_counter(&meter);
 
         Self {
             workers_active,
             tasks_acquired,
             tasks_execution_duration,
             tasks_lease_expired,
+            epoch_reclaims,
             journal_commit_duration,
             relay_tick,
             wakeup_fallback_sweep,
@@ -596,6 +660,7 @@ impl ServerMetrics {
             documents_written,
             effects,
             effect_duration,
+            fence_refused,
             meter,
         }
     }
@@ -603,6 +668,30 @@ impl ServerMetrics {
 
 // ─────────────────────────────────────────────────────────────────────
 // Internal helpers
+// ─────────────────────────────────────────────────────────────────────
+
+/// `agent_server.epoch.reclaims`.
+fn epoch_reclaims_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.epoch.reclaims")
+        .with_description(
+            "Leases a lease sweep or a start-up epoch reclaim took back, attributed by \
+             scope and what recovery did with the row.",
+        )
+        .build()
+}
+
+/// `agent_server.fence.refused`.
+fn fence_refused_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.fence.refused")
+        .with_description(
+            "Writes outside a transition the purge fence refused, attributed by writer and \
+             thread status.",
+        )
+        .build()
+}
+
 // ─────────────────────────────────────────────────────────────────────
 
 fn read_cached() -> Option<Arc<ServerMetrics>> {

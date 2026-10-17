@@ -778,7 +778,7 @@ async fn simulate_restart(
     let clock = after + Duration::seconds(restart_delta_seconds());
     let records = stores
         .tasks
-        .release_expired_leases(clock)
+        .release_expired_leases(clock, crate::journal::LeaseRecoveryScope::Expired)
         .await
         .context("release_expired_leases during restart")?;
     Ok((clock, records))
@@ -1940,7 +1940,10 @@ async fn nested_grandchild_tree_linkage_survives_restart() -> Result<()> {
     // nothing to do.
     let records_again = stores
         .tasks
-        .release_expired_leases(t_plus(restart_delta_seconds() + 60))
+        .release_expired_leases(
+            t_plus(restart_delta_seconds() + 60),
+            crate::journal::LeaseRecoveryScope::Expired,
+        )
         .await?;
     assert!(
         records_again.is_empty(),

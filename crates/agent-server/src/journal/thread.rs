@@ -59,15 +59,22 @@ pub enum ThreadStatus {
     Deleted,
 }
 
-impl std::fmt::Display for ThreadStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = match self {
+impl ThreadStatus {
+    /// The status's stable label, as in logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Active => "active",
             Self::Completed => "completed",
             Self::Deleting => "deleting",
             Self::Deleted => "deleted",
-        };
-        f.write_str(status)
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -106,9 +113,11 @@ pub enum ThreadOperation {
     Append,
 }
 
-impl std::fmt::Display for ThreadOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let operation = match self {
+impl ThreadOperation {
+    /// The operation's stable label, as in logs and metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Create => "create",
             Self::Fork => "fork",
             Self::Submit => "submit",
@@ -117,8 +126,13 @@ impl std::fmt::Display for ThreadOperation {
             Self::Acquire => "acquire",
             Self::Commit => "commit",
             Self::Append => "append",
-        };
-        f.write_str(operation)
+        }
+    }
+}
+
+impl std::fmt::Display for ThreadOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -133,6 +147,60 @@ pub struct ThreadStateConflict {
     pub thread_id: ThreadId,
     pub status: ThreadStatus,
     pub operation: ThreadOperation,
+}
+
+/// A write the purge fence guards outside a transition, as a bounded
+/// metric label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FencedWriter {
+    /// `AgentTaskStore::requeue_owned_task` with a boundary event.
+    RequeueOwnedTask,
+    /// `AgentTaskStore::pause_on_question`.
+    PauseOnQuestion,
+    /// A `MessageProjectionStore` write.
+    MessageHead,
+    /// `ThreadStore::commit_fork` from a purged source.
+    ForkSource,
+}
+
+impl FencedWriter {
+    /// The writer's stable label, as in metrics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequeueOwnedTask => "requeue_owned_task",
+            Self::PauseOnQuestion => "pause_on_question",
+            Self::MessageHead => "message_head",
+            Self::ForkSource => "fork_source",
+        }
+    }
+}
+
+/// Count `refused` when it is the fence's [`ThreadStateConflict`]: one
+/// `agent_server.fence.refused` by writer and thread status, and a debug
+/// log naming the thread. Returns `refused` unchanged.
+///
+/// # Errors
+/// `refused` itself.
+pub fn record_fence_refusal(
+    writer: FencedWriter,
+    refused: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if let Err(error) = &refused
+        && let Some(conflict) = error.downcast_ref::<ThreadStateConflict>()
+    {
+        #[cfg(feature = "otel")]
+        crate::observability::ServerMetrics::global().record_fence_refusal(writer, conflict);
+        log::debug!(
+            thread_id = conflict.thread_id.0.as_str(),
+            writer = writer.as_str(),
+            thread_status = conflict.status.as_str();
+            "the purge fence refused {} on a {} thread",
+            writer.as_str(),
+            conflict.status,
+        );
+    }
+    refused
 }
 
 /// Purge reach: only the named thread, or its durable subagent invocation

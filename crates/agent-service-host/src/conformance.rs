@@ -42,6 +42,7 @@
 #[cfg(test)]
 mod tests {
     use agent_server::journal::SpawnChildrenExt;
+    use agent_server::journal::{EpochId, EpochRecord, LeaseRecoveryScope};
     use anyhow::{Context, Result};
     use time::{Duration, OffsetDateTime};
 
@@ -448,7 +449,10 @@ mod tests {
                 .await?
                 .context("claim for retry-budget exhaustion")?;
             last = task_store
-                .release_expired_leases(t_plus(start_secs + offset + 6))
+                .release_expired_leases(
+                    t_plus(start_secs + offset + 6),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
                 .await?;
         }
         Ok(last)
@@ -565,7 +569,12 @@ mod tests {
             .await?;
 
         // Sweep after lease expires.
-        let records = task_store.release_expired_leases(t_plus(43)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(43),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::Requeue));
 
@@ -581,6 +590,134 @@ mod tests {
     /// cancelled row reports `NotOwned` without touching the row; a
     /// budget-exhausted row reports `BudgetExhausted` leaving the row
     /// owned so the caller can run its terminal envelope.
+    async fn begin_epoch(task_store: &dyn AgentTaskStore, secs: i64) -> Result<EpochId> {
+        let record = EpochRecord::begin(t_plus(secs), Some("conformance".to_owned()));
+        let epoch = record.id.clone();
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![agent_server::journal::Write::BeginEpoch(record)],
+                },
+                t_plus(secs),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(epoch)
+    }
+
+    /// Lease `root` (submitted first) for an hour, so only an epoch change
+    /// can reclaim it.
+    async fn lease_for_an_hour(
+        task_store: &dyn AgentTaskStore,
+        root: &AgentTask,
+        secs: i64,
+    ) -> Result<LeaseId> {
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &root.id,
+                WorkerId::from_string("worker-0"),
+                lease.clone(),
+                t_plus(secs + 3_600),
+                t_plus(secs),
+            )
+            .await?
+            .context("the root is acquirable")?;
+        Ok(lease)
+    }
+
+    /// A lease records the epoch the store began last. Reclaiming the
+    /// leases of other epochs requeues every live lease granted before
+    /// the current epoch (and before any epoch), fails closed the one at
+    /// its budget, leaves the current epoch's lease alone, and refuses an
+    /// epoch the store did not begin. Lease expiry is unaffected.
+    async fn test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        use agent_server::journal::recovery::FailureReason;
+
+        let before_epochs = fresh_root("conformance-epoch-none", 300);
+        let _ = lease_for_an_hour(task_store, &before_epochs, 301).await?;
+        let old = begin_epoch(task_store, 302).await?;
+        let earlier = fresh_root("conformance-epoch-old", 303);
+        let _ = lease_for_an_hour(task_store, &earlier, 304).await?;
+        let at_budget =
+            AgentTask::new_root_turn(thread_id("conformance-epoch-last"), t_plus(305), 1);
+        let _ = lease_for_an_hour(task_store, &at_budget, 306).await?;
+        let current = begin_epoch(task_store, 307).await?;
+        let live = fresh_root("conformance-epoch-live", 308);
+        let live_lease = lease_for_an_hour(task_store, &live, 309).await?;
+
+        let expired = task_store
+            .release_expired_leases(t_plus(310), LeaseRecoveryScope::Expired)
+            .await?;
+        assert!(expired.is_empty(), "no lease has expired: {expired:?}");
+        assert!(
+            task_store
+                .release_expired_leases(t_plus(310), LeaseRecoveryScope::ForeignEpoch(old.clone()))
+                .await
+                .is_err(),
+            "only the epoch the store began reclaims"
+        );
+        let duplicate = task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![agent_server::journal::Write::BeginEpoch(EpochRecord {
+                        id: current.clone(),
+                        started_at: t_plus(310),
+                        label: None,
+                    })],
+                },
+                t_plus(310),
+            )
+            .await;
+        assert!(duplicate.is_err(), "an epoch id begins once");
+
+        let reclaimed = task_store
+            .release_expired_leases(
+                t_plus(311),
+                LeaseRecoveryScope::ForeignEpoch(current.clone()),
+            )
+            .await?;
+        let mut requeued: Vec<_> = reclaimed
+            .iter()
+            .filter(|record| record.action.is_requeue())
+            .map(|record| record.id.clone())
+            .collect();
+        requeued.sort();
+        let mut expected = vec![before_epochs.id.clone(), earlier.id.clone()];
+        expected.sort();
+        assert_eq!(requeued, expected, "{reclaimed:?}");
+        for id in &expected {
+            let row = task_store.get(id).await?.context("row")?;
+            assert_eq!(row.status, TaskStatus::Pending);
+            assert!(row.lease_id.is_none());
+        }
+        let failed = task_store.get(&at_budget.id).await?.context("row")?;
+        assert_eq!(failed.status, TaskStatus::Failed, "{reclaimed:?}");
+        assert!(
+            failed.last_error.as_deref().is_some_and(|error| error
+                .starts_with(FailureReason::LeaseExpiredBudgetExhausted.error_prefix())),
+            "{:?}",
+            failed.last_error,
+        );
+        let untouched = task_store.get(&live.id).await?.context("row")?;
+        assert_eq!(untouched.status, TaskStatus::Running);
+        assert_eq!(untouched.lease_id, Some(live_lease));
+
+        let again = task_store
+            .release_expired_leases(t_plus(312), LeaseRecoveryScope::ForeignEpoch(current))
+            .await?;
+        assert!(
+            again.is_empty(),
+            "a reclaimed lease is reclaimed once: {again:?}"
+        );
+        Ok(())
+    }
+
     async fn test_requeue_owned_task(task_store: &dyn AgentTaskStore) -> Result<()> {
         use agent_server::journal::store::RequeueOutcome;
 
@@ -933,7 +1070,12 @@ mod tests {
         let attempt_id = params.turn_attempt_id.clone();
         params.now = t_plus(630);
 
-        let released = task_store.release_expired_leases(t_plus(621)).await?;
+        let released = task_store
+            .release_expired_leases(
+                t_plus(621),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(released.len(), 1, "the first worker's lease expired");
         let thief = task_store
             .try_acquire_task(
@@ -2061,7 +2203,12 @@ mod tests {
             )
             .await?
             .context("child root must be acquirable")?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         let record = records
             .iter()
             .find(|record| record.id == child_root.id)
@@ -2623,6 +2770,267 @@ mod tests {
                 .await?
                 .context("child")?;
             assert_eq!(unchanged.status, TaskStatus::Running, "no settle lands");
+        }
+        Ok(())
+    }
+
+    fn expect_purge_conflict(
+        what: &str,
+        refused: Result<()>,
+        status: agent_server::journal::thread::ThreadStatus,
+        operation: agent_server::journal::thread::ThreadOperation,
+    ) -> Result<()> {
+        use agent_server::journal::thread::ThreadStateConflict;
+
+        let error = refused
+            .err()
+            .with_context(|| format!("{what} on a {status} thread is refused"))?;
+        let conflict = error
+            .downcast_ref::<ThreadStateConflict>()
+            .with_context(|| format!("{what}: a typed purge-fence refusal: {error:#}"))?;
+        assert_eq!(conflict.status, status, "{what}");
+        assert_eq!(conflict.operation, operation, "{what}");
+        Ok(())
+    }
+
+    /// Every lease-guarded event writer, message-head writer and fork that
+    /// [`test_lease_writers_and_head_writers_on_a_purged_thread_are_refused`]
+    /// drives on a `status` thread is refused with a typed purge conflict.
+    async fn expect_every_writer_refused(
+        stores: (
+            &dyn AgentTaskStore,
+            &dyn ThreadStore,
+            &dyn MessageProjectionStore,
+        ),
+        root: &AgentTask,
+        (worker, lease): (&WorkerId, &LeaseId),
+        status: agent_server::journal::thread::ThreadStatus,
+        round: u32,
+    ) -> Result<()> {
+        use agent_sdk_foundation::llm::Message;
+        use agent_server::journal::fork_transaction::ForkCommitParams;
+        use agent_server::journal::thread::ThreadOperation;
+
+        let (task_store, thread_store, messages) = stores;
+        let thread = &root.thread_id;
+        let at = t_plus(90 + i64::from(round));
+        let late = || vec![Message::user("[late]")];
+        let append = ThreadOperation::Append;
+        let boundary = Some(AgentEvent::start(thread.clone(), 1));
+        let refusals: [(&str, Result<()>); 7] = [
+            (
+                "a requeue with a boundary event",
+                task_store
+                    .requeue_owned_task(&root.id, worker, lease, boundary, at)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "a question pause",
+                task_store
+                    .pause_on_question(
+                        &root.id,
+                        worker,
+                        lease,
+                        question_pause(&thread.0, round),
+                        at,
+                    )
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "commit_messages",
+                messages
+                    .commit_messages(thread, late(), at)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "replace_history",
+                messages
+                    .replace_history(thread, late(), at)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "append_repair",
+                messages
+                    .append_repair(thread, late(), late(), 0, at)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "set_draft",
+                messages.set_draft(thread, late(), at).await.map(|_| ()),
+            ),
+            (
+                "clear_draft",
+                messages.clear_draft(thread, at).await.map(|_| ()),
+            ),
+        ];
+        for (what, refused) in refusals {
+            expect_purge_conflict(what, refused, status, append)?;
+        }
+        let fork = thread_id(&format!("{}-fork-{round}", thread.0));
+        let forked = thread_store
+            .commit_fork(ForkCommitParams {
+                source_thread_id: thread.clone(),
+                creation: None,
+                new_thread_id: fork.clone(),
+                now: at,
+                committed_turns: 0,
+                cumulative_total_usage: TokenUsage::default(),
+                messages: Vec::new(),
+                checkpoint: None,
+                events: vec![AgentEvent::thread_created(
+                    fork.clone(),
+                    Some(thread.clone()),
+                    Some(0),
+                )],
+                outbox_max_attempts: 3,
+            })
+            .await
+            .map(|_| ());
+        expect_purge_conflict(
+            "a fork of the thread",
+            forked,
+            status,
+            ThreadOperation::Fork,
+        )?;
+        assert!(
+            thread_store.get(&fork).await?.is_none(),
+            "a refused fork creates no thread"
+        );
+        Ok(())
+    }
+
+    /// Begin (`Deleting`) or finish (`Deleted`) the purge of each of
+    /// `threads`.
+    async fn advance_purges(
+        thread_store: &dyn ThreadStore,
+        threads: &[ThreadId],
+        status: agent_server::journal::thread::ThreadStatus,
+    ) -> Result<()> {
+        use agent_server::journal::thread::{PurgeReceipt, PurgeScope, PurgeSeed, ThreadStatus};
+
+        for thread in threads {
+            if status == ThreadStatus::Deleted {
+                let receipt = PurgeReceipt {
+                    root_thread_id: thread.clone(),
+                    scope: PurgeScope::Thread,
+                    purged_thread_ids: vec![thread.clone()],
+                    cancelled_task_ids: Vec::new(),
+                    started_at: t_plus(83),
+                    completed_at: t_plus(84),
+                };
+                let _ = thread_store.finish_purge(thread, &receipt).await?;
+            } else {
+                let seed = PurgeSeed {
+                    root_thread_id: thread.clone(),
+                    scope: PurgeScope::Thread,
+                    started_at: t_plus(83),
+                };
+                let _ = thread_store.begin_purge(thread, seed).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The lease-guarded event writers, every message-head writer and a
+    /// fork that copies the thread are refused on a purged thread, and
+    /// none of them writes a row, an event, an advisory or a head.
+    async fn test_lease_writers_and_head_writers_on_a_purged_thread_are_refused(
+        stores: (
+            &dyn AgentTaskStore,
+            &dyn ThreadStore,
+            &dyn MessageProjectionStore,
+            &dyn EventRepository,
+            &dyn OutboxStore,
+        ),
+    ) -> Result<()> {
+        use agent_sdk_foundation::llm::Message;
+        use agent_server::journal::thread::ThreadStatus;
+
+        let (task_store, thread_store, messages, events, outbox) = stores;
+        let root = fresh_root("conformance-purge-lease-writers", 80);
+        let thread = root.thread_id.clone();
+        thread_store.get_or_create(&thread, t_plus(80)).await?;
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        acquire_or_explain(
+            task_store,
+            &root.id,
+            &worker,
+            &lease,
+            81,
+            "purge-fence root",
+        )
+        .await?;
+        let history = vec![Message::user("question"), Message::assistant("answer")];
+        messages
+            .commit_messages(&thread, history, t_plus(82))
+            .await?;
+        messages
+            .set_draft(&thread, vec![Message::user("in flight")], t_plus(82))
+            .await?;
+        let headless = thread_id("conformance-purge-headless");
+        thread_store.get_or_create(&headless, t_plus(80)).await?;
+        let purged = [thread.clone(), headless.clone()];
+        advance_purges(thread_store, &purged, ThreadStatus::Deleting).await?;
+        let head_before = messages.get(&thread).await?.context("projection")?;
+        let events_before = events.get_events(&thread).await?.len();
+        let advisories_before = thread_events_rows(outbox, &thread).await?;
+
+        for (round, status) in [(0, ThreadStatus::Deleting), (1, ThreadStatus::Deleted)] {
+            if status == ThreadStatus::Deleted {
+                advance_purges(thread_store, &purged, status).await?;
+            }
+            expect_purge_conflict(
+                "clear_draft on a thread with no head",
+                messages
+                    .clear_draft(&headless, t_plus(90 + i64::from(round)))
+                    .await
+                    .map(|_| ()),
+                status,
+                agent_server::journal::thread::ThreadOperation::Append,
+            )?;
+            assert!(
+                messages.get(&headless).await?.is_none(),
+                "a refused clear_draft writes no head"
+            );
+            expect_every_writer_refused(
+                (task_store, thread_store, messages),
+                &root,
+                (&worker, &lease),
+                status,
+                round,
+            )
+            .await?;
+
+            let row = thread_store.get(&thread).await?.context("thread row")?;
+            assert_eq!(row.status, status, "the thread stays purged");
+            let head = messages.get(&thread).await?.context("projection")?;
+            assert_eq!(head.messages, head_before.messages, "no history lands");
+            assert_eq!(
+                head.draft_messages, head_before.draft_messages,
+                "no draft lands"
+            );
+            assert_eq!(head.version, head_before.version, "no head write lands");
+            assert_eq!(events.get_events(&thread).await?.len(), events_before);
+            assert_eq!(
+                thread_events_rows(outbox, &thread).await?,
+                advisories_before
+            );
+            let unchanged = AgentTaskStore::get(task_store, &root.id)
+                .await?
+                .context("root")?;
+            assert_eq!(
+                unchanged.status,
+                TaskStatus::Running,
+                "the root stays leased"
+            );
+            assert_eq!(unchanged.lease_id.as_ref(), Some(&lease));
         }
         Ok(())
     }
@@ -3702,7 +4110,12 @@ mod tests {
                 t_plus(2),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert!(
             records.iter().any(|record| record.id == swept.id
                 && matches!(record.action, RecoveryAction::FailClosed(_))),
@@ -3867,7 +4280,12 @@ mod tests {
                 t_plus(90),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(92)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(92),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
 
@@ -3944,7 +4362,12 @@ mod tests {
                 t_plus(203),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(211)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(211),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(matches!(records[0].action, RecoveryAction::FailClosed(_)));
 
@@ -4166,7 +4589,12 @@ mod tests {
                 )
                 .await?
                 .with_context(|| format!("acquire for crash {crash}"))?;
-            let records = task_store.release_expired_leases(t_plus(secs + 6)).await?;
+            let records = task_store
+                .release_expired_leases(
+                    t_plus(secs + 6),
+                    agent_server::journal::LeaseRecoveryScope::Expired,
+                )
+                .await?;
             anyhow::ensure!(records.len() == 1, "one expired lease per crash");
             actions.push(records[0].action);
         }
@@ -4226,7 +4654,12 @@ mod tests {
             )
             .await?
             .context("claim swept root")?;
-        let records = task_store.release_expired_leases(t_plus(6)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(6),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(
             records.first().map(|record| record.action),
             Some(RecoveryAction::FailClosed(
@@ -4303,7 +4736,12 @@ mod tests {
             )
             .await?
             .context("claim child")?;
-        let records = task_store.release_expired_leases(t_plus(11)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(11),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(
             records.first().map(|record| record.action),
             Some(RecoveryAction::FailClosed(
@@ -4603,7 +5041,12 @@ mod tests {
                 t_plus(10),
             )
             .await?;
-        let records = task_store.release_expired_leases(t_plus(12)).await?;
+        let records = task_store
+            .release_expired_leases(
+                t_plus(12),
+                agent_server::journal::LeaseRecoveryScope::Expired,
+            )
+            .await?;
         assert_eq!(records.len(), 1);
         assert!(
             records[0].action.is_requeue(),
@@ -4811,6 +5254,7 @@ mod tests {
             fork_after_committed_turns: 1,
         };
         Ok(ForkCommitParams {
+            source_thread_id: source.clone(),
             creation: Some(creation),
             new_thread_id: destination.clone(),
             now,
@@ -5128,6 +5572,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_requeue_owned_task() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_requeue_owned_task(s.task.as_ref()).await
@@ -5189,6 +5640,24 @@ mod tests {
             s.thread.as_ref(),
             s.event.as_ref(),
         )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_lease_writers_and_head_writers_on_a_purged_thread_are_refused()
+    -> Result<()> {
+        let s = fresh_in_memory_stores();
+        let messages = agent_server::journal::message_store::PurgeFencedMessageProjectionStore::new(
+            s.message.clone(),
+            s.thread.clone(),
+        );
+        test_lease_writers_and_head_writers_on_a_purged_thread_are_refused((
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            &messages,
+            s.event.as_ref(),
+            s.outbox.as_ref(),
+        ))
         .await
     }
 
@@ -5639,6 +6108,14 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_requeue_owned_task() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_requeue_owned_task(&store).await
@@ -5706,6 +6183,17 @@ mod tests {
     async fn conformance_sqlite_an_append_to_a_thread_with_no_row_is_accepted() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_an_append_to_a_thread_with_no_row_is_accepted(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_lease_writers_and_head_writers_on_a_purged_thread_are_refused()
+    -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_lease_writers_and_head_writers_on_a_purged_thread_are_refused((
+            &store, &store, &store, &store, &store,
+        ))
+        .await
     }
 
     #[cfg(feature = "sqlite")]
@@ -6322,6 +6810,16 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn conformance_postgres_requeue_owned_task() -> Result<()> {
         let Some((store, _guard)) = pg_test_store().await? else {
             return Ok(());
@@ -6409,6 +6907,19 @@ mod tests {
             return Ok(());
         };
         test_an_append_to_a_thread_with_no_row_is_accepted(&store, &store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_lease_writers_and_head_writers_on_a_purged_thread_are_refused()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_lease_writers_and_head_writers_on_a_purged_thread_are_refused((
+            &store, &store, &store, &store, &store,
+        ))
+        .await
     }
 
     #[cfg(feature = "postgres")]
@@ -7138,6 +7649,7 @@ mod tests {
             ),
         ];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             creation: None,
             new_thread_id: new_thread_id.clone(),
             now,
@@ -7247,6 +7759,7 @@ mod tests {
 
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             creation: None,
             new_thread_id: new_thread_id.clone(),
             now,
@@ -7328,6 +7841,7 @@ mod tests {
         let forked = thread_id("atomic-fork-success");
         store
             .commit_fork(ForkCommitParams {
+                source_thread_id: thread_id("atomic-fork-source"),
                 creation: None,
                 new_thread_id: forked.clone(),
                 now,
@@ -7468,6 +7982,7 @@ mod tests {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         let forked = thread_id("atomic-fork-rollback");
         let crashed = std::panic::AssertUnwindSafe(store.commit_fork(ForkCommitParams {
+            source_thread_id: thread_id("atomic-fork-rollback-source"),
             creation: None,
             new_thread_id: forked.clone(),
             now: t0(),

@@ -26,6 +26,7 @@ use serde::de::DeserializeOwned;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -38,6 +39,7 @@ use agent_server::journal::commit::{
 };
 use agent_server::journal::committed_event::CommittedEvent;
 use agent_server::journal::effect::{EffectKey, EffectRecord, EffectRow, EffectState, EffectWrite};
+use agent_server::journal::epoch::{EpochId, LeaseRecoveryScope};
 use agent_server::journal::event_repository::EventRepository;
 use agent_server::journal::fork_transaction::ForkCommitParams;
 use agent_server::journal::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
@@ -112,6 +114,9 @@ mod documents;
 pub struct SqliteDurableStore {
     pool: SqlitePool,
     held_probe: HeldProbe<HeldKey>,
+    /// The epoch the newest committed `Write::BeginEpoch` began; every
+    /// lease this store grants after it records it.
+    current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -136,6 +141,7 @@ impl SqliteDurableStore {
         Self {
             pool,
             held_probe: HeldProbe::default(),
+            current_epoch: Arc::default(),
         }
     }
 
@@ -509,8 +515,7 @@ ON CONFLICT (thread_id) DO NOTHING
         retained_message_count: usize,
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
-        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
-        Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await?;
+        Self::bootstrap_appendable_thread_tx(tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(tx, thread_id, now).await?;
         let updated = projection.append_compaction(
             result_messages,
@@ -529,6 +534,77 @@ ON CONFLICT (thread_id) DO NOTHING
     ) -> Result<()> {
         let _inserted = Self::insert_thread_row_tx(tx, thread_id, now).await?;
         Ok(())
+    }
+
+    /// The epoch new leases record, if one has begun.
+    fn current_epoch(&self) -> Option<EpochId> {
+        self.current_epoch.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |epoch| epoch.clone(),
+        )
+    }
+
+    fn set_current_epoch(&self, epoch: EpochId) {
+        let mut current = self
+            .current_epoch
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Some(epoch);
+    }
+
+    async fn insert_epoch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        record: &agent_server::journal::EpochRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES (?1, ?2, ?3)",
+        )
+        .bind(record.id.as_str())
+        .bind(record.started_at)
+        .bind(record.label.as_deref())
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("begin epoch {}", record.id))?;
+        Ok(())
+    }
+
+    /// Record that `task`'s new lease was granted under `epoch`.
+    async fn stamp_lease_epoch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        task: &AgentTaskId,
+        epoch: Option<&EpochId>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = ?1 WHERE id = ?2")
+            .bind(epoch.map(EpochId::as_str))
+            .bind(task.as_str())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("stamp the lease epoch of {task}"))?;
+        Ok(())
+    }
+
+    async fn bootstrap_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        Self::bootstrap_thread_row_tx(tx, thread_id, now).await?;
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::MessageHead,
+            Self::require_active_thread_tx(tx, thread_id, ThreadOperation::Append).await,
+        )
+    }
+
+    async fn require_appendable_thread_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: &ThreadId,
+        writer: agent_server::journal::thread::FencedWriter,
+    ) -> Result<()> {
+        let thread = Self::get_thread_tx(tx, thread_id).await?;
+        crate::fence_signal::fence_refused(
+            writer,
+            agent_server::journal::Fence::APPEND.check(thread_id, thread.as_ref()),
+        )
     }
 
     async fn claim_thread_creation_tx(
@@ -1409,6 +1485,8 @@ INSERT INTO agent_sdk_tasks (
                             "acquire_next_runnable rejected: mark_running transition failed",
                         )?;
                     Self::update_task_tx(&mut tx, &claimed).await?;
+                    Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref())
+                        .await?;
                     tx.commit().await.context("commit acquire_next_runnable")?;
                     return Ok(Some(claimed));
                 }
@@ -2915,6 +2993,13 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
 
         let mut tx = self.begin().await?;
 
+        let source = Self::get_thread_tx(&mut tx, &params.source_thread_id).await?;
+        crate::fence_signal::fence_refused(
+            agent_server::journal::thread::FencedWriter::ForkSource,
+            agent_server::journal::Fence::FORK_SOURCE
+                .check(&params.source_thread_id, source.as_ref()),
+        )?;
+
         // Claim caller-minted destinations by primary key inside the same
         // transaction as the fork copy. Matching retries are no-ops; a
         // conflicting origin is typed and rolls back without mutation.
@@ -3520,6 +3605,9 @@ impl SqliteDurableStore {
         }
         agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
+        if let Some(record) = transition.begun_epochs().last() {
+            self.set_current_epoch(record.id.clone());
+        }
         Ok(committed)
     }
 }
@@ -3587,6 +3675,7 @@ impl SqliteDurableStore {
                 Self::finish_effect_tx(tx, &key, &owner, &state, now).await?;
                 agent_server::fail_point!("effect.finish_written");
             }
+            Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
@@ -4571,6 +4660,7 @@ impl AgentTaskStore for SqliteDurableStore {
             .and_then(|admitted| admitted.mark_running(worker, lease, expires_at, now))
             .context("try_acquire_task rejected: mark_running transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
+        Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref()).await?;
         tx.commit().await.context("commit try_acquire_task")?;
         Ok(Some(claimed))
     }
@@ -4698,25 +4788,52 @@ impl AgentTaskStore for SqliteDurableStore {
         })
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>> {
+        if let LeaseRecoveryScope::ForeignEpoch(epoch) = &scope {
+            ensure!(
+                self.current_epoch().as_ref() == Some(epoch),
+                "release_expired_leases: epoch {epoch} is not the epoch this store began"
+            );
+        }
         let mut tx = self.begin().await?;
         // Bound the sweep to a batch so a mass worker outage cannot turn
         // one sweep into a giant transaction that locks every expired
         // task at once; the host's drain loop (and any other caller)
         // keeps calling until a pass returns fewer than the batch.
-        let expired = sqlx::query_as::<_, TaskRecord>(concat!(
-            "SELECT ",
-            task_columns!(),
-            " FROM agent_sdk_tasks \
-             WHERE status = 'running' AND lease_expires_at <= ?1 \
-             ORDER BY lease_expires_at, id \
-             LIMIT ?2",
-        ))
-        .bind(now)
-        .bind(i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX))
-        .fetch_all(&mut *tx)
-        .await
-        .context("load expired leases")?;
+        let batch =
+            i64::try_from(agent_server::journal::store::LEASE_RELEASE_BATCH).unwrap_or(i64::MAX);
+        let expired = match &scope {
+            LeaseRecoveryScope::Expired => sqlx::query_as::<_, TaskRecord>(concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM agent_sdk_tasks \
+                 WHERE status = 'running' AND lease_expires_at <= ?1 \
+                 ORDER BY lease_expires_at, id \
+                 LIMIT ?2",
+            ))
+            .bind(now)
+            .bind(batch)
+            .fetch_all(&mut *tx)
+            .await
+            .context("load expired leases")?,
+            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as::<_, TaskRecord>(concat!(
+                "SELECT ",
+                task_columns!(),
+                " FROM agent_sdk_tasks \
+                 WHERE status = 'running' AND lease_epoch IS NOT ?1 \
+                 ORDER BY lease_expires_at, id \
+                 LIMIT ?2",
+            ))
+            .bind(epoch.as_str())
+            .bind(batch)
+            .fetch_all(&mut *tx)
+            .await
+            .context("load leases of older epochs")?,
+        };
 
         let mut released = Vec::with_capacity(expired.len());
         for record in expired {
@@ -4734,7 +4851,7 @@ impl AgentTaskStore for SqliteDurableStore {
                     old.id
                 ));
             }
-            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+            let record = match classify_recovery(&old, scope.context()) {
                 RecoveryAction::Requeue => {
                     let released_row = old
                         .clone()
@@ -4789,6 +4906,12 @@ impl AgentTaskStore for SqliteDurableStore {
         // pattern): it lands iff this caller still owned the row, and
         // it is durable before the row is acquirable.
         if let Some(event) = boundary {
+            Self::require_appendable_thread_tx(
+                &mut tx,
+                &old.thread_id,
+                agent_server::journal::thread::FencedWriter::RequeueOwnedTask,
+            )
+            .await?;
             let start_seq = Self::next_event_sequence_tx(&mut tx, &old.thread_id).await?;
             let committed =
                 Self::insert_events_tx(&mut tx, &old.thread_id, vec![event], start_seq, now)
@@ -4961,6 +5084,12 @@ impl AgentTaskStore for SqliteDurableStore {
             .await?
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            &paused.thread_id,
+            agent_server::journal::thread::FencedWriter::PauseOnQuestion,
+        )
+        .await?;
         Self::update_task_tx(&mut tx, &paused).await?;
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let start_seq = Self::next_event_sequence_tx(&mut tx, &paused.thread_id).await?;
@@ -5511,7 +5640,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_committed(messages, now)?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5526,7 +5655,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.replace_history(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5565,7 +5694,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.append_repair(
             repair_messages,
@@ -5585,7 +5714,7 @@ impl MessageProjectionStore for SqliteDurableStore {
         now: OffsetDateTime,
     ) -> Result<MessageProjection> {
         let mut tx = self.begin().await?;
-        Self::bootstrap_thread_row_tx(&mut tx, thread_id, now).await?;
+        Self::bootstrap_appendable_thread_tx(&mut tx, thread_id, now).await?;
         let projection = Self::get_message_head_tx(&mut tx, thread_id, now).await?;
         let updated = projection.set_draft(messages, now);
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
@@ -5598,14 +5727,20 @@ impl MessageProjectionStore for SqliteDurableStore {
         thread_id: &ThreadId,
         now: OffsetDateTime,
     ) -> Result<Option<MessageProjection>> {
-        let Some(projection) = self.get_message_head_pool(thread_id).await? else {
+        let mut tx = self.begin().await?;
+        Self::require_appendable_thread_tx(
+            &mut tx,
+            thread_id,
+            agent_server::journal::thread::FencedWriter::MessageHead,
+        )
+        .await?;
+        let Some(projection) = read_message_head(&mut *tx, thread_id).await? else {
             // No projection row exists yet — nothing to clear. The
             // commit path treats this as a no-op so first-turn
             // happy-paths don't bootstrap rows just to clear them.
             return Ok(None);
         };
         let updated = projection.clear_draft(now);
-        let mut tx = self.begin().await?;
         Self::upsert_message_head_tx(&mut tx, &updated).await?;
         tx.commit().await.context("commit clear_draft")?;
         Ok(Some(updated))
@@ -8769,6 +8904,7 @@ INSERT INTO agent_sdk_execution_intents (
             ),
         ];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -8856,6 +8992,7 @@ INSERT INTO agent_sdk_execution_intents (
         };
         let messages = vec![Message::user("u"), Message::assistant("a")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,
@@ -8968,6 +9105,7 @@ INSERT INTO agent_sdk_execution_intents (
         // collide and the transaction rolls back.
         let fresh_messages = vec![Message::user("seeded")];
         let params = ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation: None,
             now,

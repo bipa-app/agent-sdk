@@ -28,10 +28,11 @@ mod tests {
         AWAITING_QUESTION_MIGRATION_VERSION, DOCUMENTS_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
         EFFECTS_MIGRATION_VERSION, EFFECTS_VALIDATION_MIGRATION_VERSION,
         HISTORY_GENERATION_MIGRATION_VERSION, HISTORY_GENERATION_VALIDATION_MIGRATION_VERSION,
-        INPUT_INJECTION_KIND_MIGRATION_VERSION, PURGE_SEED_MIGRATION_VERSION,
-        TASK_AFTER_SIBLINGS_MIGRATION_VERSION, TASK_TERMINAL_REASON_MIGRATION_VERSION,
-        THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION, durable_core_migrations,
-        event_journal_outbox_migration, outbox_message_kind_migration, tool_audit_events_migration,
+        HOST_EPOCHS_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
+        PURGE_SEED_MIGRATION_VERSION, TASK_AFTER_SIBLINGS_MIGRATION_VERSION,
+        TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
+        durable_core_migrations, event_journal_outbox_migration, outbox_message_kind_migration,
+        tool_audit_events_migration,
     };
     use super::repository::{
         completed_turn_units_of_work, event_journal_repository_boundaries,
@@ -151,6 +152,36 @@ mod tests {
             versions.contains(&EFFECTS_VALIDATION_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {EFFECTS_VALIDATION_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&HOST_EPOCHS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {HOST_EPOCHS_MIGRATION_VERSION}, got {versions:?}",
+        );
+        Ok(())
+    }
+
+    /// The epoch migration alters `agent_sdk_tasks` under a lock timeout,
+    /// which only holds inside sqlx's per-migration transaction.
+    #[test]
+    fn the_epoch_migration_runs_in_a_transaction_under_a_lock_timeout() -> Result<()> {
+        let migration = DURABLE_CORE_MIGRATOR
+            .migrations
+            .iter()
+            .find(|migration| migration.version == HOST_EPOCHS_MIGRATION_VERSION)
+            .context("the epoch migration is in the bundle")?;
+        ensure!(
+            !migration.no_tx,
+            "the epoch migration must run in a transaction"
+        );
+        let sql = durable_core_migrations()
+            .iter()
+            .find(|migration| migration.version == "0028")
+            .context("the epoch migration is in the reviewable bundle")?
+            .sql;
+        ensure!(
+            sql.contains("SET LOCAL lock_timeout"),
+            "the epoch migration must bound its ACCESS EXCLUSIVE wait",
         );
         Ok(())
     }

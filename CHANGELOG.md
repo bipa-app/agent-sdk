@@ -269,6 +269,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and survives turn boundaries until its `ToolCallEnd`; a `ToolProgress` named
   by `ViewConfig::stall_tool_name` sets `status.stalled` until the next event.
 - `ToolResult` derives `PartialEq` and `Eq`.
+- **Breaking: process epochs.** Every host begins an epoch when it starts, and
+  every lease records the epoch it was granted under, so a host that is the
+  only process on its store can requeue a dead process's leases at once
+  instead of waiting for them to expire (design §6.5).
+  - `Write::BeginEpoch(EpochRecord)` writes the epoch in one transaction.
+    `ServiceHost::run` commits it before it settles orphans and before the
+    worker pool starts. Every lease the store grants after that commit
+    stamps `agent_sdk_tasks.lease_epoch`; an epoch id that already exists is
+    refused.
+  - `AgentTaskStore::release_expired_leases` takes a `LeaseRecoveryScope`:
+    `Expired` (the lease sweep, unchanged) or `ForeignEpoch(epoch)`, which
+    reclaims every `Running` lease granted under another epoch or before
+    epochs existed, whatever its expiry. The method keeps no default, so a
+    decorating store forwards both scopes through its own hooks. A
+    `ForeignEpoch` for an epoch the store did not begin is refused.
+  - `RecoveryContext::EpochChanged` classifies a reclaimed row exactly as
+    `ExpiredLease` does: requeue, or fail closed with
+    `LeaseExpiredBudgetExhausted` at its budget.
+  - `WorkerConfig::epoch_recovery` (`EpochRecovery`): the default
+    `LeaseExpiry` keeps today's behaviour, which is right for every host
+    that shares its store (several processes on one `SQLite` file, several
+    pods on one Postgres database, a rolling deploy). `SingleHost`
+    reclaims the leases of earlier epochs at start, before the first
+    worker runs; only an embedder that guarantees one process per store
+    (for example with a single-instance lock) may set it. The backend
+    cannot tell the two apart.
+  - Migration 0028 adds the `agent_sdk_host_epochs` table and the nullable
+    `agent_sdk_tasks.lease_epoch` column, on Postgres and `SQLite`.
+  - Signals (`otel`):
+    - `agent_server.tasks.lease_expired` gains a `scope` label (`expired` or
+      `foreign_epoch`, `LeaseRecoveryScope::as_str`). The host's drain now
+      records it for every backend. Before, only the in-memory store
+      recorded it, so the SQL backends' sweeps counted nothing.
+    - New counter `agent_server.epoch.reclaims{scope, action}`. `action` is
+      `requeued` or `failed_interrupted`.
+    - `ServerMetrics::record_lease_reclaim` records the rows of one call.
+    - Start-up runs in an `agent_server.epoch.begin` span that covers the
+      epoch write and the reclaim. Its attributes are `agent_server.epoch.id`
+      (span-only), `agent_server.epoch.recovery` (`EpochRecovery::as_str`),
+      `agent_server.epoch.requeued`, `agent_server.epoch.failed_interrupted`
+      and `outcome`.
+
+  **Lock window (Postgres):** both statements are catalog-only, with no
+  rewrite and no scan. The `ALTER TABLE agent_sdk_tasks` takes
+  `ACCESS EXCLUSIVE` briefly, but the lock queues behind any open
+  transaction on the table, and every task query queues behind it. The
+  migration therefore starts with `SET LOCAL lock_timeout = '5s'`: a boot
+  that cannot get the lock fails and restarts instead of stalling the
+  table. Measured on Postgres 18 with 1M task rows (509 MB) and four
+  heartbeat loops: the migration took 118 ms. With a 30 s read
+  transaction open, the migration failed after 5.0 s with "canceling
+  statement due to lock timeout", and the heartbeats queued behind its
+  waiting lock for at most 5.7 s instead of 30 s. The retry, after the
+  read transaction ended, took 21 ms. On `SQLite` with 1M rows the
+  migration took 4 ms.
+
+  **Rollback and rolling deploys:** a pod of the previous build keeps
+  running against the migrated database: it never reads the new table or
+  column, and its leases leave `lease_epoch` NULL, which `LeaseExpiry`
+  ignores. A restarted older build refuses to start (`VersionMissing(28)`).
+  To roll back, revert 0028 by hand first, in one transaction, on either
+  backend: `DROP TABLE agent_sdk_host_epochs; ALTER TABLE agent_sdk_tasks
+  DROP COLUMN lease_epoch; DELETE FROM _sqlx_migrations WHERE version =
+  28`. No task state is lost: the epochs only decide when a dead lease is
+  reclaimed.
+
 - `agent_sdk_providers::impls::normalized_strict_schema` and its error,
   `StrictSchemaError` (`#[non_exhaustive]`), behind `openai`/`openai-codex`.
   They return a tool schema as `OpenAI` strict mode receives it, so callers
@@ -531,6 +597,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     event writers `pause_on_question` and `requeue_owned_task`, which can
     reach a purged thread only between `begin_purge` and its `cancel_tree`,
     the window the `commit` fence covers.
+- **Breaking: the lease-guarded event writers, the message-head writers and a
+  fork refuse a purged thread.** This closes the gaps the entry above lists
+  as still unfenced, except `MessageProjectionStore::get_or_create`. On a
+  `Deleting` or `Deleted` thread these writes now fail with a typed
+  `ThreadStateConflict` and write nothing:
+  - `AgentTaskStore::requeue_owned_task` with a boundary event and
+    `AgentTaskStore::pause_on_question`, on all three backends, after the
+    lease check as for every append. The task stays leased, and no event
+    or advisory row is written.
+  - `MessageProjectionStore::commit_messages`, `replace_history`,
+    `append_repair`, `set_draft` and `clear_draft`, on all three backends.
+    `clear_draft` refuses a purged thread whether or not it has a head.
+    SQLite and Postgres lock the thread row before the message head, the
+    order `append_compaction` already used. `clear_draft` now reads and
+    writes the head in one transaction.
+  - `ThreadStore::commit_fork` from a purged source. `ForkCommitParams`
+    gains the required `source_thread_id` field. `Fence::FORK_SOURCE` lets
+    a source with no row through. Postgres locks the source thread before
+    it claims the destination.
+  - In memory, `StoreRegistry::in_memory` wraps its message store in the
+    new `PurgeFencedMessageProjectionStore`, as it wraps its event journal
+    in `PurgeFencedEventRepository`. The in-memory question pause commits
+    its events before it releases the task store's lock. The in-memory
+    fences call `Fence::APPEND.check` instead of repeating its rule.
+  - `get_or_create` still adds an empty message head to a purged thread
+    with none, on every backend. It writes no history, and readers of a
+    deleted thread call it.
+  - Each of these refusals is counted on the new `agent_server.fence.refused`
+    counter (`otel`), by `writer` (`requeue_owned_task`, `pause_on_question`,
+    `message_head`, `fork_source`; `FencedWriter`) and `thread_status`. It is
+    also logged at debug with the thread id, and on SQLite and Postgres
+    emitted as an `agent_server.fence.refused` tracing event with `thread.id`
+    on the current span. `journal::thread::record_fence_refusal` records one
+    refusal. `ThreadOperation` and `ThreadStatus` gain `as_str`.
 - A fork that finds its caller-named destination already created reports
   the same `event_count` as the fork that created it (it counted the
   creation event).
@@ -749,6 +849,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The in-memory `commit` runs `Transition::validate` before it checks for an
+  event sink, so a malformed mixed spawn gets the same validation error on
+  every backend (it got "boundary events require an in-memory event sink"
+  on a store with no sink).
+- A `kill -9` test on SQLite holds the compaction transaction open and kills
+  the process: a new process sees neither the compaction nor its
+  `ContextCompacted`.
 - `agent-sdk-providers` test targets compile with any single provider
   feature. Tests that build an `OpenAIProvider` or use its model constants
   need `openai`, and `tests/provider_tiers.rs` needs `anthropic`; with the

@@ -941,6 +941,7 @@ impl GrpcControlService {
         if fork_after == 0 {
             // Empty fork — no projection, no checkpoint, no events.
             return Ok(ForkCommitParams {
+                source_thread_id: source_thread_id.clone(),
                 new_thread_id: new_thread_id.clone(),
                 creation,
                 now,
@@ -1009,6 +1010,7 @@ impl GrpcControlService {
         );
 
         Ok(ForkCommitParams {
+            source_thread_id: source_thread_id.clone(),
             new_thread_id: new_thread_id.clone(),
             creation,
             now,
@@ -6964,8 +6966,12 @@ mod tests {
                 .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
-        async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
-            self.inner.release_expired_leases(now).await
+        async fn release_expired_leases(
+            &self,
+            now: OffsetDateTime,
+            scope: agent_server::journal::LeaseRecoveryScope,
+        ) -> Result<Vec<RecoveryRecord>> {
+            self.inner.release_expired_leases(now, scope).await
         }
         async fn pause_on_children(
             &self,

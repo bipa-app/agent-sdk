@@ -552,6 +552,7 @@ pub mod document;
 #[cfg(test)]
 mod durability_dst_test;
 pub mod effect;
+pub mod epoch;
 pub mod event_notifier;
 pub mod event_repository;
 pub mod event_stream;
@@ -610,6 +611,7 @@ pub use effect::{
     EffectIntent, EffectKey, EffectKind, EffectRecord, EffectRun, EffectState, EffectSubject,
     EffectWrite, TOOL_INTERRUPTED_PREFIX, run_effect,
 };
+pub use epoch::{EpochId, EpochRecord, LeaseRecoveryScope};
 pub use event_notifier::{EventNotifier, EventReceiver};
 pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};

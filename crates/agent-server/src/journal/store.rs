@@ -221,6 +221,7 @@ use tokio::sync::RwLock;
 
 use super::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use super::committed_event::CommittedEvent;
+use super::epoch::{EpochId, EpochRecord, LeaseRecoveryScope};
 use super::event_repository::{EventRepository, InMemoryEventRepository};
 use super::idempotency::{IdempotencyClaim, IdempotencyKind, IdempotencyRecord};
 use super::outbox::{
@@ -2105,10 +2106,21 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
         now: OffsetDateTime,
     ) -> Result<AgentTask>;
 
-    /// Sweep every expired lease whose `lease_expires_at <= now` and
+    /// Sweep every `Running` row that `scope` reclaims and
     /// deterministically decide, per row, whether to return it to
     /// [`TaskStatus::Pending`] or fail it closed via Phase 2.5's
     /// recovery matrix.
+    ///
+    /// [`LeaseRecoveryScope::Expired`] reclaims every lease whose
+    /// `lease_expires_at <= now`, in expiry order.
+    /// [`LeaseRecoveryScope::ForeignEpoch`] reclaims every lease granted
+    /// under any other epoch (or before epochs existed), whatever its
+    /// expiry, and classifies it as
+    /// [`super::recovery::RecoveryContext::EpochChanged`]. Only a host
+    /// that is the sole process on the store may pass it, before it
+    /// grants a lease of its own (see [`super::epoch`]). There is no
+    /// default implementation: a decorating store must forward both
+    /// scopes through its own hooks.
     ///
     /// This is the recovery sweep that guarantees a crashed worker's
     /// rows never stay leased forever. It walks the lease-expiry index
@@ -2155,7 +2167,11 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     /// fail-close apart from the rest of the call instead logs that
     /// root's failure and returns the records it did commit; the root
     /// stays expired for the next call.
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>>;
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>>;
 
     /// Return a `Running` row this worker still owns to the runnable
     /// queue — the worker-initiated twin of the expiry sweep's requeue
@@ -2862,6 +2878,15 @@ struct Inner {
     /// ascending so [`AgentTaskStore::release_expired_leases`] can walk
     /// the head of the set until it hits a still-live lease and stop.
     leased_by_expiry: BTreeSet<(OffsetDateTime, AgentTaskId)>,
+    /// Every epoch begun on the store (`agent_sdk_host_epochs`).
+    epochs: HashMap<EpochId, EpochRecord>,
+    /// The epoch the newest [`super::transition::Write::BeginEpoch`]
+    /// began. Every lease granted after it carries it.
+    current_epoch: Option<EpochId>,
+    /// The epoch each leased row's lease was granted under
+    /// (`agent_sdk_tasks.lease_epoch`). A row with no entry was leased
+    /// before any epoch began.
+    lease_epochs: HashMap<AgentTaskId, EpochId>,
     /// Phase 10 · E durable idempotency table, keyed by `request_id`.
     /// Mirrors the `agent_sdk_idempotency` row the SQL backends own so
     /// in-memory tests exercise the same dedup contract.
@@ -3431,6 +3456,7 @@ impl InMemoryAgentTaskStore {
                         )?;
                     inner.rebalance_after_row_change(&old, &claimed);
                     inner.put_row(claimed.id.clone(), claimed.clone());
+                    inner.stamp_lease_epoch(&claimed.id);
                     result = Some(claimed);
                     break;
                 }
@@ -4522,6 +4548,63 @@ impl Inner {
     /// Complete delivered boundary-injection rows under the SAME write
     /// lock as the enclosing durable fact. Non-queued rows (a replayed
     /// commit) are skipped.
+    /// Refuse a transition that begins an epoch the store already holds,
+    /// before its first write.
+    fn require_new_epochs(&self, transition: &super::transition::Transition) -> Result<()> {
+        for record in transition.begun_epochs() {
+            ensure!(
+                !self.epochs.contains_key(&record.id),
+                "epoch {} already exists",
+                record.id
+            );
+        }
+        Ok(())
+    }
+
+    fn begin_epoch(&mut self, record: EpochRecord) {
+        self.current_epoch = Some(record.id.clone());
+        self.epochs.insert(record.id.clone(), record);
+    }
+
+    /// Record that `id`'s new lease was granted under the current epoch.
+    fn stamp_lease_epoch(&mut self, id: &AgentTaskId) {
+        match self.current_epoch.clone() {
+            Some(epoch) => {
+                self.lease_epochs.insert(id.clone(), epoch);
+            }
+            None => {
+                self.lease_epochs.remove(id);
+            }
+        }
+    }
+
+    /// Up to [`LEASE_RELEASE_BATCH`] leased rows that `scope` reclaims at
+    /// `now`, in expiry order.
+    fn reclaimable_leases(
+        &self,
+        scope: &LeaseRecoveryScope,
+        now: OffsetDateTime,
+    ) -> Vec<(OffsetDateTime, AgentTaskId)> {
+        match scope {
+            LeaseRecoveryScope::Expired => self
+                .leased_by_expiry
+                .iter()
+                .take_while(|(expires_at, _)| *expires_at <= now)
+                .take(LEASE_RELEASE_BATCH)
+                .cloned()
+                .collect(),
+            LeaseRecoveryScope::ForeignEpoch(_) => self
+                .leased_by_expiry
+                .iter()
+                .filter(|(expires_at, id)| {
+                    scope.reclaims(Some(*expires_at), self.lease_epochs.get(id), now)
+                })
+                .take(LEASE_RELEASE_BATCH)
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn complete_injection_rows(&mut self, ids: &[AgentTaskId], now: OffsetDateTime) -> Result<()> {
         for id in ids {
             let Some(old) = self.by_id.get(id).cloned() else {
@@ -5273,8 +5356,8 @@ impl InMemoryAgentTaskStore {
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
-        self.require_spawn_event_sink(&transition)?;
         transition.validate()?;
+        self.require_spawn_event_sink(&transition)?;
         let (sink, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
@@ -5296,10 +5379,9 @@ impl InMemoryAgentTaskStore {
                         .await?;
                     committed.settled.push(settled);
                 }
-                Write::RejectConfirmation { task, error } => {
-                    let rejected = Self::reject_confirmation_locked(inner, &task, error, now)?;
-                    committed.settled.push(rejected);
-                }
+                Write::RejectConfirmation { task, error } => committed
+                    .settled
+                    .push(Self::reject_confirmation_locked(inner, &task, error, now)?),
                 Write::PauseOnConfirmation {
                     task,
                     continuation,
@@ -5357,6 +5439,7 @@ impl InMemoryAgentTaskStore {
                     let batch = Self::append_transition_events(sink, &thread, events, now).await?;
                     committed.events.extend(batch);
                 }
+                Write::BeginEpoch(record) => inner.begin_epoch(record),
                 Write::SpawnChildren { parent, spawn } => {
                     let spawned = self
                         .apply_spawn_locked(&mut lock, &transition, &parent, *spawn, now)
@@ -5507,6 +5590,7 @@ impl InMemoryAgentTaskStore {
             }
         }
         transition.check_effects(|key| inner.effects.get(key))?;
+        inner.require_new_epochs(transition)?;
         self.require_appendable_threads(transition).await?;
         self.require_document_tasks(inner, transition).await?;
         Ok(plan_documents_locked(&inner.documents, transition)?.into_iter())
@@ -5696,7 +5780,8 @@ impl InMemoryAgentTaskStore {
                 | Write::ReparkAfterSteering { .. }
                 | Write::AppendCompaction { .. }
                 | Write::SpawnChildren { .. }
-                | Write::Document(_) => {}
+                | Write::Document(_)
+                | Write::BeginEpoch(_) => {}
             }
         }
         Ok(anchors)
@@ -5732,15 +5817,21 @@ impl InMemoryAgentTaskStore {
         &self,
         transition: &super::transition::Transition,
     ) -> Result<()> {
+        for thread_id in transition.appended_threads() {
+            self.require_appendable_thread(thread_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Refuse an append to a purged `thread_id`, read through the event
+    /// sink's thread store. A store built without a sink has no thread
+    /// projection to read, so it refuses nothing.
+    async fn require_appendable_thread(&self, thread_id: &ThreadId) -> Result<()> {
         let Some(sink) = &self.marker_sink else {
             return Ok(());
         };
-        for thread_id in transition.appended_threads() {
-            if let Some(thread) = sink.thread_store.get(thread_id).await? {
-                thread.require_active(super::thread::ThreadOperation::Append)?;
-            }
-        }
-        Ok(())
+        let thread = sink.thread_store.get(thread_id).await?;
+        super::transition::Fence::APPEND.check(thread_id, thread.as_ref())
     }
 
     /// A transition's events and their advisory row, through the store's
@@ -5841,8 +5932,9 @@ impl InMemoryAgentTaskStore {
     }
 
     /// Refuse a mixed spawn that carries boundary or trailing events when
-    /// the store has no event sink to commit them through, before its
-    /// shape is checked.
+    /// the store has no event sink to commit them through. It runs after
+    /// [`super::transition::Transition::validate`], so a malformed spawn
+    /// gets its validation error on every backend.
     fn require_spawn_event_sink(&self, transition: &super::transition::Transition) -> Result<()> {
         for write in &transition.writes {
             if let super::transition::Write::SpawnChildren { spawn, .. } = write
@@ -6814,6 +6906,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .context("try_acquire_task rejected: mark_running transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
         inner.put_row(claimed.id.clone(), claimed.clone());
+        inner.stamp_lease_epoch(&claimed.id);
         drop(inner);
         Ok(Some(claimed))
     }
@@ -6894,8 +6987,18 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         Ok(refreshed)
     }
 
-    async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
+    async fn release_expired_leases(
+        &self,
+        now: OffsetDateTime,
+        scope: LeaseRecoveryScope,
+    ) -> Result<Vec<RecoveryRecord>> {
         let mut inner = self.inner.write().await;
+        if let LeaseRecoveryScope::ForeignEpoch(epoch) = &scope {
+            ensure!(
+                inner.current_epoch.as_ref() == Some(epoch),
+                "release_expired_leases: epoch {epoch} is not the epoch this store began"
+            );
+        }
 
         // Walk the lease-expiry index in ascending order, collecting
         // rows whose expiry is `<= now`. Iteration stops on the first
@@ -6905,13 +7008,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // call returns fewer than the batch") holds on every backend.
         // Collecting up-front lets us mutate `inner` inside the loop
         // without fighting the borrow checker.
-        let expired_keys: Vec<(OffsetDateTime, AgentTaskId)> = inner
-            .leased_by_expiry
-            .iter()
-            .take_while(|(expires_at, _)| *expires_at <= now)
-            .take(LEASE_RELEASE_BATCH)
-            .cloned()
-            .collect();
+        let expired_keys = inner.reclaimable_leases(&scope, now);
 
         let mut released = Vec::with_capacity(expired_keys.len());
         for (_, id) in expired_keys {
@@ -6936,7 +7033,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             // carrying an unsafe prepared operation take the fail
             // path; everything else requeues with the old Phase 2.3
             // behavior.
-            let record = match classify_recovery(&old, RecoveryContext::ExpiredLease) {
+            let record = match classify_recovery(&old, scope.context()) {
                 RecoveryAction::Requeue => {
                     let released_row = old
                         .clone()
@@ -6969,10 +7066,6 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         }
 
         drop(inner);
-
-        #[cfg(feature = "otel")]
-        crate::observability::ServerMetrics::global().record_lease_expiry_outcomes(&released);
-
         Ok(released)
     }
 
@@ -7003,6 +7096,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // successor emits, and a failure here leaves the row Running
         // under the caller's lease (nothing released yet).
         if let Some(event) = boundary {
+            super::thread::record_fence_refusal(
+                super::thread::FencedWriter::RequeueOwnedTask,
+                self.require_appendable_thread(&old.thread_id).await,
+            )?;
             if let Some(sink) = &self.marker_sink {
                 let committed = sink
                     .event_repo
@@ -7212,10 +7309,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .cloned()
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::PauseOnQuestion,
+            self.require_appendable_thread(&paused.thread_id).await,
+        )?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.put_row(paused.id.clone(), paused.clone());
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
-        drop(inner);
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let Some(sink) = &self.marker_sink else {
             return Ok((paused, Vec::new()));
@@ -7228,6 +7328,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         if let Some(last) = committed.last() {
             Self::insert_marker_advisory(sink, last, now).await?;
         }
+        drop(inner);
         Ok((paused, committed))
     }
 
@@ -10281,7 +10382,7 @@ mod tests {
 
         // Sweep at `now = t+15`: `a` expired, `b` and `c` still live.
         let released = store
-            .release_expired_leases(t_plus(15))
+            .release_expired_leases(t_plus(15), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep 15")?;
         assert_eq!(released, vec![RecoveryRecord::requeued(a_id.clone())]);
@@ -10319,14 +10420,14 @@ mod tests {
 
         // A second sweep at `now = t+25` catches only `b`.
         let released = store
-            .release_expired_leases(t_plus(25))
+            .release_expired_leases(t_plus(25), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep 25")?;
         assert_eq!(released, vec![RecoveryRecord::requeued(b_id.clone())]);
 
         // Empty sweep: still-live `c` survives.
         let released = store
-            .release_expired_leases(t_plus(25))
+            .release_expired_leases(t_plus(25), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep idempotent")?;
         assert_eq!(
@@ -10365,17 +10466,17 @@ mod tests {
         // Every lease is expired at t+10; one call reclaims exactly one
         // batch, the next reclaims the remainder, the third is empty.
         let first = store
-            .release_expired_leases(t_plus(10))
+            .release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("first sweep")?;
         assert_eq!(first.len(), LEASE_RELEASE_BATCH);
         let second = store
-            .release_expired_leases(t_plus(10))
+            .release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("second sweep")?;
         assert_eq!(second.len(), 44);
         let third = store
-            .release_expired_leases(t_plus(10))
+            .release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("third sweep")?;
         assert_eq!(third, [] as [crate::journal::recovery::RecoveryRecord; 0]);
@@ -10405,7 +10506,7 @@ mod tests {
 
         // The dead worker never heartbeats. Sweep at `t+15` boots it.
         let swept = store
-            .release_expired_leases(t_plus(15))
+            .release_expired_leases(t_plus(15), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert_eq!(swept.len(), 1);
@@ -10487,7 +10588,7 @@ mod tests {
 
         // The sweep at t+15 now treats the lease as live.
         let released = store
-            .release_expired_leases(t_plus(15))
+            .release_expired_leases(t_plus(15), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert!(released.is_empty(), "heartbeat should extend lease");
@@ -10588,7 +10689,7 @@ mod tests {
         // Expire the heartbeat by advancing the sweep past it. The
         // child returns to Pending so a new worker can pick it up.
         let expired = store
-            .release_expired_leases(t_plus(300))
+            .release_expired_leases(t_plus(300), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep child")?;
         assert_eq!(expired, vec![RecoveryRecord::requeued(child_id.clone())]);
@@ -10874,7 +10975,10 @@ mod tests {
         // contains `Running` rows. A paused row dropped its lease, so
         // even at `now = t+1_000_000` the sweep must not touch it.
         let swept = store
-            .release_expired_leases(t_plus(1_000_000))
+            .release_expired_leases(
+                t_plus(1_000_000),
+                crate::journal::LeaseRecoveryScope::Expired,
+            )
             .await
             .context("sweep")?;
         assert!(
@@ -11533,7 +11637,9 @@ mod tests {
             .acquire_next_runnable(WorkerId::new(), LeaseId::new(), t_plus(60), t_plus(3))
             .await;
         assert!(scanned.is_err(), "scan: {scanned:?}");
-        let swept = store.release_expired_leases(t_plus(11)).await;
+        let swept = store
+            .release_expired_leases(t_plus(11), crate::journal::LeaseRecoveryScope::Expired)
+            .await;
         assert!(swept.is_err(), "sweep: {swept:?}");
 
         for (thread_id, id, status) in [
@@ -11571,7 +11677,7 @@ mod tests {
 
         // attempt == 1, max_attempts == 1 → sweep must fail closed.
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert_eq!(
@@ -11614,7 +11720,7 @@ mod tests {
             .context("claimed")?;
 
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert_eq!(swept, vec![RecoveryRecord::requeued(id.clone())]);
@@ -11764,7 +11870,7 @@ mod tests {
             .context("claimed")?;
 
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert_eq!(swept.len(), 1);
@@ -11941,7 +12047,7 @@ mod tests {
 
         // Sweep: budget exhausted → fail closed.
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         assert!(swept[0].action.is_fail_closed());
@@ -12055,7 +12161,7 @@ mod tests {
 
         // First sweep: one fail-closed record.
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep 1")?;
         assert_eq!(swept.len(), 1);
@@ -12063,7 +12169,7 @@ mod tests {
 
         // Second sweep: nothing to do.
         let swept = store
-            .release_expired_leases(t_plus(20))
+            .release_expired_leases(t_plus(20), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep 2")?;
         assert_eq!(swept, [] as [crate::journal::recovery::RecoveryRecord; 0]);
@@ -12244,7 +12350,10 @@ mod tests {
                 .with_context(|| format!("claim {task_id} attempt {}", attempt + 1))?;
             assert_eq!(running.status, TaskStatus::Running);
             last_sweep = store
-                .release_expired_leases(t_plus(start_secs + offset + 6))
+                .release_expired_leases(
+                    t_plus(start_secs + offset + 6),
+                    crate::journal::LeaseRecoveryScope::Expired,
+                )
                 .await?;
         }
         Ok(last_sweep)
@@ -12477,7 +12586,32 @@ mod tests {
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn sinkless_mixed_spawn_rejects_boundary_events_without_mutation() -> Result<()> {
+    async fn sinkless_mixed_spawn_rejects_trailing_events_without_mutation() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-sinkless-trailing").await?;
+        let mut spawn = mixed_spawn_for("t-sinkless-trailing", Vec::new(), &[0]);
+        spawn
+            .trailing_events
+            .push(AgentEvent::text("msg-trailing", "trailing"));
+
+        let error = store
+            .spawn_mixed_children(&parent.id, &worker, &lease, spawn, Vec::new(), t_plus(2))
+            .await
+            .expect_err("a sink-less store must reject non-empty trailing events");
+        assert!(
+            format!("{error:#}").contains("boundary events require an in-memory event sink"),
+            "unexpected error: {error:#}",
+        );
+        let persisted = store.get(&parent.id).await?.context("parent survives")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent.id).await?.is_empty());
+        Ok(())
+    }
+
+    /// A malformed spawn is refused by `Transition::validate` before the
+    /// sink check, as on the durable backends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sinkless_malformed_mixed_spawn_gets_the_validation_error() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-sinkless-boundary").await?;
         let mut spawn = mixed_spawn_for(
@@ -12495,9 +12629,10 @@ mod tests {
         let error = store
             .spawn_mixed_children(&parent.id, &worker, &lease, spawn, Vec::new(), t_plus(2))
             .await
-            .expect_err("a sink-less store must reject non-empty boundary events");
+            .expect_err("a boundary event with no precompleted child is malformed");
         assert!(
-            format!("{error:#}").contains("boundary events require an in-memory event sink"),
+            format!("{error:#}")
+                .contains("ToolCallEnd boundary events for 0 precompleted children"),
             "unexpected error: {error:#}",
         );
         let persisted = store.get(&parent.id).await?.context("parent survives")?;
@@ -13846,7 +13981,10 @@ mod tests {
             .context("acquire resume")?
             .context("resume claimed")?;
         let swept = store
-            .release_expired_leases(t_plus(sweep_at))
+            .release_expired_leases(
+                t_plus(sweep_at),
+                crate::journal::LeaseRecoveryScope::Expired,
+            )
             .await
             .context("sweep")?;
         assert_eq!(swept.len(), 1, "exactly one row should sweep per cycle");
@@ -16490,7 +16628,7 @@ mod tests {
             .context("acquire")?
             .context("claimed")?;
         store
-            .release_expired_leases(t_plus(10))
+            .release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         let err = store
@@ -16519,7 +16657,7 @@ mod tests {
             .context("acquire old")?
             .context("claimed old")?;
         store
-            .release_expired_leases(t_plus(10))
+            .release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("sweep")?;
         store
@@ -16568,8 +16706,10 @@ mod tests {
             st1.heartbeat_task(&id1, &hb_w, &hb_l, t_plus(120), None, t_plus(10))
                 .await
         });
-        let sweep_handle =
-            tokio::spawn(async move { st2.release_expired_leases(t_plus(10)).await });
+        let sweep_handle = tokio::spawn(async move {
+            st2.release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
+                .await
+        });
         let _ = hb_handle.await.context("hb join")?;
         let _ = sweep_handle.await.context("sweep join")?;
 
@@ -16614,7 +16754,8 @@ mod tests {
         for _ in 0..count {
             let st = Arc::clone(&store);
             handles.push(tokio::spawn(async move {
-                st.release_expired_leases(t_plus(10)).await
+                st.release_expired_leases(t_plus(10), crate::journal::LeaseRecoveryScope::Expired)
+                    .await
             }));
         }
         let mut total_records = 0usize;

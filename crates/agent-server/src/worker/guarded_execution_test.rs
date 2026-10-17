@@ -540,7 +540,10 @@ async fn a_worker_that_lost_its_lease_cannot_claim() -> Result<()> {
 
     let ctx = child_bootstrap(&stores, "transfer", serde_json::json!({"amount": 100})).await?;
     let key = EffectKey::tool(&ctx.task_id, &ctx.tool_call.id);
-    stores.tasks.release_expired_leases(t_plus(10_000)).await?;
+    stores
+        .tasks
+        .release_expired_leases(t_plus(10_000), crate::journal::LeaseRecoveryScope::Expired)
+        .await?;
     stores
         .tasks
         .try_acquire_task(
@@ -590,7 +593,9 @@ async fn a_refused_settle_leaves_the_record_started() -> Result<()> {
         tasks,
         &cancel,
         |_info, _collector| async move {
-            tasks.release_expired_leases(t_plus(10_000)).await?;
+            tasks
+                .release_expired_leases(t_plus(10_000), crate::journal::LeaseRecoveryScope::Expired)
+                .await?;
             Ok(ToolResult::success("transfer done"))
         },
         t_plus(20),
