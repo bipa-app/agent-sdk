@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.18.0...agent-sdk-providers-v0.19.0) - 2026-10-17
+
+### Added
+
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+- *(providers)* add Gemini 4 Argon, refresh the Gemini lineup, and fix GPT-5.6 prices ([#481](https://github.com/bipa-app/agent-sdk/pull/481))
+- *(server)* [**breaking**] request-only context hook on AgentDefinition ([#464](https://github.com/bipa-app/agent-sdk/pull/464))
+- *(providers)* add GPT-6.1 Sol capabilities ([#460](https://github.com/bipa-app/agent-sdk/pull/460))
+- *(providers)* add Claude Sonnet 5.5 capabilities ([#456](https://github.com/bipa-app/agent-sdk/pull/456))
+- *(providers)* GPT-6 family and Claude Fable 5.1; fix prompt_cache_key length and Anthropic keep-alives ([#455](https://github.com/bipa-app/agent-sdk/pull/455))
+- *(providers)* add Claude Opus 5.5 capabilities ([#454](https://github.com/bipa-app/agent-sdk/pull/454))
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+
+### Fixed
+
+- *(providers)* gate tests that reach into a provider behind its feature; check provider test targets in the feature matrix ([#501](https://github.com/bipa-app/agent-sdk/pull/501))
+- *(pricing)* OpenAI rows at their Standard tier, not the Batch tier ([#487](https://github.com/bipa-app/agent-sdk/pull/487))
+- *(pricing)* Claude Sonnet 5 at its standard $2/$10 ([#485](https://github.com/bipa-app/agent-sdk/pull/485))
+- *(gemini)* count thinking tokens as output ([#484](https://github.com/bipa-app/agent-sdk/pull/484))
+- *(gemini)* send type-list tool schemas in a shape the Schema proto parses ([#483](https://github.com/bipa-app/agent-sdk/pull/483))
+- *(tools)* accept null for every optional built-in tool input field ([#482](https://github.com/bipa-app/agent-sdk/pull/482))
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+- *(compaction)* [**breaking**] report what crossed which threshold; resolve dated model snapshots ([#478](https://github.com/bipa-app/agent-sdk/pull/478))
+- *(server)* [**breaking**] size worker max_tokens to the serving model; correct output ceilings ([#472](https://github.com/bipa-app/agent-sdk/pull/472))
+- *(server,codex)* key daemon requests by thread so Codex prompt caching hits ([#471](https://github.com/bipa-app/agent-sdk/pull/471))
+- *(compaction)* [**breaking**] trigger on real per-model context occupancy ([#465](https://github.com/bipa-app/agent-sdk/pull/465))
+- *(providers)* [**breaking**] unique tool-call ids, strict-safe schemas, argument-stream liveness; thread-scoped execution cache ([#467](https://github.com/bipa-app/agent-sdk/pull/467))
+- *(anthropic)* Claude Code 2.1.296 OAuth parity and Claude Haiku 5.5 ([#463](https://github.com/bipa-app/agent-sdk/pull/463))
+- *(providers)* serialize image attachments as Chat Completions image_url parts ([#451](https://github.com/bipa-app/agent-sdk/pull/451))
+- *(providers)* fold openai-codex into the OpenAI attachment policy ([#448](https://github.com/bipa-app/agent-sdk/pull/448))
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-providers-v0.17.0...agent-sdk-providers-v0.18.0) - 2026-08-04
 
 ### Added

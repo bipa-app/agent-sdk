@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.18.0...agent-sdk-v0.19.0) - 2026-10-17
+
+### Added
+
+- *(host)* [**breaking**] a tool child fails as stalled when its tool shows no progress for its stall budget ([#514](https://github.com/bipa-app/agent-sdk/pull/514))
+- *(host)* [**breaking**] durable prompt rows — a host's prompt is answered once and applied by its handler ([#515](https://github.com/bipa-app/agent-sdk/pull/515))
+- *(observability)* recovery and host-loop signals the crash matrix found missing ([#517](https://github.com/bipa-app/agent-sdk/pull/517))
+- *(server)* [**breaking**] a completed root turn settles the root in the same transaction ([#513](https://github.com/bipa-app/agent-sdk/pull/513))
+- *(observability)* wire workers.active, let a host name its service without a warning; record what a live daemon exports ([#512](https://github.com/bipa-app/agent-sdk/pull/512))
+- *(server)* [**breaking**] tool calls run as effects; their record is claimed under the lease and finished with the settle ([#507](https://github.com/bipa-app/agent-sdk/pull/507))
+- *(server)* [**breaking**] documents, typed JSON a transition writes in its own transaction ([#504](https://github.com/bipa-app/agent-sdk/pull/504))
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+- *(server)* [**breaking**] request-only context hook on AgentDefinition ([#464](https://github.com/bipa-app/agent-sdk/pull/464))
+- *(providers)* GPT-6 family and Claude Fable 5.1; fix prompt_cache_key length and Anthropic keep-alives ([#455](https://github.com/bipa-app/agent-sdk/pull/455))
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+- *(server)* durable tool-input preflight + atomic precompleted mixed-spawn (ENG-9548) ([#442](https://github.com/bipa-app/agent-sdk/pull/442))
+
+### Fixed
+
+- *(pricing)* OpenAI rows at their Standard tier, not the Batch tier ([#487](https://github.com/bipa-app/agent-sdk/pull/487))
+- *(gemini)* send type-list tool schemas in a shape the Schema proto parses ([#483](https://github.com/bipa-app/agent-sdk/pull/483))
+- *(tools)* accept null for every optional built-in tool input field ([#482](https://github.com/bipa-app/agent-sdk/pull/482))
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+- *(compaction)* [**breaking**] report what crossed which threshold; resolve dated model snapshots ([#478](https://github.com/bipa-app/agent-sdk/pull/478))
+- *(server)* [**breaking**] size worker max_tokens to the serving model; correct output ceilings ([#472](https://github.com/bipa-app/agent-sdk/pull/472))
+- *(server)* early resume never re-presents a running call as new ([#468](https://github.com/bipa-app/agent-sdk/pull/468))
+- *(server,codex)* key daemon requests by thread so Codex prompt caching hits ([#471](https://github.com/bipa-app/agent-sdk/pull/471))
+- *(compaction)* [**breaking**] trigger on real per-model context occupancy ([#465](https://github.com/bipa-app/agent-sdk/pull/465))
+- *(providers)* [**breaking**] unique tool-call ids, strict-safe schemas, argument-stream liveness; thread-scoped execution cache ([#467](https://github.com/bipa-app/agent-sdk/pull/467))
+- *(compaction)* skip a summarization that returns no usable text ([#450](https://github.com/bipa-app/agent-sdk/pull/450))
+- *(compaction)* skip no-progress compaction; sanitize thinking blocks from non-final turns ([#447](https://github.com/bipa-app/agent-sdk/pull/447))
+- *(mcp)* omit absent client capabilities from the initialize handshake ([#444](https://github.com/bipa-app/agent-sdk/pull/444))
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+- *(ci)* repair the rust 1.98 clippy and RustSec gate breakage on main ([#452](https://github.com/bipa-app/agent-sdk/pull/452))
+- *(dev)* make local dev runtime-agnostic, drop the compose dependency ([#438](https://github.com/bipa-app/agent-sdk/pull/438))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.17.0...agent-sdk-v0.18.0) - 2026-08-04
 
 ### Added

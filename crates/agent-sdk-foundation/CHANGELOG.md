@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.18.0...agent-sdk-foundation-v0.19.0) - 2026-10-17
+
+### Added
+
+- *(host)* GetThreadView, GetThreadViewItems and StreamThreadView, folded from the event log at read time ([#511](https://github.com/bipa-app/agent-sdk/pull/511))
+- *(foundation)* the session view fold, a pure projection of the event log ([#502](https://github.com/bipa-app/agent-sdk/pull/502))
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+- *(server)* [**breaking**] request-only context hook on AgentDefinition ([#464](https://github.com/bipa-app/agent-sdk/pull/464))
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+
+### Fixed
+
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+- *(compaction)* [**breaking**] report what crossed which threshold; resolve dated model snapshots ([#478](https://github.com/bipa-app/agent-sdk/pull/478))
+- *(server)* early resume never re-presents a running call as new ([#468](https://github.com/bipa-app/agent-sdk/pull/468))
+- *(compaction)* [**breaking**] trigger on real per-model context occupancy ([#465](https://github.com/bipa-app/agent-sdk/pull/465))
+- *(worker)* close cancelled tool calls at the cancel seam; remove turn-path repair ([#446](https://github.com/bipa-app/agent-sdk/pull/446))
+- *(journal)* never persist or ship an invalid tool_use/tool_result sequence ([#445](https://github.com/bipa-app/agent-sdk/pull/445))
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-foundation-v0.17.0...agent-sdk-foundation-v0.18.0) - 2026-08-04
 
 ### Added
