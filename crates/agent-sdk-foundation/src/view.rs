@@ -8,6 +8,33 @@
 //!
 //! `fold` reads the status only, never the items: every op addresses an item
 //! by a stable key, so a backend applies it as a keyed upsert.
+//!
+//! # Item keys
+//!
+//! Stores, streams and clients address items by these keys. They are part of
+//! the wire contract, and a change to them is a [`VIEW_SCHEMA`] bump.
+//!
+//! | Key | Item | From |
+//! |---|---|---|
+//! | `msg:<message_id>` | [`ViewItem::Text`] | `TextDelta`, `Text`, `ThinkingDelta`, `Thinking` |
+//! | `tool:<id>` | [`ViewItem::ToolCall`] | `ToolCallStart`/`ToolCallEnd`/`ToolProgress` `id`; the `ToolRequiresConfirmation` `id` (a relayed confirmation has no start); the `SubagentProgress` `subagent_id`, which is its spawning tool call's id |
+//! | `question:<tool_call_id>` | [`ViewItem::Question`] | one per `QuestionAsked` question |
+//! | `refusal:<message_id>` | [`ViewItem::Refusal`] | `Refusal` |
+//! | `user:<sequence>` | [`ViewItem::UserInput`] | `UserInput` |
+//! | `error:<sequence>` | [`ViewItem::Error`] | `Error` |
+//! | `notice:<sequence>` | rotation, pool exhaustion, compaction | `AccountRotation`, `AccountPoolExhausted`, `ContextCompacted` |
+//! | `turn_end:<sequence>` | [`ViewItem::TurnEnd`] | the event that ends a turn |
+//!
+//! `<sequence>` is the committed event's sequence.
+//!
+//! # When a turn ends
+//!
+//! A root turn ends on `Done`, `BudgetExceeded`, `Cancelled`, or an `Error`
+//! with a terminal `reason`, whatever its `recoverable` flag says. An `Error`
+//! without a reason (a retry boundary or a non-fatal notice) and a `Refusal`
+//! do not end it. `Done`, `BudgetExceeded` and `Cancelled` always close the
+//! turn and whatever it left open. An `Error` with a terminal reason when no
+//! turn is running adds its item and changes nothing else.
 
 use std::collections::BTreeMap;
 
@@ -24,10 +51,20 @@ use crate::types::{BudgetLimitKind, QuestionPayload, TokenUsage, ToolResult, Too
 
 /// Version of the fold's semantics. A stored view at another version is
 /// treated as not materialized and is rebuilt from the events.
+///
+/// The view enums are exhaustive on purpose: a host's renderer should fail to
+/// compile when the view gains a kind of item, op or patch. Such a change
+/// bumps this version and is a breaking release.
 pub const VIEW_SCHEMA: u32 = 1;
 
 /// How many recently closed message and tool keys the status remembers, so a
-/// late final event patches its item instead of opening a second one.
+/// late final event patches its item instead of opening a second one, and a
+/// late delta for a closed message is dropped.
+///
+/// The window is the last 32 closed keys. A delta for a message that closed
+/// longer ago than that, from the running task, opens the message again. The
+/// runtime journals a message's deltas before its final text, so a delta
+/// that late does not occur.
 pub const RECENTLY_CLOSED_LIMIT: usize = 32;
 
 /// Host settings for the view. A value, so a store can hold it and pass it to
@@ -48,8 +85,10 @@ pub struct ViewConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TurnState {
+    /// No root turn runs: none started yet, or the last one ended.
     #[default]
     Idle,
+    /// A root turn started and has not ended.
     Running {
         turn: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,25 +159,34 @@ pub struct PendingConfirmation {
 /// The small, bounded part of the view.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ThreadViewStatus {
+    /// The [`VIEW_SCHEMA`] the status was folded with.
     pub schema: u32,
     /// Sequence of the last event folded.
     pub sequence: u64,
     pub turn: TurnState,
+    /// How the last turn ended; cleared when the next one starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<TurnOutcome>,
+    /// Keys of text items that still stream.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_messages: Vec<String>,
+    /// Keys of tool calls that started and have not ended.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_tools: Vec<String>,
+    /// The last [`RECENTLY_CLOSED_LIMIT`] closed message and tool keys,
+    /// oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recently_closed: Vec<String>,
+    /// Confirmations the thread waits on, in the order they were asked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_confirmations: Vec<PendingConfirmation>,
+    /// Keys of unanswered questions, in the order they were asked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_questions: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryState>,
     pub usage: UsageView,
+    /// The host's stall notice was the last event.
     #[serde(default)]
     pub stalled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,10 +233,15 @@ pub enum TextKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolState {
+    /// Started, with no result yet.
     Running,
+    /// Waits for the user to approve or reject it.
     AwaitingConfirmation,
+    /// Ended with a successful result.
     Succeeded,
+    /// Ended with a failed result, including a rejected confirmation.
     Failed,
+    /// Its turn ended or restarted before it reported a result.
     Interrupted,
 }
 
@@ -362,19 +415,17 @@ pub enum ItemPatch {
         text: Option<String>,
         interrupted: bool,
     },
-    ToolEnded {
-        result: ToolResult,
-    },
+    /// Record the tool's result and its success or failure.
+    ToolEnded { result: ToolResult },
+    /// Mark the tool [`ToolState::Interrupted`].
     ToolInterrupted,
-    ToolProgress {
-        progress: ToolProgressView,
-    },
-    AwaitingConfirmation {
-        confirmation: ConfirmationView,
-    },
-    Subagent {
-        subagent: SubagentView,
-    },
+    /// Replace the tool's latest progress report.
+    ToolProgress { progress: ToolProgressView },
+    /// Mark the tool as waiting for a confirmation.
+    AwaitingConfirmation { confirmation: ConfirmationView },
+    /// Replace the latest report of the tool's subagent.
+    Subagent { subagent: SubagentView },
+    /// Mark the question answered.
     QuestionResolved,
 }
 
@@ -383,29 +434,29 @@ pub enum ItemPatch {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ViewOp {
-    SetStatus {
-        status: Box<ThreadViewStatus>,
-    },
+    /// Replace the status. The last op of every folded event.
+    SetStatus { status: Box<ThreadViewStatus> },
     /// Replace the body of the item with `key`, keeping its position, or
     /// append a new item at the end of the timeline.
-    Put {
-        key: String,
-        item: ViewItem,
-    },
-    AppendText {
-        key: String,
-        delta: String,
-    },
-    Patch {
-        key: String,
-        patch: ItemPatch,
-    },
+    Put { key: String, item: ViewItem },
+    /// Append to a text item's text.
+    AppendText { key: String, delta: String },
+    /// Change one item; see [`apply_patch`].
+    Patch { key: String, patch: ItemPatch },
 }
 
 /// Fold one committed event into the view.
 ///
+/// `sequence` and `at` are the committed event's sequence and commit
+/// timestamp; a caller that passed its own clock would make the store and a
+/// client disagree. Sequences strictly increase; a gap is allowed, and the
+/// caller folds the missing events first.
+///
 /// Returns the next status and the ops that produce it; the last op is
-/// always [`ViewOp::SetStatus`]. Pure: the same inputs give the same output.
+/// [`ViewOp::SetStatus`]. An event at or below the status's sequence was
+/// already folded: it returns the status unchanged and no ops, because
+/// [`ViewOp::AppendText`] is not idempotent. Pure: the same inputs give the
+/// same output.
 #[must_use]
 pub fn fold(
     status: &ThreadViewStatus,
@@ -414,6 +465,9 @@ pub fn fold(
     event: &AgentEvent,
     config: &ViewConfig,
 ) -> (ThreadViewStatus, Vec<ViewOp>) {
+    if status.sequence > 0 && sequence <= status.sequence {
+        return (status.clone(), Vec::new());
+    }
     let mut step = Step {
         status: status.clone(),
         ops: Vec::new(),
@@ -661,7 +715,7 @@ impl Step {
                     emitter_task_id: emitter_task_id.clone(),
                 },
             ),
-            AgentEvent::Refusal { message_id, text } => self.put_closed(
+            AgentEvent::Refusal { message_id, text } => self.put(
                 format!("refusal:{message_id}"),
                 ViewItem::Refusal {
                     message_id: message_id.clone(),
@@ -876,7 +930,7 @@ impl Step {
             if self.status.pending_questions.contains(&key) {
                 continue;
             }
-            self.put_closed(
+            self.put(
                 key.clone(),
                 ViewItem::Question {
                     task_id: task_id.to_owned(),
@@ -897,7 +951,7 @@ impl Step {
                 reason: reason.cloned(),
             },
         );
-        if let Some(reason) = reason {
+        if let Some(reason) = reason.filter(|_| self.status.turn != TurnState::Idle) {
             let turns = self.status.usage.turns;
             let usage = self.status.usage.last_turn.clone();
             self.end_turn(
@@ -1142,6 +1196,9 @@ impl Step {
 pub struct ThreadView {
     pub status: ThreadViewStatus,
     pub items: BTreeMap<String, IndexedItem>,
+    /// The index the next new item gets. It is not `items.len()`: a view
+    /// built from a snapshot or above a retention floor lacks older items.
+    pub next_index: u64,
 }
 
 /// An item and its position in the timeline.
@@ -1187,14 +1244,18 @@ impl ThreadView {
         match op {
             ViewOp::SetStatus { status } => self.status = (**status).clone(),
             ViewOp::Put { key, item } => {
-                let index = self.items.len() as u64;
-                self.items
-                    .entry(key.clone())
-                    .and_modify(|existing| existing.item = item.clone())
-                    .or_insert_with(|| IndexedItem {
-                        index,
-                        item: item.clone(),
-                    });
+                if let Some(existing) = self.items.get_mut(key) {
+                    existing.item = item.clone();
+                } else {
+                    self.items.insert(
+                        key.clone(),
+                        IndexedItem {
+                            index: self.next_index,
+                            item: item.clone(),
+                        },
+                    );
+                    self.next_index += 1;
+                }
             }
             ViewOp::AppendText { key, delta } => {
                 let Some(entry) = self.items.get_mut(key) else {

@@ -499,6 +499,14 @@ fn terminal_shapes() {
             false,
         ),
         (
+            "recoverable error with a terminal reason",
+            vec![
+                start("root-a"),
+                error(true, Some(TerminalReason::InternalError)),
+            ],
+            true,
+        ),
+        (
             "refusal before done",
             vec![
                 start("root-a"),
@@ -795,6 +803,7 @@ proptest! {
         let mut store = prefix;
         for (offset, event) in events[split..].iter().enumerate() {
             let sequence = (split + offset) as u64 + 1;
+            let was_running = store.status.turn != TurnState::Idle;
             let ops = store.fold(sequence, at, event, &config);
             let wire = serde_json::to_string(&ops).map_err(|e| TestCaseError::fail(e.to_string()))?;
             let ops: Vec<ViewOp> =
@@ -802,7 +811,12 @@ proptest! {
             for op in &ops {
                 prop_assert!(client.apply(op), "op {:?} addresses a missing item", op);
             }
-            if matches!(actions[split + offset], Action::Done | Action::Cancel | Action::Fail) {
+            let ends_turn = match actions[split + offset] {
+                Action::Done | Action::Cancel => true,
+                Action::Fail => was_running,
+                _ => false,
+            };
+            if ends_turn {
                 prop_assert_eq!(&store.status.turn, &TurnState::Idle);
                 prop_assert_eq!(store.status.open_messages.len(), 0);
                 prop_assert_eq!(store.status.open_tools.len(), 0);
@@ -815,8 +829,188 @@ proptest! {
     }
 
     #[test]
+    fn a_client_missing_its_oldest_items_keeps_the_full_folds_order(
+        actions in proptest::collection::vec(action(), 0..80),
+        split in 0usize..80,
+        dropped in 0usize..10,
+    ) {
+        let events: Vec<AgentEvent> = actions.iter().map(to_event).collect();
+        let split = split.min(events.len());
+        let config = config();
+        let at = OffsetDateTime::UNIX_EPOCH;
+
+        let full = view_of(&events);
+        let prefix = view_of(&events[..split]);
+        let mut oldest: Vec<(u64, String)> =
+            prefix.items.iter().map(|(key, indexed)| (indexed.index, key.clone())).collect();
+        oldest.sort_unstable();
+        let mut client = prefix.clone();
+        let mut removed = Vec::new();
+        for (_, key) in oldest.into_iter().take(dropped) {
+            client.items.remove(&key);
+            removed.push(key);
+        }
+        let mut store = prefix;
+        for (offset, event) in events[split..].iter().enumerate() {
+            let sequence = (split + offset) as u64 + 1;
+            for op in store.fold(sequence, at, event, &config) {
+                client.apply(&op);
+            }
+        }
+
+        let mut indexes: Vec<u64> = client.items.values().map(|indexed| indexed.index).collect();
+        indexes.sort_unstable();
+        let unique = indexes.len();
+        indexes.dedup();
+        prop_assert_eq!(indexes.len(), unique, "a truncated view gave two items one index");
+        prop_assert!(client.next_index >= full.next_index);
+        prop_assert_eq!(&client.status, &full.status);
+        let mut kept: Vec<(u64, u64)> = Vec::new();
+        for (key, indexed) in &client.items {
+            if removed.contains(key) {
+                continue;
+            }
+            let Some(in_full) = full.items.get(key) else {
+                return Err(TestCaseError::fail(format!("{key} is not in the full fold")));
+            };
+            prop_assert_eq!(&indexed.item, &in_full.item, "item {} differs", key);
+            kept.push((indexed.index, in_full.index));
+        }
+        kept.sort_unstable();
+        prop_assert!(
+            kept.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "the truncated view orders its items differently from the full fold"
+        );
+    }
+
+    #[test]
+    fn folding_the_events_again_changes_nothing(
+        actions in proptest::collection::vec(action(), 1..60),
+        replay_from in 0usize..60,
+    ) {
+        let events: Vec<AgentEvent> = actions.iter().map(to_event).collect();
+        let replay_from = replay_from.min(events.len() - 1);
+        let full = view_of(&events);
+        let mut again = full.clone();
+        for (offset, event) in events[replay_from..].iter().enumerate() {
+            let sequence = (replay_from + offset) as u64 + 1;
+            let ops = again.fold(sequence, OffsetDateTime::UNIX_EPOCH, event, &config());
+            prop_assert_eq!(ops.len(), 0);
+        }
+        prop_assert_eq!(&again, &full);
+    }
+
+    #[test]
     fn fold_is_deterministic(actions in proptest::collection::vec(action(), 0..60)) {
         let events: Vec<AgentEvent> = actions.iter().map(to_event).collect();
         prop_assert_eq!(view_of(&events), view_of(&events));
     }
+}
+
+#[test]
+fn a_view_without_its_oldest_item_gives_a_new_item_the_next_index() {
+    let mut view = view_of(&[
+        start("root-a"),
+        text("m1", "a"),
+        text("m2", "b"),
+        text("m3", "c"),
+    ]);
+    view.items.remove("msg:m1");
+    view.fold(5, OffsetDateTime::UNIX_EPOCH, &text("m4", "d"), &config());
+    let index = |key: &str| view.items.get(key).map(|indexed| indexed.index);
+    assert_eq!(index("msg:m3"), Some(2));
+    assert_eq!(index("msg:m4"), Some(3));
+    assert_eq!(view.next_index, 4);
+}
+
+#[test]
+fn an_event_at_or_below_the_folded_sequence_is_a_no_op() {
+    let at = OffsetDateTime::UNIX_EPOCH;
+    let mut view = view_of(&[start("root-a"), delta("m1", "ab"), done()]);
+    let before = view.clone();
+    assert_eq!(view.fold(2, at, &delta("m1", "ab"), &config()).len(), 0);
+    assert_eq!(view.fold(1, at, &start("root-a"), &config()).len(), 0);
+    assert_eq!(view.fold(3, at, &done(), &config()).len(), 0);
+    assert_eq!(view, before);
+    assert_eq!(view.status.sequence, 3);
+    assert_eq!(view.status.turn, TurnState::Idle);
+}
+
+#[test]
+fn a_gap_in_the_sequence_is_folded() {
+    let mut view = view_of(&[start("root-a")]);
+    let ops = view.fold(9, OffsetDateTime::UNIX_EPOCH, &done(), &config());
+    assert!(matches!(ops.last(), Some(ViewOp::SetStatus { .. })));
+    assert_eq!(view.status.sequence, 9);
+    assert_eq!(view.status.turn, TurnState::Idle);
+}
+
+#[test]
+fn a_terminal_error_after_the_turn_ended_keeps_the_outcome() {
+    let view = view_of(&[
+        start("root-a"),
+        done(),
+        error(false, Some(TerminalReason::InternalError)),
+    ]);
+    assert!(matches!(
+        view.status.last_outcome,
+        Some(TurnOutcome::Done { .. })
+    ));
+    assert_eq!(
+        view.items
+            .values()
+            .filter(|indexed| matches!(indexed.item, ViewItem::TurnEnd { .. }))
+            .count(),
+        1
+    );
+    assert!(view.items.contains_key("error:3"));
+}
+
+#[test]
+fn the_closed_window_keeps_the_newest_keys_and_drops_late_deltas_inside_it() {
+    let mut events = vec![start("root-a"), text("m1", "final")];
+    for i in 0..RECENTLY_CLOSED_LIMIT - 1 {
+        events.push(tool_start(&format!("w{i}")));
+        events.push(tool_end(&format!("w{i}"), true));
+    }
+    events.push(delta("m1", "LATE"));
+    let inside = view_of(&events);
+    assert!(matches!(
+        inside.items.get("msg:m1").map(|indexed| &indexed.item),
+        Some(ViewItem::Text { text, open: false, .. }) if text == "final"
+    ));
+    assert_eq!(inside.status.recently_closed.len(), RECENTLY_CLOSED_LIMIT);
+    assert_eq!(
+        inside.status.recently_closed.first().map(String::as_str),
+        Some("msg:m1")
+    );
+
+    events.pop();
+    events.push(tool_start("evicts-m1"));
+    events.push(tool_end("evicts-m1", true));
+    let evicted = view_of(&events);
+    assert_eq!(evicted.status.recently_closed.len(), RECENTLY_CLOSED_LIMIT);
+    assert!(
+        !evicted
+            .status
+            .recently_closed
+            .contains(&"msg:m1".to_owned())
+    );
+    assert_eq!(
+        evicted.status.recently_closed.last().map(String::as_str),
+        Some("tool:evicts-m1")
+    );
+}
+
+#[test]
+fn questions_and_refusals_stay_out_of_the_closed_window() {
+    let view = view_of(&[
+        start("root-a"),
+        question("q1"),
+        AgentEvent::Refusal {
+            message_id: "r1".to_owned(),
+            text: None,
+        },
+    ]);
+    assert_eq!(view.status.recently_closed.len(), 0);
 }
