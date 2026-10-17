@@ -590,16 +590,7 @@ impl ServerMetrics {
                 "Transitions the store retried after a deadlock or serialization failure.",
             )
             .build();
-        let extension_writes = meter
-            .u64_counter("agent_server.journal.extension.writes")
-            .with_description("Writes a transition extension added, attributed by extension point.")
-            .build();
-        let extension_refused = meter
-            .u64_counter("agent_server.journal.extension.refused")
-            .with_description(
-                "Commits refused because the transition extension returned a write it may not add.",
-            )
-            .build();
+        let (extension_writes, extension_refused) = extension_instruments(&meter);
         let documents_written = meter
             .u64_counter("agent_server.journal.documents.written")
             .with_description(
@@ -641,6 +632,22 @@ impl ServerMetrics {
             meter,
         }
     }
+}
+
+/// The transition extension's counters: the writes it added, and the
+/// commits refused for a write it may not add.
+fn extension_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
+    let extension_writes = meter
+        .u64_counter("agent_server.journal.extension.writes")
+        .with_description("Writes a transition extension added, attributed by extension point.")
+        .build();
+    let extension_refused = meter
+        .u64_counter("agent_server.journal.extension.refused")
+        .with_description(
+            "Commits refused because the transition extension returned a write it may not add.",
+        )
+        .build();
+    (extension_writes, extension_refused)
 }
 
 // ─────────────────────────────────────────────────────────────────────
