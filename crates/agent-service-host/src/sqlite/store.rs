@@ -556,12 +556,13 @@ ON CONFLICT (thread_id) DO NOTHING
         tx: &mut Transaction<'_, Sqlite>,
         record: &agent_server::journal::EpochRecord,
     ) -> Result<()> {
-        sqlx::query(
+        let (id, label) = (record.id.as_str(), record.label.as_deref());
+        sqlx::query!(
             "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES (?1, ?2, ?3)",
+            id,
+            record.started_at,
+            label,
         )
-        .bind(record.id.as_str())
-        .bind(record.started_at)
-        .bind(record.label.as_deref())
         .execute(&mut **tx)
         .await
         .with_context(|| format!("begin epoch {}", record.id))?;
@@ -574,12 +575,15 @@ ON CONFLICT (thread_id) DO NOTHING
         task: &AgentTaskId,
         epoch: Option<&EpochId>,
     ) -> Result<()> {
-        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = ?1 WHERE id = ?2")
-            .bind(epoch.map(EpochId::as_str))
-            .bind(task.as_str())
-            .execute(&mut **tx)
-            .await
-            .with_context(|| format!("stamp the lease epoch of {task}"))?;
+        let (epoch, id) = (epoch.map(EpochId::as_str), task.as_str());
+        sqlx::query!(
+            "UPDATE agent_sdk_tasks SET lease_epoch = ?1 WHERE id = ?2",
+            epoch,
+            id,
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("stamp the lease epoch of {task}"))?;
         Ok(())
     }
 
