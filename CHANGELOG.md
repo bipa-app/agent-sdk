@@ -15,10 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions on one daemon, an effect claim failed with `begin sqlite
   durable-core transaction: (code: 5) database is locked`, so its tool never
   ran.
-- The retry is in the one place every write transaction begins, so it covers
-  transitions (effect claims included), lease acquisition and the other store
-  writes. Nothing has run before `BEGIN`, so a retry is always safe.
+- The retry covers every SQLite write:
+  - every write transaction, because they all begin in one place: transitions
+    (effect claims included), lease acquisition and heartbeats, turn attempts,
+    and the steering wake;
+  - the single-statement writes that run outside a transaction: the
+    idempotency claim and record (the first write of `CreateThread`,
+    `ForkThread`, `DecideConfirmation` and `AnswerQuestion`), the outbox
+    acks, checkpoint pruning and tool-audit events;
+  - the startup repair sweep's transactions.
+- A write that found the database locked ran nothing, and each of these is
+  safe to repeat, so a retry is always safe.
 - Each retry counts on `agent_server.journal.transition.lock_conflict_retries{backend="sqlite"}`.
+  On SQLite this counts every retried write, not only transitions. A write
+  that stays locked through every retry also logs how long it waited.
   A write that is still locked after the last retry fails with
   `LockConflict { retries: 3 }`, counted as `outcome=lock_conflict`. Before,
   it failed with `retries: 0`.
