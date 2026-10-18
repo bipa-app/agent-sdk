@@ -513,7 +513,8 @@ pub(crate) mod test_meter {
     }
 
     impl TestMeter {
-        /// Installs a fresh global meter provider and rebinds [`super::HostMetrics`].
+        /// Installs a fresh global meter provider and rebinds [`super::HostMetrics`]
+        /// and `agent_server`'s `ServerMetrics`.
         pub async fn install() -> Self {
             let guard = LOCK.lock().await;
             let exporter = InMemoryMetricExporter::default();
@@ -522,6 +523,7 @@ pub(crate) mod test_meter {
                 .build();
             opentelemetry::global::set_meter_provider(provider.clone());
             super::HostMetrics::reset_for_testing();
+            agent_server::observability::ServerMetrics::reset_for_testing();
             Self {
                 provider,
                 exporter,

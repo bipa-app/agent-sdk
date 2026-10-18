@@ -85,6 +85,8 @@ use super::stores::StoreRegistry;
 use super::wakeup::WakeupScheduler;
 use super::watch::ThreadEventsWatchScheduler;
 
+#[cfg(feature = "otel")]
+mod subagent_stall;
 mod tool_stall;
 
 use agent_server::journal::relay::RetryBackoff;
@@ -2765,6 +2767,8 @@ async fn deadline_tick(
         timeout_ms = enforced.timeout_ms,
         "subagent child root stalled for its whole budget; failing and aborting the turn",
     );
+    #[cfg(feature = "otel")]
+    let trace = subagent_stall::SubagentStallTrace::read(stores, owned.task).await;
     match fail_timed_out_subagent_root(
         stores,
         FailTimedOutChild {
@@ -2784,7 +2788,15 @@ async fn deadline_tick(
     )
     .await
     {
-        Ok(()) => DeadlineTick::Stop,
+        Ok(()) => {
+            #[cfg(feature = "otel")]
+            trace.record(
+                agent_server::observability::attrs::SUBAGENT_STALL_RUNNING,
+                owned.task,
+                enforced.timeout_ms,
+            );
+            DeadlineTick::Stop
+        }
         Err(err) => {
             warn!(
                 worker_id = %owned.worker,
@@ -3876,7 +3888,10 @@ async fn fail_timed_out_subagent_root(
         .next_sequence(ctx.thread)
         .await
         .context("reading timeout event watermark")?;
-    let error = anyhow!("subagent timed out after {}ms", ctx.timeout_ms);
+    let error = anyhow!(
+        "subagent stalled: no progress for its stall budget of {}",
+        stall_budget_text(ctx.timeout_ms)
+    );
     fail_root_task_if_owned(
         stores,
         OwnedRootTask {
@@ -3892,6 +3907,15 @@ async fn fail_timed_out_subagent_root(
         now,
     )
     .await
+}
+
+/// Whole seconds as `Ns`, anything finer as `Nms`.
+fn stall_budget_text(budget_ms: u64) -> String {
+    if budget_ms.is_multiple_of(1_000) {
+        format!("{}s", budget_ms / 1_000)
+    } else {
+        format!("{budget_ms}ms")
+    }
 }
 
 /// Drive a timeout failure to a durable outcome while holding the
@@ -4125,7 +4149,15 @@ async fn enforce_subagent_deadlines(
         match enforce_parked_child_deadline(stores, &child_root, deadline.timeout_ms, cancel, now)
             .await
         {
-            Ok(true) => enforced += 1,
+            Ok(true) => {
+                enforced += 1;
+                #[cfg(feature = "otel")]
+                subagent_stall::SubagentStallTrace::of(&child_root, &invocation).record(
+                    agent_server::observability::attrs::SUBAGENT_STALL_PARKED,
+                    &child_root.id,
+                    deadline.timeout_ms,
+                );
+            }
             // Lost a benign race (another worker acquired, a child
             // spawned concurrently) or exhausted the bounded fail
             // budget: the acquisition-expiry check, lease expiry, or
@@ -7313,7 +7345,8 @@ mod tests {
     // `created_at` + invocation `spec.timeout_ms`) on child-thread
     // roots linked to a durable subagent invocation:
     //   * a hung provider stream is aborted and the child fails with
-    //     `subagent timed out after {timeout_ms}ms` (never Cancelled),
+    //     `subagent stalled: no progress for its stall budget of …` (never
+    //     Cancelled),
     //   * a child acquired past its deadline fails up front with zero
     //     LLM dispatch, and
     //   * either way the parent's fan-in resumes with the failed child
@@ -8137,7 +8170,7 @@ mod tests {
         );
         let hang_error = hang_root.last_error.clone().unwrap_or_default();
         assert!(
-            hang_error.contains("subagent timed out after 2500ms"),
+            hang_error.contains("subagent stalled: no progress for its stall budget of 2500ms"),
             "timed-out child must carry the timeout message, got {hang_error:?}",
         );
         assert!(
@@ -8189,7 +8222,7 @@ mod tests {
         }
         let resume_text = provider.recorded_resume_text()?;
         assert!(
-            resume_text.contains("subagent timed out after 2500ms"),
+            resume_text.contains("subagent stalled: no progress for its stall budget of 2500ms"),
             "the parent's resume request must carry the failed child's timeout message, got \
              {resume_text:?}",
         );
@@ -8269,10 +8302,22 @@ mod tests {
         timeout_ms: u64,
         at: time::OffsetDateTime,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        persist_traced_subagent_fixture(stores, parent_thread, timeout_ms, at, None).await
+    }
+
+    /// [`persist_subagent_fixture`] whose parent root carries `traceparent`,
+    /// which its invocation inherits.
+    async fn persist_traced_subagent_fixture(
+        stores: &StoreRegistry,
+        parent_thread: &agent_sdk_foundation::ThreadId,
+        timeout_ms: u64,
+        at: time::OffsetDateTime,
+        traceparent: Option<&str>,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         use agent_server::journal::SubagentInvocationSpawn;
 
         stores.thread_store.get_or_create(parent_thread, at).await?;
-        let parent = AgentTask::new_root_turn_with_input(
+        let mut parent = AgentTask::new_root_turn_with_input(
             parent_thread.clone(),
             vec![SubmittedInputItem::Text {
                 text: "coordinate the helpers".into(),
@@ -8280,6 +8325,7 @@ mod tests {
             at,
             3,
         );
+        parent.otel_traceparent = traceparent.map(ToOwned::to_owned);
         let parent_id = parent.id.clone();
         stores.task_store.submit_root_turn(parent).await?;
         let worker = WorkerId::from_string("w-fixture");
@@ -10092,7 +10138,7 @@ mod tests {
         );
         let hang_error = hang_root.last_error.clone().unwrap_or_default();
         assert!(
-            hang_error.contains("subagent timed out after 2500ms"),
+            hang_error.contains("subagent stalled: no progress for its stall budget of 2500ms"),
             "parked timed-out child must carry the timeout message, got {hang_error:?}",
         );
 
@@ -10124,7 +10170,7 @@ mod tests {
         assert_eq!(fast_root.status, TaskStatus::Completed);
         let resume_text = provider.recorded_resume_text()?;
         assert!(
-            resume_text.contains("subagent timed out after 2500ms"),
+            resume_text.contains("subagent stalled: no progress for its stall budget of 2500ms"),
             "the parent's resume request must carry the timeout message, got {resume_text:?}",
         );
 
@@ -10424,8 +10470,9 @@ mod tests {
     }
 
     /// The stall's ids reach a trace: the tool child's heartbeat runs under no
-    /// span of its own, so the stall opens an `agent_server.tool.stall` span
-    /// and records `agent_server.tool.stalled` on it.
+    /// span of its own, so the stall opens an `agent_server.tool.stall` span,
+    /// parented on the child's stored traceparent, and records
+    /// `agent_server.tool.stalled` on it.
     #[cfg(feature = "otel")]
     #[tokio::test]
     async fn a_stall_is_recorded_on_its_own_span() -> Result<()> {
@@ -10437,6 +10484,9 @@ mod tests {
             .with_simple_exporter(exporter.clone())
             .build();
         opentelemetry::global::set_tracer_provider(provider.clone());
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
 
         let executor = Arc::new(StallProbeExecutor::new(StallProbe::ReportThenHang));
         let run = run_plain_root_over_probe_on(
@@ -10452,6 +10502,15 @@ mod tests {
             .iter()
             .find(|span| span.name.as_ref() == "agent_server.tool.stall")
             .context("an agent_server.tool.stall span")?;
+        // The span nests under the tool child's stored traceparent.
+        let (trace_id, parent_span_id) = traceparent_ids(
+            run.child
+                .otel_traceparent
+                .as_deref()
+                .context("the tool child stores a traceparent")?,
+        )?;
+        assert_eq!(span.span_context.trace_id(), trace_id);
+        assert_eq!(span.parent_span_id, parent_span_id);
         let event = span
             .events
             .iter()
@@ -10814,6 +10873,261 @@ mod tests {
         Ok(())
     }
 
+    /// The trace and parent span ids a W3C `traceparent` encodes.
+    #[cfg(feature = "otel")]
+    fn traceparent_ids(
+        traceparent: &str,
+    ) -> Result<(opentelemetry::trace::TraceId, opentelemetry::trace::SpanId)> {
+        let mut parts = traceparent.split('-').skip(1);
+        let trace_id = parts.next().context("a trace id")?;
+        let span_id = parts.next().context("a span id")?;
+        Ok((
+            opentelemetry::trace::TraceId::from_hex(trace_id)?,
+            opentelemetry::trace::SpanId::from_hex(span_id)?,
+        ))
+    }
+
+    /// A traced subagent child root on `thread`, failed by the running leg of
+    /// its stall budget: its heartbeat's `deadline_tick` finds it silent.
+    #[cfg(feature = "otel")]
+    async fn stall_running_subagent_child(
+        stores: &StoreRegistry,
+        thread: &str,
+        traceparent: &str,
+        backdated: time::OffsetDateTime,
+    ) -> Result<(AgentTask, AgentTask)> {
+        let (_parent, invocation, child) = persist_traced_subagent_fixture(
+            stores,
+            &agent_sdk_foundation::ThreadId::from_string(thread),
+            250,
+            backdated,
+            Some(traceparent),
+        )
+        .await?;
+        let worker = WorkerId::from_string("w-stall-signal");
+        let lease = LeaseId::new();
+        stores
+            .task_store
+            .try_acquire_task(
+                &child.id,
+                worker.clone(),
+                lease.clone(),
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(600),
+                backdated,
+            )
+            .await?
+            .context("the child root acquires")?;
+        let deadline = deadline_for(child.created_at, 250, 0).context("deadline")?;
+        let tick = deadline_tick(
+            stores,
+            OwnedRootTask {
+                task: &child.id,
+                thread: &child.thread_id,
+                worker: &worker,
+                lease: &lease,
+            },
+            SubagentDeadlineState::Enforced(deadline),
+            None,
+            STALL_PROBE_MAX,
+            0,
+            time::OffsetDateTime::now_utc(),
+        )
+        .await;
+        anyhow::ensure!(
+            matches!(tick, DeadlineTick::Stop),
+            "the running leg fails the child"
+        );
+        Ok((invocation, child))
+    }
+
+    /// The `agent_server.subagent.stalled` event of `leg` names `child` and
+    /// `invocation`, and its span nests under `traceparent`.
+    #[cfg(feature = "otel")]
+    fn assert_subagent_stall_span(
+        spans: &[opentelemetry_sdk::trace::SpanData],
+        leg: &str,
+        (invocation, child): (&AgentTask, &AgentTask),
+        traceparent: &str,
+    ) -> Result<()> {
+        use opentelemetry::Value;
+
+        let attribute = |event: &opentelemetry::trace::Event, key: &str| {
+            event
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+        let (span, event) = spans
+            .iter()
+            .filter(|span| span.name.as_ref() == "agent_server.subagent.stall")
+            .find_map(|span| {
+                span.events
+                    .iter()
+                    .find(|event| {
+                        event.name.as_ref() == "agent_server.subagent.stalled"
+                            && attribute(event, "leg") == Some(Value::from(leg.to_owned()))
+                    })
+                    .map(|event| (span, event))
+            })
+            .with_context(|| format!("the {leg} leg's agent_server.subagent.stalled event"))?;
+        assert_eq!(
+            attribute(event, "agent_server.task.id"),
+            Some(Value::from(child.id.as_str().to_owned()))
+        );
+        assert_eq!(
+            attribute(event, "agent_server.subagent.invocation_id"),
+            Some(Value::from(invocation.id.as_str().to_owned()))
+        );
+        assert_eq!(
+            attribute(event, "agent_server.tool.stall_budget_ms"),
+            Some(Value::I64(250))
+        );
+        let (trace_id, parent_span_id) = traceparent_ids(traceparent)?;
+        assert_eq!(span.span_context.trace_id(), trace_id, "{leg}");
+        assert_eq!(span.parent_span_id, parent_span_id, "{leg}");
+        Ok(())
+    }
+
+    /// Both legs of the subagent stall budget say so, on `stores`: each failed
+    /// child root is counted by leg and recorded as
+    /// `agent_server.subagent.stalled` on its own `agent_server.subagent.stall`
+    /// span, in the trace of the parent that waits on it.
+    #[cfg(feature = "otel")]
+    async fn assert_both_subagent_stall_legs(stores: StoreRegistry, tag: &str) -> Result<()> {
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(provider.clone());
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        let backdated = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+
+        let running_traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let (running_invocation, running_child) = stall_running_subagent_child(
+            &stores,
+            &format!("t-stall-signal-running-{tag}"),
+            running_traceparent,
+            backdated,
+        )
+        .await?;
+
+        // Parked leg: the sweep finds a child root parked on a silent tool.
+        let parked_traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let (_parent, parked_invocation, parked_child) = persist_traced_subagent_fixture(
+            &stores,
+            &agent_sdk_foundation::ThreadId::from_string(format!("t-stall-signal-parked-{tag}")),
+            250,
+            backdated,
+            Some(parked_traceparent),
+        )
+        .await?;
+        park_child_root_on_tool_child(&stores, &parked_child, backdated).await?;
+        let enforced = enforce_subagent_deadlines(
+            &stores,
+            time::OffsetDateTime::now_utc(),
+            0,
+            STALL_PROBE_MAX,
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(enforced, 1, "{tag}: the parked leg fails the child");
+
+        assert_eq!(
+            meter.counter("agent_server.subagent.stalls", &[("leg", "running")]),
+            1,
+            "{tag}"
+        );
+        assert_eq!(
+            meter.counter("agent_server.subagent.stalls", &[("leg", "parked")]),
+            1,
+            "{tag}"
+        );
+
+        provider.force_flush()?;
+        let spans = exporter.get_finished_spans()?;
+        assert_subagent_stall_span(
+            &spans,
+            "running",
+            (&running_invocation, &running_child),
+            running_traceparent,
+        )?;
+        assert_subagent_stall_span(
+            &spans,
+            "parked",
+            (&parked_invocation, &parked_child),
+            parked_traceparent,
+        )
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_subagent_stall_is_counted_by_leg_and_recorded_on_its_own_span() -> Result<()> {
+        let host = ServiceHost::new(
+            ServiceConfig::default(),
+            sample_registry(),
+            subagent_timeout_runtime(Arc::new(SubagentScriptProvider::new()))?,
+        )?;
+        assert_both_subagent_stall_legs(host.stores().clone(), "memory").await
+    }
+
+    #[cfg(all(feature = "otel", feature = "sqlite"))]
+    #[tokio::test]
+    async fn a_subagent_stall_is_counted_by_leg_on_sqlite() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Sqlite {
+                path: Some(dir.path().join("subagent-stall.db").display().to_string()),
+                max_connections: None,
+            },
+            ..crate::config::StorageConfig::default()
+        };
+        let stores = StoreRegistry::from_config(&storage, sample_registry())?;
+        stores.initialize().await?;
+        assert_both_subagent_stall_legs(stores, "sqlite").await
+    }
+
+    /// Runs in CI's `postgres` job (`postgres,otel,failpoints`). Without
+    /// `probe_children` selecting every `TaskRecord` column, the parked leg
+    /// never fails the child on Postgres.
+    #[cfg(all(feature = "otel", feature = "postgres"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subagent_stall_is_counted_by_leg_on_postgres() -> Result<()> {
+        use sqlx::Connection;
+
+        let Ok(database_url) =
+            std::env::var("TEST_DATABASE_URL").or_else(|_| std::env::var("DATABASE_URL"))
+        else {
+            return Ok(());
+        };
+        let schema = format!("subagent_stall_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = sqlx::postgres::PgConnection::connect(&database_url).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await?;
+        let storage = crate::config::StorageConfig {
+            backend: crate::config::StorageBackend::Postgres,
+            postgres: crate::config::PostgresStorageConfig {
+                database_url: Some(database_url.clone()),
+                schema: Some(schema.clone()),
+                max_connections: 8,
+            },
+        };
+        let stores = StoreRegistry::from_config(&storage, sample_registry())?;
+        stores.initialize().await?;
+        let outcome = assert_both_subagent_stall_legs(stores, "postgres").await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut admin)
+            .await?;
+        outcome
+    }
+
     #[tokio::test]
     async fn sweep_fails_expired_parked_child_and_cancels_hung_tool_children() -> Result<()> {
         use agent_sdk_foundation::ThreadId;
@@ -10858,7 +11172,7 @@ mod tests {
         assert_eq!(root_after.status, TaskStatus::Failed);
         let root_error = root_after.last_error.clone().unwrap_or_default();
         assert!(
-            root_error.contains("subagent timed out after 250ms"),
+            root_error.contains("subagent stalled: no progress for its stall budget of 250ms"),
             "sweep-failed child must carry the timeout message, got {root_error:?}",
         );
         let invocation_after = stores
@@ -11796,7 +12110,7 @@ mod tests {
             wait_for_status(&flaky_stores, &child_root.id, TaskStatus::Failed, 250).await?;
         let error = failed.last_error.unwrap_or_default();
         assert!(
-            error.contains("subagent timed out after 100ms"),
+            error.contains("subagent stalled: no progress for its stall budget of 100ms"),
             "deadline must be enforced once resolution finally succeeds, got {error:?}",
         );
         assert!(
@@ -11876,7 +12190,7 @@ mod tests {
             wait_for_status(&flaky_stores, &child_root.id, TaskStatus::Failed, 250).await?;
         let error = failed.last_error.unwrap_or_default();
         assert!(
-            error.contains("subagent timed out after 100ms"),
+            error.contains("subagent stalled: no progress for its stall budget of 100ms"),
             "the retried failure must carry the timeout message, got {error:?}",
         );
         assert!(
@@ -12044,7 +12358,7 @@ mod tests {
         assert_eq!(failed.status, TaskStatus::Failed);
         let error = failed.last_error.unwrap_or_default();
         assert!(
-            error.contains("subagent timed out after 250ms"),
+            error.contains("subagent stalled: no progress for its stall budget of 250ms"),
             "the retried sweep failure must carry the timeout message, got {error:?}",
         );
         // ReadyToResume acquisitions consume no retry budget, so the
@@ -12163,14 +12477,14 @@ mod tests {
         let failed = wait_for_status(&stores, &child_root.id, TaskStatus::Failed, 1_500).await?;
         let error = failed.last_error.unwrap_or_default();
         assert!(
-            error.contains("subagent timed out after 3000ms"),
+            error.contains("subagent stalled: no progress for its stall budget of 3s"),
             "the hung child must carry the timeout message, got {error:?}",
         );
         wait_for_status(&stores, &invocation.id, TaskStatus::Completed, 1_500).await?;
         wait_for_status(&stores, &parent.id, TaskStatus::Completed, 1_500).await?;
         let resume_text = provider.recorded_resume_text()?;
         assert!(
-            resume_text.contains("subagent timed out after 3000ms"),
+            resume_text.contains("subagent stalled: no progress for its stall budget of 3s"),
             "the parent's resume request must carry the timeout message, got {resume_text:?}",
         );
 
@@ -12313,7 +12627,7 @@ mod tests {
         assert_eq!(failed.status, TaskStatus::Failed);
         let error = failed.last_error.unwrap_or_default();
         assert!(
-            error.contains("subagent timed out after 500ms"),
+            error.contains("subagent stalled: no progress for its stall budget of 500ms"),
             "timed-out child must carry the timeout message, got {error:?}",
         );
 

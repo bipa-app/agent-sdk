@@ -76,8 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hung child, two overlapping hosts), boots a fresh daemon on the same
   database, and checks what recovery did. Each scenario runs on SQLite and
   on Postgres (`TEST_DATABASE_URL`). Scenarios that fail today (S3: the
-  crashed LLM attempt stays open; S7: a wait on a silent subagent child
-  never ends; the tool-child case passes since #514)
+  crashed LLM attempt stays open)
   are ignored and run as expected failures: they pass while the documented
   failure still reproduces, and fail once it is fixed, so the fix must
   un-ignore them. With `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` set they
@@ -166,6 +165,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the restart, each is answered once (a second, different answer is
   refused), and a host answer committed before the kill is applied and
   closed once.
+
+### A stalled subagent child says so, with the same signals as a stalled tool
+
+A subagent child root that its subtree leaves silent for its stall budget
+(`spec.timeout_ms`) was already failed, by its heartbeat while it runs and by
+the sweep while it is parked, but only a `warn` log said so. No migration,
+table, `Write` or `Guard` variant or protocol change.
+
+- **Text change:** the failed child root's error, which the parent's model
+  reads as the failed child result, was `subagent timed out after {N}ms` and
+  read as the child's age. It is now `subagent stalled: no progress for its
+  stall budget of {budget}`, with the budget in whole seconds (`600s`) or, if
+  finer, in milliseconds (`2500ms`). The in-process subagent's own message
+  (`agent_sdk::subagent`, and bip's `bip-agent/src/errors.rs`) is a different
+  path and is unchanged.
+  - **satoshi:** it spawns durable subagents (`research_spawn.rs` sets
+    `timeout_ms`), so its research children's failures read with the new
+    text after its next bump. It matches on neither text (grep of
+    satoshi origin/main `ea891c8` for `timed out after` and
+    `subagent timed out`), so nothing in satoshi changes.
+  - **bip:** no code matches on the old text (grep of bip origin/master
+    `10c370c9`). Its `timed out after` hits are its own in-process and
+    watchdog messages; `provider/resilience.rs` matches `timed out` only in
+    provider errors, which this text never reaches.
+- Signals, per leg (`running`: `deadline_tick`; `parked`:
+  `enforce_subagent_deadlines`), recorded after the child root's fail
+  commits: counter `agent_server.subagent.stalls{leg}` (the leg is its only
+  label), and a short `agent_server.subagent.stall` span carrying the event
+  `agent_server.subagent.stalled` (`leg`; span-only `agent_server.task.id`,
+  `agent_server.subagent.invocation_id`, `agent_server.tool.stall_budget_ms`).
+  The span is parented on the child root's stored `traceparent`, else on its
+  invocation's, which carries the parent turn's trace. New
+  `ServerMetrics::record_subagent_stall` takes a `SubagentStallSignal`.
+- The `agent_server.tool.stall` span now decodes its parent through
+  `loop_instrument::context_from_traceparent`, as the subagent span does.
+- **Fix, Postgres: the parked leg never failed a stalled child.**
+  - `PostgresDurableStore::probe_children` selected its rows with a runtime
+    query that lacked `after_siblings_json`, a `TaskRecord` column since
+    #476. Decoding a parent's live children failed, the stall probe read the
+    subtree as truncated, and the sweep (fail-safe) left the child parked.
+  - It is now a compile-checked `query_as!` over every column, so the next
+    added column fails the build instead.
+  - SQLite and in-memory were not affected.
+  - **Behaviour change for satoshi (Postgres):** a parked research child
+    root whose whole subtree is silent for its stall budget is now failed by
+    the sweep, where before it stayed parked with a `warn` per sweep. Its
+    parent then resumes with the failed child result.
+- **Crash matrix:** `s7_hung_subagent` passes on SQLite and Postgres and is
+  no longer an expected failure. It needed no SDK change: its subagent
+  `timeout_ms` (a silence budget) was 1 h, and is now the scenario's
+  `STALL_BUDGET`. S7's expected-failure branch is gone.
 
 ### A tool call ends when its tool goes silent (bip #756)
 
