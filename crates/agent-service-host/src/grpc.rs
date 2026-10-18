@@ -7619,6 +7619,9 @@ mod tests {
             self.inner.complete_input_injection(id, now).await
         }
 
+        async fn count_by_status(&self, status: JournalTaskStatus) -> Result<u64> {
+            self.inner.count_by_status(status).await
+        }
         async fn list_by_status(&self, status: JournalTaskStatus) -> Result<Vec<AgentTask>> {
             self.inner.list_by_status(status).await
         }

@@ -5726,6 +5726,18 @@ LIMIT $2
         })
     }
 
+    async fn count_by_status(&self, status: TaskStatus) -> Result<u64> {
+        let status_wire = enum_to_wire(&status)?;
+        let count = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM agent_sdk_tasks WHERE status = $1"#,
+            status_wire,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .with_context(|| format!("count tasks in status {status:?}"))?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
         let status_wire = enum_to_wire(&status)?;
         let records = sqlx::query_as!(

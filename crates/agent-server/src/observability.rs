@@ -991,7 +991,6 @@ impl ServerMetrics {
             .with_description("Wall-clock duration of a single task execution.")
             .with_boundaries(TASK_DURATION_BUCKETS_S.to_vec())
             .build();
-        let tasks_lease_expired = lease_expired_counter(&meter);
         let journal_commit_duration = meter
             .f64_histogram("agent_server.journal.commit.duration")
             .with_unit("s")
@@ -1049,7 +1048,7 @@ impl ServerMetrics {
             workers_active,
             tasks_acquired,
             tasks_execution_duration,
-            tasks_lease_expired,
+            tasks_lease_expired: lease_expired_counter(&meter),
             epoch_reclaims: epoch_reclaims_counter(&meter),
             journal_commit_duration,
             relay_tick,
