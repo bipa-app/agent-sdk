@@ -25,6 +25,9 @@ use super::thread_store::ThreadCreation;
 /// backend wrap them in one transaction.
 #[derive(Clone, Debug)]
 pub struct ForkCommitParams {
+    /// The thread the fork copies. The store refuses the fork when it is
+    /// purged ([`Fence::FORK_SOURCE`](super::transition::Fence::FORK_SOURCE)).
+    pub source_thread_id: ThreadId,
     /// Destination thread id; the store inserts its aggregate row.
     pub new_thread_id: ThreadId,
     /// Caller-addressed creation identity. `None` preserves the legacy

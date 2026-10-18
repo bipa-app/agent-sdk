@@ -5276,8 +5276,8 @@ impl InMemoryAgentTaskStore {
     ) -> Result<super::transition::Committed, super::transition::Rejected> {
         use super::transition::{Committed, Write};
 
-        self.require_spawn_event_sink(&transition)?;
         transition.validate()?;
+        self.require_spawn_event_sink(&transition)?;
         let (sink, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
@@ -5783,15 +5783,21 @@ impl InMemoryAgentTaskStore {
         &self,
         transition: &super::transition::Transition,
     ) -> Result<()> {
+        for thread_id in transition.appended_threads() {
+            self.require_appendable_thread(thread_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Refuse an append to a purged `thread_id`, read through the event
+    /// sink's thread store. A store built without a sink has no thread
+    /// projection to read, so it refuses nothing.
+    async fn require_appendable_thread(&self, thread_id: &ThreadId) -> Result<()> {
         let Some(sink) = &self.marker_sink else {
             return Ok(());
         };
-        for thread_id in transition.appended_threads() {
-            if let Some(thread) = sink.thread_store.get(thread_id).await? {
-                thread.require_active(super::thread::ThreadOperation::Append)?;
-            }
-        }
-        Ok(())
+        let thread = sink.thread_store.get(thread_id).await?;
+        super::transition::Fence::APPEND.check(thread_id, thread.as_ref())
     }
 
     /// A transition's events and their advisory row, through the store's
@@ -5908,8 +5914,9 @@ impl InMemoryAgentTaskStore {
     }
 
     /// Refuse a mixed spawn that carries boundary or trailing events when
-    /// the store has no event sink to commit them through, before its
-    /// shape is checked.
+    /// the store has no event sink to commit them through. It runs after
+    /// [`super::transition::Transition::validate`], so a malformed spawn
+    /// gets its validation error on every backend.
     fn require_spawn_event_sink(&self, transition: &super::transition::Transition) -> Result<()> {
         for write in &transition.writes {
             if let super::transition::Write::SpawnChildren { spawn, .. } = write
@@ -7065,6 +7072,10 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         // successor emits, and a failure here leaves the row Running
         // under the caller's lease (nothing released yet).
         if let Some(event) = boundary {
+            super::thread::record_fence_refusal(
+                super::thread::FencedWriter::RequeueOwnedTask,
+                self.require_appendable_thread(&old.thread_id).await,
+            )?;
             if let Some(sink) = &self.marker_sink {
                 let committed = sink
                     .event_repo
@@ -7274,10 +7285,13 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .cloned()
             .ok_or_else(|| anyhow!("question pause rejected: task {id} does not exist"))?;
         let paused = apply_question_pause(&old, worker, lease, payload, questions.clone(), now)?;
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::PauseOnQuestion,
+            self.require_appendable_thread(&paused.thread_id).await,
+        )?;
         inner.rebalance_after_row_change(&old, &paused);
         inner.put_row(paused.id.clone(), paused.clone());
         inner.complete_injection_rows(&delivered_injection_ids, now)?;
-        drop(inner);
         events.push(AgentEvent::question_asked(id.as_str(), questions));
         let Some(sink) = &self.marker_sink else {
             return Ok((paused, Vec::new()));
@@ -7290,6 +7304,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         if let Some(last) = committed.last() {
             Self::insert_marker_advisory(sink, last, now).await?;
         }
+        drop(inner);
         Ok((paused, committed))
     }
 
@@ -12543,7 +12558,32 @@ mod tests {
         Ok(())
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn sinkless_mixed_spawn_rejects_boundary_events_without_mutation() -> Result<()> {
+    async fn sinkless_mixed_spawn_rejects_trailing_events_without_mutation() -> Result<()> {
+        let store = InMemoryAgentTaskStore::new();
+        let (parent, worker, lease) = running_root_for_spawn(&store, "t-sinkless-trailing").await?;
+        let mut spawn = mixed_spawn_for("t-sinkless-trailing", Vec::new(), &[0]);
+        spawn
+            .trailing_events
+            .push(AgentEvent::text("msg-trailing", "trailing"));
+
+        let error = store
+            .spawn_mixed_children(&parent.id, &worker, &lease, spawn, Vec::new(), t_plus(2))
+            .await
+            .expect_err("a sink-less store must reject non-empty trailing events");
+        assert!(
+            format!("{error:#}").contains("boundary events require an in-memory event sink"),
+            "unexpected error: {error:#}",
+        );
+        let persisted = store.get(&parent.id).await?.context("parent survives")?;
+        assert_eq!(persisted.status, TaskStatus::Running);
+        assert!(store.list_children(&parent.id).await?.is_empty());
+        Ok(())
+    }
+
+    /// A malformed spawn is refused by `Transition::validate` before the
+    /// sink check, as on the durable backends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sinkless_malformed_mixed_spawn_gets_the_validation_error() -> Result<()> {
         let store = InMemoryAgentTaskStore::new();
         let (parent, worker, lease) = running_root_for_spawn(&store, "t-sinkless-boundary").await?;
         let mut spawn = mixed_spawn_for(
@@ -12561,9 +12601,10 @@ mod tests {
         let error = store
             .spawn_mixed_children(&parent.id, &worker, &lease, spawn, Vec::new(), t_plus(2))
             .await
-            .expect_err("a sink-less store must reject non-empty boundary events");
+            .expect_err("a boundary event with no precompleted child is malformed");
         assert!(
-            format!("{error:#}").contains("boundary events require an in-memory event sink"),
+            format!("{error:#}")
+                .contains("ToolCallEnd boundary events for 0 precompleted children"),
             "unexpected error: {error:#}",
         );
         let persisted = store.get(&parent.id).await?.context("parent survives")?;

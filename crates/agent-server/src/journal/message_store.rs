@@ -205,6 +205,142 @@ pub trait MessageProjectionStore: Send + Sync {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Purge fence for the in-memory stores
+// ─────────────────────────────────────────────────────────────────────
+
+/// A [`MessageProjectionStore`] that refuses every write to a purged
+/// thread.
+///
+/// The durable backends check the thread inside the write's transaction.
+/// The in-memory stores share no transaction, so the composed in-memory
+/// backend wraps its message store in this, as it wraps its event journal
+/// in [`super::event_repository::PurgeFencedEventRepository`].
+pub struct PurgeFencedMessageProjectionStore {
+    messages: Arc<dyn MessageProjectionStore>,
+    threads: Arc<dyn super::thread_store::ThreadStore>,
+}
+
+impl PurgeFencedMessageProjectionStore {
+    #[must_use]
+    pub fn new(
+        messages: Arc<dyn MessageProjectionStore>,
+        threads: Arc<dyn super::thread_store::ThreadStore>,
+    ) -> Self {
+        Self { messages, threads }
+    }
+
+    async fn require_appendable(&self, thread_id: &ThreadId) -> Result<()> {
+        let thread = self.threads.get(thread_id).await?;
+        super::thread::record_fence_refusal(
+            super::thread::FencedWriter::MessageHead,
+            super::transition::Fence::APPEND.check(thread_id, thread.as_ref()),
+        )
+    }
+}
+
+#[async_trait]
+impl MessageProjectionStore for PurgeFencedMessageProjectionStore {
+    async fn get_or_create(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.messages.get_or_create(thread_id, now).await
+    }
+
+    async fn get(&self, thread_id: &ThreadId) -> Result<Option<MessageProjection>> {
+        self.messages.get(thread_id).await
+    }
+
+    async fn get_history(&self, thread_id: &ThreadId) -> Result<Vec<llm::Message>> {
+        self.messages.get_history(thread_id).await
+    }
+
+    async fn commit_messages(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.require_appendable(thread_id).await?;
+        self.messages
+            .commit_messages(thread_id, messages, now)
+            .await
+    }
+
+    async fn replace_history(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.require_appendable(thread_id).await?;
+        self.messages
+            .replace_history(thread_id, messages, now)
+            .await
+    }
+
+    async fn append_compaction(
+        &self,
+        thread_id: &ThreadId,
+        result_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        retained_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.require_appendable(thread_id).await?;
+        self.messages
+            .append_compaction(
+                thread_id,
+                result_messages,
+                source_message_count,
+                retained_message_count,
+                now,
+            )
+            .await
+    }
+
+    async fn append_repair(
+        &self,
+        thread_id: &ThreadId,
+        repair_messages: Vec<llm::Message>,
+        balanced_messages: Vec<llm::Message>,
+        source_message_count: usize,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.require_appendable(thread_id).await?;
+        self.messages
+            .append_repair(
+                thread_id,
+                repair_messages,
+                balanced_messages,
+                source_message_count,
+                now,
+            )
+            .await
+    }
+
+    async fn set_draft(
+        &self,
+        thread_id: &ThreadId,
+        messages: Vec<llm::Message>,
+        now: OffsetDateTime,
+    ) -> Result<MessageProjection> {
+        self.require_appendable(thread_id).await?;
+        self.messages.set_draft(thread_id, messages, now).await
+    }
+
+    async fn clear_draft(
+        &self,
+        thread_id: &ThreadId,
+        now: OffsetDateTime,
+    ) -> Result<Option<MessageProjection>> {
+        self.require_appendable(thread_id).await?;
+        self.messages.clear_draft(thread_id, now).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // In-memory reference implementation
 // ─────────────────────────────────────────────────────────────────────
 
