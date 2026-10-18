@@ -1185,14 +1185,7 @@ async fn the_epoch_begin_span_is_exported_with_what_the_reclaim_did() -> Result<
 #[cfg(feature = "otel")]
 #[tokio::test]
 async fn the_host_drain_counts_an_epoch_reclaim() -> Result<()> {
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
-
-    let exporter = InMemoryMetricExporter::default();
-    let provider = SdkMeterProvider::builder()
-        .with_reader(PeriodicReader::builder(exporter.clone()).build())
-        .build();
-    opentelemetry::global::set_meter_provider(provider.clone());
+    let meter = crate::observability::test_meter::TestMeter::install().await;
 
     let stores = StoreRegistry::from_config(
         &crate::config::StorageConfig::default(),
@@ -1221,33 +1214,14 @@ async fn the_host_drain_counts_an_epoch_reclaim() -> Result<()> {
         now + time::Duration::seconds(1),
     )
     .await?;
-    provider.force_flush()?;
 
-    let mut requeued = 0;
-    for resource in exporter.get_finished_metrics()? {
-        for scope in resource.scope_metrics() {
-            for metric in scope.metrics() {
-                if metric.name() != "agent_server.epoch.reclaims" {
-                    continue;
-                }
-                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
-                    for point in sum.data_points() {
-                        let label = |key: &str| {
-                            point
-                                .attributes()
-                                .find(|kv| kv.key.as_str() == key)
-                                .map(|kv| kv.value.to_string())
-                        };
-                        if label("scope").as_deref() == Some("foreign_epoch")
-                            && label("action").as_deref() == Some("requeued")
-                        {
-                            requeued = requeued.max(point.value());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    assert_eq!(requeued, 1, "one foreign-epoch lease requeued by the drain");
+    assert_eq!(
+        meter.counter(
+            "agent_server.epoch.reclaims",
+            &[("scope", "foreign_epoch"), ("action", "requeued")],
+        ),
+        1,
+        "one foreign-epoch lease requeued by the drain"
+    );
     Ok(())
 }
