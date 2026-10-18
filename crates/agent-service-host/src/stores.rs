@@ -1044,6 +1044,8 @@ mod tests {
     /// [`PurgeFencedMessageProjectionStore`].
     #[tokio::test]
     async fn the_in_memory_registry_message_store_refuses_a_purged_thread() -> Result<()> {
+        use anyhow::Context as _;
+
         use agent_sdk_foundation::{ThreadId, llm::Message};
         use agent_server::journal::thread::{PurgeScope, PurgeSeed, ThreadStateConflict};
 
