@@ -34,7 +34,8 @@ use agent_server::journal::prompt::{
     all_prompts, get_prompt, owner_task_awaits,
 };
 use agent_server::journal::{
-    AgentTask, AgentTaskId, AgentTaskStore, Committed, DocumentStore, Rejected, Transition,
+    AgentTask, AgentTaskId, AgentTaskStore, Committed, DocumentStore, Guard, Rejected, TaskStatus,
+    Transition, Write,
 };
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -270,6 +271,13 @@ pub async fn answer_prompt(
 /// failed or another writer moved the prompt first (it is then closed, or
 /// answered anew, by that writer).
 ///
+/// A subagent invocation parked on the prompt (its
+/// [`owner_task`](PromptRecord::owner_task)) wakes in the same transaction
+/// even when `extra` does not wake it, so a close or withdrawal the handler
+/// did not pair with a [`Write::WakeInvocation`] cannot leave it waiting
+/// forever. `extra` that guards or wakes the invocation itself is left as
+/// it is.
+///
 /// # Errors
 /// The prompt is already closed, or the store failed.
 pub async fn close_prompt(
@@ -282,6 +290,7 @@ pub async fn close_prompt(
     now: OffsetDateTime,
 ) -> anyhow::Result<bool> {
     let mut transition = extra;
+    wake_parked_owner(store, prompt, &mut transition).await?;
     transition
         .writes
         .extend(prompt.close_writes(result, retain, now)?);
@@ -290,6 +299,45 @@ pub async fn close_prompt(
         Err(Rejected::Guard { .. }) => Ok(false),
         Err(Rejected::Store(error)) => Err(error),
     }
+}
+
+/// Add the wake of the invocation parked on `prompt` to `transition`, under
+/// the guard that it still waits: a race with another writer refuses the
+/// close, and the next re-drive closes it again.
+async fn wake_parked_owner(
+    store: &dyn AgentTaskStore,
+    prompt: &StoredPrompt,
+    transition: &mut Transition,
+) -> anyhow::Result<()> {
+    let Some(owner) = &prompt.record.owner_task else {
+        return Ok(());
+    };
+    let handled = transition
+        .guards
+        .iter()
+        .any(|guard| matches!(guard, Guard::TaskIs { task, .. } if task == owner))
+        || transition.writes.iter().any(
+            |write| matches!(write, Write::WakeInvocation { invocation, .. } if invocation == owner),
+        );
+    if handled {
+        return Ok(());
+    }
+    let parked = store.get(owner).await?.is_some_and(|task| {
+        task.status == TaskStatus::WaitingOnChildren
+            && task.state.awaited_prompt() == Some(prompt.record.id.as_str())
+    });
+    if parked {
+        transition.guards.push(Guard::TaskIs {
+            task: owner.clone(),
+            status: TaskStatus::WaitingOnChildren,
+            lease: None,
+        });
+        transition.writes.push(Write::WakeInvocation {
+            invocation: owner.clone(),
+            prompt: prompt.record.id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Hand an answered host prompt to `handler` and commit its close.
@@ -398,7 +446,6 @@ pub type TaskPromptResult = dyn Fn(&PromptRecord, Option<&AgentTask>) -> ToolRes
 /// or finish, an error naming the task's state otherwise.
 #[must_use]
 pub fn default_task_prompt_result(_: &PromptRecord, task: Option<&AgentTask>) -> ToolResult {
-    use agent_server::journal::TaskStatus;
     match task.map(|task| task.status) {
         Some(TaskStatus::Pending | TaskStatus::Running | TaskStatus::Completed) => {
             ToolResult::success("No longer awaiting")

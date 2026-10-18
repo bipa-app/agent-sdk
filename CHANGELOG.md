@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Primitive 10 (S-4): a subagent invocation can wait on a host prompt
+
+- **Breaking:** two `Write` variants, `ParkInvocation { invocation, prompt }`
+  and `WakeInvocation { invocation, prompt }`, and `Committed::invocations`.
+  - A park needs a `TaskIs` guard that the invocation runs under its lease.
+    It drops the lease and leaves the invocation `waiting_on_children`, with
+    the prompt as its one pending child.
+  - A wake needs a `TaskIs` guard that it is waiting, and is refused with
+    `Rejected::Guard` unless the invocation waits on that prompt. It makes
+    the invocation `Pending`, and its next acquisition charges no attempt.
+  - Both apply on the in-memory, SQLite and Postgres stores. No migration:
+    the marker is an optional `awaiting_prompt` field of
+    `SubagentInvocationState`, absent from rows that never parked, which
+    earlier releases ignore.
+  - `AgentTask::park_on_prompt` / `wake_from_prompt` and
+    `TaskState::awaited_prompt`. `recompute_pending_children` leaves a parked
+    invocation waiting.
+  - A transition extension may add neither write: `commit_may_add` refuses
+    both: it admits only documents and events.
+  - **Rolling back:** an earlier release has no handler that wakes a parked
+    invocation, so it would wait forever. Drain or decide parked merges
+    before rolling back.
+- **Breaking:** `CompletionOutput::park` is an `Option<NewPrompt>` (the
+  placeholder `PromptRequest` is gone).
+  - A park opens the host-owned prompt (with the invocation as its
+    `owner_task`) and parks the invocation in one transition, and the
+    effect record stays `Started`.
+  - The host's prompt handler returns `PromptResolution::Close` with a
+    `WakeInvocation` in `extra`, so the wake commits with the close.
+  - `prompts::close_prompt` adds that wake itself when `extra` neither
+    guards nor wakes the prompt's `owner_task` and the invocation still waits
+    on the prompt, so a close or withdrawal without a wake cannot leave the
+    invocation (and its parent) waiting forever.
+  - The woken run sees `CompletionContext::resumed_prompt`, gets the
+    `Started` record as `prior`, and settles as usual.
+  - A park on the invocation's last (inspect) attempt is refused with
+    `CompletionHookError::ParkOnLastAttempt`, which replaces `Unsupported`.
+  - `SubagentTaskOutcome::parked_on` names the prompt a run parked on.
+- Signals: counter `agent_server.subagent.invocation.prompts{backend, step}`
+  (`parked`, `woken`), recorded by each store's commit; a log line on each
+  park. Failpoints `invocation.park_written` and `invocation.wake_written`
+  (after the row, inside the transaction) and
+  `subagent.completion_hook.before_park`.
 ### Observability: a tool call's store-side phases
 
 - Each tool call's store work is an `agent_server.tool.phase` span with

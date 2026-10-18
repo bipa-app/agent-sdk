@@ -5676,6 +5676,293 @@ mod tests {
         Ok(())
     }
 
+    /// A host prompt on `thread`, owned by the host, for `invocation`.
+    fn invocation_prompt(
+        thread: &ThreadId,
+        invocation: &AgentTask,
+        id: &str,
+    ) -> agent_server::journal::prompt::NewPrompt {
+        use agent_server::journal::prompt::{
+            NewPrompt, PromptCloseFrame, PromptFrame, PromptOwner,
+        };
+        NewPrompt {
+            id: id.to_owned(),
+            surface_thread: thread.clone(),
+            owner: PromptOwner::Host {
+                name: "test.merge_gate".into(),
+            },
+            owner_task: Some(invocation.id.clone()),
+            frame: PromptFrame {
+                name: "apply_worker_merge".into(),
+                display_name: "Merge worker".into(),
+                input: serde_json::json!({ "unit": "unit_1" }),
+                description: "Merge unit_1?".into(),
+            },
+            close: PromptCloseFrame {
+                name: "apply_worker_merge".into(),
+                display_name: "Merge worker".into(),
+                input: serde_json::json!({ "unit": "unit_1" }),
+            },
+            must_reach_human: true,
+            host_state: serde_json::json!({}),
+        }
+    }
+
+    /// Spawn an invocation on `name`, cancel its child root, acquire it for
+    /// an hour and park it on the host prompt `prompt`, as the completion
+    /// hook's park does (the prompt open and the park in one transition).
+    /// Returns `(parent, invocation, child_root)`.
+    async fn park_an_invocation(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        name: &str,
+        prompt: &str,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        let (parent, invocation, child_root) = spawn_subagent_fixture_with(
+            task_store,
+            thread_store,
+            name,
+            subagent_call_payload(name),
+        )
+        .await?;
+        task_store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let running = task_store
+            .try_acquire_task(
+                &invocation.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(3_600),
+                t_plus(10),
+            )
+            .await?
+            .context("the woken invocation must acquire")?;
+        let mut writes = agent_server::journal::prompt::PromptRecord::open(
+            invocation_prompt(&thread_id(name), &running, prompt),
+            t_plus(11),
+        )
+        .open_writes(true)?;
+        writes.push(Write::ParkInvocation {
+            invocation: running.id.clone(),
+            prompt: prompt.to_owned(),
+        });
+        let committed = task_store
+            .commit(
+                Transition {
+                    guards: vec![Guard::TaskIs {
+                        task: running.id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((worker, lease)),
+                    }],
+                    writes,
+                },
+                t_plus(11),
+            )
+            .await?;
+        let [parked] = committed.invocations.as_slice() else {
+            anyhow::bail!("a park reports its invocation: {:?}", committed.invocations);
+        };
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked.pending_child_count, 1);
+        assert!(parked.lease_id.is_none());
+        assert_eq!(parked.state.awaited_prompt(), Some(prompt));
+        Ok((parent, invocation, child_root))
+    }
+
+    /// A `WakeInvocation` naming another prompt, under the waiting guard, is
+    /// refused as a guard: `parked` stays parked on `prompt`, and the prompt
+    /// row stays as `stored`.
+    async fn assert_a_wake_for_another_prompt_is_refused(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        still: &AgentTask,
+        stored: &agent_server::journal::prompt::StoredPrompt,
+        prompt: &str,
+    ) -> Result<()> {
+        let wrong = task_store
+            .commit(
+                Transition {
+                    guards: vec![Guard::TaskIs {
+                        task: still.id.clone(),
+                        status: TaskStatus::WaitingOnChildren,
+                        lease: None,
+                    }],
+                    writes: vec![Write::WakeInvocation {
+                        invocation: still.id.clone(),
+                        prompt: format!("{prompt}-other"),
+                    }],
+                },
+                t_plus(8_002),
+            )
+            .await;
+        assert!(
+            matches!(wrong, Err(Rejected::Guard { index: 1, .. })),
+            "a wake naming another prompt is refused: {wrong:?}"
+        );
+        let unwoken = task_store.get(&still.id).await?.context("invocation")?;
+        assert_eq!(unwoken.status, TaskStatus::WaitingOnChildren, "{unwoken:?}");
+        assert_eq!(unwoken.pending_child_count, 1);
+        assert_eq!(unwoken.state.awaited_prompt(), Some(prompt));
+        assert_eq!(
+            agent_server::journal::prompt::get_prompt(documents, &still.thread_id, prompt).await?,
+            Some(stored.clone()),
+            "the refused wake leaves the prompt row unchanged"
+        );
+        Ok(())
+    }
+
+    /// A parked invocation (primitive 10, S-4) survives every recovery and
+    /// sweep path still parked, then wakes only on its prompt's close:
+    /// - a new epoch and both lease sweeps (it holds no lease);
+    /// - a repeat `cancel_tree` of its already terminal child root (the
+    ///   linked-invocation resume must not wake it);
+    /// - the orphan scan `settle_orphaned_descendants` works from (its parent
+    ///   is waiting, not terminal).
+    ///
+    /// The prompt's close wakes it in the same transition: `Pending`, no
+    /// pending child, and its next acquisition charges no attempt.
+    async fn test_a_parked_invocation_survives_recovery_and_wakes_on_the_close(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        prompt: &str,
+    ) -> Result<()> {
+        let invocations = task_store
+            .list_parked_subagent_invocations()
+            .await?
+            .into_iter()
+            .filter(|task| task.state.awaited_prompt() == Some(prompt))
+            .collect::<Vec<_>>();
+        let [parked] = invocations.as_slice() else {
+            anyhow::bail!("expected the one parked invocation, got {invocations:?}");
+        };
+        let child_root_id = parked
+            .state
+            .subagent_invocation()
+            .context("invocation linkage")?
+            .child_root_task_id
+            .clone();
+        let epoch = begin_epoch(task_store, 4_000).await?;
+        task_store
+            .release_expired_leases(t_plus(8_000), LeaseRecoveryScope::Expired)
+            .await?;
+        task_store
+            .release_expired_leases(t_plus(8_000), LeaseRecoveryScope::ForeignEpoch(epoch))
+            .await?;
+        task_store
+            .cancel_tree(&child_root_id, t_plus(8_001))
+            .await?;
+        let orphan_roots = task_store
+            .list_terminal_roots_with_live_descendants()
+            .await?;
+        let parent_id = parked.parent_id.clone().context("parent id")?;
+        assert!(
+            !orphan_roots.contains(&parent_id),
+            "the waiting parent is not an orphan root: {orphan_roots:?}"
+        );
+        let still = task_store.get(&parked.id).await?.context("invocation")?;
+        assert_eq!(still.status, TaskStatus::WaitingOnChildren, "{still:?}");
+        assert_eq!(still.pending_child_count, 1);
+        assert_eq!(still.state.awaited_prompt(), Some(prompt));
+        assert_eq!(
+            task_store.get(&parent_id).await?.context("parent")?.status,
+            TaskStatus::WaitingOnChildren
+        );
+
+        let stored = agent_server::journal::prompt::get_prompt(documents, &still.thread_id, prompt)
+            .await?
+            .context("the prompt row is open")?;
+        assert_a_wake_for_another_prompt_is_refused(task_store, documents, &still, &stored, prompt)
+            .await?;
+        // The host's handler pairs the close with the wake, as B-4's does;
+        // the close adds no second wake.
+        let closed = crate::prompts::close_prompt(
+            task_store,
+            &stored,
+            agent_sdk_foundation::ToolResult::success("approved"),
+            false,
+            Transition {
+                guards: vec![Guard::TaskIs {
+                    task: still.id.clone(),
+                    status: TaskStatus::WaitingOnChildren,
+                    lease: None,
+                }],
+                writes: vec![Write::WakeInvocation {
+                    invocation: still.id.clone(),
+                    prompt: prompt.to_owned(),
+                }],
+            },
+            agent_server::journal::prompt::PromptStep::Close,
+            t_plus(8_002),
+        )
+        .await?;
+        assert!(closed, "the close and its wake commit");
+        let woken = task_store.get(&still.id).await?.context("invocation")?;
+        assert_eq!(woken.status, TaskStatus::Pending);
+        assert_eq!(woken.pending_child_count, 0);
+        assert!(
+            agent_server::journal::prompt::get_prompt(documents, &still.thread_id, prompt)
+                .await?
+                .is_none(),
+            "the close retires the prompt row"
+        );
+        let resumed = task_store
+            .try_acquire_task(
+                &still.id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(9_000),
+                t_plus(8_003),
+            )
+            .await?
+            .context("the woken invocation acquires")?;
+        assert_eq!(
+            resumed.attempt, still.attempt,
+            "the acquisition after a wake charges no attempt"
+        );
+        Ok(())
+    }
+
+    /// A host that withdraws a parked invocation's prompt without pairing
+    /// the close with a wake (#533 review N1) still wakes it: the close
+    /// adds the wake, so the invocation and its parent cannot wait forever.
+    async fn test_a_withdrawn_prompt_still_wakes_its_parked_invocation(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        invocation: &AgentTask,
+        prompt: &str,
+    ) -> Result<()> {
+        let stored =
+            agent_server::journal::prompt::get_prompt(documents, &invocation.thread_id, prompt)
+                .await?
+                .context("the prompt row is open")?;
+        let closed = crate::prompts::close_prompt(
+            task_store,
+            &stored,
+            agent_sdk_foundation::ToolResult::error("withdrawn"),
+            false,
+            Transition::default(),
+            agent_server::journal::prompt::PromptStep::Withdraw,
+            t_plus(8_002),
+        )
+        .await?;
+        assert!(closed, "the withdrawal commits");
+        let woken = task_store
+            .get(&invocation.id)
+            .await?
+            .context("invocation")?;
+        assert_eq!(woken.status, TaskStatus::Pending, "{woken:?}");
+        assert_eq!(woken.pending_child_count, 0);
+        assert_eq!(woken.state.awaited_prompt(), None);
+        assert!(
+            agent_server::journal::prompt::get_prompt(documents, &invocation.thread_id, prompt)
+                .await?
+                .is_none(),
+            "the withdrawal retires the prompt row"
+        );
+        Ok(())
+    }
+
     /// A test completion hook: one `merge_back` step whose run returns
     /// `extra_writes`, and with `cancel_through` cancels the invocation's
     /// tree first, as a user cancel racing the merge-back would.
@@ -8162,6 +8449,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_parked_invocation_survives_recovery() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        park_an_invocation(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            "parked-mem",
+            "merge-mem",
+        )
+        .await?;
+        test_a_parked_invocation_survives_recovery_and_wakes_on_the_close(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            "merge-mem",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_withdrawn_prompt_wakes_its_invocation() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        let (_, invocation, _) = park_an_invocation(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            "withdrawn-mem",
+            "withdraw-mem",
+        )
+        .await?;
+        test_a_withdrawn_prompt_still_wakes_its_parked_invocation(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            &invocation,
+            "withdraw-mem",
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_child_root_spawn_retry_budget() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_child_root_spawn_retry_budget(s.task.as_ref(), s.thread.as_ref()).await
@@ -8823,6 +9147,44 @@ mod tests {
             message: store.as_ref(),
             event: store.as_ref(),
         })
+        .await
+    }
+
+    /// The SQLite case also restarts the host between the park and the
+    /// recovery: the store is reopened on the same file.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_parked_invocation_survives_restart_and_recovery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("parked.db").display()
+        );
+        {
+            let store = crate::sqlite::SqliteDurableStore::connect(&url).await?;
+            park_an_invocation(&store, &store, "parked-sqlite", "merge-sqlite").await?;
+        }
+        let store = crate::sqlite::SqliteDurableStore::connect(&url).await?;
+        test_a_parked_invocation_survives_recovery_and_wakes_on_the_close(
+            &store,
+            &store,
+            "merge-sqlite",
+        )
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_withdrawn_prompt_wakes_its_invocation() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        let (_, invocation, _) =
+            park_an_invocation(&store, &store, "withdrawn-sqlite", "withdraw-sqlite").await?;
+        test_a_withdrawn_prompt_still_wakes_its_parked_invocation(
+            &store,
+            &store,
+            &invocation,
+            "withdraw-sqlite",
+        )
         .await
     }
 
@@ -9987,6 +10349,36 @@ mod tests {
             message: store.as_ref(),
             event: store.as_ref(),
         })
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_parked_invocation_survives_recovery() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        park_an_invocation(&store, &store, "parked-pg", "merge-pg").await?;
+        test_a_parked_invocation_survives_recovery_and_wakes_on_the_close(
+            &store, &store, "merge-pg",
+        )
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_withdrawn_prompt_wakes_its_invocation() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (_, invocation, _) =
+            park_an_invocation(&store, &store, "withdrawn-pg", "withdraw-pg").await?;
+        test_a_withdrawn_prompt_still_wakes_its_parked_invocation(
+            &store,
+            &store,
+            &invocation,
+            "withdraw-pg",
+        )
         .await
     }
 

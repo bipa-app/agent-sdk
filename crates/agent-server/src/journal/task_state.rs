@@ -83,6 +83,24 @@ pub struct SubagentInvocationState {
     pub child_thread_id: ThreadId,
     /// Initial `root_turn` task allocated on the child thread.
     pub child_root_task_id: super::task::AgentTaskId,
+    /// The host prompt the invocation is parked on, after its completion
+    /// hook asked for a human decision. `None` for an invocation that never
+    /// parked; absent from the stored JSON then, so rows of earlier releases
+    /// read and write unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_prompt: Option<InvocationPrompt>,
+}
+
+/// The host prompt a parked subagent invocation waits on.
+///
+/// A parked invocation is `waiting_on_children` with one pending child:
+/// the open prompt. [`Write::WakeInvocation`](super::transition::Write::WakeInvocation)
+/// marks it `decided` and makes the invocation runnable; its next
+/// acquisition is then free ([`TaskState::resumes_in_flight_turn`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationPrompt {
+    pub prompt_id: String,
+    pub decided: bool,
 }
 
 /// Typed durable per-task state owned by the task kind.
@@ -406,14 +424,38 @@ impl TaskState {
     /// row charges one attempt instead
     /// ([`super::AgentTask::release_lease`]).
     #[must_use]
-    pub const fn resumes_in_flight_turn(&self) -> bool {
+    pub fn resumes_in_flight_turn(&self) -> bool {
         match self {
             Self::ReadyToResume { .. } | Self::AnsweredQuestion { .. } => true,
+            // Woken from a host prompt: the decision continues the
+            // completion the invocation parked in, so it is not a retry.
+            Self::SubagentInvocation { invocation } => matches!(
+                invocation.awaiting_prompt,
+                Some(InvocationPrompt { decided: true, .. })
+            ),
+            Self::None
+            | Self::WaitingOnChildren { .. }
+            | Self::AwaitingConfirmation { .. }
+            | Self::AwaitingQuestion { .. } => false,
+        }
+    }
+
+    /// The prompt a parked subagent invocation still waits on: set and not
+    /// yet decided.
+    #[must_use]
+    pub fn awaited_prompt(&self) -> Option<&str> {
+        match self {
+            Self::SubagentInvocation { invocation } => invocation
+                .awaiting_prompt
+                .as_ref()
+                .filter(|prompt| !prompt.decided)
+                .map(|prompt| prompt.prompt_id.as_str()),
             Self::None
             | Self::WaitingOnChildren { .. }
             | Self::AwaitingConfirmation { .. }
             | Self::AwaitingQuestion { .. }
-            | Self::SubagentInvocation { .. } => false,
+            | Self::AnsweredQuestion { .. }
+            | Self::ReadyToResume { .. } => None,
         }
     }
 
@@ -656,6 +698,7 @@ mod tests {
             spec: sample_spec(),
             child_thread_id: ThreadId::from_string("t-child-state"),
             child_root_task_id: crate::journal::task::AgentTaskId::from_string("task_child_state"),
+            awaiting_prompt: None,
         }
     }
 

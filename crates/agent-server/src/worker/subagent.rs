@@ -1211,6 +1211,9 @@ pub struct SubagentTaskOutcome {
     pub subagent_result: SubagentResult,
     pub tool_result: ToolResult,
     pub committed_events: Vec<CommittedEvent>,
+    /// The host prompt the invocation parked on instead of settling (its
+    /// completion hook asked for a decision); `None` when it settled.
+    pub parked_on: Option<String>,
 }
 
 /// Resolve a running `subagent` invocation task into trusted
@@ -1424,6 +1427,7 @@ async fn execute_subagent_task_inner(
         subagent_result,
         tool_result,
         committed_events,
+        parked_on: None,
     })
 }
 

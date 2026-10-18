@@ -1788,6 +1788,90 @@ impl AgentTask {
         )
     }
 
+    /// Park a running subagent invocation on the host prompt `prompt_id`:
+    /// `waiting_on_children` with the prompt as its one pending child, and
+    /// no lease. The invocation's effect records stay as they are.
+    ///
+    /// # Errors
+    /// The task is not a running subagent invocation held by
+    /// `(worker, lease)`, or it already waits on an undecided prompt.
+    pub fn park_on_prompt(
+        mut self,
+        worker: &WorkerId,
+        lease: &LeaseId,
+        prompt_id: String,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::Running {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        }
+        if self.worker_id.as_ref() != Some(worker) || self.lease_id.as_ref() != Some(lease) {
+            return Err(TaskSchemaError::HeartbeatLeaseMismatch);
+        }
+        let TaskState::SubagentInvocation { invocation } = &mut self.state else {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        };
+        if invocation
+            .awaiting_prompt
+            .as_ref()
+            .is_some_and(|prompt| !prompt.decided)
+        {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::WaitingOnChildren,
+            });
+        }
+        invocation.awaiting_prompt = Some(super::task_state::InvocationPrompt {
+            prompt_id,
+            decided: false,
+        });
+        self.status = TaskStatus::WaitingOnChildren;
+        self.pending_child_count = 1;
+        self.worker_id = None;
+        self.lease_id = None;
+        self.lease_expires_at = None;
+        self.last_heartbeat_at = None;
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Wake a subagent invocation parked on `prompt_id`: `Pending`, the
+    /// prompt marked decided, so the next acquisition is free.
+    ///
+    /// # Errors
+    /// The task is not waiting on `prompt_id`.
+    pub fn wake_from_prompt(
+        mut self,
+        prompt_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Self, TaskSchemaError> {
+        if self.status != TaskStatus::WaitingOnChildren
+            || self.state.awaited_prompt() != Some(prompt_id)
+        {
+            return Err(TaskSchemaError::InvalidTransition {
+                from: self.status,
+                to: TaskStatus::Pending,
+            });
+        }
+        if let TaskState::SubagentInvocation { invocation } = &mut self.state
+            && let Some(prompt) = invocation.awaiting_prompt.as_mut()
+        {
+            prompt.decided = true;
+        }
+        self.status = TaskStatus::Pending;
+        self.pending_child_count = 0;
+        self.updated_at = now;
+        self.validate()?;
+        Ok(self)
+    }
+
     /// Authoritatively replace the parent's `pending_child_count` with
     /// `live_children` and, when the count hits zero, flip the row back
     /// to [`TaskStatus::Pending`] with [`TaskState::ReadyToResume`] so
@@ -1818,6 +1902,11 @@ impl AgentTask {
                 ..
             }
         ) {
+            return Ok(self);
+        }
+        // A subagent invocation parked on a host prompt waits for the
+        // prompt, not for task children: only `wake_from_prompt` resumes it.
+        if self.state.awaited_prompt().is_some() {
             return Ok(self);
         }
         let should_resume = match self.state.child_join_policy() {
@@ -2665,6 +2754,7 @@ mod tests {
                 },
                 child_thread_id: child_thread_id.clone(),
                 child_root_task_id: AgentTaskId::from_string("task_child_root"),
+                awaiting_prompt: None,
             },
             0,
             t_plus(2),
@@ -3423,6 +3513,185 @@ mod tests {
 
         assert_eq!(reacquired.status, TaskStatus::Running);
         assert!(matches!(reacquired.state, TaskState::ReadyToResume { .. }));
+        Ok(())
+    }
+
+    /// A subagent invocation of a running root, acquired by `(w-inv, l-inv)`
+    /// after its child root ended (pending child count back to zero).
+    fn running_invocation() -> Result<AgentTask> {
+        let root = fresh_root()
+            .mark_running(
+                WorkerId::from_string("w-subagent"),
+                LeaseId::from_string("l-subagent"),
+                t_plus(60),
+                t_plus(1),
+            )
+            .context("mark root running")?;
+        let child_thread_id = ThreadId::from_string("t-subagent-child");
+        let invocation = AgentTask::new_subagent_invocation(
+            &root,
+            SubagentInvocationState {
+                spec: crate::worker::subagent::EffectiveSubagentSpec {
+                    task: "Summarize durable recovery".into(),
+                    prompt: String::new(),
+                    model: "claude-sonnet-4-5-20250929".into(),
+                    max_turns: 4,
+                    timeout_ms: 30_000,
+                    depth: 1,
+                    max_parallel_subagents: 1,
+                    nickname: Some("Scout".into()),
+                    sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(),
+                    mcp: crate::worker::subagent::EffectiveSubagentMcpPolicy {
+                        allowed_servers: set(&["docs"]),
+                    },
+                    audit_provenance: Some(agent_sdk_foundation::audit::AuditProvenance::new(
+                        "anthropic",
+                        "claude-sonnet-4-5-20250929",
+                    )),
+                    inherited_policy: crate::worker::subagent::InheritedSubagentPolicy {
+                        default_model: "claude-sonnet-4-5-20250929".into(),
+                        allowed_models: set(&["claude-sonnet-4-5-20250929"]),
+                        default_max_turns: 4,
+                        max_turns: 4,
+                        default_timeout_ms: 30_000,
+                        max_timeout_ms: 30_000,
+                        capability_profiles: std::collections::BTreeMap::from([(
+                            "research".into(),
+                            crate::worker::subagent::SubagentCapabilityProfile {
+                                capabilities: set(&["read_file", "rg"]),
+                                sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(
+                                ),
+                                allowed_mcp_servers: set(&["docs"]),
+                            },
+                        )]),
+                        allowed_capabilities: set(&["read_file", "rg"]),
+                        max_depth: 3,
+                        max_parallel_subagents: 1,
+                        sandbox: crate::worker::subagent::SubagentSandboxPolicy::read_only(),
+                        allowed_mcp_servers: set(&["docs"]),
+                        audit_provider: "anthropic".into(),
+                    },
+                    capabilities: crate::worker::subagent::EffectiveSubagentCapabilities {
+                        profile: "research".into(),
+                        allowed: set(&["read_file", "rg"]),
+                    },
+                },
+                child_thread_id,
+                child_root_task_id: AgentTaskId::from_string("task_child_root"),
+                awaiting_prompt: None,
+            },
+            0,
+            t_plus(2),
+            2,
+        )
+        .context("new_subagent_invocation")?;
+        invocation
+            .recompute_pending_children(0, t_plus(3))
+            .context("the child root ended")?
+            .mark_running(
+                WorkerId::from_string("w-inv"),
+                LeaseId::from_string("l-inv"),
+                t_plus(600),
+                t_plus(4),
+            )
+            .context("acquire the invocation")
+    }
+
+    /// Parking needs the invocation's own lease; it then waits on the prompt
+    /// as its one pending child with no lease, and no child recompute wakes
+    /// it. Only a wake for that prompt makes it runnable, and the next
+    /// acquisition charges no attempt.
+    #[test]
+    fn a_parked_invocation_waits_for_its_prompt_and_resumes_free() -> Result<()> {
+        let running = running_invocation()?;
+        assert_eq!(running.attempt, 1);
+        let stranger = running.clone().park_on_prompt(
+            &WorkerId::from_string("w-other"),
+            &LeaseId::from_string("l-other"),
+            "p-1".into(),
+            t_plus(5),
+        );
+        assert!(stranger.is_err(), "only the lease holder parks");
+
+        let parked = running.park_on_prompt(
+            &WorkerId::from_string("w-inv"),
+            &LeaseId::from_string("l-inv"),
+            "p-1".into(),
+            t_plus(5),
+        )?;
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(parked.pending_child_count, 1);
+        assert!(parked.lease_id.is_none() && parked.worker_id.is_none());
+        assert_eq!(parked.state.awaited_prompt(), Some("p-1"));
+        assert!(!parked.state.resumes_in_flight_turn());
+
+        let recomputed = parked.clone().recompute_pending_children(0, t_plus(6))?;
+        assert_eq!(
+            recomputed.status,
+            TaskStatus::WaitingOnChildren,
+            "no child wakes it"
+        );
+        assert_eq!(recomputed.pending_child_count, 1);
+        assert!(
+            parked
+                .clone()
+                .wake_from_prompt("p-other", t_plus(6))
+                .is_err()
+        );
+
+        let woken = parked.wake_from_prompt("p-1", t_plus(7))?;
+        assert_eq!(woken.status, TaskStatus::Pending);
+        assert_eq!(woken.pending_child_count, 0);
+        assert_eq!(woken.state.awaited_prompt(), None);
+        assert!(woken.state.resumes_in_flight_turn());
+        let resumed = woken.mark_running(
+            WorkerId::from_string("w-again"),
+            LeaseId::from_string("l-again"),
+            t_plus(900),
+            t_plus(8),
+        )?;
+        assert_eq!(resumed.attempt, 1, "the acquisition after a wake is free");
+        Ok(())
+    }
+
+    /// A row a release before S-4 wrote reads with no prompt, and a row with
+    /// a prompt still reads on that release: the field is optional and the
+    /// earlier struct does not deny unknown fields.
+    #[test]
+    fn the_prompt_marker_reads_on_both_sides_of_the_release() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct EarlierInvocationState {
+            child_thread_id: ThreadId,
+            child_root_task_id: AgentTaskId,
+        }
+        let running = running_invocation()?;
+        let parked = running.park_on_prompt(
+            &WorkerId::from_string("w-inv"),
+            &LeaseId::from_string("l-inv"),
+            "p-1".into(),
+            t_plus(5),
+        )?;
+        let TaskState::SubagentInvocation { invocation } = &parked.state else {
+            anyhow::bail!("not an invocation state");
+        };
+        let with_marker = serde_json::to_value(invocation.as_ref())?;
+        assert_eq!(with_marker["awaiting_prompt"]["prompt_id"], "p-1");
+        let earlier: EarlierInvocationState = serde_json::from_value(with_marker.clone())?;
+        assert_eq!(earlier.child_thread_id, invocation.child_thread_id);
+        assert_eq!(earlier.child_root_task_id, invocation.child_root_task_id);
+
+        let mut without = with_marker;
+        without
+            .as_object_mut()
+            .context("an object")?
+            .remove("awaiting_prompt");
+        let read: SubagentInvocationState = serde_json::from_value(without.clone())?;
+        assert!(read.awaiting_prompt.is_none());
+        assert_eq!(
+            serde_json::to_value(&read)?,
+            without,
+            "no marker writes no field"
+        );
         Ok(())
     }
 

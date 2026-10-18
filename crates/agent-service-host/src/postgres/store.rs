@@ -4327,6 +4327,7 @@ async fn prepare_subagent_batch_rows_tx(
                 spec,
                 child_thread_id,
                 child_root_task_id: child_root.id.clone(),
+                awaiting_prompt: None,
             },
             spawn_index,
             now,
@@ -4866,6 +4867,71 @@ impl PostgresDurableStore {
         Ok(())
     }
 
+    /// Apply a [`Write::ParkInvocation`](agent_server::journal::Write::ParkInvocation)
+    /// or [`Write::WakeInvocation`](agent_server::journal::Write::WakeInvocation)
+    /// inside the transaction. A wake whose invocation no longer waits on its
+    /// prompt is an expectation failure: the transition is refused whole.
+    async fn invocation_step_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        transition: &agent_server::journal::Transition,
+        write: &agent_server::journal::Write,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        use agent_server::journal::Write;
+
+        let (invocation, prompt) = match write {
+            Write::ParkInvocation { invocation, prompt }
+            | Write::WakeInvocation { invocation, prompt } => (invocation, prompt),
+            other => return Err(anyhow!("not an invocation prompt step: {other:?}")),
+        };
+        let old = Self::load_task_tx(tx, invocation, true)
+            .await?
+            .ok_or_else(|| anyhow!("invocation {invocation} does not exist"))?;
+        if matches!(write, Write::ParkInvocation { .. }) {
+            let (worker, lease) = transition
+                .lease_for(invocation)
+                .ok_or_else(|| anyhow!("park rejected: no lease guard on {invocation}"))?;
+            let parked = old
+                .park_on_prompt(worker, lease, prompt.clone(), now)
+                .with_context(|| format!("park rejected for invocation {invocation}"))?;
+            Self::update_task_tx(tx, &parked).await?;
+            agent_server::fail_point!("invocation.park_written");
+            return Ok(parked);
+        }
+        if old.state.awaited_prompt() != Some(prompt.as_str()) {
+            return Err(agent_server::journal::document::ExpectationFailed {
+                reason: format!(
+                    "invocation {invocation} does not wait on prompt {prompt} ({:?})",
+                    old.state.awaited_prompt()
+                ),
+            }
+            .into());
+        }
+        let woken = old
+            .wake_from_prompt(prompt, now)
+            .with_context(|| format!("wake rejected for invocation {invocation}"))?;
+        Self::update_task_tx(tx, &woken).await?;
+        agent_server::fail_point!("invocation.wake_written");
+        Ok(woken)
+    }
+
+    /// Apply a [`Write::PauseOnConfirmation`](agent_server::journal::Write::PauseOnConfirmation).
+    async fn apply_pause_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        write: agent_server::journal::Write,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        let agent_server::journal::Write::PauseOnConfirmation {
+            task,
+            continuation,
+            prepared_operation,
+        } = write
+        else {
+            return Err(anyhow!("not a pause: {write:?}"));
+        };
+        Self::pause_on_confirmation_tx(tx, &task, *continuation, prepared_operation, now).await
+    }
+
     /// Apply one write of a transition inside its transaction.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Postgres>,
@@ -4885,21 +4951,12 @@ impl PostgresDurableStore {
             Write::RejectConfirmation { task, error } => committed
                 .settled
                 .push(Self::reject_confirmation_tx(tx, &task, error, now).await?),
-            Write::PauseOnConfirmation {
-                task,
-                continuation,
-                prepared_operation,
-            } => {
-                let paused = Self::pause_on_confirmation_tx(
-                    tx,
-                    &task,
-                    *continuation,
-                    prepared_operation,
-                    now,
-                )
-                .await?;
-                committed.paused.push(paused);
-            }
+            step @ (Write::ParkInvocation { .. } | Write::WakeInvocation { .. }) => committed
+                .invocations
+                .push(Self::invocation_step_tx(tx, transition, &step, now).await?),
+            pause @ Write::PauseOnConfirmation { .. } => committed
+                .paused
+                .push(Self::apply_pause_tx(tx, pause, now).await?),
             Write::ReparkAfterSteering {
                 task,
                 worker,
@@ -5232,6 +5289,7 @@ impl PostgresDurableStore {
                 spec: spawn.spec.clone(),
                 child_thread_id: spawn.child_thread_id.clone(),
                 child_root_task_id: child_root.id.clone(),
+                awaiting_prompt: None,
             },
             spawn.spawn_index,
             now,
