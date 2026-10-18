@@ -295,6 +295,47 @@ async fn sweep_tick_settles_children_of_a_root_failed_closed_on_lease_expiry() -
     assert_children_settled(&stores, &tree).await
 }
 
+/// A host start records the waits on a human the journal holds: a parked
+/// confirmation that survived a restart shows as
+/// `agent_service_host.parked_waits{kind=confirmation}`.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn startup_records_the_waits_on_a_human_it_found() -> Result<()> {
+    let meter = crate::observability::test_meter::TestMeter::install().await;
+    let config = ServiceConfig {
+        worker: WorkerConfig {
+            sweep_interval_secs: 3_600,
+            acquisition_interval_secs: 3_600,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let host = ServiceHost::new(config, super::sample_registry(), super::sample_runtime()?)?;
+    let stores = host.stores().clone();
+    let token = host.shutdown_token();
+    park_on_live_children(&stores, &ThreadId::from_string("t-parked-waits"), 3).await?;
+
+    let host_handle = tokio::spawn(async move { host.run().await });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let confirmations = loop {
+        let value = meter.gauge(
+            "agent_service_host.parked_waits",
+            &[("kind", "confirmation")],
+        );
+        if value.is_some() || std::time::Instant::now() > deadline {
+            break value;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let questions = meter.gauge("agent_service_host.parked_waits", &[("kind", "question")]);
+    drop(meter);
+    token.cancel();
+    host_handle.await??;
+    assert_eq!(confirmations, Some(1), "the parked confirmation is counted");
+    assert_eq!(questions, Some(0), "no question is parked");
+    Ok(())
+}
+
 /// The startup orphan settlement is exported as
 /// `agent_service_host.orphans.settled`.
 #[cfg(feature = "otel")]

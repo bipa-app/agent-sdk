@@ -81,6 +81,8 @@ pub mod attrs {
     pub const THREAD_OPERATION: &str = "operation";
     /// The refused thread's status (`completed`, `deleting`, `deleted`).
     pub const THREAD_STATUS: &str = "thread_status";
+    /// What a parked task waits on: `question` or `confirmation`.
+    pub const PARKED_WAIT_KIND: &str = "kind";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -290,6 +292,24 @@ impl HostMetrics {
                     KeyValue::new(attrs::THREAD_STATUS, status.as_str()),
                 ],
             );
+    }
+
+    /// Record, once at host start, how many tasks the journal holds parked on
+    /// a human (`agent_service_host.parked_waits{kind=question|confirmation}`).
+    /// After a restart these are the waits that survived it. The gauge is
+    /// built on use (the SDK returns the same instrument).
+    pub fn record_parked_waits(&self, questions: usize, confirmations: usize) {
+        let gauge = self
+            .meter
+            .u64_gauge("agent_service_host.parked_waits")
+            .with_description("Tasks parked on a question or a confirmation when the host started.")
+            .build();
+        for (kind, count) in [("question", questions), ("confirmation", confirmations)] {
+            gauge.record(
+                u64::try_from(count).unwrap_or(u64::MAX),
+                &[KeyValue::new(attrs::PARKED_WAIT_KIND, kind)],
+            );
+        }
     }
 
     /// Register `(active, idle)` gauges for a sqlx Postgres pool.
@@ -556,6 +576,31 @@ pub(crate) mod test_meter {
                 exporter,
                 _guard: guard,
             }
+        }
+
+        /// The latest value of the `u64` gauge `name` at the point carrying
+        /// every `(key, value)` in `labels`, from a fresh flush.
+        pub fn gauge(&self, name: &str, labels: &[(&str, &str)]) -> Option<u64> {
+            self.exporter.reset();
+            let _ = self.provider.force_flush();
+            for resource in self.exporter.get_finished_metrics().unwrap_or_default() {
+                for scope in resource.scope_metrics() {
+                    for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                        if let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = metric.data()
+                            && let Some(point) = gauge.data_points().find(|point| {
+                                labels.iter().all(|(key, value)| {
+                                    point.attributes().any(|kv| {
+                                        kv.key.as_str() == *key && kv.value.as_str() == *value
+                                    })
+                                })
+                            })
+                        {
+                            return Some(point.value());
+                        }
+                    }
+                }
+            }
+            None
         }
 
         /// The sum of the `u64` counter `name` over the points carrying every
