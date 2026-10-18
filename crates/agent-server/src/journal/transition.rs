@@ -113,6 +113,16 @@ pub enum Write {
     /// task document needs its task to exist. Backends apply document
     /// writes after the transition's other writes, in their given order.
     Document(DocumentWrite),
+    /// Wake a parent parked on its children to run a steering exchange
+    /// with `steering`, which must not be empty. A parent that is no
+    /// longer parked (its last child fanned it in, an exchange is already
+    /// running, or it is terminal) is left alone: the rest of the
+    /// transition still commits, and [`Committed::steering_resumed`]
+    /// reports `None`, so the steering waits for the next boundary.
+    EnqueueSteeringResume {
+        parent: AgentTaskId,
+        steering: Vec<llm::ContentBlock>,
+    },
 }
 
 /// What a [`Write::SpawnChildren`] spawns, one shape per spawn method of
@@ -461,6 +471,9 @@ pub struct Committed {
     pub events: Vec<CommittedEvent>,
     /// For each [`Write::Document`]: the document's live revision after it.
     pub documents: Vec<DocumentOutcome>,
+    /// For each [`Write::EnqueueSteeringResume`]: the woken parent, or
+    /// `None` when it was no longer parked.
+    pub steering_resumed: Vec<Option<AgentTask>>,
 }
 
 /// Why a transition wrote nothing.
@@ -524,6 +537,15 @@ pub trait DurableStore: Send + Sync {
 }
 
 impl Transition {
+    /// Wake `parent`, parked on its children, for a steering exchange.
+    #[must_use]
+    pub fn enqueue_steering_resume(parent: AgentTaskId, steering: Vec<llm::ContentBlock>) -> Self {
+        Self {
+            guards: Vec::new(),
+            writes: vec![Write::EnqueueSteeringResume { parent, steering }],
+        }
+    }
+
     /// Settle a running, leased task and append `events`, one transaction.
     #[must_use]
     pub fn settle(
@@ -754,7 +776,8 @@ impl Transition {
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::AppendCompaction { .. }
-            | Write::Document(_) => false,
+            | Write::Document(_)
+            | Write::EnqueueSteeringResume { .. } => false,
         })
     }
     /// Whether any write appends a compaction.
@@ -787,7 +810,8 @@ impl Transition {
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::SpawnChildren { .. }
-            | Write::Document(_) => None,
+            | Write::Document(_)
+            | Write::EnqueueSteeringResume { .. } => None,
         })
     }
 
@@ -815,7 +839,8 @@ impl Transition {
                 | Write::AppendCompaction { .. }
                 | Write::AppendEvents { .. }
                 | Write::SpawnChildren { .. }
-                | Write::Document(_) => {}
+                | Write::Document(_)
+                | Write::EnqueueSteeringResume { .. } => {}
             }
         }
         Ok(())
@@ -898,6 +923,13 @@ impl Transition {
                     if state.is_started() {
                         return Err(Rejected::Store(anyhow::anyhow!(
                             "finishing effect {key} needs an end state"
+                        )));
+                    }
+                }
+                Write::EnqueueSteeringResume { steering, .. } => {
+                    if steering.is_empty() {
+                        return Err(Rejected::Store(anyhow::anyhow!(
+                            "steering wake rejected: steering content must be non-empty"
                         )));
                     }
                 }
@@ -990,6 +1022,7 @@ impl Write {
                     Lock::Task(task.clone()),
                 ],
             },
+            Self::EnqueueSteeringResume { parent, .. } => vec![Lock::Task(parent.clone())],
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }

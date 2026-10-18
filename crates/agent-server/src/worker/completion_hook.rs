@@ -220,6 +220,7 @@ const fn write_name(write: &Write) -> &'static str {
         Write::SpawnChildren { .. } => "SpawnChildren",
         Write::Document(_) => "Document",
         Write::Effect(_) => "Effect",
+        Write::EnqueueSteeringResume { .. } => "EnqueueSteeringResume",
     }
 }
 

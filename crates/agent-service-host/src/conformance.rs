@@ -2695,6 +2695,196 @@ mod tests {
         Ok(())
     }
 
+    /// A root parked on two running tool children.
+    async fn parked_root(task_store: &dyn AgentTaskStore, tid: &str) -> Result<AgentTask> {
+        let root = fresh_root(tid, 60);
+        task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
+            .await?;
+        let (parent, _children) = task_store
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(3), ChildSpawnSpec::new(3)],
+                suspension_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        anyhow::ensure!(parent.status == TaskStatus::WaitingOnChildren);
+        Ok(parent)
+    }
+
+    fn steering_note(text: &str) -> Vec<agent_sdk_foundation::llm::ContentBlock> {
+        vec![agent_sdk_foundation::llm::ContentBlock::Text { text: text.into() }]
+    }
+
+    /// A steering note and the wake of its parked parent commit in one
+    /// transition. A parent that is no longer parked is left alone and the
+    /// note still commits; an empty note or a missing parent rejects the
+    /// whole transition.
+    async fn test_steering_resume_commits_with_its_note(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        use agent_server::journal::{DocExpect, Rejected, Write};
+
+        let tid = "conformance-steering-write";
+        let parent = parked_root(task_store, tid).await?;
+        let queue = thread_doc(&thread_id(tid), "steering_queue")?;
+        let wake = |text: &str, parent: &AgentTaskId| Write::EnqueueSteeringResume {
+            parent: parent.clone(),
+            steering: steering_note(text),
+        };
+
+        let committed = task_store
+            .commit(
+                doc_only(vec![
+                    put_doc(&queue, DocExpect::Absent, serde_json::json!(["status?"])),
+                    wake("status?", &parent.id),
+                ]),
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [Some(woken)] = committed.steering_resumed.as_slice() else {
+            anyhow::bail!("one woken parent, got {:?}", committed.steering_resumed);
+        };
+        assert_eq!(woken.status, TaskStatus::Pending);
+        assert!(woken.state.is_steering_resume());
+        assert_eq!(doc_value(documents, &queue).await?.map(|(r, _)| r), Some(1));
+
+        let committed = task_store
+            .commit(
+                doc_only(vec![
+                    put_doc(&queue, DocExpect::Revision(1), serde_json::json!(["again"])),
+                    wake("again", &parent.id),
+                ]),
+                t_plus(66),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert!(
+            matches!(committed.steering_resumed.as_slice(), [None]),
+            "a parent that is no longer parked declines the wake: {:?}",
+            committed.steering_resumed
+        );
+        assert_eq!(
+            doc_value(documents, &queue).await?,
+            Some((2, serde_json::json!(["again"]))),
+            "the note commits even when the wake declines"
+        );
+
+        for (writes, what) in [
+            (vec![wake("", &parent.id)], "an empty note"),
+            (
+                vec![wake("lost", &AgentTaskId::from_string("task_missing"))],
+                "a missing parent",
+            ),
+        ] {
+            let mut writes = writes;
+            writes.insert(
+                0,
+                put_doc(&queue, DocExpect::Revision(2), serde_json::json!(["lost"])),
+            );
+            if let Some(Write::EnqueueSteeringResume { steering, .. }) = writes.last_mut()
+                && what == "an empty note"
+            {
+                steering.clear();
+            }
+            let rejected = task_store.commit(doc_only(writes), t_plus(67)).await;
+            assert!(
+                matches!(rejected, Err(Rejected::Store(_))),
+                "{what} rejects the transition: {rejected:?}"
+            );
+            assert_eq!(
+                doc_value(documents, &queue).await?.map(|(r, _)| r),
+                Some(2),
+                "{what} writes nothing"
+            );
+        }
+        Ok(())
+    }
+
+    /// A wake on a missing parent rejects its whole transition, including
+    /// a state-changing write applied before it: an event appended earlier
+    /// in the same transition is not visible. The durable backends roll the
+    /// transaction back; the in-memory store, which cannot, checks the
+    /// parent before its first mutation (reconciliation C15).
+    async fn test_a_failing_wake_leaves_no_earlier_write(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::{Rejected, Write};
+
+        let thread = thread_id("conformance-steering-write-earlier");
+        let rejected = task_store
+            .commit(
+                doc_only(vec![
+                    Write::AppendEvents {
+                        thread: thread.clone(),
+                        events: vec![AgentEvent::text("early", "before the wake")],
+                    },
+                    Write::EnqueueSteeringResume {
+                        parent: AgentTaskId::from_string("task_missing"),
+                        steering: steering_note("lost"),
+                    },
+                ]),
+                t_plus(68),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(Rejected::Store(_))),
+            "a wake on a missing parent rejects the transition: {rejected:?}"
+        );
+        assert!(
+            events.get_events(&thread).await?.is_empty(),
+            "an earlier event of a rejected transition is not visible"
+        );
+        Ok(())
+    }
+
+    /// A crash after a wake is staged and before its transition's events
+    /// leaves the parent parked: the wake rolls back with the rest.
+    #[cfg(feature = "failpoints")]
+    async fn test_steering_resume_failpoint_leaves_the_parent_parked(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let tid = "conformance-steering-write-crash";
+        let parent = parked_root(task_store, tid).await?;
+        let transition = doc_only(vec![
+            agent_server::journal::Write::EnqueueSteeringResume {
+                parent: parent.id.clone(),
+                steering: steering_note("status?"),
+            },
+            agent_server::journal::Write::AppendEvents {
+                thread: thread_id(tid),
+                events: vec![AgentEvent::text("steer", "queued")],
+            },
+        ]);
+        fail::cfg("transition.before_events", "panic")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(task_store.commit(transition, t_plus(65)));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("transition.before_events");
+        assert!(result.is_err(), "the transition failpoint must fire");
+        let after = AgentTaskStore::get(task_store, &parent.id)
+            .await?
+            .context("parent")?;
+        assert_eq!(after.status, TaskStatus::WaitingOnChildren);
+        Ok(())
+    }
+
     /// A root parked on two tool children, one finished, woken by a
     /// steering note and re-acquired: ready to re-park on the survivor.
     async fn steering_woken_root(
@@ -6358,6 +6548,68 @@ mod tests {
     async fn conformance_in_memory_failed_settle_keeps_its_result() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_failed_settle_keeps_its_result(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_failing_wake_leaves_no_earlier_write(s.task.as_ref(), s.event.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_steering_resume_write() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_steering_resume_commits_with_its_note(s.task.as_ref(), s.documents.as_ref()).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_steering_resume_write() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_steering_resume_commits_with_its_note(&store, &store).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_steering_resume_failpoint_leaves_the_parent_parked() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_steering_resume_failpoint_leaves_the_parent_parked(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_failing_wake_leaves_no_earlier_write() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_steering_resume_write() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_steering_resume_commits_with_its_note(&store, &store).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_steering_resume_failpoint_leaves_the_parent_parked() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_steering_resume_failpoint_leaves_the_parent_parked(&store).await
     }
 
     #[tokio::test]

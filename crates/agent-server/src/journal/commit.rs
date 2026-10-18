@@ -171,7 +171,8 @@ impl CompletedTurnCommit {
                 | Write::AppendCompaction { .. }
                 | Write::AppendEvents { .. }
                 | Write::SpawnChildren { .. }
-                | Write::Document(_) => {
+                | Write::Document(_)
+                | Write::EnqueueSteeringResume { .. } => {
                     anyhow::bail!(
                         "a completed turn may carry only its own task's settle among its extra \
                          writes, not {write:?}"

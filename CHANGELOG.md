@@ -227,6 +227,20 @@ long as it needs. No migration, table, `Write` variant or protocol change.
 
 ### Crash-safety Phase 3: documents
 
+- **Breaking:** `Write::EnqueueSteeringResume { parent, steering }` wakes a
+  parent parked on its children for a steering exchange, inside a
+  transition. A host can therefore queue a steering note (a document) and
+  wake the parked parent in one transaction.
+  - A parent that is no longer parked is left alone, and the rest of the
+    transition still commits. `Committed::steering_resumed` reports `None`
+    for it.
+  - An empty note or a missing parent rejects the transition.
+  - `AgentTaskStore::enqueue_steering_resume` is now a wrapper over
+    `commit`, with unchanged behaviour and error text.
+  - The architecture test counts calls to it.
+  - Each wake is counted on `agent_server.journal.steering_resumes`, by
+    `backend` and `outcome` (`woken` / `declined`, feature `otel`).
+
 - **Breaking:** `Write::Document(DocumentWrite)` puts or retires one typed
   JSON document in the same transaction as the rest of its `Transition`
   (design §6.4, `agent_server::journal::document`).
