@@ -1130,3 +1130,85 @@ async fn kill_nine_inside_the_compaction_failpoint_leaves_neither_half() -> Resu
     let store = SqliteDurableStore::connect(&url).await?;
     assert_uncompacted(&store).await
 }
+
+/// An LLM request's start (crash matrix S3): the attempt row and its
+/// `Started` effect commit as one transaction. `effect.start_written` fires
+/// inside it after both rows were written (the attempt write comes first),
+/// and the test requires it to fire, so a crash there must leave neither.
+#[tokio::test]
+async fn llm_request_start_failpoint_rolls_back_the_attempt_with_its_effect() -> Result<()> {
+    use agent_server::journal::TurnAttemptWrite;
+    use agent_server::journal::effect::{EffectIntent, EffectSubject};
+    use agent_server::journal::turn_attempt::{OpenAttemptParams, TurnAttempt};
+    use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+
+    const STARTED: &str = "effect.start_written";
+    let _scenario = serial_failpoints();
+    let temp = tempfile::tempdir()?;
+    let store = fresh_store(&temp).await?;
+    let thread = ThreadId::from_string("llm-request-start");
+    ThreadStore::get_or_create(&store, &thread, at(1)).await?;
+    let root = AgentTask::new_root_turn(thread.clone(), at(1), 3);
+    store.submit_root_turn(root.clone()).await?;
+    let (worker, lease) = (WorkerId::from_string("w"), LeaseId::from_string("l"));
+    store
+        .try_acquire_task(&root.id, worker.clone(), lease.clone(), at(600), at(2))
+        .await?
+        .context("acquire the root")?;
+    let attempt = TurnAttempt::open(OpenAttemptParams {
+        task_id: root.id.clone(),
+        attempt_number: 1,
+        provenance: agent_sdk_foundation::audit::AuditProvenance::new(
+            "anthropic",
+            "claude-sonnet-5-5",
+        ),
+        request_blob: json!({}),
+        now: at(3),
+        otel_trace_id: None,
+        otel_span_id: None,
+    });
+    let key = EffectKey::llm(&root.id, attempt.id.as_str());
+    let begin = Transition {
+        guards: vec![
+            Guard::TaskIs {
+                task: root.id.clone(),
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            },
+            Guard::EffectFree { key: key.clone() },
+        ],
+        writes: vec![
+            Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(attempt.clone()))),
+            Write::Effect(EffectWrite::Start(EffectIntent {
+                key: key.clone(),
+                replay: agent_sdk_foundation::ToolReplay::Safe,
+                owner: root.id.clone(),
+                thread,
+                subject: EffectSubject::Llm {
+                    turn_attempt_id: attempt.id.as_str().to_owned(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-5-5".into(),
+                },
+                attempt: 1,
+            })),
+        ],
+    };
+
+    fail::cfg(STARTED, "panic").map_err(|error| anyhow::anyhow!("{error}"))?;
+    let crashed = std::panic::AssertUnwindSafe(store.commit(begin, at(3)));
+    let result = futures::FutureExt::catch_unwind(crashed).await;
+    fail::remove(STARTED);
+    ensure!(result.is_err(), "the failpoint after both writes must fire");
+
+    drop(store);
+    let store = fresh_store(&temp).await?;
+    ensure!(
+        TurnAttemptStore::get(&store, &attempt.id).await?.is_none(),
+        "the attempt row survived without its request"
+    );
+    ensure!(
+        store.effect(&key).await?.is_none(),
+        "the request survived without its attempt"
+    );
+    Ok(())
+}

@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "\nUPDATE agent_sdk_execution_intents\nSET status     = ?1,\n    error      = ?2,\n    resolution = ?3,\n    updated_at = ?4\nWHERE child_task_id = ?5\n  AND status IN ('pending', 'started')\nRETURNING operation_id AS \"operation_id!\", effect_kind AS \"effect_kind!\",\n          tool_call_id AS \"tool_call_id!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "operation_id!",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_execution_intents",
+            "name": "operation_id"
+          }
+        }
+      },
+      {
+        "name": "effect_kind!",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_execution_intents",
+            "name": "effect_kind"
+          }
+        }
+      },
+      {
+        "name": "tool_call_id!",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_execution_intents",
+            "name": "tool_call_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "296260cc4e8992b17826269a329aa5651a7aaae3034f7bc8670e0de4a9c0e850"
+}

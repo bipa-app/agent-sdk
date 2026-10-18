@@ -2321,6 +2321,46 @@ WHERE id = $1
         Ok(())
     }
 
+    /// Close the still-open attempt row an abandoned LLM request names, in
+    /// the transaction that abandons the request: its task ended before the
+    /// request finished, so nothing will close it later (crash matrix S3).
+    ///
+    /// The row is taken `FOR UPDATE SKIP LOCKED`, so this never waits: it
+    /// runs after its task's row is locked, and a completing turn locks its
+    /// attempt row before its task. An attempt row another transaction
+    /// holds is its own worker's, which closes it.
+    async fn close_abandoned_attempt_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: &TurnAttemptId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let record = sqlx::query_as::<_, TurnAttemptRecord>(
+            r"
+SELECT id, task_id, attempt_number, provider, requested_model,
+       request_blob, response_blob, response_id, response_model,
+       stop_reason, outcome, input_tokens, output_tokens,
+       cached_input_tokens, cache_creation_input_tokens, route_provider,
+       thinking_mode, thinking_budget_tokens, thinking_effort, opened_at, closed_at, duration_ms,
+       otel_trace_id, otel_span_id
+FROM agent_sdk_turn_attempts
+WHERE id = $1 AND closed_at IS NULL
+FOR UPDATE SKIP LOCKED
+",
+        )
+        .bind(id.as_str())
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("lock abandoned attempt {id}"))?;
+        let Some(attempt) = record.map(TurnAttempt::try_from).transpose()? else {
+            return Ok(());
+        };
+        if attempt.outcome.is_some() {
+            return Ok(());
+        }
+        let closed = attempt.close(CloseAttemptParams::abandoned(), now)?;
+        Self::update_attempt_tx(tx, &closed).await
+    }
+
     /// End the still-`Started` effects of a task that just became
     /// terminal as `Abandoned`, in the same transaction: a `Started`
     /// record's owner is live. Every write of a task's status goes through
@@ -2331,7 +2371,7 @@ WHERE id = $1
     ) -> Result<()> {
         let columns = EffectState::Abandoned.columns();
         let abandoned = sqlx::query!(
-            r"
+            r#"
 UPDATE agent_sdk_execution_intents
 SET status     = $1,
     error      = $2,
@@ -2339,8 +2379,8 @@ SET status     = $1,
     updated_at = $4
 WHERE child_task_id = $5
   AND status IN ('pending', 'started')
-RETURNING operation_id, effect_kind
-",
+RETURNING operation_id, effect_kind, tool_call_id AS "tool_call_id!"
+"#,
             columns.status,
             columns.error,
             columns.resolution,
@@ -2367,6 +2407,18 @@ RETURNING operation_id, effect_kind
                     &row.operation_id,
                     task.id.as_str(),
                 );
+            }
+            if row.effect_kind
+                == agent_server::journal::effect::kind_wire(
+                    agent_server::journal::effect::EffectKind::LlmRequest,
+                )
+            {
+                Self::close_abandoned_attempt_tx(
+                    tx,
+                    &TurnAttemptId::from_string(row.tool_call_id.clone()),
+                    task.updated_at,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -4663,6 +4715,9 @@ impl PostgresDurableStore {
             }
             Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
             Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
+            Write::TurnAttempt(agent_server::journal::TurnAttemptWrite::Open(attempt)) => {
+                Self::insert_attempt_tx(tx, &attempt).await?;
+            }
             Write::AppendCompaction {
                 thread,
                 messages,

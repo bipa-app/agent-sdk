@@ -823,6 +823,91 @@ mod tests {
         Ok(())
     }
 
+    /// An LLM request's start on Postgres (crash matrix S3): the attempt
+    /// row and its `Started` effect commit as one transaction.
+    /// `effect.start_written` fires inside it after both rows were written,
+    /// and the test requires it to fire, so a crash there must leave
+    /// neither. The SQLite twin is in `tests/tool_settle_crash.rs`.
+    ///
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_llm_request_start_failpoint_rolls_back_the_attempt_with_its_effect()
+    -> Result<()> {
+        use agent_server::journal::effect::{EffectIntent, EffectKey, EffectSubject, EffectWrite};
+        use agent_server::journal::turn_attempt::TurnAttempt;
+        use agent_server::journal::{DurableStore, Guard, Transition, TurnAttemptWrite, Write};
+
+        const STARTED: &str = "effect.start_written";
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let thread = ThreadId::from_string("pg-llm-request-start");
+        let task_id = AgentTaskId::from_string("task_pg-llm-request-start");
+        let _scenario = fail::FailScenario::setup();
+
+        let (attempt_id, key) = {
+            let store = schema.open_store().await?;
+            let (worker, lease) =
+                prepare_running_root(&store, &thread, &task_id, t_plus(5)).await?;
+            let attempt = TurnAttempt::open(OpenAttemptParams {
+                task_id: task_id.clone(),
+                attempt_number: 1,
+                provenance: agent_sdk_foundation::audit::AuditProvenance::new(
+                    "anthropic",
+                    "claude-sonnet-5-5",
+                ),
+                request_blob: serde_json::json!({}),
+                now: t_plus(6),
+                otel_trace_id: None,
+                otel_span_id: None,
+            });
+            let key = EffectKey::llm(&task_id, attempt.id.as_str());
+            let begin = Transition {
+                guards: vec![
+                    Guard::TaskIs {
+                        task: task_id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((worker, lease)),
+                    },
+                    Guard::EffectFree { key: key.clone() },
+                ],
+                writes: vec![
+                    Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(attempt.clone()))),
+                    Write::Effect(EffectWrite::Start(EffectIntent {
+                        key: key.clone(),
+                        replay: agent_sdk_foundation::ToolReplay::Safe,
+                        owner: task_id.clone(),
+                        thread: thread.clone(),
+                        subject: EffectSubject::Llm {
+                            turn_attempt_id: attempt.id.as_str().to_owned(),
+                            provider: "anthropic".into(),
+                            model: "claude-sonnet-5-5".into(),
+                        },
+                        attempt: 1,
+                    })),
+                ],
+            };
+            fail::cfg(STARTED, "panic").map_err(|e| anyhow::anyhow!("configure failpoint: {e}"))?;
+            let crashed = std::panic::AssertUnwindSafe(store.commit(begin, t_plus(6)));
+            let result = futures::FutureExt::catch_unwind(crashed).await;
+            fail::remove(STARTED);
+            anyhow::ensure!(result.is_err(), "the failpoint after both writes must fire");
+            (attempt.id, key)
+        };
+
+        let store = schema.open_store().await?;
+        anyhow::ensure!(
+            TurnAttemptStore::get(&store, &attempt_id).await?.is_none(),
+            "the attempt row survived without its request"
+        );
+        anyhow::ensure!(
+            store.effect(&key).await?.is_none(),
+            "the request survived without its attempt"
+        );
+        Ok(())
+    }
+
     /// Design I2 on Postgres: the completed turn and its root's terminal
     /// row commit together. `commit.completed_turn.settled` fires inside the
     /// turn's transaction only once the root's settle has been written, and

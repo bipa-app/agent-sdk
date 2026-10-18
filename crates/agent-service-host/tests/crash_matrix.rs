@@ -61,6 +61,7 @@ type ControlClient = pb::agent_control_service_client::AgentControlServiceClient
 const CHILD_ENV: &str = "AGENT_SDK_CRASH_MATRIX_CHILD";
 const DIR_ENV: &str = "AGENT_SDK_CRASH_MATRIX_DIR";
 const STORAGE_ENV: &str = "AGENT_SDK_CRASH_MATRIX_STORAGE";
+#[allow(dead_code)] // Read by an expected-failure branch; none is open today.
 const KNOWN_FAILURES_ENV: &str = "AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES";
 /// With the `otel` feature, print the recovery signals each case saw.
 #[cfg(feature = "otel")]
@@ -1546,19 +1547,50 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
         .filter(|attempt| attempt.outcome.is_none())
         .map(|attempt| attempt.attempt_number)
         .collect();
-    if !known_failure_enabled() {
-        ensure!(
-            !open.is_empty(),
-            "S3 no longer fails: every attempt row is closed. Remove its #[ignore] and its \
-             expected-failure branch"
-        );
-        println!("expected failure S3 {backend:?}: attempt rows left open: {open:?}");
-        return Ok(());
-    }
     ensure!(
         open.is_empty(),
         "attempt rows left open: {open:?} of {}",
         attempts.len()
+    );
+    // The crashed attempt was closed with its abandoned LLM request; the
+    // successor's request finished with the turn.
+    let crashed: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.closed_as_abandoned())
+        .collect();
+    ensure!(
+        crashed.len() == 1,
+        "expected the crashed attempt closed as abandoned: {attempts:?}"
+    );
+    let request = |attempt: &agent_server::journal::TurnAttempt| {
+        agent_server::journal::effect::EffectKey::llm(&case.root.id, attempt.id.as_str())
+    };
+    let abandoned = agent_server::journal::DurableStore::effect(
+        case.stores.task_store.as_ref(),
+        &request(crashed[0]),
+    )
+    .await?
+    .context("the crashed attempt's LLM request")?;
+    ensure!(
+        abandoned.state == agent_server::journal::effect::EffectState::Abandoned,
+        "the crashed request is {:?}",
+        abandoned.state
+    );
+    let successor = attempts
+        .iter()
+        .filter(|attempt| !attempt.closed_as_abandoned())
+        .max_by_key(|attempt| attempt.attempt_number)
+        .context("the successor attempt")?;
+    let completed = agent_server::journal::DurableStore::effect(
+        case.stores.task_store.as_ref(),
+        &request(successor),
+    )
+    .await?
+    .context("the successor's LLM request")?;
+    ensure!(
+        completed.state == agent_server::journal::effect::EffectState::Completed,
+        "the successor's request is {:?}",
+        completed.state
     );
     let live = live_rows(&case.stores, &case.thread).await?;
     ensure!(live.is_empty(), "rows left live: {live:?}");
@@ -1662,6 +1694,7 @@ fn is_deadlock(status: &tonic::Status) -> bool {
     message.contains("40p01") || message.contains("deadlock")
 }
 
+#[allow(dead_code)] // Called by an expected-failure branch; none is open today.
 fn known_failure_enabled() -> bool {
     std::env::var_os(KNOWN_FAILURES_ENV).is_some()
 }
@@ -2091,6 +2124,7 @@ matrix!(
     [
         s1_unsafe_tool,
         s2_safe_tool,
+        s3_llm_stream,
         s5_cancel_tree,
         s6_question,
         s6_confirmation,
@@ -2101,7 +2135,6 @@ matrix!(
     ],
     [s4_fork: "failpoints"],
     [
-        s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
 
@@ -2111,6 +2144,7 @@ matrix!(
     [
         s1_unsafe_tool,
         s2_safe_tool,
+        s3_llm_stream,
         s5_cancel_tree,
         s6_question,
         s6_confirmation,
@@ -2121,6 +2155,5 @@ matrix!(
     ],
     [s4_fork: "failpoints", s8_overlap: "postgres"],
     [
-        s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );

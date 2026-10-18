@@ -33,8 +33,8 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use std::sync::{PoisonError, RwLock};
 use time::OffsetDateTime;
-use tokio::sync::RwLock;
 
 use super::task::AgentTaskId;
 use super::turn_attempt::{CloseAttemptParams, OpenAttemptParams, TurnAttempt, TurnAttemptId};
@@ -78,6 +78,29 @@ pub trait TurnAttemptStore: Send + Sync {
         params: CloseAttemptParams,
         now: OffsetDateTime,
     ) -> Result<TurnAttempt>;
+
+    /// Store an open attempt a transition's [`TurnAttemptWrite::Open`]
+    /// carries, synchronously, for the in-memory task store's commit (the
+    /// SQL stores insert it in their own transaction). The default refuses.
+    ///
+    /// [`TurnAttemptWrite::Open`]: super::transition::TurnAttemptWrite::Open
+    ///
+    /// # Errors
+    /// A store that takes no prebuilt attempt, or an id already stored.
+    #[doc(hidden)]
+    fn put_open_attempt(&self, attempt: TurnAttempt) -> Result<()> {
+        Err(anyhow!(
+            "this attempt store takes no attempt {} from a transition",
+            attempt.id
+        ))
+    }
+
+    /// Close the still-open attempt `id` of an abandoned LLM request,
+    /// synchronously, for the in-memory task store as it ends the attempt's
+    /// task (the SQL stores close it in their own transaction). An unknown
+    /// or already-closed attempt is left alone. The default does nothing.
+    #[doc(hidden)]
+    fn close_abandoned_attempt(&self, _id: &TurnAttemptId, _now: OffsetDateTime) {}
 
     /// Look up a single attempt by id.
     ///
@@ -132,7 +155,7 @@ impl InMemoryTurnAttemptStore {
 impl TurnAttemptStore for InMemoryTurnAttemptStore {
     async fn open_attempt(&self, params: OpenAttemptParams) -> Result<TurnAttempt> {
         let attempt = TurnAttempt::open(params);
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         inner
             .by_task
             .entry(attempt.task_id.clone())
@@ -149,7 +172,7 @@ impl TurnAttemptStore for InMemoryTurnAttemptStore {
         params: CloseAttemptParams,
         now: OffsetDateTime,
     ) -> Result<TurnAttempt> {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let attempt = inner
             .by_id
             .get(id)
@@ -162,13 +185,45 @@ impl TurnAttemptStore for InMemoryTurnAttemptStore {
         Ok(closed)
     }
 
+    fn put_open_attempt(&self, attempt: TurnAttempt) -> Result<()> {
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        anyhow::ensure!(
+            !inner.by_id.contains_key(&attempt.id),
+            "attempt {} already exists",
+            attempt.id
+        );
+        inner
+            .by_task
+            .entry(attempt.task_id.clone())
+            .or_default()
+            .push(attempt.id.clone());
+        inner.by_id.insert(attempt.id.clone(), attempt);
+        drop(inner);
+        Ok(())
+    }
+
+    fn close_abandoned_attempt(&self, id: &TurnAttemptId, now: OffsetDateTime) {
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(attempt) = inner
+            .by_id
+            .get(id)
+            .filter(|attempt| attempt.outcome.is_none())
+        else {
+            return;
+        };
+        if let Ok(closed) = attempt.clone().close(CloseAttemptParams::abandoned(), now) {
+            inner.by_id.insert(closed.id.clone(), closed);
+        }
+        drop(inner);
+    }
+
     async fn get(&self, id: &TurnAttemptId) -> Result<Option<TurnAttempt>> {
-        let inner = self.inner.read().await;
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         Ok(inner.by_id.get(id).cloned())
     }
 
     async fn list_by_task(&self, task_id: &AgentTaskId) -> Result<Vec<TurnAttempt>> {
-        let inner = self.inner.read().await;
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let Some(ids) = inner.by_task.get(task_id) else {
             return Ok(Vec::new());
         };

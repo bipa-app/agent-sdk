@@ -608,6 +608,26 @@ async fn create_and_acquire_task(
 // Phase 4.3 — text-only path tests
 // ─────────────────────────────────────────────────────────────────────
 
+/// The LLM request of the attempt a completed turn closed ended
+/// `Completed` in the turn's own transaction, not `Abandoned` by the root's
+/// settle.
+async fn assert_request_completed(
+    stores: &TestStores,
+    task: &AgentTaskId,
+    attempt: &crate::journal::TurnAttemptId,
+) -> Result<()> {
+    use crate::journal::DurableStore;
+
+    let key = crate::journal::effect::EffectKey::llm(task, attempt.as_str());
+    let record = stores
+        .tasks
+        .effect(&key)
+        .await?
+        .context("the turn's LLM request")?;
+    assert_eq!(record.state, crate::journal::effect::EffectState::Completed);
+    Ok(())
+}
+
 #[tokio::test]
 async fn text_only_turn_end_to_end() -> Result<()> {
     let stores = TestStores::new();
@@ -656,6 +676,7 @@ async fn text_only_turn_end_to_end() -> Result<()> {
 
     // Turn attempt closed.
     assert!(commit.closed_attempt.is_closed());
+    assert_request_completed(&stores, &completed_task.id, &commit.closed_attempt.id).await?;
 
     // Thread aggregate advanced.
     assert_eq!(commit.thread.committed_turns, 1);
@@ -1465,17 +1486,19 @@ async fn duplicate_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
     .await?;
 
     // Worker A wins: suspends the task and closes its own attempt with 120/60.
-    let winner = execute_root_turn(
-        inputs_winner,
-        "List files",
+    // The winner runs to its suspension inside the loser's first LLM call,
+    // after the loser's attempt and its LLM request committed: the race as
+    // two live workers run it.
+    let winner_deps = stores.deps();
+    let loser_provider = WinnerInsideCall::new(
         &provider,
-        &stores.deps(),
-        t_plus(5),
-    )
-    .await?;
-    assert!(
-        matches!(winner, RootTurnOutcome::Suspended { .. }),
-        "the winning worker must suspend",
+        execute_root_turn(
+            inputs_winner,
+            "List files",
+            &provider,
+            &winner_deps,
+            t_plus(5),
+        ),
     );
 
     // Worker B loses: its stream completes (billed), then the guard sees
@@ -1483,12 +1506,17 @@ async fn duplicate_suspension_loser_bills_its_own_attempt_row() -> Result<()> {
     let loser_error = execute_root_turn(
         inputs_loser,
         "List files",
-        &provider,
+        &loser_provider,
         &stores.deps(),
         t_plus(6),
     )
     .await
     .expect_err("the duplicate suspension must bail");
+    let winner = loser_provider.winner_outcome().await?;
+    assert!(
+        matches!(winner, RootTurnOutcome::Suspended { .. }),
+        "the winning worker must suspend",
+    );
     assert!(
         loser_error.to_string().contains("duplicate suspension"),
         "expected the idempotency-guard bail, got {loser_error:#}",
@@ -1554,29 +1582,36 @@ async fn duplicate_suspension_guard_rejects_precompleted_ready_parent() -> Resul
     )
     .await?;
 
-    let winner = execute_root_turn(
-        inputs_winner,
-        "Open the signed URL",
+    // The winner runs to its suspension inside the loser's first LLM call,
+    // after the loser's attempt and its LLM request committed: the race as
+    // two live workers run it.
+    let winner_deps = stores.deps();
+    let loser_provider = WinnerInsideCall::new(
         &provider,
-        &stores.deps(),
-        t_plus(5),
-    )
-    .await?;
-    let RootTurnOutcome::Suspended { parent_task, .. } = winner else {
-        bail!("precompleted winner must suspend for immediate resume")
-    };
-    assert_eq!(parent_task.status, TaskStatus::Pending);
-    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
+        execute_root_turn(
+            inputs_winner,
+            "Open the signed URL",
+            &provider,
+            &winner_deps,
+            t_plus(5),
+        ),
+    );
 
     let error = execute_root_turn(
         inputs_loser,
         "Open the signed URL",
-        &provider,
+        &loser_provider,
         &stores.deps(),
         t_plus(6),
     )
     .await
     .expect_err("the loser must recognize Pending/ReadyToResume as already transitioned");
+    let winner = loser_provider.winner_outcome().await?;
+    let RootTurnOutcome::Suspended { parent_task, .. } = winner else {
+        bail!("precompleted winner must suspend for immediate resume")
+    };
+    assert_eq!(parent_task.status, TaskStatus::Pending);
+    assert!(matches!(parent_task.state, TaskState::ReadyToResume { .. }));
     assert!(
         error.to_string().contains("duplicate suspension"),
         "unexpected loser error: {error:#}",
@@ -1611,23 +1646,29 @@ async fn duplicate_question_suspension_loser_bills_its_own_attempt_row() -> Resu
     )
     .await?;
 
-    let winner = execute_root_turn(
-        inputs_winner,
-        "Deploy",
+    // The winner runs to its suspension inside the loser's first LLM call,
+    // after the loser's attempt and its LLM request committed: the race as
+    // two live workers run it.
+    let winner_deps = stores.deps();
+    let loser_provider = WinnerInsideCall::new(
         &provider,
+        execute_root_turn(inputs_winner, "Deploy", &provider, &winner_deps, t_plus(5)),
+    );
+
+    let loser_error = execute_root_turn(
+        inputs_loser,
+        "Deploy",
+        &loser_provider,
         &stores.deps(),
-        t_plus(5),
+        t_plus(6),
     )
-    .await?;
+    .await
+    .expect_err("the duplicate question suspension must bail");
+    let winner = loser_provider.winner_outcome().await?;
     let RootTurnOutcome::Suspended { parent_task, .. } = winner else {
         bail!("the winning worker must suspend")
     };
     assert_eq!(parent_task.status, TaskStatus::AwaitingQuestion);
-
-    let loser_error =
-        execute_root_turn(inputs_loser, "Deploy", &provider, &stores.deps(), t_plus(6))
-            .await
-            .expect_err("the duplicate question suspension must bail");
     assert!(
         loser_error.to_string().contains("duplicate suspension"),
         "expected the idempotency-guard bail, got {loser_error:#}",
@@ -2027,6 +2068,7 @@ async fn resume_text_only_end_to_end() -> Result<()> {
 
     // Turn committed.
     assert_eq!(commit.thread.committed_turns, 1);
+    assert_request_completed(&stores, &completed_task.id, &commit.closed_attempt.id).await?;
 
     // Checkpoint created with full message history:
     // [user prompt] + [assistant with tool calls] + [tool results] + [final assistant]
@@ -11814,31 +11856,81 @@ impl SalvageRacingAttemptStore {
     }
 }
 
-#[async_trait]
-impl TurnAttemptStore for SalvageRacingAttemptStore {
-    async fn open_attempt(&self, params: OpenAttemptParams) -> Result<TurnAttempt> {
-        let attempt = self.inner.open_attempt(params).await?;
-        if !self.fired.swap(true, Ordering::SeqCst) {
-            self.land_racing_salvage(t_plus(1)).await?;
+/// A loser's provider that runs the winning worker's whole turn inside the
+/// loser's first LLM call, then answers as `inner`.
+struct WinnerInsideCall<'a, P> {
+    inner: &'a P,
+    winner: tokio::sync::Mutex<Option<WinnerTurn<'a>>>,
+    outcome: tokio::sync::Mutex<Option<Result<RootTurnOutcome>>>,
+}
+
+type WinnerTurn<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<RootTurnOutcome>> + Send + 'a>>;
+
+impl<'a, P: Sync> WinnerInsideCall<'a, P> {
+    fn new(
+        inner: &'a P,
+        winner: impl std::future::Future<Output = Result<RootTurnOutcome>> + Send + 'a,
+    ) -> Self {
+        Self {
+            inner,
+            winner: tokio::sync::Mutex::new(Some(Box::pin(winner))),
+            outcome: tokio::sync::Mutex::new(None),
         }
-        Ok(attempt)
     }
 
-    async fn close_attempt(
-        &self,
-        id: &TurnAttemptId,
-        params: CloseAttemptParams,
-        now: time::OffsetDateTime,
-    ) -> Result<TurnAttempt> {
-        self.inner.close_attempt(id, params, now).await
+    async fn winner_outcome(&self) -> Result<RootTurnOutcome> {
+        self.outcome
+            .lock()
+            .await
+            .take()
+            .context("the winner never ran")?
+    }
+}
+
+#[async_trait]
+impl<P: LlmProvider> LlmProvider for WinnerInsideCall<'_, P> {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        let winner = self.winner.lock().await.take();
+        if let Some(winner) = winner {
+            let outcome = winner.await;
+            *self.outcome.lock().await = Some(outcome);
+        }
+        self.inner.chat(request).await
     }
 
-    async fn get(&self, id: &TurnAttemptId) -> Result<Option<TurnAttempt>> {
-        self.inner.get(id).await
+    fn model(&self) -> &str {
+        self.inner.model()
     }
 
-    async fn list_by_task(&self, task_id: &AgentTaskId) -> Result<Vec<TurnAttempt>> {
-        self.inner.list_by_task(task_id).await
+    fn provider(&self) -> &'static str {
+        self.inner.provider()
+    }
+}
+
+/// The successor's provider, which lands the racing salvage on its first
+/// call: after the successor's attempt and its LLM request committed, before
+/// its turn commits.
+struct RacingProvider<'a> {
+    inner: MockTextProvider,
+    racer: &'a SalvageRacingAttemptStore,
+}
+
+#[async_trait]
+impl LlmProvider for RacingProvider<'_> {
+    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+        if !self.racer.fired.swap(true, Ordering::SeqCst) {
+            self.racer.land_racing_salvage(t_plus(1)).await?;
+        }
+        self.inner.chat(request).await
+    }
+
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+
+    fn provider(&self) -> &'static str {
+        MockTextProvider::new("").provider()
     }
 }
 
@@ -11879,10 +11971,11 @@ async fn successor_turn_shifts_past_cancelled_salvage_slot_collision() -> Result
         racing_commits: vec![(TokenUsage::default(), CheckpointKind::CancelSalvage)],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("successor answer");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("successor answer"),
+        racer: &racing,
+    };
     let outcome = execute_root_turn(inputs, "run the successor", &provider, &deps, t_plus(5))
         .await
         .context("successor turn must not fail on the stolen slot")?;
@@ -11997,10 +12090,11 @@ async fn billed_foreign_commit_refuses_the_shift() -> Result<()> {
         )],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("built on a stale head");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("built on a stale head"),
+        racer: &racing,
+    };
     let error = execute_root_turn(inputs, "stale successor", &provider, &deps, t_plus(5))
         .await
         .err()
@@ -12070,10 +12164,11 @@ async fn cancelled_root_commit_never_shifts_past_a_successor() -> Result<()> {
         racing_commits: vec![(TokenUsage::default(), CheckpointKind::CancelSalvage)],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("too late");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("too late"),
+        racer: &racing,
+    };
     let error = execute_root_turn(inputs, "doomed turn", &provider, &deps, t_plus(5))
         .await
         .err()
@@ -12147,10 +12242,11 @@ async fn zero_usage_full_turn_refuses_the_shift() -> Result<()> {
         racing_commits: vec![(TokenUsage::default(), CheckpointKind::FullTurn)],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("built on a stale head");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("built on a stale head"),
+        racer: &racing,
+    };
     let error = execute_root_turn(inputs, "stale successor", &provider, &deps, t_plus(5))
         .await
         .err()
@@ -12222,10 +12318,11 @@ async fn shift_refuses_when_an_intervening_occupant_is_a_full_turn() -> Result<(
         ],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("built on a stale head");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("built on a stale head"),
+        racer: &racing,
+    };
     let error = execute_root_turn(inputs, "stale successor", &provider, &deps, t_plus(5))
         .await
         .err()
@@ -12286,10 +12383,11 @@ async fn exhausted_shift_budget_settles_the_attempt() -> Result<()> {
         ],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("cannot land");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("cannot land"),
+        racer: &racing,
+    };
     let error = execute_root_turn(inputs, "walk too far", &provider, &deps, t_plus(5))
         .await
         .err()
@@ -12341,10 +12439,11 @@ async fn shift_walks_across_consecutive_salvage_occupants() -> Result<()> {
         ],
         fired: AtomicBool::new(false),
     };
-    let mut deps = stores.deps();
-    deps.attempt_store = &racing;
-
-    let provider = MockTextProvider::new("successor answer");
+    let deps = stores.deps();
+    let provider = RacingProvider {
+        inner: MockTextProvider::new("successor answer"),
+        racer: &racing,
+    };
     let outcome = execute_root_turn(inputs, "run the successor", &provider, &deps, t_plus(5))
         .await
         .context("the walk must cross two salvage slots")?;

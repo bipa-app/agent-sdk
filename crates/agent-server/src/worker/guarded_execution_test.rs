@@ -241,6 +241,7 @@ impl TestStores {
         let threads = InMemoryThreadStore::new();
         let events = InMemoryEventRepository::new();
         let outbox = crate::journal::outbox::InMemoryOutboxStore::new();
+        let attempts = InMemoryTurnAttemptStore::new();
         Self {
             tasks: InMemoryAgentTaskStore::new()
                 .with_cancellation_markers(crate::journal::CancellationMarkerSink {
@@ -253,10 +254,11 @@ impl TestStores {
                         events.clone(),
                         outbox,
                     ),
-                )),
+                ))
+                .with_attempt_store(Arc::new(attempts.clone())),
             threads,
             messages: InMemoryMessageProjectionStore::new(),
-            attempts: InMemoryTurnAttemptStore::new(),
+            attempts,
             checkpoints: InMemoryCheckpointStore::new(),
             events,
             event_notifier: Arc::new(EventNotifier::new()),

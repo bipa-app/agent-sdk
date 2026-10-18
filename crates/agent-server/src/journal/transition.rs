@@ -27,6 +27,7 @@ use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
 use super::thread::{Thread, ThreadOperation};
+use super::turn_attempt::TurnAttempt;
 
 /// Guards and writes applied in one transaction.
 #[derive(Clone, Debug, Default)]
@@ -84,6 +85,9 @@ pub enum Write {
     /// Start or finish an effect (see [`super::effect`]). Its row is
     /// owned by its owner task's lock.
     Effect(EffectWrite),
+    /// Write a turn-attempt row (see [`super::turn_attempt`]), owned by its
+    /// task's lock. Needs a [`Guard::TaskIs`] with the lease of its task.
+    TurnAttempt(TurnAttemptWrite),
     /// Append a compaction to `thread`'s message projection: `messages`, the
     /// compactor's output, replace the `source_message_count` messages of
     /// its effective view, and their last `retained_message_count` are that
@@ -129,6 +133,25 @@ pub enum Write {
     /// grants after the commit carries this epoch (see
     /// [`super::epoch`]). An epoch id that already exists is refused.
     BeginEpoch(EpochRecord),
+}
+
+/// A [`Write::TurnAttempt`].
+#[derive(Clone, Debug)]
+pub enum TurnAttemptWrite {
+    /// Insert an open attempt the caller built with [`TurnAttempt::open`],
+    /// so it knows the attempt's id before the commit (an LLM request's
+    /// effect names it).
+    Open(Box<TurnAttempt>),
+}
+
+impl TurnAttemptWrite {
+    /// The task that owns the attempt row.
+    #[must_use]
+    pub const fn task(&self) -> &AgentTaskId {
+        match self {
+            Self::Open(attempt) => &attempt.task_id,
+        }
+    }
 }
 
 /// What a [`Write::SpawnChildren`] spawns, one shape per spawn method of
@@ -784,7 +807,8 @@ impl Transition {
             | Write::AppendCompaction { .. }
             | Write::Document(_)
             | Write::EnqueueSteeringResume { .. }
-            | Write::BeginEpoch(_) => false,
+            | Write::BeginEpoch(_)
+            | Write::TurnAttempt(_) => false,
         })
     }
 
@@ -801,9 +825,11 @@ impl Transition {
             | Write::Effect(_)
             | Write::AppendCompaction { .. }
             | Write::SpawnChildren { .. }
-            | Write::EnqueueSteeringResume { .. } => None,
+            | Write::EnqueueSteeringResume { .. }
+            | Write::TurnAttempt(_) => None,
         })
     }
+
     /// Whether any write appends a compaction.
     #[must_use]
     pub fn appends_compactions(&self) -> bool {
@@ -836,8 +862,20 @@ impl Transition {
             | Write::SpawnChildren { .. }
             | Write::Document(_)
             | Write::EnqueueSteeringResume { .. }
-            | Write::BeginEpoch(_) => None,
+            | Write::BeginEpoch(_)
+            | Write::TurnAttempt(_) => None,
         })
+    }
+
+    /// A turn-attempt write needs a lease guard on the attempt's task.
+    fn validate_turn_attempt(&self, attempt: &TurnAttemptWrite) -> Result<(), Rejected> {
+        if self.lease_for(attempt.task()).is_none() {
+            return Err(Rejected::Store(anyhow::anyhow!(
+                "writing a turn attempt of task {} needs a TaskIs guard with its lease",
+                attempt.task()
+            )));
+        }
+        Ok(())
     }
 
     /// Refuse an effect write that comes after the write ending its owner:
@@ -866,7 +904,8 @@ impl Transition {
                 | Write::SpawnChildren { .. }
                 | Write::Document(_)
                 | Write::EnqueueSteeringResume { .. }
-                | Write::BeginEpoch(_) => {}
+                | Write::BeginEpoch(_)
+                | Write::TurnAttempt(_) => {}
             }
         }
         Ok(())
@@ -959,6 +998,7 @@ impl Transition {
                         )));
                     }
                 }
+                Write::TurnAttempt(attempt) => self.validate_turn_attempt(attempt)?,
                 Write::AppendEvents { .. }
                 | Write::AppendCompaction { .. }
                 | Write::BeginEpoch(_) => {}
@@ -1000,6 +1040,7 @@ impl Write {
                 create: false,
             }],
             Self::Effect(effect) => vec![Lock::Task(effect.owner().clone())],
+            Self::TurnAttempt(attempt) => vec![Lock::Task(attempt.task().clone())],
             Self::ReparkAfterSteering { task, reattach, .. } => reattach
                 .iter()
                 .chain(std::iter::once(task))

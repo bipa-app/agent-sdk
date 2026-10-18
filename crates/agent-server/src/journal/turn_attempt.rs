@@ -370,7 +370,12 @@ impl TurnAttempt {
     /// Close this attempt with the LLM call's results.
     ///
     /// This is the only mutation a turn-attempt row ever undergoes.
-    /// Once closed the row is permanently immutable.
+    /// Once closed the row is permanently immutable, with one exception: a
+    /// close made because the attempt's LLM request was abandoned
+    /// ([`CloseAttemptParams::abandoned`]) is provisional. If the attempt's
+    /// own worker was still live (a cancel that lands mid-stream), its real
+    /// close replaces it, so the provider's billed usage is kept. A crashed
+    /// worker never closes, and the abandoned close stays.
     ///
     /// Duration is computed from `opened_at` to `now`. Negative
     /// durations (clock skew) are clamped to zero.
@@ -378,13 +383,13 @@ impl TurnAttempt {
     /// # Errors
     ///
     /// Returns [`TurnAttemptSchemaError::AlreadyClosed`] if the
-    /// attempt has already been closed.
+    /// attempt has already been closed, other than by an abandoned close.
     pub fn close(
         mut self,
         params: CloseAttemptParams,
         now: OffsetDateTime,
     ) -> Result<Self, TurnAttemptSchemaError> {
-        if self.is_closed() {
+        if self.is_closed() && !self.closed_as_abandoned() {
             return Err(TurnAttemptSchemaError::AlreadyClosed);
         }
 
@@ -423,6 +428,18 @@ impl TurnAttempt {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         self.closed_at.is_some()
+    }
+
+    /// Whether the attempt was closed because its LLM request was
+    /// abandoned, a close its own worker may still replace (see
+    /// [`Self::close`]).
+    #[must_use]
+    pub fn closed_as_abandoned(&self) -> bool {
+        self.is_closed()
+            && self
+                .response_blob
+                .as_ref()
+                .is_some_and(|blob| blob.get(ABANDONED_RESPONSE_KEY).is_some())
     }
 
     /// Validate structural invariants.
@@ -565,6 +582,41 @@ pub struct CloseAttemptParams {
     pub thinking_budget_tokens: Option<u32>,
     /// Thinking effort the dispatched request carried.
     pub thinking_effort: Option<agent_sdk_foundation::llm::Effort>,
+}
+
+/// The `response_blob` key that marks an abandoned close.
+const ABANDONED_RESPONSE_KEY: &str = "abandoned";
+
+impl CloseAttemptParams {
+    /// The close of an attempt whose LLM request was abandoned: its task
+    /// ended (or its process died) before the request finished, so no
+    /// response or usage was recorded.
+    ///
+    /// Its `response_blob` is `{"abandoned": …}`, the marker
+    /// [`TurnAttempt::closed_as_abandoned`] reads. A provider response is
+    /// never stored with that top-level key: the worker stores the
+    /// response's own fields.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn abandoned() -> Self {
+        Self {
+            response_blob: serde_json::json!({
+                ABANDONED_RESPONSE_KEY: "the request's task ended before the request finished"
+            }),
+            response_id: None,
+            response_model: None,
+            stop_reason: None,
+            outcome: TurnAttemptOutcome::Cancelled,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            route_provider: None,
+            thinking_mode: None,
+            thinking_budget_tokens: None,
+            thinking_effort: None,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────

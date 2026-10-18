@@ -98,6 +98,13 @@ impl EffectKey {
         Self(format!("{}:git:{step}", invocation.0))
     }
 
+    /// The key of the LLM request a root task `task` makes in its turn
+    /// attempt `attempt`: `llm:{task}:{attempt}`.
+    #[must_use]
+    pub fn llm(task: &AgentTaskId, attempt: &str) -> Self {
+        Self(format!("llm:{}:{attempt}", task.0))
+    }
+
     /// A key as a store read it back. Public because the stores live in
     /// another crate, and a host may keep a key it read to finish later.
     #[must_use]
@@ -227,6 +234,24 @@ pub(crate) fn record_effect(kind: EffectKind, transition: &'static str) {
 
 #[cfg(not(feature = "otel"))]
 pub(crate) const fn record_effect(_kind: EffectKind, _transition: &'static str) {}
+
+/// Count an effect that finished in the state labelled `outcome` after
+/// running `duration_secs`: its `finished` transition on
+/// `agent_server.effects` and its `agent_server.effect.duration`.
+#[cfg(feature = "otel")]
+pub(crate) fn record_effect_finished(kind: EffectKind, outcome: &'static str, duration_secs: f64) {
+    let metrics = crate::observability::ServerMetrics::global();
+    metrics.record_effect(kind, "finished");
+    metrics.record_effect_duration(kind, outcome, duration_secs);
+}
+
+#[cfg(not(feature = "otel"))]
+pub(crate) const fn record_effect_finished(
+    _kind: EffectKind,
+    _outcome: &'static str,
+    _duration_secs: f64,
+) {
+}
 
 /// Report an effect its owner's end abandoned: the counter, the span event
 /// and a log line naming it.
@@ -707,7 +732,8 @@ impl Transition {
             | Write::SpawnChildren { .. }
             | Write::Document(_)
             | Write::EnqueueSteeringResume { .. }
-            | Write::BeginEpoch(_) => None,
+            | Write::BeginEpoch(_)
+            | Write::TurnAttempt(_) => None,
         })
     }
 
