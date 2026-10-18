@@ -74,15 +74,15 @@ const PAGE: u32 = 256;
 ///
 /// # Errors
 /// Never in practice: the constant is a valid kind.
-pub fn prompt_kind() -> anyhow::Result<DocKind> {
+pub(crate) fn prompt_kind() -> anyhow::Result<DocKind> {
     DocKind::new(PROMPT_DOC_KIND)
 }
 
 /// The document a prompt row lives in.
 ///
 /// # Errors
-/// See [`prompt_kind`].
-pub fn prompt_key(surface_thread: &ThreadId, id: &str) -> anyhow::Result<DocumentKey> {
+/// Never in practice: the kind constant is valid.
+pub(crate) fn prompt_key(surface_thread: &ThreadId, id: &str) -> anyhow::Result<DocumentKey> {
     Ok(DocumentKey::new(
         DocScope::Thread(surface_thread.clone()),
         prompt_kind()?,
@@ -251,7 +251,7 @@ impl PromptRecord {
     /// The document key.
     ///
     /// # Errors
-    /// See [`prompt_kind`].
+    /// Never in practice: the kind constant is valid.
     pub fn key(&self) -> anyhow::Result<DocumentKey> {
         prompt_key(&self.surface_thread, &self.id)
     }
@@ -483,7 +483,7 @@ impl StoredPrompt {
     /// The write that retires a kept tombstone, so its id may open again.
     ///
     /// # Errors
-    /// See [`prompt_kind`].
+    /// Never in practice: the kind constant is valid.
     pub fn retire_write(&self) -> anyhow::Result<Write> {
         Ok(Write::Document(DocumentWrite::retire(
             self.record.key()?,
@@ -513,7 +513,7 @@ pub async fn get_prompt(
 ///
 /// # Errors
 /// The store failed, or a row does not decode.
-pub async fn thread_prompts(
+pub(crate) async fn thread_prompts(
     documents: &dyn DocumentStore,
     surface_thread: &ThreadId,
 ) -> anyhow::Result<Vec<StoredPrompt>> {

@@ -12767,4 +12767,114 @@ mod tests {
         assert_eq!(closes_on(&shared, session, "relayed-task").await?, 1);
         Ok(())
     }
+
+    /// A start-up re-drive counts as `step=redrive`, never as a live
+    /// `handle`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_redriven_prompt_counts_as_redrive() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        agent_server::observability::ServerMetrics::reset_for_testing();
+        let handler = Arc::new(CountingPromptHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (control, shared) =
+            prompt_service(Arc::clone(&handler) as crate::prompts::SharedPromptHandler)?;
+        let thread_owned = uuid::Uuid::new_v4().to_string();
+        let thread = thread_owned.as_str();
+        create_prompt_thread(&control, "create-redrive-signal", thread).await?;
+        let mut answered = gate_prompt(thread, "gate-signal", false);
+        answered.state = agent_server::journal::PromptState::Answered {
+            answer: agent_server::journal::PromptAnswer {
+                decision: agent_server::journal::PromptDecision::Approved,
+                request_id: "before-restart".into(),
+                automatic: false,
+                answered_at: OffsetDateTime::now_utc(),
+            },
+        };
+        open_gate(&shared, &answered, false).await?;
+        shared.recover_prompts().await;
+        wait_until_retired(&shared, thread, "gate-signal").await?;
+
+        // Lower bounds: under plain `cargo test` other tests record into the
+        // same global meter (nextest runs one per process).
+        let redrive = meter.counter(
+            "agent_server.prompts",
+            &[
+                ("owner", "host"),
+                ("step", "redrive"),
+                ("outcome", "closed"),
+            ],
+        );
+        drop(meter);
+        ensure!(
+            redrive >= 1,
+            "the re-drive is counted as redrive: {redrive}"
+        );
+        Ok(())
+    }
+
+    /// Every `DecideConfirmation` counts its idempotency claim, by task id and
+    /// by prompt id: the first decision `fresh`, the same request again
+    /// `replay`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn both_decision_routes_count_their_idempotency_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let (control, shared) = prompt_service(Arc::new(CountingPromptHandler {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }) as crate::prompts::SharedPromptHandler)?;
+        let claims = |claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", "decide_confirmation"), ("claim", claim)],
+            )
+        };
+        let (fresh_before, replay_before) = (claims("fresh"), claims("replay"));
+
+        let tool_thread_owned = uuid::Uuid::new_v4().to_string();
+        let tool_thread = tool_thread_owned.as_str();
+        create_prompt_thread(&control, "create-claim-tool", tool_thread).await?;
+        let parked = parked_tool_child(&shared, tool_thread, "call-claim").await?;
+        let by_task = || pb::DecideConfirmationRequest {
+            task_id: parked.id.to_string(),
+            thread_id: tool_thread.into(),
+            prompt_id: String::new(),
+            ..reject_by_prompt("claim-by-task", tool_thread, "")
+        };
+        control.decide_confirmation(Request::new(by_task())).await?;
+        control.decide_confirmation(Request::new(by_task())).await?;
+        let (fresh_tasks, replay_tasks) = (claims("fresh"), claims("replay"));
+
+        let prompt_thread_owned = uuid::Uuid::new_v4().to_string();
+        let prompt_thread = prompt_thread_owned.as_str();
+        create_prompt_thread(&control, "create-claim-prompt", prompt_thread).await?;
+        open_gate(
+            &shared,
+            &gate_prompt(prompt_thread, "gate-claim", false),
+            true,
+        )
+        .await?;
+        let by_prompt = || prompt_decision("claim-by-prompt", prompt_thread, "gate-claim", false);
+        control
+            .decide_confirmation(Request::new(by_prompt()))
+            .await?;
+        control
+            .decide_confirmation(Request::new(by_prompt()))
+            .await?;
+        let (fresh_all, replay_all) = (claims("fresh"), claims("replay"));
+        drop(meter);
+
+        // Lower bounds: under plain `cargo test` other tests record into the
+        // same global meter (nextest runs one per process).
+        ensure!(
+            fresh_tasks > fresh_before && replay_tasks > replay_before,
+            "the task route counts"
+        );
+        ensure!(
+            fresh_all > fresh_tasks && replay_all > replay_tasks,
+            "the prompt route counts"
+        );
+        Ok(())
+    }
 }
