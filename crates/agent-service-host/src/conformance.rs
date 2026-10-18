@@ -766,6 +766,41 @@ mod tests {
         Ok(())
     }
 
+    /// A lease the worker pool's scan grants (`acquire_next_runnable`) after
+    /// the current epoch began carries that epoch, so the epoch's own
+    /// reclaim leaves it with its worker.
+    async fn test_a_ready_head_lease_is_not_foreign_to_its_epoch(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let _old = begin_epoch(task_store, 500).await?;
+        let root = fresh_root("conformance-epoch-ready-head", 501);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let current = begin_epoch(task_store, 502).await?;
+        let lease = LeaseId::new();
+        let acquired = task_store
+            .acquire_next_runnable(
+                WorkerId::from_string("worker-0"),
+                lease.clone(),
+                t_plus(4_000),
+                t_plus(503),
+            )
+            .await?
+            .context("the root is the ready head")?;
+        assert_eq!(acquired.id, root.id);
+
+        let reclaimed = task_store
+            .release_expired_leases(t_plus(504), LeaseRecoveryScope::ForeignEpoch(current))
+            .await?;
+        assert!(
+            reclaimed.iter().all(|record| record.id != root.id),
+            "the ready head's lease was granted under the current epoch: {reclaimed:?}"
+        );
+        let row = task_store.get(&root.id).await?.context("root")?;
+        assert_eq!(row.status, TaskStatus::Running, "{:?}", row.last_error);
+        assert_eq!(row.lease_id, Some(lease));
+        Ok(())
+    }
+
     /// A lease granted by approving a confirmation after the current epoch
     /// began carries that epoch, so the epoch's own reclaim leaves it with
     /// its live drive (crash matrix F4's second layer).
@@ -6658,6 +6693,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_a_ready_head_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_ready_head_lease_is_not_foreign_to_its_epoch(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_an_approved_lease_is_not_foreign_to_its_epoch() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_an_approved_lease_is_not_foreign_to_its_epoch(s.task.as_ref()).await
@@ -7315,6 +7356,13 @@ mod tests {
     -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_a_ready_head_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_ready_head_lease_is_not_foreign_to_its_epoch(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -8103,6 +8151,15 @@ mod tests {
             return Ok(());
         };
         test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_a_ready_head_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_ready_head_lease_is_not_foreign_to_its_epoch(&store).await
     }
 
     #[cfg(feature = "postgres")]
