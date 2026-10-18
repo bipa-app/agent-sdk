@@ -51,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Durable prompt rows (primitive 6)
 
-- Follow-up: `DecideConfirmation{prompt_id}` counts its idempotency claim on
-  `agent_service_host.idempotency.claims`; a test pins `step=redrive`; the
+- Follow-up: `DecideConfirmation` counts its idempotency claim on
+  `agent_service_host.idempotency.claims{kind=decide_confirmation}`, by task id
+  and by prompt id; a test pins `step=redrive`; the
   "stays unclosed" warning is logged only while the row is still answered;
   `prompt_kind`, `prompt_key`, `thread_prompts` and `close_task_prompts`
   are crate-private.
