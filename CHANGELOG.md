@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hung child, two overlapping hosts), boots a fresh daemon on the same
   database, and checks what recovery did. Each scenario runs on SQLite and
   on Postgres (`TEST_DATABASE_URL`). Scenarios that fail today (S3: the
-  crashed LLM attempt stays open; S7: a wait on a silent child never ends)
+  crashed LLM attempt stays open; S7: a wait on a silent subagent child
+  never ends; the tool-child case passes since #514)
   are ignored and run as expected failures: they pass while the documented
   failure still reproduces, and fail once it is fixed, so the fix must
   un-ignore them. With `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` set they

@@ -739,6 +739,7 @@ fn service_config(storage: StorageConfig) -> ServiceConfig {
             heartbeat_interval_secs: 1,
             sweep_interval_secs: 1,
             acquisition_interval_secs: 1,
+            tool_stall_budget_secs: STALL_BUDGET.as_secs(),
             ..WorkerConfig::default()
         },
         ..ServiceConfig::default()
@@ -1302,6 +1303,7 @@ async fn answer_prompt(
                     )),
                 }),
                 automatic: false,
+                prompt_id: String::new(),
             };
             control.decide_confirmation(decide.clone()).await?;
             let _ = control.decide_confirmation(decide).await;
@@ -1763,7 +1765,9 @@ const STALL_BUDGET: Duration = Duration::from_secs(10);
 /// S7: a child that never returns while its lease keeps beating. The
 /// parent must continue, with a typed partial result, once the child's
 /// stall budget ends (D-5). No process is killed.
-async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
+/// `expected_failure`: assert that the parent still waits, as a known
+/// failure does (see the module docs), rather than the pass condition.
+async fn s7_hung(backend: Backend, scenario: Scenario, expected_failure: bool) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let dir = Arc::new(CaseDir(temp.path().to_owned()));
     let Some(db) = CaseDb::create(backend, temp.path()).await? else {
@@ -1791,10 +1795,10 @@ async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
     let root = AgentTaskId::from_string(&root);
     // As an expected failure, the parent must still wait well past the
     // budget; the full `WAIT` is only for the real pass condition.
-    let wait = if known_failure_enabled() {
-        WAIT
-    } else {
+    let wait = if expected_failure {
         STALL_BUDGET + Duration::from_secs(5)
+    } else {
+        WAIT
     };
     let continued = wait_for_task_within(
         &stores,
@@ -1805,7 +1809,7 @@ async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
     )
     .await;
     daemon.report(scenario.name());
-    if !known_failure_enabled() {
+    if expected_failure {
         ensure!(
             continued.is_err(),
             "S7 ({}) no longer fails: the parent continued past its silent child. Remove its \
@@ -1836,11 +1840,11 @@ async fn s7_hung(backend: Backend, scenario: Scenario) -> Result<()> {
 }
 
 async fn s7_hung_tool(backend: Backend) -> Result<()> {
-    s7_hung(backend, Scenario::HungTool).await
+    s7_hung(backend, Scenario::HungTool, false).await
 }
 
 async fn s7_hung_subagent(backend: Backend) -> Result<()> {
-    s7_hung(backend, Scenario::HungSubagent).await
+    s7_hung(backend, Scenario::HungSubagent, !known_failure_enabled()).await
 }
 
 /// S8 (Postgres): a new host starts while the old one still runs a turn,
@@ -1869,13 +1873,14 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
         .filter(|row| row.parent_id.is_some())
         .collect();
 
-    let new = start_daemon(
+    // Started on its own task: a host that waits for a leader lock does
+    // not return from its start until it leads.
+    let new = tokio::spawn(start_daemon(
         db.storage.clone(),
         Scenario::Overlap,
         Phase::Recover,
         Arc::clone(&dir),
-    )
-    .await?;
+    ));
     // Three lease periods with both hosts live.
     tokio::time::sleep(Duration::from_secs(9)).await;
     let runs_while_overlapping = dir.run_lines()?;
@@ -1895,6 +1900,9 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
     }
     drop(control);
     old.kill_nine()?;
+    let new = tokio::time::timeout(WAIT, new)
+        .await
+        .context("the new host did not start after the old one died")???;
 
     let root = AgentTaskId::from_string(&root);
     let root_row =
@@ -1957,23 +1965,21 @@ macro_rules! matrix {
 matrix!(
     sqlite,
     "sqlite",
-    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation],
+    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation, s7_hung_tool],
     [s4_fork: "failpoints"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_tool: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_subagent: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_subagent: "expected failure, S7: a subagent child that goes silent never ends its parent's wait (D-5, prim-wait W2); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
 
 matrix!(
     postgres,
     "postgres",
-    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation],
+    [s1_unsafe_tool, s2_safe_tool, s5_cancel_tree, s6_question, s6_confirmation, s7_hung_tool],
     [s4_fork: "failpoints", s8_overlap: "postgres"],
     [
         s3_llm_stream: "expected failure, S3: the crashed LLM attempt's turn_attempts row stays open; set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_tool: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
-        s7_hung_subagent: "expected failure, S7: no end condition for a wait on a silent child (D-5); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
+        s7_hung_subagent: "expected failure, S7: a subagent child that goes silent never ends its parent's wait (D-5, prim-wait W2); set AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES for the pass condition",
     ]
 );
