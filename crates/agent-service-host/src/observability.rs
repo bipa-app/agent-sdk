@@ -77,6 +77,10 @@ pub mod attrs {
     /// What a janitor cycle removed or advanced: `events_purged`,
     /// `checkpoints_pruned` or `floors_advanced`.
     pub const JANITOR_ROWS: &str = "rows";
+    /// The thread operation a thread's status refused (`submit`, `fork`, …).
+    pub const THREAD_OPERATION: &str = "operation";
+    /// The refused thread's status (`completed`, `deleting`, `deleted`).
+    pub const THREAD_STATUS: &str = "thread_status";
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -263,6 +267,29 @@ impl HostMetrics {
             self.orphans_settled
                 .add(u64::try_from(settled).unwrap_or(u64::MAX), &[]);
         }
+    }
+
+    /// Count one RPC refused because of its thread's status, on
+    /// `agent_service_host.rpc.thread_refused{operation,thread_status}`
+    /// (both bounded enums; the thread id stays off the metric). This is the
+    /// request-level count: a refused store write inside it is also counted
+    /// by the writer as `agent_server.fence.refused`.
+    pub fn record_rpc_thread_refused(
+        &self,
+        operation: agent_server::journal::ThreadOperation,
+        status: agent_server::journal::ThreadStatus,
+    ) {
+        self.meter
+            .u64_counter("agent_service_host.rpc.thread_refused")
+            .with_description("RPCs refused because of their thread's status.")
+            .build()
+            .add(
+                1,
+                &[
+                    KeyValue::new(attrs::THREAD_OPERATION, operation.as_str()),
+                    KeyValue::new(attrs::THREAD_STATUS, status.as_str()),
+                ],
+            );
     }
 
     /// Register `(active, idle)` gauges for a sqlx Postgres pool.
