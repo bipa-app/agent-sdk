@@ -6543,6 +6543,10 @@ ORDER BY descendant.root_id
             .approve_confirmation(worker, lease, expires_at, now)
             .context("approve rejected: approve_confirmation transition failed")?;
         Self::update_task_tx(&mut tx, &claimed).await?;
+        // The one lease grant outside the worker pool: stamp it like
+        // `try_acquire_task`, or the next `ForeignEpoch` reclaim would take
+        // it back from its live drive.
+        Self::stamp_lease_epoch_tx(&mut tx, &claimed.id, self.current_epoch().as_ref()).await?;
         tx.commit()
             .await
             .context("commit approve_confirmation_and_acquire")?;

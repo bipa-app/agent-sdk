@@ -1100,3 +1100,80 @@ async fn a_new_process_reclaims_a_dead_processs_lease_only_as_the_single_host() 
     }
     Ok(())
 }
+
+/// The start-up span reaches OpenTelemetry, not only the logs: a
+/// `SingleHost` begin that reclaims one earlier lease exports
+/// `agent_server.epoch.begin` with the epoch id, the mode and the counts.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn the_epoch_begin_span_is_exported_with_what_the_reclaim_did() -> Result<()> {
+    use opentelemetry::Value;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    let stores = StoreRegistry::from_config(
+        &crate::config::StorageConfig::default(),
+        super::sample_registry(),
+    )?;
+    stores.initialize().await?;
+    let now = OffsetDateTime::now_utc();
+    crate::host::begin_epoch_and_reclaim(&stores, crate::config::EpochRecovery::SingleHost, now)
+        .await?;
+    let root = AgentTask::new_root_turn(ThreadId::from_string("t-epoch-span"), now, 3);
+    stores.task_store.submit_root_turn(root.clone()).await?;
+    stores
+        .task_store
+        .try_acquire_task(
+            &root.id,
+            WorkerId::from_string("worker-0"),
+            LeaseId::new(),
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await?
+        .context("the earlier epoch leases the root")?;
+    let epoch = crate::host::begin_epoch_and_reclaim(
+        &stores,
+        crate::config::EpochRecovery::SingleHost,
+        now + time::Duration::seconds(1),
+    )
+    .await?;
+    provider.force_flush()?;
+
+    let spans = exporter.get_finished_spans()?;
+    let span = spans
+        .iter()
+        .filter(|span| span.name.as_ref() == "agent_server.epoch.begin")
+        .find(|span| {
+            span.attributes.iter().any(|kv| {
+                kv.key.as_str() == "agent_server.epoch.id"
+                    && kv.value == Value::from(epoch.as_str().to_owned())
+            })
+        })
+        .with_context(|| format!("an agent_server.epoch.begin span for {epoch}: {spans:?}"))?;
+    let attribute = |key: &str| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.clone())
+    };
+    assert_eq!(
+        attribute("agent_server.epoch.recovery"),
+        Some(Value::from("single_host"))
+    );
+    assert_eq!(
+        attribute("agent_server.epoch.requeued"),
+        Some(Value::I64(1))
+    );
+    assert_eq!(
+        attribute("agent_server.epoch.failed_interrupted"),
+        Some(Value::I64(0))
+    );
+    assert_eq!(attribute("outcome"), Some(Value::from("ok")));
+    Ok(())
+}

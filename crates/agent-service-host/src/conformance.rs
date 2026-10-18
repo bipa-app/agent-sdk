@@ -637,12 +637,7 @@ mod tests {
         Ok(())
     }
 
-    /// Worker-initiated requeue of an owned Running row (issue #354):
-    /// the collision path's twin of the expiry sweep. Owned rows
-    /// return to `Pending` with the lease cleared; a stale lease or a
-    /// cancelled row reports `NotOwned` without touching the row; a
-    /// budget-exhausted row reports `BudgetExhausted` leaving the row
-    /// owned so the caller can run its terminal envelope.
+    /// Commit a `BeginEpoch` at `secs`.
     async fn begin_epoch(task_store: &dyn AgentTaskStore, secs: i64) -> Result<EpochId> {
         let record = EpochRecord::begin(t_plus(secs), Some("conformance".to_owned()));
         let epoch = record.id.clone();
@@ -771,6 +766,94 @@ mod tests {
         Ok(())
     }
 
+    /// A lease granted by approving a confirmation after the current epoch
+    /// began carries that epoch, so the epoch's own reclaim leaves it with
+    /// its live drive (crash matrix F4's second layer).
+    async fn test_an_approved_lease_is_not_foreign_to_its_epoch(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let name = "conformance-epoch-approve";
+        let _old = begin_epoch(task_store, 400).await?;
+        let parent = AgentTask::new_root_turn(thread_id(name), t_plus(401), 3);
+        let _ = task_store.submit_root_turn(parent.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        acquire_or_explain(
+            task_store,
+            &parent.id,
+            &worker,
+            &lease,
+            402,
+            "acquire parent",
+        )
+        .await?;
+        let (_parent, children) = task_store
+            .spawn_tool_children(
+                &parent.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::new(3)],
+                suspension_payload(name),
+                None,
+                Vec::new(),
+                t_plus(403),
+            )
+            .await?;
+        let child = children.first().context("one child")?;
+        let child_worker = WorkerId::new();
+        let child_lease = LeaseId::new();
+        acquire_or_explain(
+            task_store,
+            &child.id,
+            &child_worker,
+            &child_lease,
+            404,
+            "acquire child",
+        )
+        .await?;
+        task_store
+            .pause_on_confirmation(
+                &child.id,
+                &child_worker,
+                &child_lease,
+                suspension_payload(name).continuation,
+                None,
+                t_plus(405),
+            )
+            .await?;
+
+        let current = begin_epoch(task_store, 406).await?;
+        let approved_lease = LeaseId::new();
+        let (approved, _prepared) = task_store
+            .approve_confirmation_and_acquire(
+                &child.id,
+                WorkerId::new(),
+                approved_lease.clone(),
+                t_plus(4_000),
+                t_plus(407),
+            )
+            .await?;
+        assert_eq!(approved.status, TaskStatus::Running);
+
+        let reclaimed = task_store
+            .release_expired_leases(t_plus(408), LeaseRecoveryScope::ForeignEpoch(current))
+            .await?;
+        assert!(
+            reclaimed.iter().all(|record| record.id != child.id),
+            "the approved child's lease was granted under the current epoch: {reclaimed:?}"
+        );
+        let row = task_store.get(&child.id).await?.context("child")?;
+        assert_eq!(row.status, TaskStatus::Running, "{:?}", row.last_error);
+        assert_eq!(row.lease_id, Some(approved_lease));
+        Ok(())
+    }
+
+    /// Worker-initiated requeue of an owned Running row (issue #354):
+    /// the collision path's twin of the expiry sweep. Owned rows
+    /// return to `Pending` with the lease cleared; a stale lease or a
+    /// cancelled row reports `NotOwned` without touching the row; a
+    /// budget-exhausted row reports `BudgetExhausted` leaving the row
+    /// owned so the caller can run its terminal envelope.
     async fn test_requeue_owned_task(task_store: &dyn AgentTaskStore) -> Result<()> {
         use agent_server::journal::store::RequeueOutcome;
 
@@ -6575,6 +6658,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_an_approved_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_an_approved_lease_is_not_foreign_to_its_epoch(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_requeue_owned_task() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_requeue_owned_task(s.task.as_ref()).await
@@ -7226,6 +7315,13 @@ mod tests {
     -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_an_approved_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_an_approved_lease_is_not_foreign_to_its_epoch(&store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -8007,6 +8103,15 @@ mod tests {
             return Ok(());
         };
         test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_an_approved_lease_is_not_foreign_to_its_epoch() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_an_approved_lease_is_not_foreign_to_its_epoch(&store).await
     }
 
     #[cfg(feature = "postgres")]

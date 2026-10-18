@@ -997,6 +997,80 @@ async fn begin_epoch(stores: &StoreRegistry, now: time::OffsetDateTime) -> Resul
     Ok(epoch)
 }
 
+/// `agent_server.epoch.begin` as an OpenTelemetry span, so the epoch id and
+/// what the start-up reclaim did reach a trace. The `tracing` span beside it
+/// only reaches the logs: no `tracing` bridge is installed. Without `otel`
+/// this records nothing. The span ends when the value drops.
+struct EpochSpan {
+    #[cfg(feature = "otel")]
+    span: opentelemetry::global::BoxedSpan,
+}
+
+impl EpochSpan {
+    #[cfg(feature = "otel")]
+    fn begin(recovery: EpochRecovery) -> Self {
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{Span, Tracer};
+
+        let mut span =
+            opentelemetry::global::tracer("agent-server").start("agent_server.epoch.begin");
+        span.set_attribute(KeyValue::new(
+            "agent_server.epoch.recovery",
+            recovery.as_str(),
+        ));
+        Self { span }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn begin(_recovery: EpochRecovery) -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "otel")]
+    fn epoch(&mut self, epoch: &EpochId) {
+        use opentelemetry::trace::Span;
+        self.span.set_attribute(opentelemetry::KeyValue::new(
+            "agent_server.epoch.id",
+            epoch.as_str().to_owned(),
+        ));
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn epoch(&mut self, _epoch: &EpochId) {}
+
+    #[cfg(feature = "otel")]
+    fn reclaimed(&mut self, requeued: usize, failed_interrupted: usize) {
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::Span;
+        let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        self.span.set_attribute(KeyValue::new(
+            "agent_server.epoch.requeued",
+            count(requeued),
+        ));
+        self.span.set_attribute(KeyValue::new(
+            "agent_server.epoch.failed_interrupted",
+            count(failed_interrupted),
+        ));
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn reclaimed(&mut self, _requeued: usize, _failed_interrupted: usize) {}
+
+    #[cfg(feature = "otel")]
+    fn outcome(&mut self, outcome: &'static str) {
+        use opentelemetry::trace::{Span, Status};
+        self.span
+            .set_attribute(opentelemetry::KeyValue::new("outcome", outcome));
+        if outcome == "error" {
+            self.span
+                .set_status(Status::error("epoch begin or reclaim failed"));
+        }
+    }
+
+    #[cfg(not(feature = "otel"))]
+    const fn outcome(&mut self, _outcome: &'static str) {}
+}
+
 /// Begin this process's epoch and, under [`EpochRecovery::SingleHost`],
 /// reclaim every lease an earlier process granted, before any worker of
 /// this process runs. Returns the new epoch.
@@ -1017,11 +1091,20 @@ async fn begin_epoch_and_reclaim(
         agent_server.epoch.failed_interrupted = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
-    let epoch = begin_epoch(stores, now).instrument(span.clone()).await?;
+    let mut otel = EpochSpan::begin(recovery);
+    let epoch = match begin_epoch(stores, now).instrument(span.clone()).await {
+        Ok(epoch) => epoch,
+        Err(e) => {
+            otel.outcome("error");
+            return Err(e);
+        }
+    };
     span.record("agent_server.epoch.id", epoch.as_str());
+    otel.epoch(&epoch);
     match recovery {
         EpochRecovery::LeaseExpiry => {
             span.record("outcome", "ok");
+            otel.outcome("ok");
         }
         EpochRecovery::SingleHost => {
             let scope = LeaseRecoveryScope::ForeignEpoch(epoch.clone());
@@ -1033,6 +1116,8 @@ async fn begin_epoch_and_reclaim(
                     span.record("agent_server.epoch.requeued", tally.requeued);
                     span.record("agent_server.epoch.failed_interrupted", tally.failed_closed);
                     span.record("outcome", "ok");
+                    otel.reclaimed(tally.requeued, tally.failed_closed);
+                    otel.outcome("ok");
                     if tally.total() > 0 {
                         info!(
                             requeued = tally.requeued,
@@ -1044,6 +1129,7 @@ async fn begin_epoch_and_reclaim(
                 }
                 Err(e) => {
                     span.record("outcome", "error");
+                    otel.outcome("error");
                     warn!(
                         error = %e,
                         "startup reclaim of earlier leases failed; they expire as usual"

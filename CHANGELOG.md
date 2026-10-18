@@ -560,7 +560,12 @@ long as it needs. No migration, table, `Write` variant or protocol change.
     it before the first one: a lease granted earlier carries no epoch, and
     the start-up reclaim would take it back from its live holder (crash
     matrix F4: an approval served in that window wedged the turn).
-    `grpc::LocalDaemon` awaits it before it binds its listener.
+    `grpc::LocalDaemon` awaits it before it binds its listener, and so does
+    the `agent-service-host` binary before it serves gRPC.
+  - `approve_confirmation_and_acquire`, the one lease grant outside the
+    worker pool, stamps the current epoch like `try_acquire_task` and
+    `acquire_ready_head`, on all three backends. A lease granted by approval
+    after the epoch began is not reclaimed as foreign.
   - Signals (`otel`):
     - `agent_server.tasks.lease_expired` gains a `scope` label (`expired` or
       `foreign_epoch`, `LeaseRecoveryScope::as_str`). The host's drain now
@@ -569,8 +574,9 @@ long as it needs. No migration, table, `Write` variant or protocol change.
     - New counter `agent_server.epoch.reclaims{scope, action}`. `action` is
       `requeued` or `failed_interrupted`.
     - `ServerMetrics::record_lease_reclaim` records the rows of one call.
-    - Start-up runs in an `agent_server.epoch.begin` span that covers the
-      epoch write and the reclaim. Its attributes are `agent_server.epoch.id`
+    - Start-up runs in an `agent_server.epoch.begin` OpenTelemetry span
+      (tracer `agent-server`) that covers the epoch write and the reclaim. A
+      `tracing` span of the same name stays for the logs. Its attributes are `agent_server.epoch.id`
       (span-only), `agent_server.epoch.recovery` (`EpochRecovery::as_str`),
       `agent_server.epoch.requeued`, `agent_server.epoch.failed_interrupted`
       and `outcome`.

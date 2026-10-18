@@ -14,6 +14,15 @@
 //! to expire. Hosts that share a store (several processes on one Postgres
 //! database, or overlapping pods during a rolling deploy) keep lease
 //! expiry: another live process's leases carry another epoch too.
+//!
+//! Every lease grant stamps the epoch (`try_acquire_task`,
+//! `acquire_ready_head`, `approve_confirmation_and_acquire`). Every lease
+//! granted before the current epoch began is foreign whether or not it was
+//! stamped, so the stamp only protects a lease granted between `BeginEpoch`
+//! and the start-up reclaim; a host must not serve writes in that window
+//! anyway. Beyond that it is operator data: which process granted a lease.
+//! `agent_sdk_host_epochs` gains one row per process start and is never
+//! pruned; at one row per start it stays small.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;

@@ -4548,9 +4548,6 @@ impl Inner {
         Ok(true)
     }
 
-    /// Complete delivered boundary-injection rows under the SAME write
-    /// lock as the enclosing durable fact. Non-queued rows (a replayed
-    /// commit) are skipped.
     /// Refuse a transition that begins an epoch the store already holds,
     /// before its first write.
     fn require_new_epochs(&self, transition: &super::transition::Transition) -> Result<()> {
@@ -4608,6 +4605,9 @@ impl Inner {
         }
     }
 
+    /// Complete delivered boundary-injection rows under the SAME write
+    /// lock as the enclosing durable fact. Non-queued rows (a replayed
+    /// commit) are skipped.
     fn complete_injection_rows(&mut self, ids: &[AgentTaskId], now: OffsetDateTime) -> Result<()> {
         for id in ids {
             let Some(old) = self.by_id.get(id).cloned() else {
@@ -7693,6 +7693,8 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .context("approve rejected: approve_confirmation transition failed")?;
         inner.rebalance_after_row_change(&old, &claimed);
         inner.put_row(claimed.id.clone(), claimed.clone());
+        // Stamped like `try_acquire_task`: see the durable stores.
+        inner.stamp_lease_epoch(&claimed.id);
         drop(inner);
         Ok((claimed, prepared_operation))
     }
