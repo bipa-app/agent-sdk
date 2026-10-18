@@ -976,21 +976,35 @@ async fn drain_expired_leases(
 }
 
 /// Settle a tool child the lease sweep failed closed (see
-/// [`settle_tool_child`]). A requeued row is not terminal and releases
+/// [`settle_tool_child`]), and report a subagent invocation it failed
+/// closed at its retry budget. A requeued row is not terminal and releases
 /// nothing.
 async fn settle_failed_closed_tool_child(
     stores: &StoreRegistry,
     signal: Option<&WakeupSignal>,
     record: &agent_server::journal::recovery::RecoveryRecord,
 ) {
-    match &record.action {
-        agent_server::journal::recovery::RecoveryAction::FailClosed(_) => {}
+    let reason = match &record.action {
+        agent_server::journal::recovery::RecoveryAction::FailClosed(reason) => *reason,
         agent_server::journal::recovery::RecoveryAction::NoAction
         | agent_server::journal::recovery::RecoveryAction::Requeue => return,
-    }
+    };
     match stores.task_store.get(&record.id).await {
         Ok(Some(task)) if task.kind == TaskKind::ToolRuntime => {
             settle_tool_child(signal, stores.task_store.as_ref(), task.parent_id.as_ref()).await;
+        }
+        Ok(Some(task)) if task.kind == TaskKind::Subagent => {
+            warn!(
+                task_id = %task.id,
+                task_kind = "subagent",
+                attempt = task.attempt,
+                max_attempts = task.max_attempts,
+                reason = reason.error_prefix(),
+                "the lease sweep failed a subagent invocation closed at its retry budget",
+            );
+            #[cfg(feature = "otel")]
+            agent_server::observability::ServerMetrics::global()
+                .record_invocation_failed_closed(reason);
         }
         Ok(_) => {}
         Err(error) => {
@@ -8056,6 +8070,52 @@ mod tests {
             .await
             .context("persist fixture subagent invocation")?;
         Ok((parent, invocation, child_root))
+    }
+
+    /// The lease sweep failing a subagent invocation closed at its retry
+    /// budget is counted on `agent_server.subagent.invocation.failed_closed`,
+    /// and its two earlier requeues are not.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn an_invocation_failed_closed_at_its_budget_is_counted() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        agent_server::observability::ServerMetrics::reset_for_testing();
+        let stores = StoreRegistry::in_memory(sample_registry());
+        let now = time::OffsetDateTime::now_utc();
+        let parent_thread = agent_sdk_foundation::ThreadId::from_string("t-invocation-budget");
+        let (_parent, invocation, child_root) =
+            persist_subagent_fixture(&stores, &parent_thread, 60_000, now).await?;
+        stores.task_store.cancel_tree(&child_root.id, now).await?;
+        let failed_closed = || {
+            meter.counter(
+                "agent_server.subagent.invocation.failed_closed",
+                &[("reason", "lease_expired_budget_exhausted")],
+            )
+        };
+        for attempt in 1..=AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS {
+            let at = now + time::Duration::seconds(10 * i64::from(attempt));
+            stores
+                .task_store
+                .try_acquire_task(
+                    &invocation.id,
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    at + time::Duration::seconds(5),
+                    at,
+                )
+                .await?
+                .with_context(|| format!("attempt {attempt} acquires"))?;
+            drain_expired_leases(&stores, None, at + time::Duration::seconds(6)).await?;
+            let expected = u64::from(attempt == AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS);
+            assert_eq!(failed_closed(), expected, "after attempt {attempt}");
+        }
+        let failed = stores
+            .task_store
+            .get(&invocation.id)
+            .await?
+            .context("row")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        Ok(())
     }
 
     /// Edge 2 (post-outage re-acquisition must not insta-reap).

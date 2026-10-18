@@ -61,7 +61,7 @@ mod tests {
     };
     use agent_server::journal::committed_event::CommittedEvent;
     use agent_server::journal::effect::{
-        EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite,
+        EffectIntent, EffectKey, EffectKind, EffectState, EffectSubject, EffectWrite,
     };
     use agent_server::journal::event_repository::EventRepository;
     use agent_server::journal::idempotency::{
@@ -121,6 +121,42 @@ mod tests {
                     total_usage: TokenUsage::default(),
                     turn_usage: TokenUsage::default(),
                     pending_tool_calls: vec![],
+                    awaiting_index: 0,
+                    completed_results: vec![],
+                    state: agent_sdk_foundation::AgentState::new(thread_id(name)),
+                    response_id: None,
+                    stop_reason: None,
+                    response_content: vec![],
+                },
+            ),
+            suspended_messages: vec![],
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
+        }
+    }
+
+    /// `suspension_payload` with the parent waiting on one pending
+    /// `subagent` call, which an invocation's bootstrap resolves.
+    #[cfg(feature = "failpoints")]
+    fn subagent_call_payload(name: &str) -> SuspensionPayload {
+        let input = serde_json::json!({ "task": "Inspect durable linkage" });
+        SuspensionPayload {
+            continuation: agent_sdk_foundation::ContinuationEnvelope::wrap(
+                agent_sdk_foundation::AgentContinuation {
+                    thread_id: thread_id(name),
+                    turn: 1,
+                    total_usage: TokenUsage::default(),
+                    turn_usage: TokenUsage::default(),
+                    pending_tool_calls: vec![agent_sdk_foundation::PendingToolCallInfo {
+                        id: "call_subagent".into(),
+                        name: "subagent_explore".into(),
+                        display_name: "Subagent: Explore".into(),
+                        tier: ToolTier::Confirm,
+                        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                        replay: ToolReplay::Unsafe,
+                        input: input.clone(),
+                        effective_input: input,
+                        listen_context: None,
+                    }],
                     awaiting_index: 0,
                     completed_results: vec![],
                     state: agent_sdk_foundation::AgentState::new(thread_id(name)),
@@ -385,6 +421,22 @@ mod tests {
         thread_store: &dyn ThreadStore,
         parent_thread: &str,
     ) -> Result<(AgentTask, AgentTask, AgentTask)> {
+        spawn_subagent_fixture_with(
+            task_store,
+            thread_store,
+            parent_thread,
+            suspension_payload(parent_thread),
+        )
+        .await
+    }
+
+    /// [`spawn_subagent_fixture`] with the parent suspended on `payload`.
+    async fn spawn_subagent_fixture_with(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        parent_thread: &str,
+        payload: SuspensionPayload,
+    ) -> Result<(AgentTask, AgentTask, AgentTask)> {
         let parent = AgentTask::new_root_turn(thread_id(parent_thread), t0(), 3);
         let parent_id = parent.id.clone();
         task_store.submit_root_turn(parent).await?;
@@ -417,7 +469,7 @@ mod tests {
                     child_root_input: sample_subagent_input(),
                     spawn_index: 0,
                     child_caller_metadata: None,
-                    payload: suspension_payload(parent_thread),
+                    payload,
                 },
                 Vec::new(),
                 t_plus(2),
@@ -2200,8 +2252,8 @@ mod tests {
         }
         assert_eq!(
             invocation.max_attempts,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
-            "the invocation row keeps the leaf default (parity with the in-memory store)",
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
+            "the invocation row takes the invocation budget (parity with the in-memory store)",
         );
 
         // Behavior at the seam: the child root's FIRST expired lease
@@ -2233,6 +2285,298 @@ mod tests {
             .context("child root exists")?;
         assert_eq!(requeued.status, TaskStatus::Pending);
         assert_eq!(requeued.attempt, 1);
+        Ok(())
+    }
+
+    /// Acquire `task_id` as attempt `attempt`, let the lease expire, and
+    /// return what the sweep did with it.
+    async fn expire_one_attempt(
+        task_store: &dyn AgentTaskStore,
+        task_id: &AgentTaskId,
+        attempt: u32,
+        start_secs: i64,
+    ) -> Result<RecoveryAction> {
+        let acquired = task_store
+            .try_acquire_task(
+                task_id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(start_secs + 5),
+                t_plus(start_secs + 1),
+            )
+            .await?
+            .with_context(|| format!("attempt {attempt} must acquire"))?;
+        assert_eq!(
+            acquired.attempt, attempt,
+            "the acquisition is attempt {attempt}"
+        );
+        let records = task_store
+            .release_expired_leases(t_plus(start_secs + 6))
+            .await?;
+        let record = records
+            .iter()
+            .find(|record| record.id == *task_id)
+            .with_context(|| format!("the sweep must classify attempt {attempt}: {records:?}"))?;
+        Ok(record.action)
+    }
+
+    /// A subagent invocation retries up to
+    /// [`AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS`] (3), from both spawn
+    /// paths: an expired lease on attempts 1 and 2 requeues it, and the
+    /// expiry of attempt 3 fails it closed.
+    async fn test_subagent_invocation_retry_budget(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (parent_id, worker, lease, spawn) =
+            prepare_spawn_parent(task_store, thread_store, "invocation-budget-commit").await?;
+        thread_store
+            .get_or_create(&spawn.child_thread_id, t_plus(1))
+            .await?;
+        task_store
+            .commit_subagent_spawn(spawn_commit(
+                parent_id.clone(),
+                worker,
+                lease,
+                spawn,
+                Vec::new(),
+            ))
+            .await?;
+        let committed = task_store.list_children(&parent_id).await?;
+        let [committed] = committed.as_slice() else {
+            anyhow::bail!("expected one invocation, got {committed:?}");
+        };
+        assert_eq!(
+            committed.max_attempts,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
+            "the SpawnChildren path spawns the invocation with the invocation budget",
+        );
+
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "invocation-budget").await?;
+        assert_eq!(
+            invocation.max_attempts,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS
+        );
+        const {
+            assert!(AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS == 3);
+            assert!(AgentTask::DEFAULT_MAX_ATTEMPTS == 1);
+        }
+        let child_worker = WorkerId::new();
+        let child_lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &child_root.id,
+                child_worker.clone(),
+                child_lease.clone(),
+                t_plus(600),
+                t_plus(3),
+            )
+            .await?
+            .context("the child root must acquire")?;
+        task_store
+            .fail_task(
+                &child_root.id,
+                &child_worker,
+                &child_lease,
+                "child stopped".into(),
+                t_plus(4),
+            )
+            .await?;
+
+        for attempt in 1..=2 {
+            let start = 10 * i64::from(attempt);
+            let action = expire_one_attempt(task_store, &invocation.id, attempt, start).await?;
+            assert!(
+                matches!(action, RecoveryAction::Requeue),
+                "attempt {attempt} of 3 must requeue, got {action:?}",
+            );
+            let requeued = task_store
+                .get(&invocation.id)
+                .await?
+                .context("invocation")?;
+            assert_eq!(requeued.status, TaskStatus::Pending);
+            assert_eq!(requeued.attempt, attempt);
+        }
+        let action = expire_one_attempt(task_store, &invocation.id, 3, 30).await?;
+        assert!(
+            matches!(action, RecoveryAction::FailClosed(_)),
+            "the expiry of the last attempt must fail the invocation closed, got {action:?}",
+        );
+        let failed = task_store
+            .get(&invocation.id)
+            .await?
+            .context("invocation")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.attempt, 3);
+        assert!(
+            task_store
+                .try_acquire_task(
+                    &invocation.id,
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    t_plus(50),
+                    t_plus(41),
+                )
+                .await?
+                .is_none(),
+            "a failed-closed invocation is never acquired again",
+        );
+        Ok(())
+    }
+
+    /// A requeued subagent invocation runs its body again and settles once
+    /// (P10-2). Attempts 1 and 2 each crash inside the settle transaction,
+    /// after its task write and before its events (`transition.before_events`),
+    /// so the backend drops the whole settle and the sweep requeues the
+    /// invocation. Attempt 3 settles it: the invocation completes on attempt
+    /// 3, the parent is runnable, and the parent thread has exactly one
+    /// completed `SubagentProgress`. The caller holds the `fail::FailScenario`.
+    #[cfg(feature = "failpoints")]
+    async fn test_requeued_invocation_settles_once_after_failpoint_crashes(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        message_store: &dyn MessageProjectionStore,
+        event_repo: &dyn EventRepository,
+    ) -> Result<()> {
+        let name = "invocation-retry-settle";
+        let (parent, invocation, child_root) = spawn_subagent_fixture_with(
+            task_store,
+            thread_store,
+            name,
+            subagent_call_payload(name),
+        )
+        .await?;
+        task_store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        let deps = agent_server::worker::SubagentResultDeps {
+            task_store,
+            thread_store,
+            message_store,
+            event_repo,
+            artifact_store: None,
+        };
+        let completed_progress = || async {
+            anyhow::Ok(
+                event_repo
+                    .get_events(&thread_id(name))
+                    .await?
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event.event,
+                            agent_sdk_foundation::AgentEvent::SubagentProgress {
+                                completed: true,
+                                ..
+                            }
+                        )
+                    })
+                    .count(),
+            )
+        };
+        let invocation_id = &invocation.id;
+        let run = |attempt: u32, start: i64| async move {
+            let running = task_store
+                .try_acquire_task(
+                    invocation_id,
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    t_plus(start + 5),
+                    t_plus(start),
+                )
+                .await?
+                .with_context(|| format!("attempt {attempt} must acquire"))?;
+            assert_eq!(running.attempt, attempt);
+            let bootstrap =
+                agent_server::worker::resolve_subagent_bootstrap(running, task_store).await?;
+            anyhow::Ok(bootstrap)
+        };
+
+        for (attempt, start) in [(1_u32, 10_i64), (2, 20)] {
+            let bootstrap = run(attempt, start).await?;
+            fail::cfg("transition.before_events", "panic")
+                .map_err(|error| anyhow::anyhow!("configure failpoint: {error}"))?;
+            let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                agent_server::worker::execute_subagent_task(bootstrap, &deps, t_plus(start + 1)),
+            ))
+            .await;
+            fail::remove("transition.before_events");
+            assert!(
+                crashed.is_err(),
+                "attempt {attempt}: the failpoint must fire"
+            );
+            let row = task_store
+                .get(&invocation.id)
+                .await?
+                .context("invocation")?;
+            assert_eq!(
+                row.status,
+                TaskStatus::Running,
+                "attempt {attempt}: settle dropped"
+            );
+            assert_eq!(completed_progress().await?, 0, "attempt {attempt}");
+            let records = task_store.release_expired_leases(t_plus(start + 6)).await?;
+            assert!(
+                records.iter().any(|record| record.id == invocation.id
+                    && matches!(record.action, RecoveryAction::Requeue)),
+                "attempt {attempt} of 3 must requeue: {records:?}"
+            );
+        }
+
+        let bootstrap = run(3, 30).await?;
+        let outcome =
+            agent_server::worker::execute_subagent_task(bootstrap, &deps, t_plus(31)).await?;
+        assert_eq!(outcome.invocation_task.status, TaskStatus::Completed);
+        assert_eq!(outcome.invocation_task.attempt, 3);
+        assert!(!outcome.tool_result.success, "the cancelled child's result");
+        let resumed = task_store.get(&parent.id).await?.context("parent")?;
+        assert!(resumed.status.is_runnable(), "parent {:?}", resumed.status);
+        assert_eq!(completed_progress().await?, 1, "the parent gets one result");
+        Ok(())
+    }
+
+    /// A tool child keeps [`AgentTask::DEFAULT_MAX_ATTEMPTS`] (1): its first
+    /// expired lease fails it closed.
+    async fn test_tool_child_fails_closed_after_one_attempt(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let tid = "tool-child-budget";
+        let root = fresh_root(tid, 1);
+        task_store.submit_root_turn(root.clone()).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(1),
+            )
+            .await?
+            .context("the root must acquire")?;
+        let (_parent, children) = task_store
+            .spawn_tool_children(
+                &root.id,
+                &worker,
+                &lease,
+                vec![ChildSpawnSpec::default()],
+                suspension_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(2),
+            )
+            .await?;
+        let [child] = children.as_slice() else {
+            anyhow::bail!("expected one tool child, got {children:?}");
+        };
+        assert_eq!(child.max_attempts, AgentTask::DEFAULT_MAX_ATTEMPTS);
+        let action = expire_one_attempt(task_store, &child.id, 1, 10).await?;
+        assert!(
+            matches!(action, RecoveryAction::FailClosed(_)),
+            "a tool child fails closed after attempt 1, got {action:?}",
+        );
+        let failed = task_store.get(&child.id).await?.context("tool child")?;
+        assert_eq!(failed.status, TaskStatus::Failed);
         Ok(())
     }
 
@@ -3891,6 +4235,70 @@ mod tests {
                 state,
             })],
         }
+    }
+
+    /// A `GitStep` effect owned by a subagent invocation commits through
+    /// the store, which proves the 0027 CHECK already admits `git_step`: no
+    /// migration. Its record reads back with the `Git` subject, and its
+    /// finish keeps the state.
+    async fn test_git_step_effect_round_trips(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+    ) -> Result<()> {
+        let (_parent, invocation, child_root) =
+            spawn_subagent_fixture(task_store, thread_store, "git-step-round-trip").await?;
+        task_store.cancel_tree(&child_root.id, t_plus(3)).await?;
+        let worker = WorkerId::new();
+        let lease = LeaseId::new();
+        let running = task_store
+            .try_acquire_task(
+                &invocation.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(600),
+                t_plus(4),
+            )
+            .await?
+            .context("the woken invocation must acquire")?;
+        let intent = EffectIntent {
+            key: EffectKey::git(&running.id, "merge_back"),
+            replay: ToolReplay::Safe,
+            owner: running.id.clone(),
+            thread: running.thread_id.clone(),
+            subject: EffectSubject::Git {
+                step: "merge_back".into(),
+                repo: "repo_1".into(),
+                unit: "unit_1".into(),
+            },
+            attempt: running.attempt,
+        };
+        let key = intent.key.clone();
+        task_store
+            .commit(start_effect(intent.clone(), &worker, &lease), t_plus(5))
+            .await?;
+        let started = task_store.effect(&key).await?.context("the git record")?;
+        assert_eq!(started.kind(), EffectKind::GitStep);
+        assert_eq!(started.subject, intent.subject);
+        assert_eq!(started.replay, ToolReplay::Safe);
+        assert_eq!(started.owner, running.id);
+        assert_eq!(started.state, EffectState::Started);
+
+        let salvaged = EffectState::Salvaged {
+            captured_output: Some("branch bip/thread/c1 at abc123".into()),
+        };
+        task_store
+            .commit(
+                finish_effect(&key, &running.id, salvaged.clone()),
+                t_plus(6),
+            )
+            .await?;
+        let records = task_store.effects_for_task(&running.id).await?;
+        let [record] = records.as_slice() else {
+            anyhow::bail!("expected the one git record, got {records:?}");
+        };
+        assert_eq!(record.subject, intent.subject);
+        assert_eq!(record.state, salvaged);
+        Ok(())
     }
 
     /// An effect's record is claimed once, under its owner's lease, and
@@ -5732,6 +6140,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_subagent_invocation_retry_budget() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_subagent_invocation_retry_budget(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_tool_child_fails_closed_after_one_attempt() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_tool_child_fails_closed_after_one_attempt(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_git_step_effect_round_trips() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_git_step_effect_round_trips(s.task.as_ref(), s.thread.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_child_root_spawn_retry_budget() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_child_root_spawn_retry_budget(s.task.as_ref(), s.thread.as_ref()).await
@@ -6252,6 +6678,17 @@ mod tests {
 
     #[cfg(all(feature = "sqlite", feature = "failpoints"))]
     #[tokio::test]
+    async fn sqlite_requeued_invocation_settles_once_after_failpoint_crashes() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_requeued_invocation_settles_once_after_failpoint_crashes(
+            &store, &store, &store, &store,
+        )
+        .await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
     async fn sqlite_transition_failpoint_writes_neither_half() -> Result<()> {
         let _scenario = fail::FailScenario::setup();
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
@@ -6263,6 +6700,27 @@ mod tests {
     async fn conformance_sqlite_child_spawn() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_subagent_invocation_retry_budget() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_subagent_invocation_retry_budget(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_tool_child_fails_closed_after_one_attempt() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_tool_child_fails_closed_after_one_attempt(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_git_step_effect_round_trips() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_git_step_effect_round_trips(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -7264,6 +7722,19 @@ mod tests {
 
     #[cfg(all(feature = "postgres", feature = "failpoints"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_requeued_invocation_settles_once_after_failpoint_crashes() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_requeued_invocation_settles_once_after_failpoint_crashes(
+            &store, &store, &store, &store,
+        )
+        .await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn postgres_transition_failpoint_writes_neither_half() -> Result<()> {
         let _scenario = fail::FailScenario::setup();
         let Some((store, _guard)) = pg_test_store().await? else {
@@ -7279,6 +7750,33 @@ mod tests {
             return Ok(());
         };
         test_child_spawn_and_resume(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_subagent_invocation_retry_budget() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_subagent_invocation_retry_budget(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_tool_child_fails_closed_after_one_attempt() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_tool_child_fails_closed_after_one_attempt(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_git_step_effect_round_trips() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_git_step_effect_round_trips(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

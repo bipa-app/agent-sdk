@@ -1296,6 +1296,7 @@ pub async fn execute_subagent_task(
     #[cfg(feature = "otel")]
     crate::observability::ServerMetrics::global()
         .record_task_acquired(crate::observability::attrs::KIND_SUBAGENT);
+    report_invocation_attempt(&bootstrap.invocation_task);
 
     // Box-pin the inner future so the outer function's state
     // machine stays small enough that clippy::large_futures does
@@ -1317,6 +1318,47 @@ pub async fn execute_subagent_task(
     }
 
     result
+}
+
+/// Count an invocation run by its attempt, and report a retry (an attempt
+/// above 1, after a crash or an expired lease): a log line and a span
+/// `agent_server.subagent.invocation.retry`.
+fn report_invocation_attempt(invocation: &AgentTask) {
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global().record_invocation_attempt(invocation.attempt);
+    if invocation.attempt <= 1 {
+        return;
+    }
+    log::info!(
+        task_id = invocation.id.as_str(),
+        task_kind = "subagent",
+        attempt = invocation.attempt,
+        max_attempts = invocation.max_attempts;
+        "a requeued subagent invocation runs again"
+    );
+    #[cfg(feature = "otel")]
+    {
+        use crate::observability::attrs;
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{Span, Tracer};
+
+        let mut span = opentelemetry::global::tracer("agent-server")
+            .start("agent_server.subagent.invocation.retry");
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_ID,
+            invocation.id.as_str().to_owned(),
+        ));
+        span.set_attribute(KeyValue::new(attrs::SPAN_TASK_KIND, attrs::KIND_SUBAGENT));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_ATTEMPT,
+            i64::from(invocation.attempt),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_MAX_ATTEMPTS,
+            i64::from(invocation.max_attempts),
+        ));
+        span.end();
+    }
 }
 
 /// Inner body of [`execute_subagent_task`]. Kept separate so the
