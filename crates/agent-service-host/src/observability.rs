@@ -298,17 +298,14 @@ impl HostMetrics {
     /// a human (`agent_service_host.parked_waits{kind=question|confirmation}`).
     /// After a restart these are the waits that survived it. The gauge is
     /// built on use (the SDK returns the same instrument).
-    pub fn record_parked_waits(&self, questions: usize, confirmations: usize) {
+    pub fn record_parked_waits(&self, questions: u64, confirmations: u64) {
         let gauge = self
             .meter
             .u64_gauge("agent_service_host.parked_waits")
             .with_description("Tasks parked on a question or a confirmation when the host started.")
             .build();
         for (kind, count) in [("question", questions), ("confirmation", confirmations)] {
-            gauge.record(
-                u64::try_from(count).unwrap_or(u64::MAX),
-                &[KeyValue::new(attrs::PARKED_WAIT_KIND, kind)],
-            );
+            gauge.record(count, &[KeyValue::new(attrs::PARKED_WAIT_KIND, kind)]);
         }
     }
 

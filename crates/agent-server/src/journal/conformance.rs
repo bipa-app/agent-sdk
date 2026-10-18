@@ -284,6 +284,9 @@ mod in_memory_bundle {
         ) -> Result<Option<AgentTask>> {
             self.task.complete_input_injection(id, now).await
         }
+        async fn count_by_status(&self, status: TaskStatus) -> Result<u64> {
+            self.task.count_by_status(status).await
+        }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
             self.task.list_by_status(status).await
         }

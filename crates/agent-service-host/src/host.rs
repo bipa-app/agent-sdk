@@ -972,13 +972,7 @@ async fn settle_orphaned_descendants(
 /// is logged and records nothing.
 #[cfg(feature = "otel")]
 async fn record_parked_waits(stores: &StoreRegistry) {
-    let count = |status| async move {
-        stores
-            .task_store
-            .list_by_status(status)
-            .await
-            .map(|tasks| tasks.len())
-    };
+    let count = |status| stores.task_store.count_by_status(status);
     match (
         count(TaskStatus::AwaitingQuestion).await,
         count(TaskStatus::AwaitingConfirmation).await,
@@ -11480,6 +11474,9 @@ mod tests {
             now: time::OffsetDateTime,
         ) -> Result<Option<AgentTask>> {
             self.inner.complete_input_injection(id, now).await
+        }
+        async fn count_by_status(&self, status: TaskStatus) -> Result<u64> {
+            self.inner.count_by_status(status).await
         }
         async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
             self.inner.list_by_status(status).await

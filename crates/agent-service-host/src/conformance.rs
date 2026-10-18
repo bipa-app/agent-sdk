@@ -766,6 +766,45 @@ mod tests {
         Ok(())
     }
 
+    /// `count_by_status` counts exactly the rows `list_by_status` returns, in
+    /// every status, without loading them.
+    async fn test_count_by_status_matches_list_by_status(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let roots: Vec<_> = (0..3)
+            .map(|n| fresh_root(&format!("conformance-count-{n}"), 600 + n))
+            .collect();
+        for root in &roots {
+            let _ = task_store.submit_root_turn(root.clone()).await?;
+        }
+        let leased = roots.first().context("a root")?;
+        task_store
+            .try_acquire_task(
+                &leased.id,
+                WorkerId::from_string("worker-0"),
+                LeaseId::new(),
+                t_plus(4_000),
+                t_plus(610),
+            )
+            .await?
+            .context("the first root is acquirable")?;
+
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Running,
+            TaskStatus::AwaitingQuestion,
+            TaskStatus::AwaitingConfirmation,
+            TaskStatus::Completed,
+        ] {
+            let listed = u64::try_from(task_store.list_by_status(status).await?.len())?;
+            let counted = task_store.count_by_status(status).await?;
+            assert_eq!(counted, listed, "{status:?}");
+        }
+        assert_eq!(task_store.count_by_status(TaskStatus::Running).await?, 1);
+        assert_eq!(task_store.count_by_status(TaskStatus::Pending).await?, 2);
+        Ok(())
+    }
+
     /// A lease the worker pool's scan grants (`acquire_next_runnable`) after
     /// the current epoch began carries that epoch, so the epoch's own
     /// reclaim leaves it with its worker.
@@ -7369,6 +7408,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_count_by_status_matches_list_by_status() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_count_by_status_matches_list_by_status(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_a_ready_head_lease_is_not_foreign_to_its_epoch() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_a_ready_head_lease_is_not_foreign_to_its_epoch(s.task.as_ref()).await
@@ -8280,6 +8325,13 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_count_by_status_matches_list_by_status() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_count_by_status_matches_list_by_status(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_a_ready_head_lease_is_not_foreign_to_its_epoch() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_a_ready_head_lease_is_not_foreign_to_its_epoch(&store).await
@@ -9085,6 +9137,15 @@ mod tests {
             return Ok(());
         };
         test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_count_by_status_matches_list_by_status() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_count_by_status_matches_list_by_status(&store).await
     }
 
     #[cfg(feature = "postgres")]

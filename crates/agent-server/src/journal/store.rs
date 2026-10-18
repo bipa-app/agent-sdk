@@ -1885,6 +1885,12 @@ pub trait AgentTaskStore: super::transition::DurableStore + Send + Sync {
     /// Returns an error if the store cannot be queried.
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>>;
 
+    /// How many tasks are currently in `status`, without loading them.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be queried.
+    async fn count_by_status(&self, status: TaskStatus) -> Result<u64>;
+
     /// Return the currently blocking [`TaskKind::RootTurn`] for a thread,
     /// if one exists.
     ///
@@ -6864,6 +6870,19 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let completed = inner.complete_input_injection(id, now)?;
         drop(inner);
         Ok(completed)
+    }
+
+    async fn count_by_status(&self, status: TaskStatus) -> Result<u64> {
+        let inner = self.inner.read().await;
+        let count = inner
+            .by_status
+            .get(&status)
+            .into_iter()
+            .flatten()
+            .filter(|id| inner.by_id.contains_key(*id))
+            .count();
+        drop(inner);
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
     async fn list_by_status(&self, status: TaskStatus) -> Result<Vec<AgentTask>> {
