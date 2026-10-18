@@ -681,6 +681,103 @@ async fn a_commit_records_its_outcome_and_its_documents() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
+    use agent_sdk_foundation::{
+        AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage, llm::ContentBlock,
+    };
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::task::{
+        AgentTask, ChildSpawnSpec, LeaseId, SuspensionPayload, WorkerId,
+    };
+    use agent_server::journal::{AgentTaskStore, DurableStore, SpawnChildrenExt, Transition};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new();
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let thread = ThreadId::from_string("steer");
+    let root = AgentTask::new_root_turn(thread.clone(), now, 3);
+    let _ = store.submit_root_turn(root.clone()).await?;
+    let (worker, lease) = (WorkerId::new(), LeaseId::new());
+    let _ = store
+        .try_acquire_task(
+            &root.id,
+            worker.clone(),
+            lease.clone(),
+            now + Duration::from_secs(60),
+            now,
+        )
+        .await?;
+    let payload = SuspensionPayload {
+        continuation: ContinuationEnvelope::wrap(AgentContinuation {
+            thread_id: thread.clone(),
+            turn: 1,
+            total_usage: TokenUsage::default(),
+            turn_usage: TokenUsage::default(),
+            pending_tool_calls: Vec::new(),
+            awaiting_index: 0,
+            completed_results: Vec::new(),
+            state: AgentState::new(thread.clone()),
+            response_id: None,
+            stop_reason: None,
+            response_content: Vec::new(),
+        }),
+        suspended_messages: Vec::new(),
+        child_join_policy: agent_server::ChildJoinPolicy::default(),
+    };
+    let _ = store
+        .spawn_tool_children(
+            &root.id,
+            &worker,
+            &lease,
+            vec![ChildSpawnSpec::new(3)],
+            payload,
+            None,
+            Vec::new(),
+            now,
+        )
+        .await?;
+    let note = || {
+        vec![ContentBlock::Text {
+            text: "status?".into(),
+        }]
+    };
+    for expected_woken in [true, false] {
+        let committed = store
+            .commit(
+                Transition::enqueue_steering_resume(root.id.clone(), note()),
+                now,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            matches!(committed.steering_resumed.as_slice(), [Some(_)]),
+            expected_woken,
+            "the parked parent wakes, then a second wake declines"
+        );
+    }
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let resumes = collect_u64_counter(&snapshots, "agent_server.journal.steering_resumes");
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    for outcome in [attrs::OUTCOME_WOKEN, attrs::OUTCOME_DECLINED] {
+        assert!(
+            resumes.iter().any(|(labels, count)| *count == 1
+                && matches_all(
+                    labels,
+                    &[
+                        (attrs::BACKEND, attrs::BACKEND_MEMORY),
+                        (attrs::OUTCOME, outcome)
+                    ]
+                )),
+            "one {outcome} wake is counted: {resumes:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A store error marked [`LockConflict`](agent_server::journal::LockConflict)
 /// is recorded as `outcome=lock_conflict`; any other store error stays
 /// `outcome=store`.

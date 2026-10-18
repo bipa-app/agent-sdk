@@ -10878,7 +10878,8 @@ mod tests {
                     | Write::AppendEvents { .. }
                     | Write::AppendCompaction { .. }
                     | Write::SpawnChildren { .. }
-                    | Write::Document(_) => {}
+                    | Write::Document(_)
+                    | Write::EnqueueSteeringResume { .. } => {}
                 }
             }
             if let Ok(mut committed) = self.committed.lock() {

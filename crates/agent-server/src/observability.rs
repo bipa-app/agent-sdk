@@ -200,6 +200,11 @@ pub mod attrs {
     /// SQLite after its busy timeout.
     pub const OUTCOME_LOCK_CONFLICT: &str = "lock_conflict";
 
+    /// Steering wake outcome: `woken` / `declined` (the parent was no
+    /// longer parked).
+    pub const OUTCOME_WOKEN: &str = "woken";
+    pub const OUTCOME_DECLINED: &str = "declined";
+
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
 
@@ -283,6 +288,9 @@ pub struct ServerMetrics {
     pub(crate) transition_duration: Histogram<f64>,
     pub(crate) transition_lock_conflict_retries: Counter<u64>,
     pub(crate) documents_written: Counter<u64>,
+    /// `agent_server.journal.steering_resumes`: steering wakes committed,
+    /// by backend and outcome.
+    pub(crate) steering_resumes: Counter<u64>,
     /// `agent_server.effects`: effect transitions, by kind.
     pub(crate) effects: Counter<u64>,
     /// `agent_server.effect.duration`: started to finished, by kind and
@@ -484,6 +492,20 @@ impl ServerMetrics {
         let Ok(committed) = result else {
             return;
         };
+        for resumed in &committed.steering_resumed {
+            let outcome = if resumed.is_some() {
+                attrs::OUTCOME_WOKEN
+            } else {
+                attrs::OUTCOME_DECLINED
+            };
+            self.steering_resumes.add(
+                1,
+                &[
+                    KeyValue::new(attrs::BACKEND, backend),
+                    KeyValue::new(attrs::OUTCOME, outcome),
+                ],
+            );
+        }
         for document in &committed.documents {
             let op = if document.revision.is_some() {
                 attrs::OP_PUT
@@ -818,12 +840,8 @@ impl ServerMetrics {
                 "Transitions the store retried after a deadlock or serialization failure.",
             )
             .build();
-        let documents_written = meter
-            .u64_counter("agent_server.journal.documents.written")
-            .with_description(
-                "Document writes committed, attributed by backend, scope and operation.",
-            )
-            .build();
+        let steering_resumes = steering_resumes_counter(&meter);
+        let documents_written = documents_written_counter(&meter);
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
@@ -847,6 +865,7 @@ impl ServerMetrics {
             transition_duration,
             transition_lock_conflict_retries,
             documents_written,
+            steering_resumes,
             effects,
             effect_duration,
             completed_turn_commits,
@@ -972,6 +991,26 @@ fn view_instruments(
         .with_description("Session view stream steps and refused view RPCs.")
         .build();
     (fold_duration, folded_events, stream)
+}
+
+/// `agent_server.journal.documents.written`: document writes committed, by
+/// backend, scope and operation.
+fn documents_written_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.journal.documents.written")
+        .with_description("Document writes committed, attributed by backend, scope and operation.")
+        .build()
+}
+
+/// `agent_server.journal.steering_resumes`: steering wakes committed, by
+/// backend and outcome.
+fn steering_resumes_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.journal.steering_resumes")
+        .with_description(
+            "Steering wakes committed, attributed by backend and outcome (woken or declined).",
+        )
+        .build()
 }
 
 // ─────────────────────────────────────────────────────────────────────
