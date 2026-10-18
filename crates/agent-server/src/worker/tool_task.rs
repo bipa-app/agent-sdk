@@ -468,8 +468,11 @@ where
     Fut: Future<Output = anyhow::Result<ToolResult>>,
 {
     #[cfg(feature = "otel")]
-    crate::observability::ServerMetrics::global()
-        .record_task_acquired(crate::observability::attrs::KIND_TOOL);
+    {
+        let metrics = crate::observability::ServerMetrics::global();
+        metrics.record_task_acquired(crate::observability::attrs::KIND_TOOL);
+        metrics.record_tool_attempt(&bootstrap.child_task, &bootstrap.tool_call.name);
+    }
 
     // The collector carries this task's activity beacon: nothing the tool
     // emits reaches the journal until it returns (see the deferred commit

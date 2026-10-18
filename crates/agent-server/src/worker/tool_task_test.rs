@@ -854,3 +854,114 @@ async fn execute_with_wrong_lease_fails_at_complete() -> Result<()> {
 
     Ok(())
 }
+
+/// A tool child run again after its lease expired (how a `Safe` tool
+/// re-runs after a crash) counts `agent_server.tool.attempts{attempt="2"}`
+/// and emits `agent_server.tool.retry` with its task id, attempt and tool.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn a_tool_run_again_after_its_lease_expired_is_counted_and_traced() -> Result<()> {
+    use super::tool_task::run_tool_executor;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+    let spans = InMemorySpanExporter::default();
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_simple_exporter(spans.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+    let _ = tracer_provider.tracer("warm-up");
+    crate::observability::ServerMetrics::reset_for_testing();
+
+    let stores = TestStores::new();
+    let (_parent, children) = suspend_root_with_tools(
+        &stores,
+        vec![("call_retry".into(), "list".into(), serde_json::json!({}))],
+    )
+    .await?;
+    acquire_child(&stores.tasks, &children[0].id).await?;
+    stores
+        .tasks
+        .release_expired_leases(t_plus(601), crate::journal::LeaseRecoveryScope::Expired)
+        .await?;
+    let again = stores
+        .tasks
+        .try_acquire_task(
+            &children[0].id,
+            child_worker(),
+            child_lease(),
+            t_plus(1_200),
+            t_plus(602),
+        )
+        .await?
+        .context("the requeued child acquires again")?;
+    assert_eq!(again.attempt, 2);
+    let bootstrap = resolve_tool_bootstrap(again, &stores.tasks, ActivityBeacon::default()).await?;
+    let _ = run_tool_executor(&bootstrap, |_info, _collector| async {
+        Ok(ToolResult::success("listed"))
+    })
+    .await;
+
+    provider.force_flush()?;
+    let second_attempts: u64 = exporter
+        .get_finished_metrics()?
+        .iter()
+        .rev()
+        .take(1)
+        .flat_map(opentelemetry_sdk::metrics::data::ResourceMetrics::scope_metrics)
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .filter(|metric| metric.name() == "agent_server.tool.attempts")
+        .map(|metric| match metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                .data_points()
+                .filter(|point| {
+                    point
+                        .attributes()
+                        .any(|kv| kv.key.as_str() == "attempt" && kv.value.as_str() == "2")
+                })
+                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                .sum(),
+            _ => 0,
+        })
+        .sum();
+    // A lower bound: other lib tests share the global meter under plain
+    // `cargo test` (nextest runs one per process).
+    assert!(second_attempts >= 1, "the second attempt is counted");
+
+    tracer_provider.force_flush()?;
+    let task_id = children[0].id.as_str().to_owned();
+    let retry = spans
+        .get_finished_spans()?
+        .into_iter()
+        .find(|span| {
+            span.name == "agent_server.tool.retry"
+                && span.attributes.iter().any(|kv| {
+                    kv.key.as_str() == crate::observability::attrs::SPAN_TASK_ID
+                        && kv.value.as_str() == task_id
+                })
+        })
+        .context("no retry span for this task")?;
+    let attr = |key: &str| {
+        retry
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    };
+    assert_eq!(
+        attr(crate::observability::attrs::SPAN_TASK_ATTEMPT).as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        attr(crate::observability::attrs::SPAN_TOOL_NAME).as_deref(),
+        Some("list")
+    );
+    Ok(())
+}
