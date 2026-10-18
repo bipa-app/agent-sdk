@@ -3359,7 +3359,12 @@ fn not_found_status(resource_kind: &str, resource_id: &str) -> Status {
     Status::not_found(format!("{resource_kind} '{resource_id}' was not found"))
 }
 
+/// Every RPC a thread's status refuses is mapped here, so this is where it
+/// is counted (`agent_service_host.rpc.thread_refused`).
 fn thread_state_conflict_status(error: &ThreadStateConflict) -> Status {
+    #[cfg(feature = "otel")]
+    crate::observability::HostMetrics::global()
+        .record_rpc_thread_refused(error.operation, error.status);
     Status::failed_precondition(error.to_string())
 }
 
@@ -10076,6 +10081,58 @@ mod tests {
     /// transitions it — exactly the state `CancelTask` must handle.
     ///
     /// Returns `(thread_id, root_task_id)`.
+    /// A submit to a purged thread is refused and counted on
+    /// `agent_service_host.rpc.thread_refused{operation=submit,thread_status=deleted}`.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn an_rpc_a_thread_status_refuses_is_counted() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let shared = event_test_shared()?;
+        let service = GrpcControlService {
+            shared: Arc::clone(&shared),
+        };
+        let thread_id = service
+            .create_thread(Request::new(pb::CreateThreadRequest {
+                request_id: "refused-create".into(),
+                thread_id: String::new(),
+            }))
+            .await?
+            .into_inner()
+            .thread
+            .and_then(|view| view.thread)
+            .map(|thread| thread.thread_id)
+            .context("create response missing thread id")?;
+        service
+            .purge_thread(Request::new(pb::PurgeThreadRequest {
+                thread_id: thread_id.clone(),
+                scope: pb::PurgeScope::InvocationTree as i32,
+            }))
+            .await?;
+        let refused = service
+            .submit_thread_work(Request::new(pb::SubmitThreadWorkRequest {
+                request_id: "refused-submit".into(),
+                thread_id,
+                input: vec![text_input("too late")],
+                caller_metadata: String::new(),
+                disposition: pb::SubmitDisposition::NextTurn as i32,
+            }))
+            .await;
+        let Err(status) = refused else {
+            anyhow::bail!("a submit to a purged thread must be refused");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+
+        // A lower bound: under plain `cargo test` other tests in this binary
+        // record into the same global meter (nextest runs one per process).
+        let refusals = meter.counter(
+            "agent_service_host.rpc.thread_refused",
+            &[("operation", "submit"), ("thread_status", "deleted")],
+        );
+        drop(meter);
+        assert!(refusals >= 1, "the refused submit is counted");
+        Ok(())
+    }
+
     async fn seed_pending_root(
         service: &GrpcControlService,
         label: &str,
