@@ -1377,6 +1377,7 @@ mod invocation_fixture {
                 message_store: &self.messages,
                 event_repo: &self.events,
                 artifact_store: None,
+                completion_hook: None,
             }
         }
 
@@ -1451,6 +1452,334 @@ mod invocation_fixture {
     }
 
     fn payload(thread: &ThreadId) -> SuspensionPayload {
+        let input = serde_json::json!({"task": "Change one file"});
+        SuspensionPayload {
+            continuation: ContinuationEnvelope::wrap(AgentContinuation {
+                thread_id: thread.clone(),
+                turn: 1,
+                total_usage: TokenUsage::default(),
+                turn_usage: TokenUsage::default(),
+                pending_tool_calls: vec![PendingToolCallInfo {
+                    id: "call_worker".into(),
+                    name: "subagent_worker".into(),
+                    display_name: "Subagent: Worker".into(),
+                    tier: ToolTier::Confirm,
+                    concurrency: ToolConcurrency::Exclusive,
+                    replay: ToolReplay::Unsafe,
+                    input: input.clone(),
+                    effective_input: input,
+                    listen_context: None,
+                }],
+                awaiting_index: 0,
+                completed_results: Vec::new(),
+                state: AgentState::new(thread.clone()),
+                response_id: None,
+                stop_reason: None,
+                response_content: Vec::new(),
+            }),
+            suspended_messages: Vec::new(),
+            child_join_policy: agent_server::ChildJoinPolicy::default(),
+        }
+    }
+}
+
+/// A subagent completion hook's `GitStep` record is counted on
+/// `agent_server.effects{kind="git_step"}` (started, then finished), with
+/// its run time, and an output the SDK refuses is counted on
+/// `agent_server.subagent.completion_hook.refused`.
+#[tokio::test]
+async fn completion_hook_signals_count_git_steps_and_refusals() -> Result<()> {
+    use agent_server::journal::{Settle, Write};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let _ = ServerMetrics::global();
+
+    let stores = hook_fixture::Stores::new();
+    let refused_write = Write::SettleTask {
+        task: AgentTaskId::new(),
+        outcome: Settle::Fail { error: "x".into() },
+    };
+    for (name, extra_writes) in [
+        ("hook-ok", Vec::new()),
+        ("hook-refused", vec![refused_write]),
+    ] {
+        let settled = stores.settle_through_hook(name, extra_writes).await?;
+        assert_eq!(
+            settled.is_ok(),
+            name == "hook-ok",
+            "{name}: {:?}",
+            settled.err()
+        );
+    }
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let effects = collect_u64_counter(&snapshots, "agent_server.effects");
+    let git_steps = |transition: &str| -> u64 {
+        effects
+            .iter()
+            .filter(|(set, _)| {
+                matches_all(
+                    set,
+                    &[(attrs::KIND, "git_step"), (attrs::TRANSITION, transition)],
+                )
+            })
+            .map(|(_, value)| value)
+            .sum()
+    };
+    assert_eq!(git_steps("started"), 2, "{effects:?}");
+    assert_eq!(git_steps("finished"), 1, "{effects:?}");
+    let durations = collect_histogram_attrs(&snapshots, "agent_server.effect.duration");
+    assert!(
+        durations.iter().any(|set| matches_all(
+            set,
+            &[(attrs::KIND, "git_step"), (attrs::OUTCOME, "completed")]
+        )),
+        "{durations:?}"
+    );
+    let refused = collect_u64_counter(&snapshots, "agent_server.subagent.completion_hook.refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(matches_all(
+        &refused[0].0,
+        &[(attrs::REASON, "extra_write")]
+    ));
+    assert_eq!(refused[0].1, 1);
+    Ok(())
+}
+
+/// In-memory stores and an invocation fixture for the hook signals test.
+mod hook_fixture {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use agent_sdk_foundation::audit::AuditProvenance;
+    use agent_sdk_foundation::{
+        AgentContinuation, AgentState, ContinuationEnvelope, PendingToolCallInfo, ThreadId,
+        TokenUsage, ToolConcurrency, ToolReplay, ToolTier,
+    };
+    use agent_server::journal::effect::{EffectRecord, EffectState};
+    use agent_server::journal::event_repository::InMemoryEventRepository;
+    use agent_server::journal::message_store::InMemoryMessageProjectionStore;
+    use agent_server::journal::outbox::InMemoryOutboxStore;
+    use agent_server::journal::store::SubagentInvocationSpawn;
+    use agent_server::journal::store::{
+        AgentTaskStore, CancellationMarkerSink, InMemoryAgentTaskStore,
+        InMemoryAtomicSpawnEventCommitter,
+    };
+    use agent_server::journal::task::{AgentTask, LeaseId, SuspensionPayload, WorkerId};
+    use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+    use agent_server::journal::{DurableStore, SpawnChildrenExt, Write};
+    use agent_server::worker::subagent::{
+        EffectiveSubagentCapabilities, EffectiveSubagentMcpPolicy, EffectiveSubagentSpec,
+        InheritedSubagentPolicy, SubagentCapabilityProfile, SubagentSandboxPolicy,
+    };
+    use agent_server::worker::{
+        CompletionContext, CompletionOutput, CompletionPlan, InstalledCompletionHook, RunMode,
+        SubagentCompletionHook, SubagentResultDeps, execute_subagent_task,
+        resolve_subagent_bootstrap,
+    };
+    use anyhow::{Context, Result};
+
+    use super::t0;
+
+    pub struct Stores {
+        pub tasks: InMemoryAgentTaskStore,
+        pub threads: InMemoryThreadStore,
+        pub messages: InMemoryMessageProjectionStore,
+        pub events: InMemoryEventRepository,
+    }
+
+    impl Stores {
+        pub fn new() -> Self {
+            let threads = InMemoryThreadStore::new();
+            let events = InMemoryEventRepository::new();
+            let outbox = InMemoryOutboxStore::new();
+            let messages = InMemoryMessageProjectionStore::new();
+            let tasks = InMemoryAgentTaskStore::new()
+                .with_cancellation_markers(CancellationMarkerSink {
+                    event_repo: Arc::new(events.clone()),
+                    outbox_store: Arc::new(outbox.clone()),
+                    thread_store: Arc::new(threads.clone()),
+                })
+                .with_spawn_event_committer(Arc::new(InMemoryAtomicSpawnEventCommitter::new(
+                    events.clone(),
+                    outbox,
+                )))
+                .with_message_store(Arc::new(messages.clone()));
+            Self {
+                tasks,
+                threads,
+                messages,
+                events,
+            }
+        }
+
+        pub async fn running_parent(
+            &self,
+            thread: &ThreadId,
+            worker: &WorkerId,
+            lease: &LeaseId,
+        ) -> Result<AgentTask> {
+            self.threads.get_or_create(thread, t0()).await?;
+            let parent = AgentTask::new_root_turn(thread.clone(), t0(), 3);
+            let id = parent.id.clone();
+            self.tasks.submit_root_turn(parent).await?;
+            self.tasks
+                .try_acquire_task(
+                    &id,
+                    worker.clone(),
+                    lease.clone(),
+                    t0() + time::Duration::hours(1),
+                    t0(),
+                )
+                .await?
+                .context("acquire the parent")
+        }
+
+        /// Spawn an invocation of a cancelled child on `name`, and settle it
+        /// through a hook whose output carries `extra_writes`.
+        pub async fn settle_through_hook(
+            &self,
+            name: &str,
+            extra_writes: Vec<Write>,
+        ) -> Result<Result<()>> {
+            let parent_thread = ThreadId::from_string(name);
+            let (worker, lease) = (WorkerId::new(), LeaseId::new());
+            let parent = self.running_parent(&parent_thread, &worker, &lease).await?;
+            let child_thread = ThreadId::from_string(format!("{name}-child"));
+            agent_server::journal::thread_store::ThreadStore::get_or_create(
+                &self.threads,
+                &child_thread,
+                t0(),
+            )
+            .await?;
+            let (_, invocation, child_root) = self
+                .tasks
+                .spawn_subagent_invocation(
+                    &parent.id,
+                    &worker,
+                    &lease,
+                    SubagentInvocationSpawn {
+                        child_thread_id: child_thread,
+                        spec: spec(),
+                        child_root_input: Vec::new(),
+                        spawn_index: 0,
+                        child_caller_metadata: None,
+                        payload: payload(&parent_thread),
+                    },
+                    Vec::new(),
+                    t0(),
+                )
+                .await?;
+            self.tasks.cancel_tree(&child_root.id, t0()).await?;
+            let running = self
+                .tasks
+                .try_acquire_task(
+                    &invocation.id,
+                    WorkerId::new(),
+                    LeaseId::new(),
+                    t0() + time::Duration::hours(1),
+                    t0(),
+                )
+                .await?
+                .context("acquire the invocation")?;
+            let bootstrap = resolve_subagent_bootstrap(running, &self.tasks).await?;
+            let deps = SubagentResultDeps {
+                task_store: &self.tasks,
+                thread_store: &self.threads,
+                message_store: &self.messages,
+                event_repo: &self.events,
+                artifact_store: None,
+                completion_hook: Some(InstalledCompletionHook {
+                    hook: Arc::new(Hook { extra_writes }),
+                    store: Arc::new(self.tasks.clone()) as Arc<dyn DurableStore>,
+                }),
+            };
+            Ok(execute_subagent_task(bootstrap, &deps, t0())
+                .await
+                .map(drop))
+        }
+    }
+
+    struct Hook {
+        extra_writes: Vec<Write>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubagentCompletionHook for Hook {
+        fn plan(&self, _ctx: &CompletionContext) -> Option<CompletionPlan> {
+            Some(CompletionPlan {
+                step: "merge_back".into(),
+                repo: "repo_1".into(),
+                unit: "unit_1".into(),
+            })
+        }
+
+        async fn run(
+            &self,
+            _ctx: &CompletionContext,
+            _prior: Option<&EffectRecord>,
+            _mode: RunMode,
+        ) -> Result<CompletionOutput> {
+            Ok(CompletionOutput {
+                result: agent_sdk_foundation::ToolResult::success("merged"),
+                state: EffectState::Completed,
+                extra_writes: self.extra_writes.clone(),
+                park: None,
+            })
+        }
+    }
+
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    pub fn spec() -> EffectiveSubagentSpec {
+        EffectiveSubagentSpec {
+            task: "Change one file".into(),
+            prompt: String::new(),
+            model: "mock-model".into(),
+            max_turns: 4,
+            timeout_ms: 30_000,
+            depth: 1,
+            max_parallel_subagents: 1,
+            nickname: None,
+            sandbox: SubagentSandboxPolicy::read_only(),
+            mcp: EffectiveSubagentMcpPolicy {
+                allowed_servers: set(&[]),
+            },
+            audit_provenance: Some(AuditProvenance::new("mock", "mock-model")),
+            inherited_policy: InheritedSubagentPolicy {
+                default_model: "mock-model".into(),
+                allowed_models: set(&["mock-model"]),
+                default_max_turns: 4,
+                max_turns: 4,
+                default_timeout_ms: 30_000,
+                max_timeout_ms: 30_000,
+                capability_profiles: BTreeMap::from([(
+                    "worker".into(),
+                    SubagentCapabilityProfile {
+                        capabilities: set(&["read_file"]),
+                        sandbox: SubagentSandboxPolicy::read_only(),
+                        allowed_mcp_servers: set(&[]),
+                    },
+                )]),
+                allowed_capabilities: set(&["read_file"]),
+                max_depth: 3,
+                max_parallel_subagents: 1,
+                sandbox: SubagentSandboxPolicy::read_only(),
+                allowed_mcp_servers: set(&[]),
+                audit_provider: "mock".into(),
+            },
+            capabilities: EffectiveSubagentCapabilities {
+                profile: "worker".into(),
+                allowed: set(&["read_file"]),
+            },
+        }
+    }
+
+    pub fn payload(thread: &ThreadId) -> SuspensionPayload {
         let input = serde_json::json!({"task": "Change one file"});
         SuspensionPayload {
             continuation: ContinuationEnvelope::wrap(AgentContinuation {

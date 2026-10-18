@@ -200,7 +200,7 @@ inventory covers the whole observability surface.
 | `agent_server.journal.transition.lock_conflict_retries` | Counter | `backend` | `[agent-service-host]` Postgres `commit` | crash-safety Phase 3 |
 | `agent_server.journal.documents.written` | Counter | `backend`, `scope` (`host`/`thread`/`task`), `op` (`put`/`retire`) | `[agent-server]`, recorded by each store's `commit` | crash-safety Phase 3 |
 | `agent_server.journal.completed_turn.commits` | Counter | `outcome` (`ok`, `lost_ownership`, `stale_turn`, `error`) | `[agent-server]` `commit_completed_turn` | Phase 2 |
-| `agent_server.effects` | Counter | `kind`, `transition` (`started`, `refused`, `finished`, `reclaimed`, `abandoned`) | `[agent-server]` (abandons also from the SQL stores) | Phase 2 |
+| `agent_server.effects` | Counter | `kind` (`tool_call`, `llm_request`, `git_step`), `transition` (`started`, `refused`, `finished`, `reclaimed`, `abandoned`, `continued`: a requeued subagent invocation continues its `git_step` record) | `[agent-server]` (abandons also from the SQL stores) | Phase 2; `git_step`/`continued` primitive 10 |
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
 | span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
 | `agent_server.tool.stalls` | Counter | `outcome` (`tripped`, `fallback_settled`) | `[agent-service-host]` (tool child heartbeat) | prim-wait W1 |
@@ -211,6 +211,8 @@ inventory covers the whole observability surface.
 | `agent_server.subagent.invocation.attempts` | Counter | `attempt` (`1`, `2`, `3`, `4+`) | `[agent-server]` `execute_subagent_task` | primitive 10 (S-1) |
 | `agent_server.subagent.invocation.failed_closed` | Counter | `reason` (the `FailureReason` prefix, e.g. `lease_expired_budget_exhausted`) | `[agent-service-host]` host lease drain | primitive 10 (S-1) |
 | span `agent_server.subagent.invocation.retry` | Span | span-only `agent_server.task.id`, `agent_server.task.kind` (`subagent`), `agent_server.task.attempt`, `agent_server.task.max_attempts`; emitted for a run with attempt > 1 | `[agent-server]` | primitive 10 (S-1) |
+| span `agent_server.subagent.completion_hook` | Span | span-only `agent_server.effect.id` (the effect key, `{invocation}:git:{step}`; absent when the hook planned no step), `agent_server.task.id` (the invocation), `agent_server.task.attempt`, `agent_server.completion_hook.mode` (`execute`, `inspect`), `agent_server.completion_hook.outcome` (the effect's end state, `no_effect`, `refused` or `error`) | `[agent-server]` `worker/completion_hook.rs` | primitive 10 (S-2) |
+| `agent_server.subagent.completion_hook.refused` | Counter | `reason` (`extra_write`: a write other than `Document`/`AppendEvents`; `park`: unsupported until primitive 6; `state`: a `Started` finish) | `[agent-server]` | primitive 10 (S-2) |
 | event `agent_server.effect.abandoned` | Span event | `reason` (`owner_cancelled`, `lease_sweep`, `owner_terminal`), kind; span-only effect id, task id | `[agent-server]`, `[agent-service-host]` | Phase 2 |
 | `agent_server.prompts` | Counter | `owner` (`host`/`task`), `step` (`answer`/`close`/`withdraw` with the commit outcome `committed`/`guard`/`expectation`/`store`; `handle` for a live answer and `redrive` for one found unclosed at start, with `closed`/`pending`/`error`) | `[agent-server]` instrument, recorded by `agent_service_host::prompts` | primitive 6 (prompt rows) |
 

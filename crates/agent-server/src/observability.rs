@@ -144,6 +144,13 @@ pub mod attrs {
     pub const STALL_FALLBACK_SETTLED: &str = "fallback_settled";
     pub const SPAN_STALL_BUDGET_MS: &str = "agent_server.tool.stall_budget_ms";
     pub const SPAN_STALL_SILENT_FOR_MS: &str = "agent_server.tool.silent_for_ms";
+    /// Span-only: the `RunMode` of a subagent completion hook run
+    /// (`execute` / `inspect`).
+    pub const SPAN_COMPLETION_HOOK_MODE: &str = "agent_server.completion_hook.mode";
+    /// Span-only: how a subagent completion hook run ended: the effect's
+    /// end state (`completed`, `failed`, `salvaged`, ...), `no_effect`,
+    /// `refused` or `error`.
+    pub const SPAN_COMPLETION_HOOK_OUTCOME: &str = "agent_server.completion_hook.outcome";
 
     pub const KIND_ROOT: &str = "root";
     pub const KIND_SUBAGENT: &str = "subagent";
@@ -303,6 +310,9 @@ pub struct ServerMetrics {
     /// `agent_server.fence.refused`: writes outside a transition the purge
     /// fence refused, by writer and thread status.
     pub(crate) fence_refused: Counter<u64>,
+    /// `agent_server.subagent.completion_hook.refused`: hook outputs the
+    /// SDK refused, by `reason`.
+    pub(crate) completion_hook_refused: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -598,7 +608,7 @@ impl ServerMetrics {
     }
 
     /// Count one effect transition (`started`, `refused`, `finished`,
-    /// `reclaimed`, `abandoned`) on `agent_server.effects`.
+    /// `reclaimed`, `abandoned`, `continued`) on `agent_server.effects`.
     pub fn record_effect(
         &self,
         kind: crate::journal::effect::EffectKind,
@@ -632,6 +642,14 @@ impl ServerMetrics {
             1,
             &[KeyValue::new(attrs::REASON, failure_reason_label(reason))],
         );
+    }
+
+    /// Count a subagent completion hook output the SDK refused, by `reason`:
+    /// `extra_write` (a write other than `Document` or `AppendEvents`),
+    /// `park` (unsupported in this release) or `state` (a `Started` finish).
+    pub fn record_completion_hook_refused(&self, reason: &'static str) {
+        self.completion_hook_refused
+            .add(1, &[KeyValue::new(attrs::REASON, reason)]);
     }
 
     /// Record how long an effect ran, started to finished, with the state it
@@ -809,7 +827,8 @@ impl ServerMetrics {
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
-        let (invocation_attempts, invocation_failed_closed) = invocation_instruments(&meter);
+        let (invocation_attempts, invocation_failed_closed, completion_hook_refused) =
+            invocation_instruments(&meter);
         let (tool_stalls, tool_stall_unbounded) = Self::build_tool_stall_instruments(&meter);
         let fence_refused = fence_refused_counter(&meter);
 
@@ -840,6 +859,7 @@ impl ServerMetrics {
             tool_stalls,
             tool_stall_unbounded,
             fence_refused,
+            completion_hook_refused,
             meter,
         }
     }
@@ -874,9 +894,12 @@ fn fence_refused_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> 
         .build()
 }
 
-/// The subagent invocation retry instruments: runs by attempt, and
-/// invocations the lease sweep failed closed at their budget.
-fn invocation_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
+/// The subagent invocation instruments: runs by attempt, invocations the
+/// lease sweep failed closed at their budget, and completion hook outputs
+/// the SDK refused.
+fn invocation_instruments(
+    meter: &opentelemetry::metrics::Meter,
+) -> (Counter<u64>, Counter<u64>, Counter<u64>) {
     let attempts = meter
         .u64_counter("agent_server.subagent.invocation.attempts")
         .with_description(
@@ -890,7 +913,14 @@ fn invocation_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64
             "Subagent invocations the lease sweep failed closed at their retry budget, by reason.",
         )
         .build();
-    (attempts, failed_closed)
+    let completion_hook_refused = meter
+        .u64_counter("agent_server.subagent.completion_hook.refused")
+        .with_description(
+            "Subagent completion hook outputs refused before the settle, by reason: \
+             extra_write, park or state. The invocation then fails closed.",
+        )
+        .build();
+    (attempts, failed_closed, completion_hook_refused)
 }
 
 /// The crash-safety instruments: effect transitions, effect run time and
@@ -910,7 +940,8 @@ fn durability_instruments(
         .u64_counter("agent_server.effects")
         .with_description(
             "Effect transitions by kind: started (its record committed), refused (the \
-             claim did not commit), finished, reclaimed (recovery ended it without \
+             claim did not commit), continued (a requeued owner continues its started \
+             record), finished, reclaimed (recovery ended it without \
              running it again), abandoned (its owner became terminal first).",
         )
         .build();

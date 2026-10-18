@@ -132,18 +132,18 @@ impl LlmProvider for MockToolCallProvider {
     }
 }
 
-struct TestStores {
-    tasks: InMemoryAgentTaskStore,
-    threads: InMemoryThreadStore,
+pub(super) struct TestStores {
+    pub(super) tasks: InMemoryAgentTaskStore,
+    pub(super) threads: InMemoryThreadStore,
     messages: InMemoryMessageProjectionStore,
     attempts: InMemoryTurnAttemptStore,
     checkpoints: InMemoryCheckpointStore,
-    events: InMemoryEventRepository,
+    pub(super) events: InMemoryEventRepository,
     event_notifier: Arc<EventNotifier>,
 }
 
 impl TestStores {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let attempts = InMemoryTurnAttemptStore::new();
         let messages = InMemoryMessageProjectionStore::new();
         let checkpoints = InMemoryCheckpointStore::new();
@@ -197,13 +197,14 @@ impl TestStores {
         }
     }
 
-    fn subagent_deps(&self) -> SubagentResultDeps<'_> {
+    pub(super) fn subagent_deps(&self) -> SubagentResultDeps<'_> {
         SubagentResultDeps {
             task_store: &self.tasks,
             thread_store: &self.threads,
             message_store: &self.messages,
             event_repo: &self.events,
             artifact_store: None,
+            completion_hook: None,
         }
     }
 }
@@ -212,7 +213,7 @@ fn t0() -> OffsetDateTime {
     OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)
 }
 
-fn t_plus(secs: i64) -> OffsetDateTime {
+pub(super) fn t_plus(secs: i64) -> OffsetDateTime {
     t0() + Duration::seconds(secs)
 }
 
@@ -369,7 +370,7 @@ fn submitted_text(task: &AgentTask) -> Result<String> {
         .map(|parts| parts.join("\n"))
 }
 
-async fn create_running_parent_root(
+pub(super) async fn create_running_parent_root(
     store: &InMemoryAgentTaskStore,
     thread_id: &ThreadId,
 ) -> Result<(AgentTask, WorkerId, LeaseId)> {
@@ -391,7 +392,7 @@ async fn create_running_parent_root(
     Ok((claimed, worker, lease))
 }
 
-fn child_spawn(thread_id: &ThreadId) -> crate::journal::SubagentInvocationSpawn {
+pub(super) fn child_spawn(thread_id: &ThreadId) -> crate::journal::SubagentInvocationSpawn {
     crate::journal::SubagentInvocationSpawn {
         child_thread_id: ThreadId::new(),
         spec: subagent_spec(),
