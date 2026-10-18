@@ -27,6 +27,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::OffsetDateTime;
 
 use agent_server::journal::checkpoint::{
@@ -125,6 +126,9 @@ pub struct SqliteDurableStore {
     /// lease this store grants after it records it.
     current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
     extension: Option<std::sync::Arc<dyn agent_server::journal::TransitionExtension>>,
+    /// Write transactions [`Self::begin`] retried after the database stayed
+    /// locked past the busy timeout.
+    lock_conflict_retries: Arc<AtomicU64>,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -151,6 +155,7 @@ impl SqliteDurableStore {
             held_probe: HeldProbe::default(),
             current_epoch: Arc::default(),
             extension: None,
+            lock_conflict_retries: Arc::default(),
         }
     }
 
@@ -480,16 +485,31 @@ impl SqliteDurableStore {
         })
     }
 
+    /// How many times [`Self::begin`] retried a write transaction that
+    /// found the database locked.
+    #[cfg(test)]
+    pub(crate) fn lock_conflict_retries(&self) -> u64 {
+        self.lock_conflict_retries.load(Ordering::Relaxed)
+    }
+
+    /// Begin a write transaction, retrying a `BEGIN IMMEDIATE` that found
+    /// the database locked past the busy timeout ([`BEGIN_BUSY_BACKOFF`]):
+    /// nothing has run yet, so a retry is safe for every caller. The last
+    /// failure carries [`agent_server::journal::LockConflict`] with the
+    /// number of retries.
     async fn begin(&self) -> Result<Transaction<'_, Sqlite>> {
         // BEGIN IMMEDIATE acquires the RESERVED lock up front so that
         // under WAL mode we fail fast with plain SQLITE_BUSY (which
         // busy_timeout retries) rather than SQLITE_BUSY_SNAPSHOT on
         // upgrade from a deferred read snapshot to a write (which
         // busy_timeout does not retry).  See the module-level docs.
-        self.pool
-            .begin_with("BEGIN IMMEDIATE")
-            .await
-            .context("begin sqlite durable-core transaction")
+        retry_busy(
+            &self.lock_conflict_retries,
+            "begin a write transaction",
+            || self.pool.begin_with("BEGIN IMMEDIATE"),
+        )
+        .await
+        .context("begin sqlite durable-core transaction")
     }
 
     async fn insert_thread_row_tx(
@@ -3596,12 +3616,73 @@ fn mark_busy(
     result: Result<agent_server::journal::Committed, agent_server::journal::Rejected>,
 ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
     match result {
-        Err(agent_server::journal::Rejected::Store(error)) if is_busy(&error) => {
+        Err(agent_server::journal::Rejected::Store(error))
+            if is_busy(&error)
+                && error
+                    .downcast_ref::<agent_server::journal::LockConflict>()
+                    .is_none() =>
+        {
             Err(agent_server::journal::Rejected::Store(error.context(
                 agent_server::journal::LockConflict { retries: 0 },
             )))
         }
         result => result,
+    }
+}
+
+/// How long [`SqliteDurableStore::begin`] waits before each retry of a
+/// `BEGIN IMMEDIATE` that found the database locked, on top of the
+/// connection's own `busy_timeout` wait.
+const BEGIN_BUSY_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_millis(800),
+];
+
+/// Run one database operation, retrying it after the database stayed locked
+/// past the connection's busy timeout: [`BEGIN_BUSY_BACKOFF`] sleeps, each
+/// counted in `retries_seen` and on
+/// `agent_server.journal.transition.lock_conflict_retries`. Only for an
+/// operation that is safe to repeat: one that found the database locked ran
+/// nothing (a `BEGIN`, or a single autocommit statement). The last failure
+/// carries [`agent_server::journal::LockConflict`] with the retry count.
+pub(super) async fn retry_busy<T, Fut>(
+    retries_seen: &AtomicU64,
+    what: &'static str,
+    mut op: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: std::future::Future<Output = std::result::Result<T, sqlx::Error>>,
+{
+    let started = std::time::Instant::now();
+    let mut retries = 0;
+    loop {
+        match op().await.map_err(anyhow::Error::from) {
+            Err(error) if is_busy(&error) => {
+                let Some(backoff) = BEGIN_BUSY_BACKOFF.get(retries) else {
+                    tracing::warn!(
+                        what,
+                        retries,
+                        waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        %error,
+                        "a sqlite write stayed locked through every retry"
+                    );
+                    return Err(error.context(agent_server::journal::LockConflict {
+                        retries: u32::try_from(retries).unwrap_or(u32::MAX),
+                    }));
+                };
+                retries += 1;
+                retries_seen.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "otel")]
+                agent_server::observability::ServerMetrics::global()
+                    .record_transition_lock_conflict_retry(
+                        agent_server::observability::attrs::BACKEND_SQLITE,
+                    );
+                tracing::warn!(what, retries, %error, "retrying a sqlite write that found the database locked");
+                tokio::time::sleep(*backoff).await;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -4570,7 +4651,8 @@ impl AgentTaskStore for SqliteDurableStore {
         // it cannot also observe `Fresh`.
         let now = OffsetDateTime::now_utc();
         let kind_wire = kind.as_str();
-        let inserted = sqlx::query!(
+        let inserted = retry_busy(&self.lock_conflict_retries, "claim an idempotency key", || {
+            sqlx::query!(
             r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
                VALUES (?1, ?2, ?3, 'null', ?4)
                ON CONFLICT (request_id) DO NOTHING"#,
@@ -4579,7 +4661,8 @@ impl AgentTaskStore for SqliteDurableStore {
             fingerprint,
             now,
         )
-        .execute(&self.pool)
+                .execute(&self.pool)
+        })
         .await
         .with_context(|| format!("idempotency claim for {request_id}"))?;
 
@@ -4625,7 +4708,8 @@ impl AgentTaskStore for SqliteDurableStore {
         // placeholder and never overwrites a real recorded result, so a
         // racing retry cannot clobber it. With no prior claim row the
         // INSERT lands the full record (defensive path).
-        sqlx::query!(
+        retry_busy(&self.lock_conflict_retries, "record an idempotency result", || {
+            sqlx::query!(
             r#"INSERT INTO agent_sdk_idempotency (request_id, kind, fingerprint, result_json, created_at)
                VALUES (?1, ?2, ?3, ?4, ?5)
                ON CONFLICT (request_id) DO UPDATE
@@ -4637,7 +4721,8 @@ impl AgentTaskStore for SqliteDurableStore {
             result_text,
             created_at,
         )
-        .execute(&self.pool)
+                .execute(&self.pool)
+        })
         .await
         .with_context(|| format!("record idempotency result for {}", record.request_id))?;
         Ok(())
@@ -6076,12 +6161,14 @@ impl CheckpointStore for SqliteDurableStore {
         ensure!(keep_latest_n >= 1, "keep_latest_n must be at least 1");
         let tid = thread_key(thread_id);
         let keep = i64::from(keep_latest_n);
-        let result = sqlx::query!(
+        let result = retry_busy(&self.lock_conflict_retries, "delete old checkpoints", || {
+            sqlx::query!(
             r"DELETE FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 AND id NOT IN (SELECT id FROM agent_sdk_turn_checkpoints WHERE thread_id = ?1 ORDER BY turn_number DESC LIMIT ?2)",
             tid,
             keep,
         )
-        .execute(&self.pool)
+                .execute(&self.pool)
+        })
         .await
         .with_context(|| format!("delete checkpoints beyond limit for {thread_id}"))?;
         Ok(result.rows_affected())
@@ -6426,9 +6513,11 @@ impl OutboxStore for SqliteDurableStore {
         // Guard on `claimed_by`: only the worker still holding the claim may
         // ack. A reclaimed or cascade-deleted row matches zero rows — a safe
         // no-op (the current owner acks it; acking here would double-process).
-        sqlx::query!("UPDATE agent_sdk_outbox SET status = 'delivered', delivered_at = ?2 WHERE id = ?1 AND claimed_by = ?3", id_str, now, worker_id)
-            .execute(&self.pool)
-            .await
+        retry_busy(&self.lock_conflict_retries, "mark an outbox row delivered", || {
+            sqlx::query!("UPDATE agent_sdk_outbox SET status = 'delivered', delivered_at = ?2 WHERE id = ?1 AND claimed_by = ?3", id_str, now, worker_id)
+                .execute(&self.pool)
+        })
+        .await
             .with_context(|| format!("mark outbox row {id} delivered"))?;
         Ok(())
     }
@@ -6444,8 +6533,12 @@ impl OutboxStore for SqliteDurableStore {
         let id_str = id.as_str();
         // `claimed_by = ?4` guard: a reclaimed or cascade-deleted row matches
         // zero rows — a safe no-op (the current owner handles it).
-        sqlx::query!(
-            r"
+        retry_busy(
+            &self.lock_conflict_retries,
+            "mark an outbox row failed",
+            || {
+                sqlx::query!(
+                    r"
 UPDATE agent_sdk_outbox SET
     attempt_count = attempt_count + 1,
     status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'expired' ELSE 'pending' END,
@@ -6455,12 +6548,14 @@ UPDATE agent_sdk_outbox SET
     claimed_at = CASE WHEN attempt_count + 1 >= max_attempts THEN claimed_at ELSE NULL END
 WHERE id = ?1 AND claimed_by = ?4
 ",
-            id_str,
-            error,
-            next_attempt_at,
-            worker_id,
+                    id_str,
+                    error,
+                    next_attempt_at,
+                    worker_id,
+                )
+                .execute(&self.pool)
+            },
         )
-        .execute(&self.pool)
         .await
         .with_context(|| format!("mark outbox row {id} failed"))?;
         Ok(())
@@ -6472,12 +6567,14 @@ WHERE id = ?1 AND claimed_by = ?4
         claim_lease: time::Duration,
     ) -> Result<u64> {
         let threshold = now - claim_lease;
-        let result = sqlx::query!(
+        let result = retry_busy(&self.lock_conflict_retries, "reclaim expired outbox claims", || {
+            sqlx::query!(
             r"UPDATE agent_sdk_outbox SET status = 'pending', claimed_by = NULL, claimed_at = NULL, next_attempt_at = ?1 WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at <= ?2",
             now,
             threshold,
         )
-        .execute(&self.pool)
+                .execute(&self.pool)
+        })
         .await
         .context("reclaim expired outbox claims")?;
         Ok(result.rows_affected())
@@ -6616,8 +6713,12 @@ impl ToolAuditEventStore for SqliteDurableStore {
         let parent_task_id = event.parent_task_id.as_str();
         let thread_id = thread_key(&event.thread_id);
 
-        sqlx::query!(
-            r"
+        retry_busy(
+            &self.lock_conflict_retries,
+            "record a tool audit event",
+            || {
+                sqlx::query!(
+                    r"
 INSERT INTO agent_sdk_tool_audit_events (
     id, operation_id, task_id, parent_task_id, thread_id,
     tool_call_id, tool_name, effect_class, kind, kind_payload,
@@ -6628,24 +6729,26 @@ INSERT INTO agent_sdk_tool_audit_events (
     ?11, ?12, ?13, ?14, ?15, ?16
 )
 ",
-            id,
-            event.operation_id,
-            task_id,
-            parent_task_id,
-            thread_id,
-            event.tool_call_id,
-            event.tool_name,
-            effect_class_wire,
-            kind_str,
-            kind_payload,
-            event.provider,
-            event.model,
-            event.input,
-            event.output,
-            event.error,
-            event.recorded_at,
+                    id,
+                    event.operation_id,
+                    task_id,
+                    parent_task_id,
+                    thread_id,
+                    event.tool_call_id,
+                    event.tool_name,
+                    effect_class_wire,
+                    kind_str,
+                    kind_payload,
+                    event.provider,
+                    event.model,
+                    event.input,
+                    event.output,
+                    event.error,
+                    event.recorded_at,
+                )
+                .execute(&self.pool)
+            },
         )
-        .execute(&self.pool)
         .await
         .with_context(|| format!("record tool audit event {id}"))?;
         Ok(())
@@ -7328,9 +7431,9 @@ mod tests {
 
     use super::SqliteDurableStore;
 
-    /// A commit that cannot get the write lock before the busy timeout is
-    /// marked a lock conflict (`retries: 0`); a commit that fails for any
-    /// other reason is not.
+    /// A commit that cannot get the write lock through the busy timeout and
+    /// every retry is marked a lock conflict with its retry count; a commit
+    /// that fails for any other reason is not.
     #[tokio::test]
     async fn a_commit_that_stays_locked_is_a_lock_conflict() -> Result<()> {
         use sqlx::Connection as _;
@@ -7373,7 +7476,9 @@ mod tests {
         };
         assert_eq!(
             error.downcast_ref::<agent_server::journal::LockConflict>(),
-            Some(&agent_server::journal::LockConflict { retries: 0 }),
+            Some(&agent_server::journal::LockConflict {
+                retries: u32::try_from(super::BEGIN_BUSY_BACKOFF.len())?,
+            }),
             "{error:#}"
         );
         sqlx::query("ROLLBACK").execute(&mut holder).await?;
@@ -7390,6 +7495,145 @@ mod tests {
             error.downcast_ref::<agent_server::journal::LockConflict>(),
             None,
             "{error:#}"
+        );
+        Ok(())
+    }
+
+    /// Eight sessions claim effects on one SQLite file while another writer
+    /// holds the write lock for longer than the busy timeout: each write
+    /// transaction waits and retries instead of failing, and every claim
+    /// commits (dogfood D8: an effect claim failed with "database is
+    /// locked" at `BEGIN`, so its tool never ran).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn effect_claims_survive_a_writer_that_holds_the_lock_past_the_busy_timeout() -> Result<()>
+    {
+        use agent_server::journal::DurableStore as _;
+        use sqlx::Connection as _;
+
+        const SESSIONS: usize = 8;
+        let dir = tempfile::tempdir()?;
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("contended.db").display()
+        );
+        drop(SqliteDurableStore::connect(&url).await?);
+        let store = SqliteDurableStore::from_pool(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(u32::try_from(SESSIONS)?)
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 200")
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+                .await?,
+        );
+
+        let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+        let claims: Vec<_> = (0..SESSIONS)
+            .map(|session| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    seed_started_effect(&store, &format!("contended-{session}")).await
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        sqlx::query("ROLLBACK").execute(&mut holder).await?;
+
+        for claim in claims {
+            let (_task, key) = claim.await??;
+            let record = store.effect(&key).await?.context("the claimed effect")?;
+            assert!(record.state.is_started(), "{key}: {:?}", record.state);
+        }
+        assert!(
+            store.lock_conflict_retries() > 0,
+            "the writer held the lock, so some transaction must have retried"
+        );
+        Ok(())
+    }
+
+    /// The autocommit writes retry too: eight requests claim and record an
+    /// idempotency key (the first write of `CreateThread`, `ForkThread`,
+    /// `DecideConfirmation` and `AnswerQuestion`) while another writer holds
+    /// the lock longer than the busy timeout. Every claim is `Fresh` and every
+    /// record lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idempotency_claims_survive_a_writer_that_holds_the_lock_past_the_busy_timeout()
+    -> Result<()> {
+        use agent_server::journal::idempotency::{
+            IdempotencyClaim, IdempotencyKind, IdempotencyRecord,
+        };
+        use sqlx::Connection as _;
+
+        const REQUESTS: usize = 8;
+        let dir = tempfile::tempdir()?;
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("claims.db").display()
+        );
+        drop(SqliteDurableStore::connect(&url).await?);
+        let store = SqliteDurableStore::from_pool(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(u32::try_from(REQUESTS)?)
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 200")
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+                .await?,
+        );
+
+        let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|request| {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let request_id = format!("req-{request}");
+                    let claim = store
+                        .claim_idempotency(&request_id, IdempotencyKind::CreateThread, b"print")
+                        .await?;
+                    anyhow::ensure!(
+                        matches!(claim, IdempotencyClaim::Fresh),
+                        "{request_id}: {claim:?}"
+                    );
+                    store
+                        .record_idempotency(IdempotencyRecord {
+                            request_id: request_id.clone(),
+                            kind: IdempotencyKind::CreateThread,
+                            fingerprint: b"print".to_vec(),
+                            result_json: serde_json::json!({ "thread": request }),
+                        })
+                        .await?;
+                    Ok::<_, anyhow::Error>(request_id)
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        sqlx::query("ROLLBACK").execute(&mut holder).await?;
+
+        for request in requests {
+            let request_id = request.await??;
+            let replay = store
+                .claim_idempotency(&request_id, IdempotencyKind::CreateThread, b"print")
+                .await?;
+            assert!(
+                matches!(replay, IdempotencyClaim::Replay(_)),
+                "{request_id} was recorded: {replay:?}"
+            );
+        }
+        assert!(
+            store.lock_conflict_retries() > 0,
+            "the writer held the lock, so some write must have retried"
         );
         Ok(())
     }

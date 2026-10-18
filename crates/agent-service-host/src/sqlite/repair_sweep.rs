@@ -193,10 +193,13 @@ async fn repair_one_thread(
     thread_id: &ThreadId,
     now: OffsetDateTime,
 ) -> Result<ThreadRepair> {
-    let mut tx = pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .context("begin repair transaction")?;
+    let mut tx = super::store::retry_busy(
+        &std::sync::atomic::AtomicU64::new(0),
+        "begin a repair transaction",
+        || pool.begin_with("BEGIN IMMEDIATE"),
+    )
+    .await
+    .context("begin repair transaction")?;
 
     if let Some(live_task) = live_task_on_thread(&mut tx, thread_id).await? {
         return Ok(ThreadRepair::Deferred { live_task });
