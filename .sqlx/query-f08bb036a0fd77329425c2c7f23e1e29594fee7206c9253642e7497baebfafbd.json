@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_sdk_host_epochs SET superseded_at = $1 WHERE epoch_id <> $2 AND superseded_at IS NULL AND recovery IN ($3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f08bb036a0fd77329425c2c7f23e1e29594fee7206c9253642e7497baebfafbd"
+}

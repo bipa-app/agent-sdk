@@ -99,7 +99,8 @@ fn main() -> Result<()> {
                 .await
                 .context("initializing service host")?;
             // Before the transport serves a write: a lease granted before
-            // the epoch begins would be reclaimed as foreign at start.
+            // the epoch begins would be reclaimed as foreign at start. Under
+            // `PostgresLeader` this also waits for the store's leader lock.
             host.begin_epoch()
                 .await
                 .context("beginning the host's epoch")?;

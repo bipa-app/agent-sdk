@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Host: one leader per Postgres store, and epoch fencing
+
+- **Breaking:** `EpochRecovery::PostgresLeader`. Before it begins its
+  epoch, a Postgres host takes the store's leader advisory lock (two-key,
+  per schema) on a dedicated connection and holds it for its whole life. A
+  second host (a rolling deploy) waits for the lock, ready, with no workers.
+  The lock dies with its connection, so a killed host frees it at once, and
+  a host that fails or is dropped after taking it frees it on drop. A
+  retried `begin_epoch` reuses the lock it holds. The leader pings the lock
+  connection every 1 s, each ping bounded by 2 s. On loss it stops
+  acquiring at once, records `lost`, and shuts down; `run` then returns an
+  error, not `Ok`. It releases the lock only after its workers have
+  drained. On SQLite and in memory the mode behaves as `SingleHost`. Code
+  that matches `EpochRecovery` exhaustively needs the new arm.
+- **Breaking: epoch fencing (migration 0038).** Epoch rows record the
+  recovery mode they began under (`EpochRecord::recovery`,
+  `EpochRecord::with_recovery`). An epoch begun under an exclusive mode
+  (`single_host`, `postgres_leader`; `EXCLUSIVE_RECOVERY`) marks every
+  other exclusive epoch superseded in the same transaction. From then on
+  every backend refuses a superseded epoch's lease grants (acquire,
+  targeted acquire, confirmation approval), heartbeats, and commits guarded
+  by its leases (`Rejected::Guard`, `EpochSuperseded`). A host that lost
+  its lock therefore cannot acquire, extend or settle anything once its
+  successor began, whatever its own monitor has noticed yet. `lease_expiry`
+  epochs, and epochs from before 0038, are never fenced.
+- **Breaking:** `LeaseRecoveryScope::SupersededEpochs`, and
+  `LeaseRecoveryScope::reclaims` takes a `superseded` predicate. A
+  `PostgresLeader` successor waits out the lost leader's detection window
+  and abort grace (about 6 s, only when leases are live), then reclaims at
+  once only the leases of superseded epochs. The leases of hosts in another
+  mode, or of no epoch, wait for expiry, so the switch-over deploy from
+  `LeaseExpiry` may overlap. `SingleHost` is unchanged (it keeps
+  `ForeignEpoch`), but its epochs now supersede, and so fence, earlier
+  exclusive epochs.
+- **Breaking:** `ServiceHealth.leadership` (`not_applicable`, `standby`,
+  `leader`, `lost`); `ServiceHealth` and `Leadership` are
+  `#[non_exhaustive]`. A standby host is ready (`/readyz` 200) with no
+  sweep and no workers, so a rolling deploy can route to it and stop the
+  old host. It serves nothing else until it leads: the host binary and
+  `LocalDaemon` open their gRPC port after `begin_epoch`. A host that lost
+  its lock is neither ready nor live. The HTTP health endpoint now starts
+  before the epoch, so a waiting host answers its probes.
+- The lock costs one server connection beyond the pool, and session
+  advisory locks do not work behind a transaction-mode pooler (`PgBouncer`).
+- `StoreRegistry::postgres_pool` no longer needs the `otel` feature.
+- Signals: `agent_server.leader{state=waiting|acquired|lost|released}`,
+  `agent_server.leader.is_leader` (summed per store, more than 1 is two
+  leaders), the `leader.acquire` span with `agent_server.leader.waited_ms`,
+  and `agent_server.epoch.reclaims{scope=superseded_epoch}`.
+- **Migration 0038** adds two nullable columns to `agent_sdk_host_epochs`
+  (`recovery`, `superseded_at`). Catalog-only; it locks only that small
+  table (`AccessExclusiveLock`, bounded by `lock_timeout = 5s`) and never
+  `agent_sdk_tasks`. 2.4 ms on a store with 1M task rows and 2,000 epochs.
+  A previous binary refuses a migrated store ("migration 38 was previously
+  applied but is missing"). Rollback, either backend:
+  `ALTER TABLE agent_sdk_host_epochs DROP COLUMN recovery, DROP COLUMN superseded_at;`
+  (SQLite: one `DROP COLUMN` per statement), then
+  `DELETE FROM _sqlx_migrations WHERE version = 38;`.
+- **satoshi:** a deploy of this release changes nothing until a host opts
+  in. To switch to `PostgresLeader`, roll it out normally: the first leader
+  leaves the old `LeaseExpiry` pods' leases to expire. From then on, run
+  every pod in this mode, gate `HostBridge::submit_turn` on
+  `ServiceHost::begin_epoch`, and point the readiness probe at the host's
+  `/readyz`.
+
 ### Fixed: a SQLite write no longer fails at `BEGIN` on a long-held lock
 
 - `SqliteDurableStore` retries a `BEGIN IMMEDIATE` that found the database

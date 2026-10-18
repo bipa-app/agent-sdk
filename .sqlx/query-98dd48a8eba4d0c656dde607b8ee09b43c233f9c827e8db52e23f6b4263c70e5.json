@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sdk_host_epochs SET superseded_at = ?1 WHERE epoch_id <> ?2 AND superseded_at IS NULL AND recovery IN (?3, ?4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "98dd48a8eba4d0c656dde607b8ee09b43c233f9c827e8db52e23f6b4263c70e5"
+}

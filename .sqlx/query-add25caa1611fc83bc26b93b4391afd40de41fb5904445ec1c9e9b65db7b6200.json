@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT e.superseded_at IS NOT NULL AS \"superseded!: bool\" FROM agent_sdk_tasks t\n               JOIN agent_sdk_host_epochs e ON e.epoch_id = t.lease_epoch WHERE t.id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "superseded!: bool",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "add25caa1611fc83bc26b93b4391afd40de41fb5904445ec1c9e9b65db7b6200"
+}

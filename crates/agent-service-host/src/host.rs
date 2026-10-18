@@ -48,6 +48,9 @@
 //! [`StoreRegistry`]: super::stores::StoreRegistry
 //! [`HealthSurface`]: super::health::HealthSurface
 
+#[cfg(feature = "postgres")]
+mod leader;
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -125,6 +128,15 @@ pub struct ServiceHost {
     shutdown: CancellationToken,
     /// The epoch this process began, once [`Self::begin_epoch`] ran.
     epoch: tokio::sync::OnceCell<EpochId>,
+    /// The HTTP health server, started once by [`Self::serve_probes`].
+    http_health: tokio::sync::Mutex<Probes>,
+    /// The store's leader lock under [`EpochRecovery::PostgresLeader`],
+    /// held from [`Self::begin_epoch`] until `run` has drained its workers.
+    #[cfg(feature = "postgres")]
+    leader_lock: tokio::sync::Mutex<Option<leader::LeaderLock>>,
+    /// Whether the workers may acquire: cleared the moment a held leader
+    /// lock is lost, before the shutdown it starts reaches them.
+    acquiring: Arc<std::sync::atomic::AtomicBool>,
     /// Hold the `db.pool.connections.{active,idle}`
     /// `ObservableGauge` handles for the host's lifetime so the
     /// callback registrations are not dropped early.  Empty unless
@@ -162,6 +174,10 @@ impl ServiceHost {
             metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
             epoch: tokio::sync::OnceCell::new(),
+            http_health: tokio::sync::Mutex::new(Probes::NotStarted),
+            #[cfg(feature = "postgres")]
+            leader_lock: tokio::sync::Mutex::new(None),
+            acquiring: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
         })
@@ -189,6 +205,10 @@ impl ServiceHost {
             metrics: default_metrics_recorder(),
             shutdown: CancellationToken::new(),
             epoch: tokio::sync::OnceCell::new(),
+            http_health: tokio::sync::Mutex::new(Probes::NotStarted),
+            #[cfg(feature = "postgres")]
+            leader_lock: tokio::sync::Mutex::new(None),
+            acquiring: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "otel")]
             _pool_gauges: pool_gauges,
         })
@@ -394,17 +414,89 @@ impl ServiceHost {
     ///
     /// # Errors
     /// The epoch could not be begun.
+    ///
+    /// Under [`EpochRecovery::PostgresLeader`] it first serves the health
+    /// probes, then waits for the store's leader lock, so a standby host is
+    /// probed as ready and writes nothing until it leads. It gives up when
+    /// the host shuts down.
     pub async fn begin_epoch(&self) -> Result<EpochId> {
         self.epoch
-            .get_or_try_init(|| {
+            .get_or_try_init(|| async {
+                #[cfg(feature = "postgres")]
+                self.take_leader_lock().await?;
                 begin_epoch_and_reclaim(
                     &self.stores,
                     self.config.worker.epoch_recovery,
                     time::OffsetDateTime::now_utc(),
                 )
+                .await
             })
             .await
             .cloned()
+    }
+
+    /// Under [`EpochRecovery::PostgresLeader`], serve the probes and wait
+    /// for the store's leader lock, or for a shutdown.
+    #[cfg(feature = "postgres")]
+    async fn take_leader_lock(&self) -> Result<()> {
+        if self.config.worker.epoch_recovery != EpochRecovery::PostgresLeader {
+            return Ok(());
+        }
+        self.serve_probes().await?;
+        // A `begin_epoch` retried after a failure keeps the lock it took:
+        // a second connection would wait on this host's own lock forever.
+        let mut held = self.leader_lock.lock().await;
+        if held.is_some() {
+            return Ok(());
+        }
+        let acquire = leader::acquire(
+            &self.stores,
+            leader::LeaderSignals {
+                health: Arc::clone(&self.health),
+                acquiring: Arc::clone(&self.acquiring),
+                shutdown: self.shutdown.clone(),
+            },
+        );
+        *held = tokio::select! {
+            lock = acquire => lock?,
+            () = self.shutdown.cancelled() => {
+                anyhow::bail!("shut down while waiting for the store's leader lock")
+            }
+        };
+        drop(held);
+        Ok(())
+    }
+
+    /// Start the HTTP health server once (when HTTP is on).
+    async fn serve_probes(&self) -> Result<()> {
+        // Held across the spawn, so two callers cannot both start one.
+        let mut probes = self.http_health.lock().await;
+        if matches!(*probes, Probes::NotStarted) {
+            *probes = Probes::Started(self.spawn_http_health().await?);
+        }
+        drop(probes);
+        Ok(())
+    }
+
+    /// Take the HTTP health server's handle (`None` when HTTP is off, or
+    /// when the probes were never started or already taken).
+    async fn take_probes(&self) -> Option<HttpHealthHandle> {
+        let mut probes = self.http_health.lock().await;
+        match std::mem::replace(&mut *probes, Probes::Started(None)) {
+            Probes::Started(handle) => handle,
+            Probes::NotStarted => {
+                *probes = Probes::NotStarted;
+                None
+            }
+        }
+    }
+
+    async fn stop_probes(&self) {
+        if let Some(handle) = self.take_probes().await
+            && let Err(err) = handle.shutdown().await
+        {
+            warn!(error = %err, "HTTP health server exited with error");
+        }
     }
 
     /// Token that, when cancelled, triggers graceful shutdown.
@@ -440,7 +532,33 @@ impl ServiceHost {
             signal(SignalKind::terminate()).context("registering SIGTERM handler")?
         };
 
-        self.begin_epoch().await?;
+        // Probes first, so a host waiting for the leader lock answers them.
+        self.serve_probes().await?;
+        #[cfg(unix)]
+        let stopped = wait_for_shutdown(&self.shutdown, &mut sigterm);
+        #[cfg(not(unix))]
+        let stopped = wait_for_shutdown(&self.shutdown);
+        tokio::select! {
+            begun = self.begin_epoch() => {
+                // A standby host that is told to stop gives up its wait;
+                // that is a clean stop, not a failure.
+                if let Err(err) = begun {
+                    if !self.shutdown.is_cancelled() {
+                        return Err(err);
+                    }
+                    info!("shut down before the epoch began");
+                    self.stop_probes().await;
+                    return Ok(());
+                }
+            }
+            stopped = stopped => {
+                stopped?;
+                info!("shut down before the epoch began");
+                self.stop_probes().await;
+                return Ok(());
+            }
+        }
+        let http_health_handle = self.take_probes().await;
 
         // Before any worker can pick up a task a previous process left
         // under a terminal root.
@@ -475,7 +593,6 @@ impl ServiceHost {
         let relay_handle = self.spawn_relay_scheduler()?;
         let watch_handle = self.spawn_watch_scheduler();
         let janitor_handle = self.spawn_retention_janitor();
-        let http_health_handle = self.spawn_http_health().await?;
         #[cfg(feature = "otel")]
         record_parked_waits(&self.stores).await;
 
@@ -495,16 +612,31 @@ impl ServiceHost {
         #[cfg(not(unix))]
         wait_for_shutdown(&self.shutdown).await?;
 
-        self.drain_background_tasks(BackgroundHandles {
-            sweep: sweep_handle,
-            workers: worker_handles,
-            wakeup: wakeup_handle,
-            relay: relay_handle,
-            watch: watch_handle,
-            janitor: janitor_handle,
-            http_health: http_health_handle,
-        })
-        .await?;
+        let drained = self
+            .drain_background_tasks(BackgroundHandles {
+                sweep: sweep_handle,
+                workers: worker_handles,
+                wakeup: wakeup_handle,
+                relay: relay_handle,
+                watch: watch_handle,
+                janitor: janitor_handle,
+                http_health: http_health_handle,
+            })
+            .await;
+        // After the drain, so a successor never reclaims a finishing lease.
+        #[cfg(feature = "postgres")]
+        {
+            let leader_lock = self.leader_lock.lock().await.take();
+            if let Some(lock) = leader_lock {
+                lock.release().await;
+            }
+        }
+        drained?;
+        if self.health.snapshot().leadership == super::health::Leadership::Lost {
+            anyhow::bail!(
+                "the host lost the store's leader lock and stopped; another host may lead now"
+            );
+        }
         info!("service host stopped");
         Ok(())
     }
@@ -583,6 +715,7 @@ impl ServiceHost {
                 poll_interval: self.config.worker.acquisition_interval(),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
+                acquiring: Arc::clone(&self.acquiring),
             };
             handles.push(tokio::spawn(worker_loop(params)));
         }
@@ -830,6 +963,13 @@ async fn wait_for_shutdown(shutdown: &CancellationToken) -> Result<()> {
 // Lease sweep loop
 // ─────────────────────────────────────────────────────────────────────
 
+/// Whether a host has started its HTTP health server.
+enum Probes {
+    NotStarted,
+    /// Started; the handle is `None` when HTTP is off or once it was taken.
+    Started(Option<HttpHealthHandle>),
+}
+
 /// Periodic lease-expiry sweep.
 ///
 /// Runs [`AgentTaskStore::release_expired_leases`] at the configured
@@ -1018,8 +1158,13 @@ fn forward_settlement(
 ///
 /// # Errors
 /// The store refused or failed the commit.
-async fn begin_epoch(stores: &StoreRegistry, now: time::OffsetDateTime) -> Result<EpochId> {
-    let record = EpochRecord::begin(now, Some(format!("pid {}", std::process::id())));
+async fn begin_epoch(
+    stores: &StoreRegistry,
+    recovery: EpochRecovery,
+    now: time::OffsetDateTime,
+) -> Result<EpochId> {
+    let record = EpochRecord::begin(now, Some(format!("pid {}", std::process::id())))
+        .with_recovery(recovery.as_str());
     let epoch = record.id.clone();
     stores
         .task_store
@@ -1118,6 +1263,37 @@ impl EpochSpan {
 /// # Errors
 /// The epoch could not be begun. A failed reclaim is only logged: the
 /// leases then expire as they would without epochs.
+/// Before a new leader reclaims the old epoch's leases, let the old leader's
+/// in-flight work stop. A leader that lost its lock (its connection died
+/// while it lived) runs on for up to its detection window, then its
+/// executions get [`EXECUTION_ABORT_GRACE`] to end. The store already
+/// refuses its acquires, heartbeats and commits; the wait keeps its
+/// running tools from overlapping the successor's re-runs. Nothing to wait
+/// for when no lease is live.
+async fn wait_out_lost_leader(stores: &StoreRegistry) {
+    #[cfg(feature = "postgres")]
+    {
+        if stores.postgres_pool().is_none() {
+            return;
+        }
+        let live = stores
+            .task_store
+            .list_by_status(agent_server::journal::task::TaskStatus::Running)
+            .await
+            .map_or(true, |running| !running.is_empty());
+        if live {
+            let wait = leader::DETECTION_WINDOW + EXECUTION_ABORT_GRACE;
+            info!(
+                wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                "waiting out the previous leader's detection window before reclaiming its leases"
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = stores;
+}
+
 async fn begin_epoch_and_reclaim(
     stores: &StoreRegistry,
     recovery: EpochRecovery,
@@ -1132,7 +1308,10 @@ async fn begin_epoch_and_reclaim(
         outcome = tracing::field::Empty,
     );
     let mut otel = EpochSpan::begin(recovery);
-    let epoch = match begin_epoch(stores, now).instrument(span.clone()).await {
+    let epoch = match begin_epoch(stores, recovery, now)
+        .instrument(span.clone())
+        .await
+    {
         Ok(epoch) => epoch,
         Err(e) => {
             otel.outcome("error");
@@ -1146,8 +1325,16 @@ async fn begin_epoch_and_reclaim(
             span.record("outcome", "ok");
             otel.outcome("ok");
         }
-        EpochRecovery::SingleHost => {
-            let scope = LeaseRecoveryScope::ForeignEpoch(epoch.clone());
+        EpochRecovery::SingleHost | EpochRecovery::PostgresLeader => {
+            // A leader reclaims at once only the leases of epochs it
+            // superseded (exclusive ones). The leases of a host that runs
+            // another mode (a switch-over deploy) wait for expiry.
+            let scope = if recovery == EpochRecovery::PostgresLeader {
+                wait_out_lost_leader(stores).instrument(span.clone()).await;
+                LeaseRecoveryScope::SupersededEpochs
+            } else {
+                LeaseRecoveryScope::ForeignEpoch(epoch.clone())
+            };
             match drain_leases(stores, None, now, &scope)
                 .instrument(span.clone())
                 .await
@@ -1378,6 +1565,8 @@ struct WorkerLoopParams {
     poll_interval: std::time::Duration,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
+    /// See [`ServiceHost`]'s `acquiring`.
+    acquiring: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct TaskRunIntervals {
@@ -1416,6 +1605,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         poll_interval,
         wakeup_signal,
         cancel,
+        acquiring,
     } = params;
     let worker_id = WorkerId::from_string(format!("worker-{index}"));
     info!(%worker_id, "worker started");
@@ -1450,7 +1640,7 @@ async fn worker_loop(params: WorkerLoopParams) {
             () = wakeup_signal.wait_for_nudge() => {}
         }
 
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || !acquiring.load(std::sync::atomic::Ordering::SeqCst) {
             info!(%worker_id, "worker shutting down");
             return;
         }

@@ -72,6 +72,28 @@ pub enum LatencyLayerHealth {
     NotConfigured,
 }
 
+/// Whether this host leads its store, under
+/// [`EpochRecovery::PostgresLeader`](crate::config::EpochRecovery::PostgresLeader).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Leadership {
+    /// The host takes no leader lock.
+    #[default]
+    NotApplicable,
+    /// Another host leads; this one waits for the lock without workers.
+    /// It reports ready so a rolling deploy (`maxUnavailable: 0`) can
+    /// route to it and stop the old host, which frees the lock. It serves
+    /// nothing else until it leads: the host binary and `LocalDaemon`
+    /// open their gRPC port only after `ServiceHost::begin_epoch`, so a
+    /// standby pod is ready with that port still closed.
+    Standby,
+    /// This host holds the store's leader lock.
+    Leader,
+    /// The lock's connection died; the host is shutting down.
+    Lost,
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Snapshot
 // ─────────────────────────────────────────────────────────────────────
@@ -81,6 +103,7 @@ pub enum LatencyLayerHealth {
 /// Cheap to construct (no heap allocation) and suitable for
 /// serialization into a probe response body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ServiceHealth {
     /// Aggregate status.
     pub status: HealthStatus,
@@ -92,6 +115,8 @@ pub struct ServiceHealth {
     pub sweep_loop_alive: bool,
     /// Whether the worker pool background tasks are alive.
     pub worker_pool_alive: bool,
+    /// Whether this host leads its store.
+    pub leadership: Leadership,
 }
 
 impl ServiceHealth {
@@ -147,6 +172,8 @@ pub struct HealthSurface {
     latency_layer: AtomicU8,
     sweep_alive: AtomicBool,
     workers_alive: AtomicBool,
+    /// 0 = `NotApplicable`, 1 = `Standby`, 2 = `Leader`, 3 = `Lost`
+    leadership: AtomicU8,
 }
 
 impl Default for HealthSurface {
@@ -157,6 +184,7 @@ impl Default for HealthSurface {
             latency_layer: AtomicU8::new(2), // NotConfigured
             sweep_alive: AtomicBool::new(false),
             workers_alive: AtomicBool::new(false),
+            leadership: AtomicU8::new(0),
         }
     }
 }
@@ -189,6 +217,17 @@ impl HealthSurface {
         self.core.store(val, Ordering::Relaxed);
     }
 
+    /// Update whether this host leads its store.
+    pub fn set_leadership(&self, leadership: Leadership) {
+        let val = match leadership {
+            Leadership::NotApplicable => 0,
+            Leadership::Standby => 1,
+            Leadership::Leader => 2,
+            Leadership::Lost => 3,
+        };
+        self.leadership.store(val, Ordering::Relaxed);
+    }
+
     /// Update latency-layer health.
     pub fn set_latency_layer(&self, health: LatencyLayerHealth) {
         let val = match health {
@@ -215,13 +254,23 @@ impl HealthSurface {
         };
         let sweep_loop_alive = self.sweep_alive.load(Ordering::Relaxed);
         let workers_alive = self.workers_alive.load(Ordering::Relaxed);
-
-        // Derive core health from component liveness.
-        let effective_core = if core == CoreHealth::Healthy && sweep_loop_alive && workers_alive {
-            CoreHealth::Healthy
-        } else {
-            CoreHealth::Unhealthy
+        let leadership = match self.leadership.load(Ordering::Relaxed) {
+            1 => Leadership::Standby,
+            2 => Leadership::Leader,
+            3 => Leadership::Lost,
+            _ => Leadership::NotApplicable,
         };
+
+        // Derive core health from component liveness. A standby host runs
+        // no sweep and no workers by design, and stays ready.
+        let components_alive =
+            leadership == Leadership::Standby || (sweep_loop_alive && workers_alive);
+        let effective_core =
+            if core == CoreHealth::Healthy && components_alive && leadership != Leadership::Lost {
+                CoreHealth::Healthy
+            } else {
+                CoreHealth::Unhealthy
+            };
 
         let status = match (effective_core, latency_layer) {
             (CoreHealth::Unhealthy, _) => HealthStatus::Unhealthy,
@@ -235,6 +284,7 @@ impl HealthSurface {
             latency_layer,
             sweep_loop_alive,
             worker_pool_alive: workers_alive,
+            leadership,
         }
     }
 }
@@ -352,8 +402,10 @@ mod tests {
             latency_layer: LatencyLayerHealth::Degraded,
             sweep_loop_alive: true,
             worker_pool_alive: true,
+            leadership: Leadership::Standby,
         };
         let json: serde_json::Value = serde_json::from_slice(&health.to_json_bytes()?)?;
+        assert_eq!(json["leadership"], "standby");
         assert_eq!(json["status"], "degraded");
         assert_eq!(json["core"], "healthy");
         assert_eq!(json["latency_layer"], "degraded");
@@ -370,9 +422,36 @@ mod tests {
             latency_layer: LatencyLayerHealth::NotConfigured,
             sweep_loop_alive: true,
             worker_pool_alive: true,
+            leadership: Leadership::NotApplicable,
         };
         let json: serde_json::Value = serde_json::from_slice(&health.to_json_bytes()?)?;
         assert_eq!(json["latency_layer"], "not_configured");
         Ok(())
+    }
+
+    /// A rolling deploy routes to the new host before the old one stops, so
+    /// a host waiting for the leader lock (no sweep, no workers) is ready.
+    #[test]
+    fn a_standby_host_is_ready_and_a_host_that_lost_its_lock_is_not() {
+        let surface = HealthSurface::default();
+        assert!(
+            !surface.snapshot().is_ready(),
+            "no workers and no leader lock"
+        );
+
+        surface.set_leadership(Leadership::Standby);
+        let standby = surface.snapshot();
+        assert!(standby.is_ready() && standby.is_live(), "{standby:?}");
+        assert_eq!(standby.leadership, Leadership::Standby);
+
+        surface.set_leadership(Leadership::Leader);
+        assert!(!surface.snapshot().is_ready(), "a leader needs its workers");
+        surface.set_sweep_alive(true);
+        surface.set_workers_alive(true);
+        assert!(surface.snapshot().is_ready());
+
+        surface.set_leadership(Leadership::Lost);
+        let lost = surface.snapshot();
+        assert!(!lost.is_ready() && !lost.is_live(), "{lost:?}");
     }
 }

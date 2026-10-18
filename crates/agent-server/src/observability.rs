@@ -123,6 +123,9 @@ pub mod attrs {
     pub const THREAD_STATUS: &str = "thread_status";
     /// What happened to an effect (`agent_server.effects`).
     pub const TRANSITION: &str = "transition";
+    /// A host's leader-lock state (`agent_server.leader`): `waiting`,
+    /// `acquired`, `lost` or `released`.
+    pub const LEADER_STATE: &str = "state";
     /// Span-only: the kind of the effect an `effect.run` span runs.
     pub const SPAN_EFFECT_KIND: &str = "agent_server.effect.kind";
     /// Span-only: the state an `effect.run` span's effect ended in.
@@ -389,6 +392,12 @@ pub struct ServerMetrics {
     /// `agent_server.subagent.stalls`: subagent child roots failed for
     /// silence, by leg.
     pub(crate) subagent_stalls: Counter<u64>,
+    /// `agent_server.leader`: leader-lock transitions, by state.
+    pub(crate) leader: Counter<u64>,
+    /// `agent_server.leader.is_leader`: hosts that hold their store's
+    /// leader lock now. Summed across hosts, more than 1 per store is two
+    /// leaders.
+    pub(crate) is_leader: UpDownCounter<i64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -535,6 +544,22 @@ impl ServerMetrics {
                     KeyValue::new(attrs::ACTION, action),
                 ],
             );
+        }
+    }
+
+    /// Count one leader-lock transition (`waiting`, `acquired`, `lost`,
+    /// `released`).
+    ///
+    /// `acquired` raises `agent_server.leader.is_leader` and `released`
+    /// lowers it. A host that loses its lock counts as a leader until it
+    /// has drained and released, which is the window to watch.
+    pub fn record_leader(&self, state: &'static str) {
+        self.leader
+            .add(1, &[KeyValue::new(attrs::LEADER_STATE, state)]);
+        match state {
+            "acquired" => self.is_leader.add(1, &[]),
+            "released" => self.is_leader.add(-1, &[]),
+            _ => {}
         }
     }
 
@@ -977,10 +1002,6 @@ impl ServerMetrics {
     fn build(scope: &'static str) -> Self {
         let meter = global::meter(scope);
 
-        let workers_active = meter
-            .i64_up_down_counter("agent_server.workers.active")
-            .with_description("Active worker processes ready to acquire tasks.")
-            .build();
         let tasks_acquired = meter
             .u64_counter("agent_server.tasks.acquired")
             .with_description("Tasks acquired by a worker for execution.")
@@ -1045,7 +1066,7 @@ impl ServerMetrics {
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
 
         Self {
-            workers_active,
+            workers_active: workers_active_counter(&meter),
             tasks_acquired,
             tasks_execution_duration,
             tasks_lease_expired: lease_expired_counter(&meter),
@@ -1077,6 +1098,8 @@ impl ServerMetrics {
             progress_refused,
             completion_hook_refused,
             subagent_stalls,
+            leader: leader_counter(&meter),
+            is_leader: is_leader_gauge(&meter),
             meter,
         }
     }
@@ -1147,6 +1170,33 @@ fn progress_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>,
         )
         .build();
     (events, refused)
+}
+
+/// `agent_server.workers.active`.
+fn workers_active_counter(meter: &opentelemetry::metrics::Meter) -> UpDownCounter<i64> {
+    meter
+        .i64_up_down_counter("agent_server.workers.active")
+        .with_description("Active worker processes ready to acquire tasks.")
+        .build()
+}
+
+/// `agent_server.leader.is_leader`.
+fn is_leader_gauge(meter: &opentelemetry::metrics::Meter) -> UpDownCounter<i64> {
+    meter
+        .i64_up_down_counter("agent_server.leader.is_leader")
+        .with_description("Hosts that hold their store's leader lock now.")
+        .build()
+}
+
+/// `agent_server.leader`.
+fn leader_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> {
+    meter
+        .u64_counter("agent_server.leader")
+        .with_description(
+            "Leader-lock transitions of a host under EpochRecovery::PostgresLeader: \
+             waiting, acquired, lost, released.",
+        )
+        .build()
 }
 
 /// `agent_server.fence.refused`.

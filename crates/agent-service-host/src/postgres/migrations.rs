@@ -152,11 +152,15 @@ const DOCUMENTS_SQL: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/migrations/postgres/0030_documents.sql"
 ));
+const EPOCH_FENCE_SQL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/migrations/postgres/0038_epoch_recovery_and_fence.sql"
+));
 
 /// `sqlx`-managed migration bundle for the Postgres durable contract.
 pub static DURABLE_CORE_MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-const MIGRATIONS: [PostgresMigration; 28] = [
+const MIGRATIONS: [PostgresMigration; 29] = [
     PostgresMigration {
         version: "0001",
         summary: "current durable core tables, constraints, and indexes",
@@ -296,6 +300,11 @@ const MIGRATIONS: [PostgresMigration; 28] = [
         version: "0030",
         summary: "typed JSON documents written in the same transaction as their transition",
         sql: DOCUMENTS_SQL,
+    },
+    PostgresMigration {
+        version: "0038",
+        summary: "the recovery mode of each epoch, and when a newer exclusive epoch superseded it",
+        sql: EPOCH_FENCE_SQL,
     },
 ];
 
