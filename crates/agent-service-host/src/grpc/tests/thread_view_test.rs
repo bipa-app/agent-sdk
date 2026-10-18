@@ -89,6 +89,12 @@ fn text_delta(message: &str) -> AgentEvent {
     }
 }
 
+fn from_ms(ms: i64) -> Result<OffsetDateTime> {
+    Ok(OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(ms) * 1_000_000,
+    )?)
+}
+
 fn snapshot_view(snapshot: &pb::ThreadViewSnapshot) -> Result<ThreadView> {
     let status: ThreadViewStatus = serde_json::from_str(&snapshot.status_json)?;
     let items = snapshot
@@ -100,6 +106,8 @@ fn snapshot_view(snapshot: &pb::ThreadViewSnapshot) -> Result<ThreadView> {
                 IndexedItem {
                     index: item.index,
                     item: serde_json::from_str(&item.body_json)?,
+                    started_at: item.started_at_ms.map(from_ms).transpose()?,
+                    updated_at: item.updated_at_ms.map(from_ms).transpose()?,
                 },
             ))
         })
@@ -279,7 +287,10 @@ async fn the_stream_snapshot_plus_its_changes_equals_the_store_view() -> Result<
         };
         let ops: Vec<ViewOp> = serde_json::from_str(&change.ops_json)?;
         for op in &ops {
-            ensure!(client.apply(op), "op {op:?} addresses a missing item");
+            ensure!(
+                client.apply_at(op, change.committed_at_ms.map(from_ms).transpose()?),
+                "op {op:?} addresses a missing item"
+            );
         }
         ensure!(client.status.sequence == Some(change.sequence));
     }
@@ -325,7 +336,7 @@ async fn a_skipped_notification_is_backfilled_from_the_journal() -> Result<()> {
             change.sequence
         );
         for op in &serde_json::from_str::<Vec<ViewOp>>(&change.ops_json)? {
-            ensure!(client.apply(op));
+            ensure!(client.apply_at(op, change.committed_at_ms.map(from_ms).transpose()?));
         }
     }
     ensure!(client == folded(&shared, &thread_id).await?);
@@ -365,7 +376,9 @@ async fn a_lagged_subscriber_gets_a_fresh_snapshot() -> Result<()> {
             pb::stream_thread_view_response::Item::Change(change) => {
                 if let Some(view) = client.as_mut() {
                     for op in &serde_json::from_str::<Vec<ViewOp>>(&change.ops_json)? {
-                        ensure!(view.apply(op));
+                        ensure!(
+                            view.apply_at(op, change.committed_at_ms.map(from_ms).transpose()?)
+                        );
                     }
                 }
             }
@@ -420,7 +433,10 @@ async fn an_event_during_the_snapshot_fold_arrives_once() -> Result<()> {
     };
     ensure!(change.sequence == 1);
     for op in &serde_json::from_str::<Vec<ViewOp>>(&change.ops_json)? {
-        ensure!(client.apply(op), "op {op:?} addresses a missing item");
+        ensure!(
+            client.apply_at(op, change.committed_at_ms.map(from_ms).transpose()?),
+            "op {op:?} addresses a missing item"
+        );
     }
     ensure!(
         client == folded(&shared, &thread_id).await?,
@@ -715,6 +731,74 @@ async fn the_cached_view_follows_appends_and_refolds_across_a_hole() -> Result<(
     ensure!(
         refolded == folded(&shared, &thread_id).await?,
         "a cache whose next events were pruned folds the retained events again"
+    );
+    Ok(())
+}
+
+/// A change carries its event's commit time, and a snapshot's items carry
+/// the times of the events that put and last changed them.
+#[tokio::test]
+async fn changes_and_snapshot_items_carry_commit_times() -> Result<()> {
+    let shared = view_shared(enabled())?;
+    let thread_id = thread(&shared, "view-rpc-times").await?;
+    let put_at = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    let ended_at = put_at + time::Duration::seconds(7);
+    let committed = shared
+        .stores
+        .event_repo
+        .commit_event_batch(
+            &thread_id,
+            vec![AgentEvent::start(thread_id.clone(), 1), tool_start("t1")],
+            put_at,
+        )
+        .await?;
+    shared.stores.event_notifier.notify(&committed);
+    let events = GrpcEventService {
+        shared: Arc::clone(&shared),
+    };
+    let mut stream = events
+        .stream_thread_view(Request::new(pb::StreamThreadViewRequest {
+            thread_id: thread_id.0.clone(),
+            item_limit: None,
+        }))
+        .await?
+        .into_inner();
+    let pb::stream_thread_view_response::Item::Snapshot(_) = next_frame(&mut stream).await? else {
+        anyhow::bail!("the stream opens with a snapshot");
+    };
+    let committed = shared
+        .stores
+        .event_repo
+        .commit_event_batch(&thread_id, vec![tool_end("t1")], ended_at)
+        .await?;
+    shared.stores.event_notifier.notify(&committed);
+    let pb::stream_thread_view_response::Item::Change(change) = next_frame(&mut stream).await?
+    else {
+        anyhow::bail!("the tool's end arrives as a change");
+    };
+    assert_eq!(change.committed_at_ms, Some(1_800_000_007_000));
+
+    let snapshot = events
+        .get_thread_view(Request::new(pb::GetThreadViewRequest {
+            thread_id: thread_id.0.clone(),
+            item_limit: None,
+        }))
+        .await?
+        .into_inner();
+    let item = snapshot
+        .items
+        .iter()
+        .find(|item| item.key == "tool:t1")
+        .ok_or_else(|| anyhow::anyhow!("the tool item"))?;
+    assert_eq!(
+        item.started_at_ms,
+        Some(1_800_000_000_000),
+        "put by the tool's start"
+    );
+    assert_eq!(
+        item.updated_at_ms,
+        Some(1_800_000_007_000),
+        "changed by its end"
     );
     Ok(())
 }

@@ -810,7 +810,7 @@ proptest! {
             let ops: Vec<ViewOp> =
                 serde_json::from_str(&wire).map_err(|e| TestCaseError::fail(e.to_string()))?;
             for op in &ops {
-                prop_assert!(client.apply(op), "op {:?} addresses a missing item", op);
+                prop_assert!(client.apply_at(op, Some(at)), "op {:?} addresses a missing item", op);
             }
             let ends_turn = match actions[split + offset] {
                 Action::Done | Action::Cancel => true,
@@ -1032,4 +1032,159 @@ fn the_first_committed_sequence_is_zero_and_folds_once() {
         Some(ViewItem::Text { text, open: true, .. }) if text == "ab"
     ));
     assert_eq!(view.status.sequence, Some(1));
+}
+
+/// Fold `events`, the event at position `i` committed `i` seconds after the
+/// epoch.
+fn timed_view(events: &[AgentEvent]) -> ThreadView {
+    ThreadView::from_events(
+        events.iter().enumerate().map(|(i, event)| {
+            let at = OffsetDateTime::UNIX_EPOCH
+                + time::Duration::seconds(i64::try_from(i).unwrap_or(i64::MAX));
+            (i as u64, at, event)
+        }),
+        &config(),
+    )
+}
+
+fn turn_end(view: &ThreadView) -> Result<(TokenUsage, Option<u64>), String> {
+    view.items
+        .values()
+        .find_map(|indexed| match &indexed.item {
+            ViewItem::TurnEnd {
+                usage, duration_ms, ..
+            } => Some((usage.clone(), *duration_ms)),
+            _ => None,
+        })
+        .ok_or_else(|| "a turn end".to_owned())
+}
+
+/// A turn whose model calls a tool, as the durable worker journals it: two
+/// model calls (the tool round, then the round after the tool result) and
+/// one `TurnComplete` with their summed usage.
+fn tool_turn(turn: usize, tokens_per_call: u32) -> Vec<AgentEvent> {
+    let mut both = usage(tokens_per_call);
+    both.add(&usage(tokens_per_call));
+    vec![
+        tool_start(&format!("t{turn}")),
+        tool_end(&format!("t{turn}"), true),
+        delta(&format!("m{turn}"), "done"),
+        text(&format!("m{turn}"), "done"),
+        AgentEvent::TurnComplete {
+            turn,
+            usage: both,
+            emitter_task_id: Some("root".to_owned()),
+        },
+    ]
+}
+
+#[test]
+fn a_tool_turn_counts_both_model_calls_usage_once() {
+    let mut events = vec![start("root")];
+    events.extend(tool_turn(1, 100));
+    let view = timed_view(&events);
+    let mut both = usage(100);
+    both.add(&usage(100));
+    assert_eq!(
+        view.status.usage.run_so_far, both,
+        "the one TurnComplete carries both calls"
+    );
+    assert_eq!(view.status.usage.turns, 1);
+
+    events.push(done());
+    events.push(start("root"));
+    let again = timed_view(&events);
+    assert_eq!(
+        again.status.usage.run_so_far,
+        TokenUsage::default(),
+        "a root start resets it"
+    );
+}
+
+#[test]
+fn a_failed_run_ends_with_the_usage_of_the_turns_it_completed_and_its_duration()
+-> Result<(), String> {
+    let mut events = vec![start("root")];
+    events.extend(tool_turn(1, 3));
+    events.extend(tool_turn(2, 4));
+    events.push(error(false, Some(TerminalReason::InternalError)));
+    let view = timed_view(&events);
+    let (usage_at_end, duration_ms) = turn_end(&view)?;
+    let mut sum = usage(3);
+    sum.add(&usage(3));
+    sum.add(&usage(4));
+    sum.add(&usage(4));
+    assert_eq!(
+        usage_at_end, sum,
+        "both completed turns, not the last one alone"
+    );
+    assert_eq!(duration_ms, Some(11_000), "Start at 0 s, the error at 11 s");
+
+    let mut cut = vec![start("root")];
+    cut.extend(tool_turn(1, 3).into_iter().take(2));
+    cut.push(error(false, Some(TerminalReason::InternalError)));
+    let (usage_at_end, _) = turn_end(&timed_view(&cut))?;
+    assert_eq!(
+        usage_at_end,
+        TokenUsage::default(),
+        "a turn still in flight when the run fails is not in it",
+    );
+    Ok(())
+}
+
+#[test]
+fn a_done_turn_ends_with_its_own_duration() -> Result<(), String> {
+    let mut events = vec![start("root")];
+    events.extend(tool_turn(1, 3));
+    events.push(done());
+    let view = timed_view(&events);
+    assert_eq!(
+        turn_end(&view)?.1,
+        Some(5),
+        "Done's own duration, not the clock"
+    );
+    Ok(())
+}
+
+#[test]
+fn items_carry_the_time_they_were_put_and_last_changed() -> Result<(), String> {
+    let view = timed_view(&[
+        start("root"),
+        delta("m1", "a"),
+        delta("m1", "b"),
+        text("m1", "ab"),
+    ]);
+    let indexed = view.items.get("msg:m1").ok_or("the message")?;
+    let at = |seconds: i64| Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(seconds));
+    assert_eq!(indexed.started_at, at(1), "the first delta put it");
+    assert_eq!(indexed.updated_at, at(3), "the final text changed it last");
+
+    let mut untimed = ThreadView::default();
+    let (_, ops) = fold(
+        &untimed.status,
+        0,
+        OffsetDateTime::UNIX_EPOCH,
+        &start("root"),
+        &config(),
+    );
+    for op in &ops {
+        untimed.apply(op);
+    }
+    let (_, ops) = fold(
+        &untimed.status,
+        1,
+        OffsetDateTime::UNIX_EPOCH,
+        &delta("m1", "a"),
+        &config(),
+    );
+    for op in &ops {
+        untimed.apply(op);
+    }
+    let untimed = untimed.items.get("msg:m1").ok_or("the message")?;
+    assert_eq!(
+        (untimed.started_at, untimed.updated_at),
+        (None, None),
+        "apply without a time"
+    );
+    Ok(())
 }

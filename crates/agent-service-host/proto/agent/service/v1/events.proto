@@ -656,6 +656,10 @@ message ThreadViewItem {
   uint64 index = 2;
   // JSON of agent_sdk_foundation::view::ViewItem.
   string body_json = 3;
+  // Commit time (unix-epoch milliseconds) of the event that first put the
+  // item, and of the last event that changed it.
+  optional int64 started_at_ms = 4;
+  optional int64 updated_at_ms = 5;
 }
 
 // The view's status and its newest items, at the status's sequence.
@@ -692,6 +696,11 @@ message ThreadViewChange {
   // JSON array of agent_sdk_foundation::view::ViewOp, applied in order; the
   // last op sets the status.
   string ops_json = 3;
+  // Commit time (unix-epoch milliseconds) of the change's event. The items
+  // the ops put or change take it as their `updated_at_ms`, and a new item
+  // as its `started_at_ms` (ThreadView::apply_at). Absent from a host that
+  // predates the field.
+  optional int64 committed_at_ms = 4;
 }
 
 message StreamThreadViewRequest {

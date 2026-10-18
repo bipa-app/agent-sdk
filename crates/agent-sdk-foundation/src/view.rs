@@ -93,6 +93,14 @@ pub enum TurnState {
         turn: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
+        /// The commit time of the turn's `Start`; absent in a status folded
+        /// before the field existed.
+        #[serde(
+            default,
+            with = "time::serde::rfc3339::option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        started_at: Option<OffsetDateTime>,
     },
 }
 
@@ -145,6 +153,12 @@ pub struct UsageView {
     pub turns: usize,
     /// Run totals from the last `Done`, `BudgetExceeded` or `Cancelled`.
     pub run: TokenUsage,
+    /// The usage of the turns the current or last run completed so far (each
+    /// `TurnComplete` carries a whole turn's usage, all its model calls
+    /// included); reset when a root turn starts. A turn still in flight is
+    /// not in it.
+    #[serde(default)]
+    pub run_so_far: TokenUsage,
 }
 
 /// A confirmation the thread waits on. `relayed` marks one copied from
@@ -402,7 +416,14 @@ pub enum ViewItem {
     TurnEnd {
         turn: usize,
         outcome: TurnOutcome,
+        /// The run's usage: the run total `Done`, `BudgetExceeded` and
+        /// `Cancelled` carry, or, for a failed turn, the usage of the turns
+        /// the run completed (`UsageView::run_so_far`).
         usage: TokenUsage,
+        /// How long the run took: `Done`'s own duration, else the time from
+        /// the turn's `Start` to the event that ended it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -491,6 +512,7 @@ fn fold_owned(
         status,
         ops: Vec::new(),
         sequence,
+        at,
     };
     step.status.schema = VIEW_SCHEMA;
     step.status.sequence = Some(sequence);
@@ -503,6 +525,7 @@ struct Step {
     status: ThreadViewStatus,
     ops: Vec<ViewOp>,
     sequence: u64,
+    at: OffsetDateTime,
 }
 
 fn message_key(message_id: &str) -> String {
@@ -517,11 +540,16 @@ fn question_key(tool_call_id: &str) -> String {
     format!("question:{tool_call_id}")
 }
 
-fn run_end(event: &AgentEvent) -> Option<(usize, TokenUsage, TurnOutcome)> {
+/// How a run-ending event ended the run: its turns, usage and outcome, and
+/// its own duration when it carries one.
+type RunEnd = (usize, TokenUsage, TurnOutcome, Option<u64>);
+
+fn run_end(event: &AgentEvent) -> Option<RunEnd> {
     if let AgentEvent::Done {
         total_turns,
         total_usage,
         estimated_cost_usd,
+        duration,
         ..
     } = event
     {
@@ -531,6 +559,7 @@ fn run_end(event: &AgentEvent) -> Option<(usize, TokenUsage, TurnOutcome)> {
             TurnOutcome::Done {
                 estimated_cost_usd: *estimated_cost_usd,
             },
+            Some(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
         ));
     }
     if let AgentEvent::BudgetExceeded {
@@ -544,6 +573,7 @@ fn run_end(event: &AgentEvent) -> Option<(usize, TokenUsage, TurnOutcome)> {
             *total_turns,
             total_usage.clone(),
             TurnOutcome::BudgetExceeded { limit: *limit },
+            None,
         ));
     }
     let AgentEvent::Cancelled {
@@ -561,6 +591,7 @@ fn run_end(event: &AgentEvent) -> Option<(usize, TokenUsage, TurnOutcome)> {
         TurnOutcome::Cancelled {
             reason: reason.clone(),
         },
+        None,
     ))
 }
 
@@ -688,13 +719,14 @@ impl Step {
             AgentEvent::TurnComplete { turn, usage, .. } => {
                 self.status.usage.last_turn = usage.clone();
                 self.status.usage.turns = *turn;
+                self.status.usage.run_so_far.add(usage);
                 self.status.retry = None;
             }
             AgentEvent::Done { .. }
             | AgentEvent::BudgetExceeded { .. }
             | AgentEvent::Cancelled { .. } => {
-                if let Some((turns, usage, outcome)) = run_end(event) {
-                    self.end_turn(turns, &usage, outcome);
+                if let Some((turns, usage, outcome, duration_ms)) = run_end(event) {
+                    self.end_turn(turns, &usage, outcome, duration_ms);
                 }
             }
             AgentEvent::Error {
@@ -855,8 +887,13 @@ impl Step {
     fn start(&mut self, turn: usize, task_id: Option<String>) {
         self.interrupt_open();
         self.resolve_turn_prompts();
-        self.status.turn = TurnState::Running { turn, task_id };
+        self.status.turn = TurnState::Running {
+            turn,
+            task_id,
+            started_at: Some(self.at),
+        };
         self.status.last_outcome = None;
+        self.status.usage.run_so_far = TokenUsage::default();
     }
 
     fn tool_start(
@@ -967,7 +1004,7 @@ impl Step {
         );
         if let Some(reason) = reason.filter(|_| self.status.turn != TurnState::Idle) {
             let turns = self.status.usage.turns;
-            let usage = self.status.usage.last_turn.clone();
+            let usage = self.status.usage.run_so_far.clone();
             self.end_turn(
                 turns,
                 &usage,
@@ -975,6 +1012,7 @@ impl Step {
                     message: message.to_owned(),
                     reason: reason.clone(),
                 },
+                None,
             );
         }
     }
@@ -1184,7 +1222,20 @@ impl Step {
         self.status.retry = None;
     }
 
-    fn end_turn(&mut self, turns: usize, usage: &TokenUsage, outcome: TurnOutcome) {
+    fn end_turn(
+        &mut self,
+        turns: usize,
+        usage: &TokenUsage,
+        outcome: TurnOutcome,
+        duration_ms: Option<u64>,
+    ) {
+        let duration_ms = duration_ms.or_else(|| match &self.status.turn {
+            TurnState::Running {
+                started_at: Some(started_at),
+                ..
+            } => u64::try_from((self.at - *started_at).whole_milliseconds().max(0)).ok(),
+            TurnState::Running { .. } | TurnState::Idle => None,
+        });
         self.interrupt_open();
         self.resolve_turn_prompts();
         self.status.usage.run = usage.clone();
@@ -1195,6 +1246,7 @@ impl Step {
                 turn: turns,
                 outcome: outcome.clone(),
                 usage: usage.clone(),
+                duration_ms,
             },
         );
         self.status.turn = TurnState::Idle;
@@ -1215,11 +1267,34 @@ pub struct ThreadView {
     pub next_index: u64,
 }
 
-/// An item and its position in the timeline.
+/// An item, its position in the timeline, and when it changed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexedItem {
     pub index: u64,
     pub item: ViewItem,
+    /// The commit time of the event that first put the item; absent when
+    /// the op was applied without one.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<OffsetDateTime>,
+    /// The commit time of the last event that changed the item.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+impl IndexedItem {
+    const fn touch(&mut self, at: Option<OffsetDateTime>) {
+        if at.is_some() {
+            self.updated_at = at;
+        }
+    }
 }
 
 impl ThreadView {
@@ -1255,7 +1330,7 @@ impl ThreadView {
         let status = std::mem::take(&mut self.status);
         let (status, ops) = fold_owned(status, sequence, at, event, config);
         for op in ops {
-            self.apply_owned(op);
+            self.apply_owned_at(op, Some(at));
         }
         self.status = status;
     }
@@ -1270,7 +1345,7 @@ impl ThreadView {
     ) -> Vec<ViewOp> {
         let (_, ops) = fold(&self.status, sequence, at, event, config);
         for op in &ops {
-            self.apply(op);
+            self.apply_at(op, Some(at));
         }
         ops
     }
@@ -1278,6 +1353,12 @@ impl ThreadView {
     /// [`Self::apply`] for an op the caller no longer needs: moves its
     /// status and item instead of cloning them.
     pub fn apply_owned(&mut self, op: ViewOp) -> bool {
+        self.apply_owned_at(op, None)
+    }
+
+    /// [`Self::apply_owned`], stamping the items the op touches with `at`,
+    /// the commit time of the event the op came from.
+    pub fn apply_owned_at(&mut self, op: ViewOp, at: Option<OffsetDateTime>) -> bool {
         match op {
             ViewOp::SetStatus { status } => {
                 self.status = *status;
@@ -1286,19 +1367,22 @@ impl ThreadView {
             ViewOp::Put { key, item } => {
                 if let Some(existing) = self.items.get_mut(&key) {
                     existing.item = item;
+                    existing.touch(at);
                 } else {
                     self.items.insert(
                         key,
                         IndexedItem {
                             index: self.next_index,
                             item,
+                            started_at: at,
+                            updated_at: at,
                         },
                     );
                     self.next_index += 1;
                 }
                 true
             }
-            ViewOp::AppendText { .. } | ViewOp::Patch { .. } => self.apply(&op),
+            ViewOp::AppendText { .. } | ViewOp::Patch { .. } => self.apply_at(&op, at),
         }
     }
 
@@ -1306,17 +1390,27 @@ impl ThreadView {
     /// append that addresses an item the view does not have: an item from
     /// before the view's seed or retention floor.
     pub fn apply(&mut self, op: &ViewOp) -> bool {
+        self.apply_at(op, None)
+    }
+
+    /// [`Self::apply`], stamping the items the op touches with `at`, the
+    /// commit time of the event the op came from (a client takes it from the
+    /// change that carried the op).
+    pub fn apply_at(&mut self, op: &ViewOp, at: Option<OffsetDateTime>) -> bool {
         match op {
             ViewOp::SetStatus { status } => self.status = (**status).clone(),
             ViewOp::Put { key, item } => {
                 if let Some(existing) = self.items.get_mut(key) {
                     existing.item = item.clone();
+                    existing.touch(at);
                 } else {
                     self.items.insert(
                         key.clone(),
                         IndexedItem {
                             index: self.next_index,
                             item: item.clone(),
+                            started_at: at,
+                            updated_at: at,
                         },
                     );
                     self.next_index += 1;
@@ -1329,12 +1423,14 @@ impl ThreadView {
                 if let ViewItem::Text { text, .. } = &mut entry.item {
                     text.push_str(delta);
                 }
+                entry.touch(at);
             }
             ViewOp::Patch { key, patch } => {
                 let Some(entry) = self.items.get_mut(key) else {
                     return false;
                 };
                 apply_patch(&mut entry.item, patch);
+                entry.touch(at);
             }
         }
         true

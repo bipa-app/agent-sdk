@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added: commit times, run usage and turn duration in the session view
+
+- Each item records when it was first put and when it last changed:
+  `IndexedItem.started_at` / `updated_at`, and on the wire
+  `ThreadViewItem.started_at_ms` / `updated_at_ms`. The fold's appliers stamp
+  them. `ThreadView::apply_at` / `apply_owned_at` let a client stamp them with
+  a change's time, and `apply` / `apply_owned` behave as before.
+- Each change carries its event's commit time:
+  `ThreadViewChange.committed_at_ms`.
+- `UsageView.run_so_far` holds the usage of the turns the run completed so
+  far, and resets when a root turn starts. A failed turn's `TurnEnd.usage` is
+  now that sum. It used to be the previous `TurnComplete` alone, which a new
+  run did not reset.
+- `TurnEnd.duration_ms` is `Done`'s own duration, otherwise the time from the
+  turn's `Start` (the new `TurnState::Running.started_at`) to the event that
+  ended it.
+- Every new field is additive with a serde default. `VIEW_SCHEMA` stays 1.
+
 ### Server: a failed root turn's work reaches the next turn
 
 - A root turn that ends `Failed` now leaves the thread's next turn what a

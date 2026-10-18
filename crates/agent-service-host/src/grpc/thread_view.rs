@@ -48,11 +48,17 @@ fn json<T: serde::Serialize>(value: &T, what: &'static str) -> Result<String, St
         .map_err(|error| Status::internal(format!("encode {what}: {error}")))
 }
 
+fn unix_ms(at: time::OffsetDateTime) -> i64 {
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
+}
+
 fn item_proto(key: &str, indexed: &IndexedItem) -> Result<pb::ThreadViewItem, Status> {
     Ok(pb::ThreadViewItem {
         key: key.to_owned(),
         index: indexed.index,
         body_json: json(&indexed.item, "view item")?,
+        started_at_ms: indexed.started_at.map(unix_ms),
+        updated_at_ms: indexed.updated_at.map(unix_ms),
     })
 }
 
@@ -242,6 +248,7 @@ fn change_frame(
                 thread_id: thread_id.0.clone(),
                 sequence: event.sequence,
                 ops_json: json(&ops, "view ops")?,
+                committed_at_ms: Some(unix_ms(event.timestamp)),
             },
         )),
     }))
