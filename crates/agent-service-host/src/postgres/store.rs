@@ -8975,6 +8975,52 @@ mod tests {
         Ok(())
     }
 
+    /// Any other database error is neither retried nor marked: it stays a
+    /// plain store failure (`outcome=store`).
+    #[tokio::test]
+    async fn a_transition_that_fails_otherwise_is_not_a_lock_conflict() -> Result<()> {
+        let Some((store, _schema)) = test_store().await? else {
+            return Ok(());
+        };
+        let thread_id = ThreadId::from_string("fails-otherwise");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+        sqlx::query(
+            "CREATE FUNCTION force_failure() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced failure' USING ERRCODE = 'P0001'; END $$",
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER force_failure BEFORE INSERT ON agent_sdk_committed_events \
+             FOR EACH ROW EXECUTE FUNCTION force_failure()",
+        )
+        .execute(store.pool())
+        .await?;
+
+        let rejected = agent_server::journal::DurableStore::commit(
+            &store,
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::AppendEvents {
+                    thread: thread_id,
+                    events: vec![AgentEvent::text("m1", "never lands")],
+                }],
+            },
+            t0(),
+        )
+        .await;
+        let Err(agent_server::journal::Rejected::Store(error)) = rejected else {
+            anyhow::bail!("expected a store error, got {rejected:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<agent_server::journal::LockConflict>(),
+            None,
+            "{error:#}"
+        );
+        assert_eq!(store.lock_conflict_retries(), 0);
+        Ok(())
+    }
+
     /// The child-thread link a root's undelivered input is classified by
     /// is read through an index, never a scan of every task: with
     /// sequential scans priced out, the plan still finds an index to use.

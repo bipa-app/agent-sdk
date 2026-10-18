@@ -3475,6 +3475,36 @@ async fn prepare_mixed_tool_and_reattach_rows_tx(
 /// Applies a transition in one database transaction: the guards are read
 /// first, then the writes in order, then each thread's coalesced outbox
 /// row. Any error drops the transaction, so nothing was written.
+/// Marks a commit that failed because the database stayed locked past the
+/// busy timeout with [`agent_server::journal::LockConflict`] (`retries: 0`:
+/// SQLite's busy handler waited, the store does not retry), so telemetry
+/// counts it as `outcome=lock_conflict`, as on Postgres.
+fn mark_busy(
+    result: Result<agent_server::journal::Committed, agent_server::journal::Rejected>,
+) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+    match result {
+        Err(agent_server::journal::Rejected::Store(error)) if is_busy(&error) => {
+            Err(agent_server::journal::Rejected::Store(error.context(
+                agent_server::journal::LockConflict { retries: 0 },
+            )))
+        }
+        result => result,
+    }
+}
+
+/// Whether `error` is `SQLITE_BUSY` (5) or `SQLITE_LOCKED` (6), in any of
+/// their extended forms (the primary code is the low byte).
+fn is_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .and_then(sqlx::error::DatabaseError::code)
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    })
+}
+
 #[async_trait]
 impl agent_server::journal::DurableStore for SqliteDurableStore {
     async fn commit(
@@ -3484,7 +3514,7 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
         #[cfg(feature = "otel")]
         let (started, guard_count) = (std::time::Instant::now(), transition.guards.len());
-        let result = self.commit_transition(transition, now).await;
+        let result = mark_busy(self.commit_transition(transition, now).await);
         #[cfg(feature = "otel")]
         agent_server::observability::ServerMetrics::global().record_transition(
             agent_server::observability::attrs::BACKEND_SQLITE,
@@ -7110,6 +7140,72 @@ mod tests {
     use agent_server::journal::{Guard, Transition, Write};
 
     use super::SqliteDurableStore;
+
+    /// A commit that cannot get the write lock before the busy timeout is
+    /// marked a lock conflict (`retries: 0`); a commit that fails for any
+    /// other reason is not.
+    #[tokio::test]
+    async fn a_commit_that_stays_locked_is_a_lock_conflict() -> Result<()> {
+        use sqlx::Connection as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("busy.db");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let store = SqliteDurableStore::connect(&url).await?;
+        let thread_id = agent_sdk_foundation::ThreadId::from_string("stays-locked");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+        let append = |thread: &agent_sdk_foundation::ThreadId| Transition {
+            guards: Vec::new(),
+            writes: vec![Write::AppendEvents {
+                thread: thread.clone(),
+                events: vec![AgentEvent::text("m1", "waits")],
+            }],
+        };
+
+        // Another writer holds the lock; this store waits 50 ms, not 5 s.
+        let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+        let impatient = SqliteDurableStore::from_pool(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 50")
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&url)
+                .await?,
+        );
+        let locked =
+            agent_server::journal::DurableStore::commit(&impatient, append(&thread_id), t0()).await;
+        let Err(agent_server::journal::Rejected::Store(error)) = locked else {
+            anyhow::bail!("expected a store error, got {locked:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<agent_server::journal::LockConflict>(),
+            Some(&agent_server::journal::LockConflict { retries: 0 }),
+            "{error:#}"
+        );
+        sqlx::query("ROLLBACK").execute(&mut holder).await?;
+
+        // Unlocked, a commit that fails otherwise (a missing thread) is not
+        // a lock conflict.
+        let missing = agent_sdk_foundation::ThreadId::from_string("never-created");
+        let refused =
+            agent_server::journal::DurableStore::commit(&impatient, append(&missing), t0()).await;
+        let Err(agent_server::journal::Rejected::Store(error)) = refused else {
+            anyhow::bail!("expected a store error, got {refused:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<agent_server::journal::LockConflict>(),
+            None,
+            "{error:#}"
+        );
+        Ok(())
+    }
 
     fn t0() -> time::OffsetDateTime {
         time::OffsetDateTime::UNIX_EPOCH + Duration::seconds(1_700_000_000)

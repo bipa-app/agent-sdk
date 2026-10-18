@@ -1798,9 +1798,16 @@ impl AgentControlService for GrpcControlService {
             })
             .await
             .map_err(|error| {
+                if matches!(error, SubmitRootTurnError::IdempotencyConflict) {
+                    observe_submit_claim(SubmitClaim::Conflict);
+                }
                 map_submit_root_error("SubmitThreadWork", &request.request_id, error)
             })?;
-        observe_submit_claim(outcome.replayed);
+        observe_submit_claim(if outcome.replayed {
+            SubmitClaim::Replay
+        } else {
+            SubmitClaim::Fresh
+        });
 
         Ok(Response::new(pb::SubmitThreadWorkResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
@@ -3238,17 +3245,28 @@ fn observe_idempotency_claim(kind: IdempotencyKind, claim: &IdempotencyClaim) {
     let _ = (kind, claim);
 }
 
-/// Counts a submit's claim, which the store resolves inside the submit
-/// transaction, as `fresh` or `replay` on
-/// `agent_service_host.idempotency.claims`.
-fn observe_submit_claim(replayed: bool) {
+/// What a submit's claim found. The store resolves it inside the submit
+/// transaction, so it never sees `in_flight`.
+#[derive(Clone, Copy)]
+enum SubmitClaim {
+    Fresh,
+    Replay,
+    Conflict,
+}
+
+/// Counts a submit's claim on `agent_service_host.idempotency.claims`.
+fn observe_submit_claim(claim: SubmitClaim) {
     #[cfg(feature = "otel")]
     crate::observability::HostMetrics::global().record_idempotency_outcome(
         IdempotencyKind::SubmitWork,
-        if replayed { "replay" } else { "fresh" },
+        match claim {
+            SubmitClaim::Fresh => "fresh",
+            SubmitClaim::Replay => "replay",
+            SubmitClaim::Conflict => "conflict",
+        },
     );
     #[cfg(not(feature = "otel"))]
-    let _ = replayed;
+    let _ = claim;
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -8855,6 +8873,11 @@ mod tests {
                 open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
             let _ = collect_until_closed(&mut stream).await?;
             submit_text_work(&mut control, "claim-submit", &source, "first").await?;
+            let reused = submit_text_work(&mut control, "claim-submit", &source, "other").await;
+            anyhow::ensure!(
+                reused.is_err(),
+                "a reused request id with other text conflicts"
+            );
             fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
             fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
             anyhow::Ok(())
@@ -8883,6 +8906,10 @@ mod tests {
         assert!(claims("fork_thread", "replay") >= 1, "fork_thread, replay");
         assert!(claims("submit_work", "fresh") >= 1, "submit_work, fresh");
         assert!(claims("submit_work", "replay") >= 1, "submit_work, replay");
+        assert!(
+            claims("submit_work", "conflict") >= 1,
+            "submit_work, conflict"
+        );
         Ok(())
     }
 

@@ -242,7 +242,7 @@ impl HostMetrics {
     /// Count one idempotent request whose claim the store resolved itself
     /// (`submit_work`'s claim runs inside the submit transaction), as
     /// `fresh` or `replay`.
-    pub fn record_idempotency_outcome(
+    pub(crate) fn record_idempotency_outcome(
         &self,
         kind: agent_server::journal::idempotency::IdempotencyKind,
         claim: &'static str,

@@ -180,8 +180,9 @@ pub mod attrs {
     pub const OUTCOME_EXPECTATION: &str = "expectation";
     /// Transition outcome: malformed, refused, or the store failed.
     pub const OUTCOME_STORE: &str = "store";
-    /// A store error that is a lock conflict the store stopped retrying
-    /// ([`crate::journal::LockConflict`]).
+    /// A store error that is a lock conflict the store could not wait out
+    /// ([`crate::journal::LockConflict`]): Postgres after its retries,
+    /// SQLite after its busy timeout.
     pub const OUTCOME_LOCK_CONFLICT: &str = "lock_conflict";
 
     pub const OP_PUT: &str = "put";
