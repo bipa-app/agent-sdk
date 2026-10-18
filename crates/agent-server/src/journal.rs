@@ -580,6 +580,7 @@ mod replay_determinism_test;
 mod replay_test;
 pub mod retention;
 pub mod retention_janitor;
+pub mod root_turn;
 pub mod sibling_order;
 pub mod spawn_children;
 pub mod staged;
@@ -650,6 +651,7 @@ pub use retention::{InMemoryRetentionStore, RetentionCursor, RetentionStore};
 pub use retention_janitor::{
     JanitorCycleReport, RetentionJanitorDeps, RetentionPolicy, run_janitor_cycle,
 };
+pub use root_turn::{RootTurnOutcome, TerminalRootTurn};
 pub use spawn_children::SpawnChildrenExt;
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{

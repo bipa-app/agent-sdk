@@ -59,6 +59,7 @@ use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
+use agent_server::journal::root_turn::TerminalRootTurn;
 use agent_server::journal::sibling_order::{
     HELD_PROBE_WINDOW, HeldProbe, HeldRow, decoded_wait_list, hold_tool_children_behind_siblings,
     mixed_spawn_waits, pure_spawn_waits,
@@ -349,18 +350,20 @@ impl SqliteDurableStore {
                 "cancel rejected: task {root_id} is not running under this worker and lease"
             ));
         }
-        let outcome = Self::cancel_scoped_tx(&mut tx, root_id, scope, now).await?;
+        let (outcome, root_turns) = Self::cancel_scoped_tx(&mut tx, root_id, scope, now).await?;
         tx.commit().await.context("commit cancel_tree")?;
+        TerminalRootTurn::record_each(root_turns);
         Ok(outcome)
     }
 
-    /// The body of `cancel_scoped`, inside the caller's transaction.
+    /// The body of `cancel_scoped`, inside the caller's transaction, with
+    /// the root turns it cancelled (recorded once the caller commits).
     async fn cancel_scoped_tx(
         tx: &mut Transaction<'_, Sqlite>,
         root_id: &AgentTaskId,
         scope: CancelScope,
         now: OffsetDateTime,
-    ) -> Result<CancelTreeOutcome> {
+    ) -> Result<(CancelTreeOutcome, Vec<TerminalRootTurn>)> {
         // Collect the given task + descendants (mirror in-memory
         // `collect_subtree`: children-BFS, root-first, following
         // SubagentInvocation linkage across threads). A mid-tree id
@@ -411,6 +414,7 @@ impl SqliteDurableStore {
         // cancellation, and an idempotent retry (terminal tree) emits
         // nothing.
         let mut markers: Vec<CommittedEvent> = Vec::new();
+        let mut root_turns = Vec::new();
         for row in all_tasks {
             let Some(reason) = cancel_reason(scope, root_id, &row) else {
                 continue;
@@ -437,6 +441,7 @@ impl SqliteDurableStore {
                 .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(tx, &cancelled).await?;
+            root_turns.extend(TerminalRootTurn::of(&cancelled));
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
                 cancelled_root_threads.push(thread_id);
@@ -479,10 +484,13 @@ impl SqliteDurableStore {
             Self::propagate_terminal_to_parent_tx(tx, &cancelled_top, now, "cancel_tree").await?;
         }
 
-        Ok(CancelTreeOutcome {
-            transitioned,
-            markers,
-        })
+        Ok((
+            CancelTreeOutcome {
+                transitioned,
+                markers,
+            },
+            root_turns,
+        ))
     }
 
     /// How many times [`Self::begin`] retried a write transaction that
@@ -1597,12 +1605,13 @@ INSERT INTO agent_sdk_tasks (
                     return Ok(Some(claimed));
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let _settled =
+                    let (_settled, root_turns) =
                         Self::fail_closed_tx(&mut tx, &old, reason, now, "acquire_next_runnable")
                             .await?;
                     tx.commit()
                         .await
                         .context("commit fail-closed runnable head")?;
+                    TerminalRootTurn::record_each(root_turns);
                 }
                 RecoveryAction::Requeue => {
                     return Err(anyhow!(
@@ -2482,18 +2491,19 @@ WHERE operation_id = ?1
     /// Fail `old` closed for `reason` inside the caller's transaction:
     /// the terminal transition, the terminal event that closes a root's
     /// turn (see [`FailureReason::terminal_event`]), and the parent /
-    /// successor wake-up land together.
+    /// successor wake-up land together. Also returns the root turns it
+    /// ended, for the caller to record once it commits.
     async fn fail_closed_tx(
         tx: &mut Transaction<'_, Sqlite>,
         old: &AgentTask,
         reason: FailureReason,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<CancelTreeOutcome> {
-        let settled = if old.kind == TaskKind::RootTurn && old.is_root() {
+    ) -> Result<(CancelTreeOutcome, Vec<TerminalRootTurn>)> {
+        let (settled, mut root_turns) = if old.kind == TaskKind::RootTurn && old.is_root() {
             Self::cancel_scoped_tx(tx, &old.id, CancelScope::Descendants, now).await?
         } else {
-            CancelTreeOutcome::default()
+            (CancelTreeOutcome::default(), Vec::new())
         };
         let failed = old
             .clone()
@@ -2513,7 +2523,8 @@ WHERE operation_id = ?1
             .await?;
         }
         Self::propagate_terminal_to_parent_tx(tx, &failed, now, error_prefix).await?;
-        Ok(settled)
+        root_turns.extend(TerminalRootTurn::of(&failed));
+        Ok((settled, root_turns))
     }
 
     /// Settle the input injections `root` never delivered, inside the
@@ -3792,6 +3803,9 @@ impl agent_server::journal::DurableStore for SqliteDurableStore {
             &result,
             started.elapsed().as_secs_f64(),
         );
+        if let Ok(committed) = &result {
+            TerminalRootTurn::record_settled(&committed.settled);
+        }
         result
     }
 
@@ -4557,7 +4571,9 @@ impl SqliteDurableStore {
 impl AgentTaskStore for SqliteDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
         let params = params.extended(self.extension.as_deref())?;
-        self.commit_completed_turn_atomic_inner(params).await
+        let outcome = self.commit_completed_turn_atomic_inner(params).await?;
+        TerminalRootTurn::record_tasks(outcome.settled.iter().map(|(task, _)| task));
+        Ok(outcome)
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -5064,9 +5080,10 @@ impl AgentTaskStore for SqliteDurableStore {
         match classify_recovery(&old, RecoveryContext::AcquisitionAttempt) {
             RecoveryAction::NoAction => {}
             RecoveryAction::FailClosed(reason) => {
-                let _settled =
+                let (_settled, root_turns) =
                     Self::fail_closed_tx(&mut tx, &old, reason, now, "try_acquire_task").await?;
                 tx.commit().await.context("commit fail-closed acquire")?;
+                TerminalRootTurn::record_each(root_turns);
                 return Ok(None);
             }
             RecoveryAction::Requeue => {
@@ -5276,6 +5293,7 @@ impl AgentTaskStore for SqliteDurableStore {
         };
 
         let mut released = Vec::with_capacity(expired.len());
+        let mut root_turns = Vec::new();
         for record in expired {
             let Some(old) = Self::load_task_tx(&mut tx, &AgentTask::try_from(record)?.id).await?
             else {
@@ -5301,9 +5319,10 @@ impl AgentTaskStore for SqliteDurableStore {
                     RecoveryRecord::requeued(old.id.clone())
                 }
                 RecoveryAction::FailClosed(reason) => {
-                    let settled =
+                    let (settled, ended) =
                         Self::fail_closed_tx(&mut tx, &old, reason, now, "release_expired_leases")
                             .await?;
+                    root_turns.extend(ended);
                     RecoveryRecord::failed_closed(old.id.clone(), reason).with_settled(settled)
                 }
                 RecoveryAction::NoAction => {
@@ -5317,6 +5336,7 @@ impl AgentTaskStore for SqliteDurableStore {
         }
 
         tx.commit().await.context("commit release_expired_leases")?;
+        TerminalRootTurn::record_each(root_turns);
         Ok(released)
     }
 
@@ -5616,6 +5636,7 @@ impl AgentTaskStore for SqliteDurableStore {
         )
         .await?;
         tx.commit().await.context("commit complete_task")?;
+        TerminalRootTurn::record_tasks([&result.0]);
         Ok(result)
     }
 

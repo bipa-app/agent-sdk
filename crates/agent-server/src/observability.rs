@@ -69,6 +69,14 @@ use crate::journal::tool_audit::ToolEffectClass;
 /// metrics.
 const TASK_DURATION_BUCKETS_S: &[f64] = &[0.01, 0.04, 0.16, 0.64, 2.56, 10.24, 40.96];
 
+/// Bucket boundaries for `agent_server.root_turn.duration` (seconds):
+/// log-2 from 10 ms to about 87 minutes, the boundaries of the
+/// `bip.turn.duration` histogram this metric replaces.
+const ROOT_TURN_DURATION_BUCKETS_S: &[f64] = &[
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92, 163.84,
+    327.68, 655.36, 1_310.72, 2_621.44, 5_242.88,
+];
+
 /// Bucket boundaries for `agent_server.journal.commit.duration`
 /// (seconds). Journal commits are dominated by Postgres round-trips
 /// so the boundaries are tighter at the short end.
@@ -423,6 +431,12 @@ pub struct ServerMetrics {
     /// leader lock now. Summed across hosts, more than 1 per store is two
     /// leaders.
     pub(crate) is_leader: UpDownCounter<i64>,
+    /// `agent_server.root_turn.duration`: a root turn's admission to its
+    /// terminal status, by outcome.
+    pub(crate) root_turn_duration: Histogram<f64>,
+    /// `agent_server.root_turn.outcome`: root turns that reached a terminal
+    /// status, by outcome.
+    pub(crate) root_turn_outcome: Counter<u64>,
     /// Shared meter handle reused by `register_outbox_depth_callback`
     /// callers so they bind their gauge to the same provider as
     /// every other instrument on this struct.
@@ -805,6 +819,16 @@ impl ServerMetrics {
 
     /// Record one `agent_server.tool_audit.outcome` increment for
     /// the given tool-audit event.
+    /// Record one root turn that reached a terminal status on
+    /// `agent_server.root_turn.duration` and `agent_server.root_turn.outcome`
+    /// (see [`crate::journal::TerminalRootTurn`]). The stores call it after
+    /// the transaction commits.
+    pub fn record_root_turn(&self, turn: crate::journal::TerminalRootTurn) {
+        let labels = [KeyValue::new(attrs::OUTCOME, turn.outcome.as_str())];
+        self.root_turn_duration.record(turn.duration_secs, &labels);
+        self.root_turn_outcome.add(1, &labels);
+    }
+
     /// Count one completed-turn commit with its bounded outcome (see
     /// [`crate::journal::commit::commit_outcome_label`]).
     pub fn record_completed_turn_commit(&self, outcome: &'static str) {
@@ -1117,6 +1141,7 @@ impl ServerMetrics {
         let (progress_events, progress_refused) = progress_instruments(&meter);
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
+        let (root_turn_duration, root_turn_outcome) = root_turn_instruments(&meter);
 
         Self {
             workers_active: workers_active_counter(&meter),
@@ -1155,6 +1180,8 @@ impl ServerMetrics {
             subagent_stalls,
             leader: leader_counter(&meter),
             is_leader: is_leader_gauge(&meter),
+            root_turn_duration,
+            root_turn_outcome,
             meter,
         }
     }
@@ -1224,6 +1251,26 @@ fn transition_instruments(meter: &opentelemetry::metrics::Meter) -> (Histogram<f
         )
         .build();
     (duration, lock_conflict_retries)
+}
+
+/// `agent_server.root_turn.duration` and `agent_server.root_turn.outcome`.
+fn root_turn_instruments(meter: &opentelemetry::metrics::Meter) -> (Histogram<f64>, Counter<u64>) {
+    let duration = meter
+        .f64_histogram("agent_server.root_turn.duration")
+        .with_unit("s")
+        .with_description(
+            "A root turn's admission to its terminal status, by outcome (success, error, \
+             cancelled).",
+        )
+        .with_boundaries(ROOT_TURN_DURATION_BUCKETS_S.to_vec())
+        .build();
+    let outcome = meter
+        .u64_counter("agent_server.root_turn.outcome")
+        .with_description(
+            "Root turns that reached a terminal status, by outcome (success, error, cancelled).",
+        )
+        .build();
+    (duration, outcome)
 }
 
 /// `agent_server.progress.events` and `agent_server.progress.refused`.

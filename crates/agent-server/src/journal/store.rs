@@ -3468,6 +3468,10 @@ impl InMemoryAgentTaskStore {
         // The transitions: pure, synchronous, no await. Once the markers
         // are durable nothing can interrupt the flips they describe.
         let transitioned = inner.cancel_rows(to_cancel, &fenced_threads, now)?;
+        // The flips above are this backend's commit point.
+        super::root_turn::TerminalRootTurn::record_tasks(
+            transitioned.iter().filter_map(|id| inner.by_id.get(id)),
+        );
 
         Ok(CancelTreeOutcome {
             transitioned,
@@ -4064,6 +4068,7 @@ impl InMemoryAgentTaskStore {
         let thread = self.thread_admission_locked(inner, &old.id).await?;
         self.commit_fail_closed_event(old, reason, now).await?;
         inner.publish_failed_row(old, &failed, thread, now)?;
+        super::root_turn::TerminalRootTurn::record_tasks([&failed]);
         Ok(settled)
     }
 
@@ -5452,6 +5457,9 @@ impl super::transition::DurableStore for InMemoryAgentTaskStore {
             &result,
             started.elapsed().as_secs_f64(),
         );
+        if let Ok(committed) = &result {
+            super::root_turn::TerminalRootTurn::record_settled(&committed.settled);
+        }
         result
     }
     async fn effect(
@@ -6871,6 +6879,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         );
         #[cfg(not(feature = "otel"))]
         drop(extra_documents);
+        super::root_turn::TerminalRootTurn::record_tasks(settled.iter().map(|(task, _)| task));
         Ok(super::commit::CommitOutcome {
             thread,
             checkpoint,
@@ -7822,6 +7831,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             |child| child.complete(now),
         )?;
         drop(inner);
+        super::root_turn::TerminalRootTurn::record_tasks([&result.0]);
         Ok(result)
     }
 
