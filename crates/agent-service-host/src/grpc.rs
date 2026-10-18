@@ -1808,6 +1808,14 @@ impl AgentControlService for GrpcControlService {
         } else {
             SubmitClaim::Fresh
         });
+        // A fresh runnable root wakes a parked worker now instead of
+        // waiting out its acquisition interval.
+        if !outcome.replayed
+            && outcome.task.status.is_runnable()
+            && let Some(signal) = self.shared.runtime.wakeup_signal()
+        {
+            signal.notify_workers();
+        }
 
         Ok(Response::new(pb::SubmitThreadWorkResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
@@ -2918,6 +2926,184 @@ pub struct LocalDaemon {
     shutdown: CancellationToken,
     host_task: JoinHandle<Result<()>>,
     grpc_task: JoinHandle<Result<()>>,
+    stores: StoreRegistry,
+}
+
+type StoreDecorator = Box<dyn FnOnce(StoreRegistry) -> StoreRegistry + Send>;
+type PreWorkerGate =
+    Box<dyn FnOnce(StoreRegistry) -> futures::future::BoxFuture<'static, Result<()>> + Send>;
+type TransportConfigurer = Box<dyn FnOnce(GrpcTransport) -> GrpcTransport + Send>;
+
+/// Assembles a [`LocalDaemon`]: [`LocalDaemon::builder`].
+///
+/// Startup order: build the [`StoreRegistry`] for `config.storage`, apply
+/// the store decorator, initialize the stores (migrations), await the
+/// pre-worker gate, then create the [`ServiceHost`], configure the gRPC
+/// transport, bind the loopback listener and start both. No worker can
+/// acquire a task, and no sweep or transport can run, before the gate
+/// returns `Ok`.
+#[must_use = "a builder does nothing until `start` is awaited"]
+pub struct LocalDaemonBuilder {
+    config: ServiceConfig,
+    definition_registry: Arc<dyn AgentDefinitionRegistry>,
+    runtime: Arc<ExecutionRuntime>,
+    decorate: Option<StoreDecorator>,
+    before_workers: Option<PreWorkerGate>,
+    configure_transport: Option<TransportConfigurer>,
+}
+
+impl LocalDaemonBuilder {
+    /// Wrap the assembled [`StoreRegistry`] before the daemon uses it.
+    /// The contract is [`LocalDaemon::start_with_store_decorator`]'s.
+    pub fn decorate_stores(
+        mut self,
+        decorate: impl FnOnce(StoreRegistry) -> StoreRegistry + Send + 'static,
+    ) -> Self {
+        self.decorate = Some(Box::new(decorate));
+        self
+    }
+
+    /// Await `gate` after the stores are initialized and before any worker,
+    /// sweep or transport starts. The gate gets the exact (decorated)
+    /// registry the daemon mounts, so it can do startup store I/O, such as
+    /// fencing threads whose deletion was pending at shutdown, without a
+    /// second pool. An `Err` aborts the start: nothing has been spawned.
+    pub fn before_workers<F, Fut>(mut self, gate: F) -> Self
+    where
+        F: FnOnce(StoreRegistry) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.before_workers = Some(Box::new(move |stores| Box::pin(gate(stores))));
+        self
+    }
+
+    /// Configure the gRPC transport (view config, prompt handler, tool stall
+    /// budget, confirmation guard) before it serves.
+    pub fn configure_transport(
+        mut self,
+        configure: impl FnOnce(GrpcTransport) -> GrpcTransport + Send + 'static,
+    ) -> Self {
+        self.configure_transport = Some(Box::new(configure));
+        self
+    }
+
+    /// Start the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the durable stores, the pre-worker gate, the host
+    /// runtime, or the local gRPC listener cannot be initialized.
+    pub async fn start(self) -> Result<LocalDaemon> {
+        let Self {
+            config,
+            definition_registry,
+            runtime,
+            decorate,
+            before_workers,
+            configure_transport,
+        } = self;
+        let stores = StoreRegistry::from_config(&config.storage, definition_registry)
+            .context("creating daemon stores")?;
+        let event_notifier = Arc::clone(&stores.event_notifier);
+        let confirm_drive_cancels = Arc::clone(&stores.confirm_drive_cancels);
+        let stores = match decorate {
+            Some(decorate) => decorate(stores),
+            None => stores,
+        };
+        // Two pointer comparisons catch both a forbidden wiring swap
+        // and a whole-registry substitution (e.g. returning a fresh
+        // `StoreRegistry::in_memory`). A violation is a decorator
+        // contract bug, not runtime input — hence debug assertions.
+        debug_assert!(
+            Arc::ptr_eq(&event_notifier, &stores.event_notifier),
+            "store decorator must not replace the registry's event_notifier",
+        );
+        debug_assert!(
+            Arc::ptr_eq(&confirm_drive_cancels, &stores.confirm_drive_cancels),
+            "store decorator must not replace the registry's confirm_drive_cancels",
+        );
+        stores
+            .initialize()
+            .await
+            .context("initializing daemon stores")?;
+        if let Some(gate) = before_workers {
+            run_pre_worker_gate(gate, stores.clone()).await?;
+        }
+        let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))
+            .context("creating daemon host")?;
+        host.begin_epoch()
+            .await
+            .context("beginning the daemon's epoch before it serves")?;
+        let health = Arc::clone(host.health());
+        let shutdown = host.shutdown_token();
+        let grpc = GrpcTransport::with_admission(
+            stores.clone(),
+            runtime,
+            health,
+            shutdown.clone(),
+            config.worker.lease_duration(),
+            config.worker.heartbeat_interval(),
+            config.admission.clone(),
+        );
+        let grpc = match configure_transport {
+            Some(configure) => configure(grpc),
+            None => grpc,
+        };
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .context("binding local daemon listener")?;
+        let addr = listener
+            .local_addr()
+            .context("reading local daemon listener address")?;
+
+        let host_task = tokio::spawn(async move { host.run().await });
+        let grpc_task = tokio::spawn(async move { grpc.serve_listener(listener).await });
+
+        info!(%addr, "local daemon started");
+        Ok(LocalDaemon {
+            addr,
+            shutdown,
+            host_task,
+            grpc_task,
+            stores,
+        })
+    }
+}
+
+/// Await the pre-worker gate, with its span
+/// `agent_service_host.daemon.pre_worker_gate` (`outcome`: `ok` / `error`)
+/// and a log line carrying how long it took.
+async fn run_pre_worker_gate(gate: PreWorkerGate, stores: StoreRegistry) -> Result<()> {
+    let started = std::time::Instant::now();
+    #[cfg(feature = "otel")]
+    let mut span = {
+        use opentelemetry::trace::Tracer as _;
+        opentelemetry::global::tracer("agent-service-host")
+            .start("agent_service_host.daemon.pre_worker_gate")
+    };
+    let result = gate(stores).await;
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    #[cfg(feature = "otel")]
+    {
+        use opentelemetry::trace::Span as _;
+        span.set_attribute(opentelemetry::KeyValue::new("outcome", outcome));
+        if let Err(error) = &result {
+            span.set_status(opentelemetry::trace::Status::error(format!("{error:#}")));
+        }
+        span.end();
+    }
+    match &result {
+        Ok(()) => info!(elapsed_ms, outcome, "daemon pre-worker gate passed"),
+        Err(error) => warn!(
+            elapsed_ms,
+            outcome,
+            error = %format!("{error:#}"),
+            "daemon pre-worker gate failed; the daemon does not start"
+        ),
+    }
+    result.context("running daemon pre-worker gate")
 }
 
 impl LocalDaemon {
@@ -2930,7 +3116,8 @@ impl LocalDaemon {
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
         runtime: Arc<ExecutionRuntime>,
     ) -> Result<Self> {
-        Self::start_with_store_decorator(config, definition_registry, runtime, |stores| stores)
+        Self::builder(config, definition_registry, runtime)
+            .start()
             .await
     }
 
@@ -2984,63 +3171,37 @@ impl LocalDaemon {
         config: ServiceConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
         runtime: Arc<ExecutionRuntime>,
-        decorate: impl FnOnce(StoreRegistry) -> StoreRegistry + Send,
+        decorate: impl FnOnce(StoreRegistry) -> StoreRegistry + Send + 'static,
     ) -> Result<Self> {
-        let stores = StoreRegistry::from_config(&config.storage, definition_registry)
-            .context("creating daemon stores")?;
-        let event_notifier = Arc::clone(&stores.event_notifier);
-        let confirm_drive_cancels = Arc::clone(&stores.confirm_drive_cancels);
-        let stores = decorate(stores);
-        // Two pointer comparisons catch both a forbidden wiring swap
-        // and a whole-registry substitution (e.g. returning a fresh
-        // `StoreRegistry::in_memory`). A violation is a decorator
-        // contract bug, not runtime input — hence debug assertions.
-        debug_assert!(
-            Arc::ptr_eq(&event_notifier, &stores.event_notifier),
-            "store decorator must not replace the registry's event_notifier",
-        );
-        debug_assert!(
-            Arc::ptr_eq(&confirm_drive_cancels, &stores.confirm_drive_cancels),
-            "store decorator must not replace the registry's confirm_drive_cancels",
-        );
-        stores
-            .initialize()
+        Self::builder(config, definition_registry, runtime)
+            .decorate_stores(decorate)
+            .start()
             .await
-            .context("initializing daemon stores")?;
-        let host = ServiceHost::with_stores(config.clone(), stores.clone(), Arc::clone(&runtime))
-            .context("creating daemon host")?;
-        host.begin_epoch()
-            .await
-            .context("beginning the daemon's epoch before it serves")?;
-        let health = Arc::clone(host.health());
-        let shutdown = host.shutdown_token();
-        let grpc = GrpcTransport::with_admission(
-            stores,
+    }
+
+    /// A [`LocalDaemonBuilder`]: a daemon with optional store decoration, a
+    /// pre-worker gate and transport configuration.
+    pub fn builder(
+        config: ServiceConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        runtime: Arc<ExecutionRuntime>,
+    ) -> LocalDaemonBuilder {
+        LocalDaemonBuilder {
+            config,
+            definition_registry,
             runtime,
-            health,
-            shutdown.clone(),
-            config.worker.lease_duration(),
-            config.worker.heartbeat_interval(),
-            config.admission.clone(),
-        );
+            decorate: None,
+            before_workers: None,
+            configure_transport: None,
+        }
+    }
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .context("binding local daemon listener")?;
-        let addr = listener
-            .local_addr()
-            .context("reading local daemon listener address")?;
-
-        let host_task = tokio::spawn(async move { host.run().await });
-        let grpc_task = tokio::spawn(async move { grpc.serve_listener(listener).await });
-
-        info!(%addr, "local daemon started");
-        Ok(Self {
-            addr,
-            shutdown,
-            host_task,
-            grpc_task,
-        })
+    /// The store registry the daemon's workers, sweeps and transport use
+    /// (the decorated one): the same `Arc` handles, so a frame an embedding
+    /// host commits through `event_repo` wakes the daemon's live followers.
+    #[must_use]
+    pub const fn stores(&self) -> &StoreRegistry {
+        &self.stores
     }
 
     #[must_use]
@@ -6338,6 +6499,249 @@ mod tests {
             );
             Ok(())
         })();
+        daemon.stop().await?;
+        result
+    }
+
+    /// The thread tasks of `thread_id`, read through `stores`.
+    async fn thread_task_statuses(
+        stores: &StoreRegistry,
+        thread_id: &ThreadId,
+    ) -> Result<Vec<agent_server::journal::task::TaskStatus>> {
+        Ok(stores
+            .task_store
+            .list_by_thread(thread_id)
+            .await?
+            .into_iter()
+            .map(|task| task.status)
+            .collect())
+    }
+
+    /// Submit a pending root turn on `thread_id` straight through `stores`.
+    async fn seed_gated_root(stores: &StoreRegistry, thread_id: &ThreadId) -> Result<()> {
+        let now = OffsetDateTime::now_utc();
+        stores.thread_store.get_or_create(thread_id, now).await?;
+        stores.message_store.get_or_create(thread_id, now).await?;
+        stores
+            .task_store
+            .submit_root_turn(AgentTask::new_root_turn_with_input(
+                thread_id.clone(),
+                vec![agent_server::journal::task::SubmittedInputItem::Text { text: "hi".into() }],
+                now,
+                3,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// The handle a store decorator wrapped and the handle it put in its place.
+    type DecoratedTaskStore = (Arc<dyn AgentTaskStore>, Arc<dyn AgentTaskStore>);
+
+    /// A store decorator that wraps `task_store` in a passthrough and records
+    /// `(the wrapped handle, the wrapper)` in `slot`.
+    fn wrapping_decorator(
+        slot: Arc<std::sync::Mutex<Option<DecoratedTaskStore>>>,
+    ) -> impl FnOnce(StoreRegistry) -> StoreRegistry + Send + 'static {
+        move |mut stores| {
+            let undecorated = Arc::clone(&stores.task_store);
+            let wrapper: Arc<dyn AgentTaskStore> = Arc::new(CountingTaskStore {
+                inner: Arc::clone(&undecorated),
+                complete_calls: Arc::new(AtomicUsize::new(0)),
+                complete_with_result_calls: Arc::new(AtomicUsize::new(0)),
+                submit_root_turn_idempotent_calls: Arc::new(AtomicUsize::new(0)),
+                fail_get: false,
+                artifact_store_seen: None,
+                artifact_store_alive_at_completion: None,
+                committed_result: None,
+                fail_root_reads: None,
+            });
+            if let Ok(mut recorded) = slot.lock() {
+                *recorded = Some((undecorated, Arc::clone(&wrapper)));
+            }
+            stores.task_store = wrapper;
+            stores
+        }
+    }
+
+    /// The pre-worker gate runs on the daemon's own *decorated* stores after
+    /// they are initialized and before any worker acquires a task: a root
+    /// the gate submits stays `Pending` for as long as the gate runs, then
+    /// completes once the daemon starts. The gate and `LocalDaemon::stores`
+    /// get the decorator's `task_store`, not the one it wrapped, and
+    /// `configure_transport` is applied.
+    #[tokio::test]
+    async fn local_daemon_awaits_its_pre_worker_gate_before_any_worker() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_gate_1",
+                "after the gate",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let thread_id = ThreadId::from_string("gate-thread");
+        let gate_saw = Arc::new(std::sync::Mutex::new(None::<StoreRegistry>));
+        let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let decorated = Arc::new(std::sync::Mutex::new(None));
+        let daemon = LocalDaemon::builder(ServiceConfig::default(), registry, runtime)
+            .decorate_stores(wrapping_decorator(Arc::clone(&decorated)))
+            .before_workers({
+                let thread_id = thread_id.clone();
+                let gate_saw = Arc::clone(&gate_saw);
+                move |stores| async move {
+                    seed_gated_root(&stores, &thread_id).await?;
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let statuses = thread_task_statuses(&stores, &thread_id).await?;
+                    anyhow::ensure!(
+                        statuses == [agent_server::journal::task::TaskStatus::Pending],
+                        "a worker ran before the gate returned: {statuses:?}"
+                    );
+                    *gate_saw.lock().map_err(|_| anyhow::anyhow!("gate lock"))? = Some(stores);
+                    Ok(())
+                }
+            })
+            .configure_transport({
+                let configured = Arc::clone(&configured);
+                move |transport| {
+                    configured.store(true, std::sync::atomic::Ordering::SeqCst);
+                    transport
+                }
+            })
+            .start()
+            .await?;
+
+        let result = async {
+            let gate_stores = gate_saw
+                .lock()
+                .map_err(|_| anyhow::anyhow!("gate lock"))?
+                .clone()
+                .context("the gate ran")?;
+            assert!(Arc::ptr_eq(
+                &gate_stores.event_notifier,
+                &daemon.stores().event_notifier
+            ));
+            let (undecorated, wrapper) = decorated
+                .lock()
+                .map_err(|_| anyhow::anyhow!("decorator lock"))?
+                .clone()
+                .context("the decorator ran")?;
+            assert!(
+                Arc::ptr_eq(&gate_stores.task_store, &wrapper),
+                "the gate gets the decorated task_store"
+            );
+            assert!(
+                !Arc::ptr_eq(&gate_stores.task_store, &undecorated),
+                "the gate must not get the handle the decorator wrapped"
+            );
+            assert!(
+                Arc::ptr_eq(&daemon.stores().task_store, &wrapper),
+                "stores() is the decorated registry"
+            );
+            assert!(configured.load(std::sync::atomic::Ordering::SeqCst));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let statuses = thread_task_statuses(daemon.stores(), &thread_id).await?;
+                if statuses == [agent_server::journal::task::TaskStatus::Completed] {
+                    break;
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "the gated root never completed: {statuses:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result
+    }
+
+    /// A pre-worker gate that fails aborts the start: no worker ever runs
+    /// the root it saw.
+    #[tokio::test]
+    async fn a_failed_pre_worker_gate_starts_no_worker() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response("resp_x", "x")])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let thread_id = ThreadId::from_string("failed-gate-thread");
+        let gate_saw = Arc::new(std::sync::Mutex::new(None::<StoreRegistry>));
+        let started = LocalDaemon::builder(ServiceConfig::default(), registry, runtime)
+            .before_workers({
+                let thread_id = thread_id.clone();
+                let gate_saw = Arc::clone(&gate_saw);
+                move |stores| async move {
+                    seed_gated_root(&stores, &thread_id).await?;
+                    *gate_saw.lock().map_err(|_| anyhow::anyhow!("gate lock"))? = Some(stores);
+                    anyhow::bail!("deletion fence failed")
+                }
+            })
+            .start()
+            .await;
+        let error = started.err().context("a failed gate must fail the start")?;
+        assert!(
+            format!("{error:#}").contains("deletion fence failed"),
+            "{error:#}"
+        );
+        let stores = gate_saw
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gate lock"))?
+            .clone()
+            .context("the gate ran")?;
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            thread_task_statuses(&stores, &thread_id).await?,
+            [agent_server::journal::task::TaskStatus::Pending]
+        );
+        Ok(())
+    }
+
+    /// `SubmitThreadWork` wakes a parked worker: with a 60 s acquisition
+    /// interval, a submitted turn still completes within seconds.
+    #[tokio::test]
+    async fn a_submitted_turn_wakes_a_parked_worker() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_wake_1",
+                "woken",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let mut config = ServiceConfig::default();
+        config.worker.acquisition_interval_secs = 60;
+        let daemon = LocalDaemon::start(config, registry, runtime).await?;
+
+        let result = async {
+            // Let every worker take its first, empty poll and park.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-wake-thread").await?;
+            submit_text_work(&mut control, "submit-wake-turn", &thread_id, "hi").await?;
+            let thread_id = ThreadId::from_string(&thread_id);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let statuses = thread_task_statuses(daemon.stores(), &thread_id).await?;
+                if statuses == [agent_server::journal::task::TaskStatus::Completed] {
+                    break;
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "the submitted turn waited for the acquisition interval: {statuses:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Ok(())
+        }
+        .await;
         daemon.stop().await?;
         result
     }
