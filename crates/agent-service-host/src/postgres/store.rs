@@ -3934,7 +3934,7 @@ async fn prepare_subagent_batch_rows_tx(
             },
             spawn_index,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
         ensure_spawn_task_id_available_tx(tx, &invocation.id, "invocation").await?;
@@ -4759,7 +4759,7 @@ impl PostgresDurableStore {
             },
             spawn.spawn_index,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
         ensure_spawn_task_id_available_tx(tx, &invocation.id, "invocation").await?;

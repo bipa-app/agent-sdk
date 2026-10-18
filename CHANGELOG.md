@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Primitive 10 (S-1): git-step effects and the invocation retry budget
+
+- **Breaking** (for code that matches these enums exhaustively):
+  `EffectKind::GitStep` and `EffectSubject::Git { step, repo, unit }`, a git
+  step a host runs when a subagent invocation completes.
+  `EffectKey::git(invocation, step)` is `{invocation}:git:{step}`. The row
+  keeps the unit in `tool_call_id`, `git:{step}` in `tool_name` and the
+  subject in `input`. Migration 0027 already allows `git_step` on both
+  backends, so there is no migration. An old binary that reads a `git_step`
+  row fails that read with `unknown effect kind`, as it does for any kind
+  newer than itself.
+- `AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS = 3`. Every store spawns a
+  subagent invocation with it, so an expired lease or a crash requeues the
+  invocation for attempts 2 and 3, and the expiry of attempt 3 fails it
+  closed. Invocations already stored keep the budget they were spawned with.
+  `DEFAULT_MAX_ATTEMPTS` stays 1, so tool children spawned with
+  `ChildSpawnSpec::default()` still fail closed after one attempt.
+- Signals for the invocation retry: counter
+  `agent_server.subagent.invocation.attempts{attempt}` (`1`, `2`, `3`,
+  `4+`) for each run; span `agent_server.subagent.invocation.retry` and an
+  info log for a run above attempt 1, with the task id, kind, attempt and
+  budget; counter `agent_server.subagent.invocation.failed_closed{reason}`
+  and a warn log when the host's lease drain fails an invocation closed at
+  its budget.
+
 ### Tests: the crash matrix
 
 - `agent-service-host/tests/crash_matrix.rs` kills a real `LocalDaemon`

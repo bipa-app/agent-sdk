@@ -3392,7 +3392,7 @@ async fn prepare_subagent_batch_rows_tx(
             },
             spawn_index,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
         let existing = SqliteDurableStore::load_task_tx(tx, &invocation.id).await?;
@@ -3994,7 +3994,7 @@ impl SqliteDurableStore {
             },
             subagent.spawn.spawn_index,
             now,
-            AgentTask::DEFAULT_MAX_ATTEMPTS,
+            AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS,
         )
         .context("spawn rejected: new_subagent_invocation failed")?;
         ensure!(

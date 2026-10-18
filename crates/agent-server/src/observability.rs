@@ -126,6 +126,14 @@ pub mod attrs {
     pub const SPAN_EFFECT_ID: &str = "agent_server.effect.id";
     /// Span-only: the owner task of an effect.
     pub const SPAN_TASK_ID: &str = "agent_server.task.id";
+    /// Span-only: a task's kind (`subagent`, ...).
+    pub const SPAN_TASK_KIND: &str = "agent_server.task.kind";
+    /// Span-only: the task's acquisition count, from 1.
+    pub const SPAN_TASK_ATTEMPT: &str = "agent_server.task.attempt";
+    /// Span-only: the task's retry budget.
+    pub const SPAN_TASK_MAX_ATTEMPTS: &str = "agent_server.task.max_attempts";
+    /// A subagent invocation's acquisition count: `1`, `2`, `3` or `4+`.
+    pub const ATTEMPT: &str = "attempt";
     /// The tool a stalled call ran (span-only: tool names are unbounded).
     pub const SPAN_TOOL_NAME: &str = "agent_server.tool.name";
     /// `outcome` of `agent_server.tool.stalls`: the heartbeat found the tool
@@ -276,6 +284,12 @@ pub struct ServerMetrics {
     /// `agent_server.journal.completed_turn.commits`: completed-turn commits
     /// by outcome.
     pub(crate) completed_turn_commits: Counter<u64>,
+    /// `agent_server.subagent.invocation.attempts`: subagent invocation
+    /// runs, by attempt.
+    pub(crate) invocation_attempts: Counter<u64>,
+    /// `agent_server.subagent.invocation.failed_closed`: invocations the
+    /// lease sweep failed closed at their retry budget, by reason.
+    pub(crate) invocation_failed_closed: Counter<u64>,
     pub(crate) view_fold_duration: Histogram<f64>,
     pub(crate) view_folded_events: Histogram<f64>,
     pub(crate) view_stream: Counter<u64>,
@@ -597,6 +611,29 @@ impl ServerMetrics {
         self.effects.add(1, &attrs);
     }
 
+    /// Count one run of a subagent invocation on
+    /// `agent_server.subagent.invocation.attempts{attempt}`. A run with
+    /// `attempt` above 1 is a retry after a crash or an expired lease.
+    pub fn record_invocation_attempt(&self, attempt: u32) {
+        let label = match attempt {
+            0 | 1 => "1",
+            2 => "2",
+            3 => "3",
+            _ => "4+",
+        };
+        self.invocation_attempts
+            .add(1, &[KeyValue::new(attrs::ATTEMPT, label)]);
+    }
+
+    /// Count a subagent invocation the lease sweep failed closed at its
+    /// retry budget, by its failure reason.
+    pub fn record_invocation_failed_closed(&self, reason: FailureReason) {
+        self.invocation_failed_closed.add(
+            1,
+            &[KeyValue::new(attrs::REASON, failure_reason_label(reason))],
+        );
+    }
+
     /// Record how long an effect ran, started to finished, with the state it
     /// finished in.
     pub fn record_effect_duration(
@@ -772,6 +809,7 @@ impl ServerMetrics {
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
+        let (invocation_attempts, invocation_failed_closed) = invocation_instruments(&meter);
         let (tool_stalls, tool_stall_unbounded) = Self::build_tool_stall_instruments(&meter);
         let fence_refused = fence_refused_counter(&meter);
 
@@ -793,6 +831,8 @@ impl ServerMetrics {
             effects,
             effect_duration,
             completed_turn_commits,
+            invocation_attempts,
+            invocation_failed_closed,
             view_fold_duration,
             view_folded_events,
             view_stream,
@@ -832,6 +872,25 @@ fn fence_refused_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> 
              thread status.",
         )
         .build()
+}
+
+/// The subagent invocation retry instruments: runs by attempt, and
+/// invocations the lease sweep failed closed at their budget.
+fn invocation_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
+    let attempts = meter
+        .u64_counter("agent_server.subagent.invocation.attempts")
+        .with_description(
+            "Subagent invocation runs by attempt (1, 2, 3, 4+). A run above attempt 1 is a \
+             retry after a crash or an expired lease.",
+        )
+        .build();
+    let failed_closed = meter
+        .u64_counter("agent_server.subagent.invocation.failed_closed")
+        .with_description(
+            "Subagent invocations the lease sweep failed closed at their retry budget, by reason.",
+        )
+        .build();
+    (attempts, failed_closed)
 }
 
 /// The crash-safety instruments: effect transitions, effect run time and
