@@ -15652,3 +15652,228 @@ async fn a_suspension_never_strands_children_without_their_tool_call_starts() ->
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Salvage of cut-off LLM requests (P2-3c)
+// ─────────────────────────────────────────────────────────────────────
+
+const PARTIAL: &str = "half an answer the crash cut";
+
+/// Start an LLM request for `task` as the root worker does (its attempt row
+/// and a `Started` effect), then journal `partial` as its streamed text.
+async fn start_cut_off_request(
+    stores: &TestStores,
+    task: &AgentTask,
+    partial: &str,
+) -> Result<crate::journal::TurnAttempt> {
+    use crate::journal::effect::{EffectIntent, EffectKey, EffectSubject, EffectWrite};
+    use crate::journal::{DurableStore, Guard, Transition, TurnAttemptWrite, Write};
+
+    let attempt = crate::journal::TurnAttempt::open(crate::journal::OpenAttemptParams {
+        task_id: task.id.clone(),
+        attempt_number: 1,
+        provenance: agent_sdk_foundation::audit::AuditProvenance::new("mock", "mock-model"),
+        request_blob: serde_json::json!({}),
+        now: t_plus(1),
+        otel_trace_id: None,
+        otel_span_id: None,
+    });
+    let key = EffectKey::llm(&task.id, attempt.id.as_str());
+    stores
+        .tasks
+        .commit(
+            Transition {
+                guards: vec![
+                    Guard::TaskIs {
+                        task: task.id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((
+                            WorkerId::from_string("worker_test"),
+                            LeaseId::from_string("lease_test"),
+                        )),
+                    },
+                    Guard::EffectFree { key: key.clone() },
+                ],
+                writes: vec![
+                    Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(attempt.clone()))),
+                    Write::Effect(EffectWrite::Start(EffectIntent {
+                        key,
+                        replay: agent_sdk_foundation::ToolReplay::Safe,
+                        owner: task.id.clone(),
+                        thread: task.thread_id.clone(),
+                        subject: EffectSubject::Llm {
+                            turn_attempt_id: attempt.id.as_str().to_owned(),
+                            provider: "mock".into(),
+                            model: "mock-model".into(),
+                        },
+                        attempt: 1,
+                    })),
+                ],
+            },
+            t_plus(1),
+        )
+        .await?;
+    stores
+        .events
+        .commit_event(
+            &task.thread_id,
+            AgentEvent::TextDelta {
+                message_id: "m-cut".into(),
+                delta: partial.into(),
+                emitter_task_id: Some(task.id.to_string()),
+            },
+            t_plus(2),
+        )
+        .await?;
+    Ok(attempt)
+}
+
+async fn request_state(
+    stores: &TestStores,
+    task: &AgentTaskId,
+    attempt: &crate::journal::TurnAttempt,
+) -> Result<crate::journal::effect::EffectState> {
+    use crate::journal::DurableStore;
+
+    let key = crate::journal::effect::EffectKey::llm(task, attempt.id.as_str());
+    Ok(stores.tasks.effect(&key).await?.context("request")?.state)
+}
+
+fn text_of(message: &agent_sdk_foundation::llm::Message) -> String {
+    match &message.content {
+        agent_sdk_foundation::llm::Content::Text(text) => text.clone(),
+        agent_sdk_foundation::llm::Content::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+    }
+}
+
+/// A root task re-acquired after a crash mid-stream sends its prompt, the
+/// cut-off response and the note, and commits them once with the turn,
+/// with the request finished `Salvaged` and its attempt closed.
+#[tokio::test]
+async fn a_reacquired_turn_salvages_its_cut_off_response() -> Result<()> {
+    use crate::journal::effect::{EffectState, is_aborted_response_note};
+
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let crashed = start_cut_off_request(&stores, &task, PARTIAL).await?;
+
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task.clone()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(inputs, "the question", &provider, &stores.deps(), t_plus(5)).await?;
+
+    let sent = provider.captured()?;
+    let tail: Vec<String> = sent.iter().rev().take(3).rev().map(text_of).collect();
+    assert_eq!(tail[0], "the question");
+    assert_eq!(tail[1], PARTIAL);
+    assert!(is_aborted_response_note(&sent[sent.len() - 1]), "{sent:?}");
+
+    let committed = stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?
+        .messages;
+    let partials = committed.iter().filter(|m| text_of(m) == PARTIAL).count();
+    assert_eq!(partials, 1, "{committed:?}");
+    assert!(committed.iter().any(is_aborted_response_note));
+
+    assert!(matches!(
+        request_state(&stores, &task.id, &crashed).await?,
+        EffectState::Salvaged { .. }
+    ));
+    let closed = stores.attempts.get(&crashed.id).await?.context("attempt")?;
+    assert!(closed.closed_as_abandoned(), "{closed:?}");
+    Ok(())
+}
+
+/// The next root turn on the thread salvages a cancelled root's cut-off
+/// response: it comes before the new prompt, and the note and the prompt
+/// merge into one user message.
+#[tokio::test]
+async fn the_next_turn_salvages_a_cancelled_roots_cut_off_response() -> Result<()> {
+    use crate::journal::effect::{CANCELLED_RESPONSE_NOTE, EffectState};
+
+    let stores = TestStores::new();
+    let cancelled = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let cut = start_cut_off_request(&stores, &cancelled, PARTIAL).await?;
+    stores.tasks.cancel_tree(&cancelled.id, t_plus(3)).await?;
+    assert_eq!(
+        request_state(&stores, &cancelled.id, &cut).await?,
+        EffectState::Abandoned
+    );
+
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(next),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(
+        inputs,
+        "next question",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await?;
+
+    let sent = provider.captured()?;
+    let tail: Vec<String> = sent.iter().rev().take(2).rev().map(text_of).collect();
+    assert_eq!(tail[0], PARTIAL, "{sent:?}");
+    // A user's stop is not a crash: the note says the user stopped it, and
+    // does not ask the model to continue.
+    assert_eq!(tail[1], format!("{CANCELLED_RESPONSE_NOTE}|next question"));
+    assert!(matches!(
+        request_state(&stores, &cancelled.id, &cut).await?,
+        EffectState::Salvaged { .. }
+    ));
+    Ok(())
+}
+
+/// A request that failed and was retried closed its attempt as a server
+/// error: its text was superseded, so it is not salvaged.
+#[tokio::test]
+async fn a_retried_request_is_not_salvaged() -> Result<()> {
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let retried = start_cut_off_request(&stores, &task, PARTIAL).await?;
+    let mut close = crate::journal::CloseAttemptParams::abandoned();
+    close.response_blob = serde_json::json!({"error": "overloaded"});
+    close.outcome = crate::journal::TurnAttemptOutcome::ServerError;
+    stores
+        .attempts
+        .close_attempt(&retried.id, close, t_plus(2))
+        .await?;
+
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(inputs, "the question", &provider, &stores.deps(), t_plus(5)).await?;
+    let sent = provider.captured()?;
+    assert!(sent.iter().all(|m| text_of(m) != PARTIAL), "{sent:?}");
+    Ok(())
+}

@@ -177,7 +177,10 @@ impl CompletedTurnCommit {
                     );
                     settles += 1;
                 }
-                Write::Effect(EffectWrite::Finish { owner, .. }) if *owner == self.task_id => {
+                Write::Effect(EffectWrite::Finish { owner, state, .. })
+                    if *owner == self.task_id
+                        || matches!(state, super::effect::EffectState::Salvaged { .. }) =>
+                {
                     anyhow::ensure!(
                         self.owner_guard.is_some(),
                         "a completed turn finishes its task's effects only under an owner guard"

@@ -82,6 +82,10 @@ pub struct UserInput {
     /// `RESUME_AUDIT_PROMPT` sentinel directly), `None` otherwise (so
     /// we lazily flatten text blocks on demand).
     audit_override: Option<&'static str>,
+    /// Cut-off LLM requests this turn salvages (see
+    /// [`super::salvage`]): their messages go around the prompt, and their
+    /// finishes commit with the turn.
+    salvaged: Vec<super::salvage::SalvagedRequest>,
 }
 
 impl UserInput {
@@ -93,6 +97,7 @@ impl UserInput {
         Self {
             blocks: vec![ContentBlock::Text { text: text.into() }],
             audit_override: None,
+            salvaged: Vec::new(),
         }
     }
 
@@ -102,6 +107,7 @@ impl UserInput {
         Self {
             blocks,
             audit_override: None,
+            salvaged: Vec::new(),
         }
     }
 
@@ -114,6 +120,7 @@ impl UserInput {
         Self {
             blocks: Vec::new(),
             audit_override: Some(RESUME_AUDIT_PROMPT),
+            salvaged: Vec::new(),
         }
     }
 
@@ -138,6 +145,70 @@ impl UserInput {
     #[must_use]
     pub fn blocks(&self) -> &[ContentBlock] {
         &self.blocks
+    }
+
+    /// Add the cut-off requests this turn salvages.
+    #[must_use]
+    pub fn with_salvage(mut self, salvaged: Vec<super::salvage::SalvagedRequest>) -> Self {
+        self.salvaged = salvaged;
+        self
+    }
+
+    /// Keep `from`'s salvage finishes but not its messages: the messages
+    /// were already staged (a boundary-injection turn swaps its input for
+    /// a resume input after its first call).
+    #[must_use]
+    pub fn keep_salvage_finishes(mut self, from: &Self) -> Self {
+        self.salvaged = from
+            .salvaged
+            .iter()
+            .map(|request| super::salvage::SalvagedRequest {
+                messages: Vec::new(),
+                ..request.clone()
+            })
+            .collect();
+        self
+    }
+
+    /// The requests this turn salvages.
+    #[must_use]
+    pub const fn salvaged(&self) -> &[super::salvage::SalvagedRequest] {
+        self.salvaged.as_slice()
+    }
+
+    /// Whether this turn salvages any cut-off request.
+    #[must_use]
+    pub const fn salvages(&self) -> bool {
+        !self.salvaged.is_empty()
+    }
+
+    /// The finishes of the requests this turn salvages, to commit with the
+    /// messages.
+    #[must_use]
+    pub fn salvage_finishes(&self) -> Vec<crate::journal::transition::Write> {
+        self.salvaged
+            .iter()
+            .map(super::salvage::SalvagedRequest::finish)
+            .collect()
+    }
+
+    /// The messages this input adds to the turn: an earlier root's
+    /// salvaged response and note, then the prompt (none for a resume
+    /// input), then the turn's own salvaged response and note.
+    #[must_use]
+    pub fn into_messages(self) -> Vec<Message> {
+        let (own, earlier): (Vec<_>, Vec<_>) = self
+            .salvaged
+            .iter()
+            .cloned()
+            .partition(|request| request.own);
+        let mut messages: Vec<Message> = earlier
+            .into_iter()
+            .flat_map(|request| request.messages)
+            .collect();
+        messages.extend(self.into_message());
+        messages.extend(own.into_iter().flat_map(|request| request.messages));
+        messages
     }
 
     /// Consume into an `llm::Message` with role `User`. Returns

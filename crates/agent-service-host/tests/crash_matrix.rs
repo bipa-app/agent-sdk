@@ -1504,6 +1504,58 @@ async fn s2_safe_tool(backend: Backend) -> Result<()> {
     Ok(())
 }
 
+/// S3's request states: the crashed attempt was closed when the re-acquired
+/// turn salvaged its LLM request, and the successor's request finished with
+/// the turn.
+async fn s3_requests_ended(
+    case: &Recovered,
+    attempts: &[agent_server::journal::TurnAttempt],
+) -> Result<()> {
+    // LLM request; the successor's request finished with the turn.
+    let crashed: Vec<_> = attempts
+        .iter()
+        .filter(|attempt| attempt.closed_as_abandoned())
+        .collect();
+    ensure!(
+        crashed.len() == 1,
+        "expected the crashed attempt closed as abandoned: {attempts:?}"
+    );
+    let request = |attempt: &agent_server::journal::TurnAttempt| {
+        agent_server::journal::effect::EffectKey::llm(&case.root.id, attempt.id.as_str())
+    };
+    let salvaged = agent_server::journal::DurableStore::effect(
+        case.stores.task_store.as_ref(),
+        &request(crashed[0]),
+    )
+    .await?
+    .context("the crashed attempt's LLM request")?;
+    ensure!(
+        matches!(
+            salvaged.state,
+            agent_server::journal::effect::EffectState::Salvaged { .. }
+        ),
+        "the crashed request is {:?}",
+        salvaged.state
+    );
+    let successor = attempts
+        .iter()
+        .filter(|attempt| !attempt.closed_as_abandoned())
+        .max_by_key(|attempt| attempt.attempt_number)
+        .context("the successor attempt")?;
+    let completed = agent_server::journal::DurableStore::effect(
+        case.stores.task_store.as_ref(),
+        &request(successor),
+    )
+    .await?
+    .context("the successor's LLM request")?;
+    ensure!(
+        completed.state == agent_server::journal::effect::EffectState::Completed,
+        "the successor's request is {:?}",
+        completed.state
+    );
+    Ok(())
+}
+
 /// S3: no duplicate assistant message, the partial text is either kept
 /// as an aborted note or gone, and every attempt row is closed.
 async fn s3_llm_stream(backend: Backend) -> Result<()> {
@@ -1536,7 +1588,27 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
         .iter()
         .filter(|text| text.contains(PARTIAL_TEXT))
         .count();
-    ensure!(partials <= 1, "the partial text is duplicated: {texts:?}");
+    ensure!(
+        partials == 1,
+        "the cut-off text must be salvaged exactly once: {texts:?}"
+    );
+    // The salvaged response is followed by the note, before the final
+    // answer.
+    let partial_at = messages
+        .iter()
+        .position(|message| {
+            message.role == llm::Role::Assistant
+                && assistant_texts(std::slice::from_ref(message))
+                    .iter()
+                    .any(|text| text.contains(PARTIAL_TEXT))
+        })
+        .context("the salvaged response")?;
+    ensure!(
+        messages
+            .get(partial_at + 1)
+            .is_some_and(agent_server::journal::effect::is_aborted_response_note),
+        "the salvaged response is not followed by the note: {messages:?}"
+    );
     let attempts = case
         .stores
         .attempt_store
@@ -1552,46 +1624,7 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
         "attempt rows left open: {open:?} of {}",
         attempts.len()
     );
-    // The crashed attempt was closed with its abandoned LLM request; the
-    // successor's request finished with the turn.
-    let crashed: Vec<_> = attempts
-        .iter()
-        .filter(|attempt| attempt.closed_as_abandoned())
-        .collect();
-    ensure!(
-        crashed.len() == 1,
-        "expected the crashed attempt closed as abandoned: {attempts:?}"
-    );
-    let request = |attempt: &agent_server::journal::TurnAttempt| {
-        agent_server::journal::effect::EffectKey::llm(&case.root.id, attempt.id.as_str())
-    };
-    let abandoned = agent_server::journal::DurableStore::effect(
-        case.stores.task_store.as_ref(),
-        &request(crashed[0]),
-    )
-    .await?
-    .context("the crashed attempt's LLM request")?;
-    ensure!(
-        abandoned.state == agent_server::journal::effect::EffectState::Abandoned,
-        "the crashed request is {:?}",
-        abandoned.state
-    );
-    let successor = attempts
-        .iter()
-        .filter(|attempt| !attempt.closed_as_abandoned())
-        .max_by_key(|attempt| attempt.attempt_number)
-        .context("the successor attempt")?;
-    let completed = agent_server::journal::DurableStore::effect(
-        case.stores.task_store.as_ref(),
-        &request(successor),
-    )
-    .await?
-    .context("the successor's LLM request")?;
-    ensure!(
-        completed.state == agent_server::journal::effect::EffectState::Completed,
-        "the successor's request is {:?}",
-        completed.state
-    );
+    s3_requests_ended(&case, &attempts).await?;
     let live = live_rows(&case.stores, &case.thread).await?;
     ensure!(live.is_empty(), "rows left live: {live:?}");
     Ok(())

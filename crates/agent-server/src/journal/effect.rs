@@ -65,15 +65,25 @@ pub const TOOL_INTERRUPTED_PREFIX: &str = "interrupted:";
 pub const ABORTED_RESPONSE_NOTE: &str = "[interrupted: the response above was cut off when the \
      process stopped. Continue from where it ends; do not repeat it.]";
 
-/// Whether `message` is the [`ABORTED_RESPONSE_NOTE`] recovery appended.
+/// The `user` message that follows a salvaged response the user stopped.
+///
+/// A cancelled root's cut-off response is salvaged by the next turn. This
+/// note says the user stopped it instead of asking the model to continue.
+/// Model context only, like [`ABORTED_RESPONSE_NOTE`].
+pub const CANCELLED_RESPONSE_NOTE: &str =
+    "[interrupted: the user stopped the response above before it finished.]";
+
+/// Whether `message` is a note recovery appended after a salvaged response:
+/// [`ABORTED_RESPONSE_NOTE`] or [`CANCELLED_RESPONSE_NOTE`].
 #[must_use]
 pub fn is_aborted_response_note(message: &llm::Message) -> bool {
+    let is_note = |text: &str| text == ABORTED_RESPONSE_NOTE || text == CANCELLED_RESPONSE_NOTE;
     message.role == llm::Role::User
         && match &message.content {
-            llm::Content::Text(text) => text == ABORTED_RESPONSE_NOTE,
+            llm::Content::Text(text) => is_note(text),
             llm::Content::Blocks(blocks) => matches!(
                 blocks.as_slice(),
-                [llm::ContentBlock::Text { text }] if text == ABORTED_RESPONSE_NOTE
+                [llm::ContentBlock::Text { text }] if is_note(text)
             ),
         }
 }
@@ -195,6 +205,23 @@ impl EffectState {
     #[must_use]
     pub const fn is_started(&self) -> bool {
         matches!(self, Self::Started)
+    }
+
+    /// Whether a record in this state may be finished as `next`: a
+    /// `Started` record by any end state, and an `Abandoned` one only as
+    /// `Salvaged`, once. An LLM request abandoned when its owner ended is
+    /// still salvaged by the next turn on its thread (its partial text is
+    /// in the journal); every other end state is final.
+    #[must_use]
+    pub const fn can_finish_as(&self, next: &Self) -> bool {
+        match self {
+            Self::Started => true,
+            Self::Abandoned => matches!(next, Self::Salvaged { .. }),
+            Self::Completed
+            | Self::Failed { .. }
+            | Self::Interrupted { .. }
+            | Self::Salvaged { .. } => false,
+        }
     }
 
     /// The state as the `outcome` attribute of the
@@ -762,7 +789,7 @@ impl Transition {
             }
         }
         for (index, write) in self.writes.iter().enumerate() {
-            let Write::Effect(EffectWrite::Finish { key, owner, .. }) = write else {
+            let Write::Effect(EffectWrite::Finish { key, owner, state }) = write else {
                 continue;
             };
             let reject = |reason: String| Rejected::Guard {
@@ -778,7 +805,7 @@ impl Transition {
                     record.owner
                 )));
             }
-            if !record.state.is_started() {
+            if !record.state.can_finish_as(state) {
                 return Err(reject(format!(
                     "effect {key} already ended ({:?})",
                     record.state
@@ -908,6 +935,9 @@ mod tests {
     fn only_the_note_itself_is_an_aborted_response_note() {
         assert!(is_aborted_response_note(&llm::Message::user(
             ABORTED_RESPONSE_NOTE
+        )));
+        assert!(is_aborted_response_note(&llm::Message::user(
+            CANCELLED_RESPONSE_NOTE
         )));
         assert!(is_aborted_response_note(&llm::Message {
             role: llm::Role::User,

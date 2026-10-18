@@ -2201,8 +2201,8 @@ ON CONFLICT (operation_id) DO NOTHING
         let columns = state.columns();
         let key_str = key.as_str();
         let owner_str = owner.as_str();
-        let result = sqlx::query!(
-            r"
+        let finished = sqlx::query!(
+            r#"
 UPDATE agent_sdk_execution_intents
 SET status          = ?3,
     error           = ?4,
@@ -2211,8 +2211,9 @@ SET status          = ?3,
     updated_at      = ?7
 WHERE operation_id = ?1
   AND child_task_id = ?2
-  AND status IN ('pending', 'started')
-",
+  AND (status IN ('pending', 'started') OR (resolution = 'abandoned' AND ?5 = 'salvaged'))
+RETURNING effect_kind AS "effect_kind!", tool_call_id AS "tool_call_id!"
+"#,
             key_str,
             owner_str,
             columns.status,
@@ -2221,14 +2222,27 @@ WHERE operation_id = ?1
             columns.captured_output,
             now,
         )
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
         .with_context(|| format!("finish effect {key}"))?;
-        ensure!(
-            result.rows_affected() == 1,
-            "finish effect {key} affected {} rows",
-            result.rows_affected(),
-        );
+        let [row] = finished.as_slice() else {
+            anyhow::bail!("finish effect {key} affected {} rows", finished.len());
+        };
+        // An LLM request that ends closes its attempt if it is still open
+        // (provisionally, as an abandoned close: a live worker's own close
+        // replaces it).
+        if row.effect_kind
+            == agent_server::journal::effect::kind_wire(
+                agent_server::journal::effect::EffectKind::LlmRequest,
+            )
+        {
+            Self::close_abandoned_attempt_tx(
+                tx,
+                &TurnAttemptId::from_string(row.tool_call_id.clone()),
+                now,
+            )
+            .await?;
+        }
         Ok(())
     }
 

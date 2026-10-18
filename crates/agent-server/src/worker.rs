@@ -93,6 +93,7 @@ pub mod connectivity;
 pub mod definition;
 pub mod registry;
 pub mod root_turn;
+pub mod salvage;
 pub mod subagent;
 pub mod subagent_spawn_selector;
 pub mod tool_effect;
