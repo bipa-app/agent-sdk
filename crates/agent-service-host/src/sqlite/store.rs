@@ -99,6 +99,13 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
 use super::migrations::apply_durable_core_migrations;
 
+/// A completed turn's settle (when it carries one) and the documents its
+/// extra writes put.
+type CompletedTurnExtra = (
+    Option<(AgentTask, Option<AgentTask>)>,
+    Vec<agent_server::journal::DocumentOutcome>,
+);
+
 mod documents;
 
 // ─────────────────────────────────────────────────────────────────────
@@ -117,6 +124,7 @@ pub struct SqliteDurableStore {
     /// The epoch the newest committed `Write::BeginEpoch` began; every
     /// lease this store grants after it records it.
     current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
+    extension: Option<std::sync::Arc<dyn agent_server::journal::TransitionExtension>>,
 }
 
 /// A held row's position in the backstop probe's `(created_at, id)` order,
@@ -142,6 +150,7 @@ impl SqliteDurableStore {
             pool,
             held_probe: HeldProbe::default(),
             current_epoch: Arc::default(),
+            extension: None,
         }
     }
 
@@ -278,6 +287,18 @@ impl SqliteDurableStore {
     #[must_use]
     pub const fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Install the host's transition extension: it runs once per
+    /// [`commit`](agent_server::journal::DurableStore::commit) and per
+    /// completed turn, and its writes commit in the same transaction.
+    #[must_use]
+    pub fn with_transition_extension(
+        mut self,
+        extension: std::sync::Arc<dyn agent_server::journal::TransitionExtension>,
+    ) -> Self {
+        self.extension = Some(extension);
+        self
     }
 }
 
@@ -3304,11 +3325,13 @@ VALUES (?1, ?2, ?3, NULL, NULL, 'pending', ?4, ?5, ?5, 0, ?6)
         agent_server::fail_point!("commit.before_event_commit");
 
         Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
-        let settled = Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
+        let (settled, extra_documents) =
+            Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
 
         tx.commit()
             .await
             .context("commit sqlite completed-turn transaction")?;
+        Self::record_turn_documents(extra_documents);
 
         Ok(CommitOutcome {
             closed_attempt,
@@ -3644,6 +3667,7 @@ impl SqliteDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        let transition = transition.extended(self.extension.as_deref())?;
         transition.validate()?;
         let mut tx = self.begin().await?;
         Self::check_declared_threads_tx(&mut tx, &transition, true, now).await?;
@@ -3677,13 +3701,24 @@ impl SqliteDurableStore {
 }
 
 impl SqliteDurableStore {
+    /// Count the documents a committed turn wrote.
+    fn record_turn_documents(documents: Vec<agent_server::journal::DocumentOutcome>) {
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_documents(
+            agent_server::observability::attrs::BACKEND_SQLITE,
+            &documents,
+        );
+        drop(documents);
+    }
+
     /// Apply a completed turn's extra writes inside its transaction,
-    /// through the same write arms as a transition, and return its settle.
+    /// through the same write arms as a transition, and return its settle
+    /// and the documents it wrote.
     async fn settle_completed_turn_tx(
         tx: &mut Transaction<'_, Sqlite>,
         extra: &agent_server::journal::Transition,
         now: OffsetDateTime,
-    ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
+    ) -> Result<CompletedTurnExtra> {
         let mut committed = agent_server::journal::Committed::default();
         for write in extra.writes.iter().cloned() {
             Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
@@ -3691,7 +3726,10 @@ impl SqliteDurableStore {
         if !committed.settled.is_empty() {
             agent_server::fail_point!("commit.completed_turn.settled");
         }
-        Ok(committed.settled.pop())
+        // After every extra write, before the commit: a crash here must
+        // leave none of them.
+        agent_server::fail_point!("commit.completed_turn.extra_written");
+        Ok((committed.settled.pop(), committed.documents))
     }
 
     /// Apply one effect write of a transition inside its transaction.
@@ -4294,6 +4332,7 @@ impl SqliteDurableStore {
 #[async_trait]
 impl AgentTaskStore for SqliteDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        let params = params.extended(self.extension.as_deref())?;
         self.commit_completed_turn_atomic_inner(params).await
     }
 

@@ -100,6 +100,13 @@ use agent_server::journal::turn_attempt_store::TurnAttemptStore;
 
 use super::migrations::apply_durable_core_migrations;
 
+/// A completed turn's settle (when it carries one) and the documents its
+/// extra writes put.
+type CompletedTurnExtra = (
+    Option<(AgentTask, Option<AgentTask>)>,
+    Vec<agent_server::journal::DocumentOutcome>,
+);
+
 mod documents;
 
 /// `sqlx`-backed durable-core store.
@@ -152,6 +159,7 @@ pub struct PostgresDurableStore {
     /// The epoch the newest committed `Write::BeginEpoch` began; every
     /// lease this store grants after it records it.
     current_epoch: Arc<std::sync::RwLock<Option<EpochId>>>,
+    extension: Option<Arc<dyn agent_server::journal::TransitionExtension>>,
 }
 
 impl PostgresDurableStore {
@@ -192,6 +200,7 @@ impl PostgresDurableStore {
             held_probe: HeldProbe::default(),
             lock_conflict_retries: Arc::default(),
             current_epoch: Arc::default(),
+            extension: None,
         }
     }
 
@@ -312,6 +321,18 @@ impl PostgresDurableStore {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Install the host's transition extension: it runs once per
+    /// [`commit`](agent_server::journal::DurableStore::commit) and per
+    /// completed turn, and its writes commit in the same transaction.
+    #[must_use]
+    pub fn with_transition_extension(
+        mut self,
+        extension: Arc<dyn agent_server::journal::TransitionExtension>,
+    ) -> Self {
+        self.extension = Some(extension);
+        self
     }
 
     async fn begin(&self) -> Result<Transaction<'_, Postgres>> {
@@ -3813,18 +3834,7 @@ FOR UPDATE
             .await?
             .context("thread missing after bootstrap")?;
         old_thread.require_active(ThreadOperation::Commit)?;
-        // Stale turn double-commit guard. The thread row is locked
-        // FOR UPDATE; assert it is still positioned to produce
-        // `expected_turn` before incrementing. A stale-lease worker that
-        // lost the race to another worker fails here instead of durably
-        // double-committing the turn (pure in-Rust comparison on the
-        // already-locked row — no extra query).
-        if old_thread.committed_turns.saturating_add(1) != params.expected_turn {
-            return Err(anyhow::Error::new(StaleTurnCommit {
-                expected_turn: params.expected_turn,
-                committed_turns: old_thread.committed_turns,
-            }));
-        }
+        require_turn_slot(&old_thread, params.expected_turn)?;
 
         // Owner-guarded commit, enforced after the thread lock so the
         // transaction's lock order stays thread→task, consistent with
@@ -3921,11 +3931,13 @@ FOR UPDATE
         agent_server::fail_point!("commit.before_event_commit");
 
         Self::complete_injections_tx(&mut tx, &params.delivered_injection_ids, params.now).await?;
-        let settled = Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
+        let (settled, extra_documents) =
+            Self::settle_completed_turn_tx(&mut tx, &extra, params.now).await?;
 
         tx.commit()
             .await
             .context("commit postgres completed-turn transaction")?;
+        Self::record_turn_documents(extra_documents);
 
         Ok(CommitOutcome {
             thread,
@@ -3935,6 +3947,21 @@ FOR UPDATE
             settled,
         })
     }
+}
+
+/// Stale turn double-commit guard. The thread row is locked FOR UPDATE;
+/// it must still be positioned to produce `expected_turn` before the
+/// increment. A stale-lease worker that lost the race to another worker
+/// fails here instead of durably double-committing the turn (a pure
+/// comparison on the already-locked row, no extra query).
+fn require_turn_slot(thread: &Thread, expected_turn: u32) -> Result<()> {
+    if thread.committed_turns.saturating_add(1) != expected_turn {
+        return Err(anyhow::Error::new(StaleTurnCommit {
+            expected_turn,
+            committed_turns: thread.committed_turns,
+        }));
+    }
+    Ok(())
 }
 
 fn validate_schema_name(schema: &str) -> Result<()> {
@@ -4380,6 +4407,7 @@ impl PostgresDurableStore {
         transition: agent_server::journal::Transition,
         now: OffsetDateTime,
     ) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+        let transition = transition.extended(self.extension.as_deref())?;
         transition.validate()?;
         let mut attempt = 0;
         loop {
@@ -4623,13 +4651,24 @@ impl PostgresDurableStore {
 }
 
 impl PostgresDurableStore {
+    /// Count the documents a committed turn wrote.
+    fn record_turn_documents(documents: Vec<agent_server::journal::DocumentOutcome>) {
+        #[cfg(feature = "otel")]
+        agent_server::observability::ServerMetrics::global().record_documents(
+            agent_server::observability::attrs::BACKEND_POSTGRES,
+            &documents,
+        );
+        drop(documents);
+    }
+
     /// Apply a completed turn's extra writes inside its transaction,
-    /// through the same write arms as a transition, and return its settle.
+    /// through the same write arms as a transition, and return its settle
+    /// and the documents it wrote.
     async fn settle_completed_turn_tx(
         tx: &mut Transaction<'_, Postgres>,
         extra: &agent_server::journal::Transition,
         now: OffsetDateTime,
-    ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
+    ) -> Result<CompletedTurnExtra> {
         let mut committed = agent_server::journal::Committed::default();
         for write in extra.writes.iter().cloned() {
             Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
@@ -4637,7 +4676,10 @@ impl PostgresDurableStore {
         if !committed.settled.is_empty() {
             agent_server::fail_point!("commit.completed_turn.settled");
         }
-        Ok(committed.settled.pop())
+        // After every extra write, before the commit: a crash here must
+        // leave none of them.
+        agent_server::fail_point!("commit.completed_turn.extra_written");
+        Ok((committed.settled.pop(), committed.documents))
     }
 
     /// Apply one effect write of a transition inside its transaction.
@@ -5190,6 +5232,7 @@ impl PostgresDurableStore {
 #[async_trait]
 impl AgentTaskStore for PostgresDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
+        let params = params.extended(self.extension.as_deref())?;
         self.commit_completed_turn_atomic_inner(params, None).await
     }
 

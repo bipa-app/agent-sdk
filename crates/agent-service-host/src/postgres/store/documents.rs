@@ -90,8 +90,11 @@ impl PostgresDurableStore {
         Ok(())
     }
 
-    /// Apply one document write inside its transition's transaction. A
-    /// task document's task row is already locked, and must exist.
+    /// Apply one document write inside its transaction. A task document's
+    /// task must exist. A transition reaches the document under its
+    /// `Lock::ThreadOf` and `Lock::Task`; a completed turn reaches it under
+    /// its own thread row's lock, and its task row's too when it has an
+    /// owner guard.
     pub(super) async fn apply_document_tx(
         tx: &mut Transaction<'_, Postgres>,
         document: DocumentWrite,

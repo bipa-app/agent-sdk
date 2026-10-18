@@ -56,6 +56,7 @@ use time::OffsetDateTime;
 use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointKind;
 use super::committed_event::CommittedEvent;
+use super::document::{DocScope, DocumentWrite};
 use super::effect::EffectWrite;
 use super::store::AgentTaskStore;
 use super::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
@@ -137,10 +138,12 @@ pub struct CompletedTurnCommit {
     /// because the root's settle among [`Self::extra_writes`] needs it.
     pub owner_guard: Option<CommitOwnerGuard>,
     /// Further writes applied inside the completed turn's transaction,
-    /// after its own rows and events. Only the task's own
-    /// [`Write::SettleTask`] for now (see [`Self::validate_extra_writes`]),
-    /// which needs [`Self::owner_guard`]: the turn and the task's terminal
-    /// row then commit together (design I2).
+    /// after its own rows and events: the task's own [`Write::SettleTask`],
+    /// which needs [`Self::owner_guard`] so the turn and the task's terminal
+    /// row commit together (design I2), and documents on the turn's own
+    /// thread or task, which a host's
+    /// [`super::extension::TransitionExtension`] adds (see
+    /// [`Self::validate_extra_writes`]).
     pub extra_writes: Vec<Write>,
     /// Current wall-clock time.
     pub now: OffsetDateTime,
@@ -150,10 +153,19 @@ impl CompletedTurnCommit {
     /// Check the extra writes every backend applies inside the turn's
     /// transaction, only with an [`Self::owner_guard`] for its lease: the
     /// finishes of the task's own effects (its LLM request's), then at most
-    /// one settle of the task itself.
+    /// one settle of the task itself; and documents, each scoped to the
+    /// turn's own thread or its own task.
+    ///
+    /// The scope rule keeps the purge fence and the lock order without a
+    /// lock pass of its own: every completed turn locks its thread row first
+    /// and refuses a thread that is being purged, and a document on that
+    /// thread or on its task is reached only under that lock, as a
+    /// transition reaches it under `Lock::Thread` / `Lock::ThreadOf`.
     ///
     /// # Errors
-    /// Names the first write a completed turn may not carry.
+    /// Names the first write a completed turn may not carry, the first
+    /// document outside the turn's own scope, or the first malformed
+    /// document.
     pub fn validate_extra_writes(&self) -> Result<()> {
         let mut settles = 0;
         for write in &self.extra_writes {
@@ -175,6 +187,7 @@ impl CompletedTurnCommit {
                         "a completed turn finishes its effects before it settles its task"
                     );
                 }
+                Write::Document(document) => self.check_own_document(document)?,
                 Write::SettleTask { .. }
                 | Write::RejectConfirmation { .. }
                 | Write::PauseOnConfirmation { .. }
@@ -183,13 +196,12 @@ impl CompletedTurnCommit {
                 | Write::AppendCompaction { .. }
                 | Write::AppendEvents { .. }
                 | Write::SpawnChildren { .. }
-                | Write::Document(_)
                 | Write::EnqueueSteeringResume { .. }
                 | Write::BeginEpoch(_)
                 | Write::TurnAttempt(_) => {
                     anyhow::bail!(
-                        "a completed turn may carry only its own task's effect finishes and \
-                         settle among its extra writes, not {write:?}"
+                        "a completed turn may carry only its own task's effect finishes, \
+                         settle and documents among its extra writes, not {write:?}"
                     );
                 }
             }
@@ -202,6 +214,27 @@ impl CompletedTurnCommit {
             .validate()
             .map_err(|rejected| anyhow::anyhow!("{rejected}"))?;
         Ok(())
+    }
+
+    /// Check that `document` is on the turn's own thread or its own task,
+    /// and well-formed.
+    ///
+    /// # Errors
+    /// Names the document when it is outside the turn's scope or malformed.
+    pub(crate) fn check_own_document(&self, document: &DocumentWrite) -> Result<()> {
+        let own = match &document.key.scope {
+            DocScope::Thread(thread) => thread == &self.thread_id,
+            DocScope::Task(task) => task == &self.task_id,
+            DocScope::Host => false,
+        };
+        anyhow::ensure!(
+            own,
+            "a completed turn may write documents only on its own thread {} or task {}, not {}",
+            self.thread_id,
+            self.task_id,
+            document.key
+        );
+        document.validate()
     }
 
     /// The extra writes as a transition for the backends' shared write
