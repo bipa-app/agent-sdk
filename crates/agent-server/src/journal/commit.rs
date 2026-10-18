@@ -56,6 +56,7 @@ use time::OffsetDateTime;
 use super::checkpoint::Checkpoint;
 use super::checkpoint::CheckpointKind;
 use super::committed_event::CommittedEvent;
+use super::effect::EffectWrite;
 use super::store::AgentTaskStore;
 use super::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
 use super::thread::Thread;
@@ -147,8 +148,9 @@ pub struct CompletedTurnCommit {
 
 impl CompletedTurnCommit {
     /// Check the extra writes every backend applies inside the turn's
-    /// transaction: at most one, the task's own [`Write::SettleTask`], and
-    /// only with an [`Self::owner_guard`] for its lease.
+    /// transaction, only with an [`Self::owner_guard`] for its lease: the
+    /// finishes of the task's own effects (its LLM request's), then at most
+    /// one settle of the task itself.
     ///
     /// # Errors
     /// Names the first write a completed turn may not carry.
@@ -163,6 +165,16 @@ impl CompletedTurnCommit {
                     );
                     settles += 1;
                 }
+                Write::Effect(EffectWrite::Finish { owner, .. }) if *owner == self.task_id => {
+                    anyhow::ensure!(
+                        self.owner_guard.is_some(),
+                        "a completed turn finishes its task's effects only under an owner guard"
+                    );
+                    anyhow::ensure!(
+                        settles == 0,
+                        "a completed turn finishes its effects before it settles its task"
+                    );
+                }
                 Write::SettleTask { .. }
                 | Write::RejectConfirmation { .. }
                 | Write::PauseOnConfirmation { .. }
@@ -173,10 +185,11 @@ impl CompletedTurnCommit {
                 | Write::SpawnChildren { .. }
                 | Write::Document(_)
                 | Write::EnqueueSteeringResume { .. }
-                | Write::BeginEpoch(_) => {
+                | Write::BeginEpoch(_)
+                | Write::TurnAttempt(_) => {
                     anyhow::bail!(
-                        "a completed turn may carry only its own task's settle among its extra \
-                         writes, not {write:?}"
+                        "a completed turn may carry only its own task's effect finishes and \
+                         settle among its extra writes, not {write:?}"
                     );
                 }
             }
@@ -185,6 +198,9 @@ impl CompletedTurnCommit {
             settles <= 1,
             "a completed turn settles its task at most once"
         );
+        self.extra_transition()
+            .validate()
+            .map_err(|rejected| anyhow::anyhow!("{rejected}"))?;
         Ok(())
     }
 

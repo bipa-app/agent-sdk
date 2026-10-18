@@ -2009,3 +2009,202 @@ async fn subagent_stall_signals_count_by_leg_without_the_ids() -> Result<()> {
     );
     Ok(())
 }
+
+struct TextProvider;
+
+#[async_trait::async_trait]
+impl agent_sdk_providers::LlmProvider for TextProvider {
+    async fn chat(
+        &self,
+        _request: agent_sdk_foundation::llm::ChatRequest,
+    ) -> Result<agent_sdk_foundation::llm::ChatOutcome> {
+        use agent_sdk_foundation::llm::{
+            ChatOutcome, ChatResponse, ContentBlock, StopReason, Usage,
+        };
+
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: "metrics-response".into(),
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
+            model: "metrics-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                served_speed: None,
+                input_tokens: 1,
+                output_tokens: 1,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                request_input_tokens: None,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "metrics-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "metrics"
+    }
+}
+
+fn text_definition() -> agent_server::worker::definition::AgentDefinition {
+    use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+
+    AgentDefinition {
+        provider: "metrics".into(),
+        model: "metrics-model".into(),
+        system_prompt: "Answer.".into(),
+        max_tokens: 64,
+        tools: Vec::new(),
+        thinking: ThinkingPolicy::default(),
+        thinking_display: None,
+        tools_fn: None,
+        tool_input_sanitizer: None,
+        request_context_fn: None,
+        policy: RuntimePolicy::server_default(),
+    }
+}
+
+/// One root turn under its lease, one under a lease it does not hold, on
+/// in-memory stores wired as a host wires them.
+async fn run_llm_signal_turns() -> Result<()> {
+    use agent_server::journal::checkpoint_store::InMemoryCheckpointStore;
+    use agent_server::journal::event_notifier::EventNotifier;
+    use agent_server::journal::event_repository::InMemoryEventRepository;
+    use agent_server::journal::execution_context::build_root_worker_inputs;
+    use agent_server::journal::message_store::InMemoryMessageProjectionStore;
+    use agent_server::journal::outbox::InMemoryOutboxStore;
+    use agent_server::journal::store::{
+        AgentTaskStore, CancellationMarkerSink, CompletedTurnSink, InMemoryAgentTaskStore,
+    };
+    use agent_server::journal::task::{AgentTask, LeaseId, WorkerId};
+    use agent_server::journal::thread_store::{InMemoryThreadStore, ThreadStore};
+    use agent_server::journal::turn_attempt_store::InMemoryTurnAttemptStore;
+    use agent_server::worker::bootstrap::WorkerBootstrapContext;
+    use agent_server::worker::root_turn::{RootTurnDeps, execute_root_turn};
+
+    let (threads, events, messages) = (
+        InMemoryThreadStore::new(),
+        InMemoryEventRepository::new(),
+        InMemoryMessageProjectionStore::new(),
+    );
+    let (attempts, checkpoints) = (
+        InMemoryTurnAttemptStore::new(),
+        InMemoryCheckpointStore::new(),
+    );
+    let tasks = InMemoryAgentTaskStore::new()
+        .with_cancellation_markers(CancellationMarkerSink {
+            event_repo: Arc::new(events.clone()),
+            outbox_store: Arc::new(InMemoryOutboxStore::new()),
+            thread_store: Arc::new(threads.clone()),
+        })
+        .with_message_store(Arc::new(messages.clone()))
+        .with_completed_turns(CompletedTurnSink {
+            attempt_store: Arc::new(attempts.clone()),
+            checkpoint_store: Arc::new(checkpoints.clone()),
+        });
+    let notifier = EventNotifier::new();
+    let deps = RootTurnDeps {
+        task_store: &tasks,
+        thread_store: &threads,
+        message_store: &messages,
+        attempt_store: &attempts,
+        checkpoint_store: &checkpoints,
+        event_repo: &events,
+        event_notifier: &notifier,
+        subagent_spawn_selector: None,
+        compaction_config: None,
+        compaction_provider: None,
+        compaction_artifact_store: None,
+        cancel: None,
+        wakeup: None,
+        activity: None,
+        connectivity_waits: None,
+    };
+    // One root turn under its lease, one under a lease it does not hold.
+    for (name, holds_lease) in [("llm-signals-ok", true), ("llm-signals-refused", false)] {
+        let thread = ThreadId::from_string(name);
+        threads.get_or_create(&thread, t0()).await?;
+        let root = AgentTask::new_root_turn(thread.clone(), t0(), 3);
+        tasks.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let acquired = tasks
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease,
+                t0() + time::Duration::hours(1),
+                t0(),
+            )
+            .await?
+            .context("acquire the root")?;
+        let bootstrap = WorkerBootstrapContext {
+            thread_id: thread,
+            task_id: root.id.clone(),
+            task: acquired.clone(),
+            worker_id: worker,
+            lease_id: if holds_lease {
+                acquired.lease_id.clone().context("lease")?
+            } else {
+                LeaseId::new()
+            },
+            definition: text_definition(),
+        };
+        let inputs =
+            build_root_worker_inputs(bootstrap, &threads, &checkpoints, &messages, t0()).await?;
+        let outcome = execute_root_turn(
+            inputs,
+            "hi",
+            &TextProvider,
+            &deps,
+            t0() + time::Duration::seconds(5),
+        )
+        .await;
+        assert_eq!(outcome.is_ok(), holds_lease, "{name}: {:?}", outcome.err());
+    }
+
+    Ok(())
+}
+
+/// An LLM request's signals: `agent_server.effects{kind="llm_request"}`
+/// counts its start, its finish with the completed turn, and a begin the
+/// lease guard refused; `agent_server.effect.duration` records the finished
+/// request's run time.
+#[tokio::test]
+async fn llm_request_signals_count_start_finish_and_refusal() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let _ = ServerMetrics::global();
+    run_llm_signal_turns().await?;
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.effects");
+    for transition in ["started", "finished", "refused"] {
+        let seen: u64 = counts
+            .iter()
+            .filter(|(set, _)| {
+                matches_all(
+                    set,
+                    &[
+                        (attrs::KIND, "llm_request"),
+                        (attrs::TRANSITION, transition),
+                    ],
+                )
+            })
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(seen, 1, "transition {transition}: {counts:?}");
+    }
+    let durations = collect_histogram_attrs(&snapshots, "agent_server.effect.duration");
+    assert!(
+        durations.iter().any(|set| matches_all(
+            set,
+            &[(attrs::KIND, "llm_request"), (attrs::OUTCOME, "completed")]
+        )),
+        "{durations:?}"
+    );
+    Ok(())
+}

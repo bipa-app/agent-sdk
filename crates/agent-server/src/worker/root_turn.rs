@@ -71,6 +71,9 @@ use crate::journal::commit::{
     StaleTurnCommit, commit_completed_turn,
 };
 use crate::journal::committed_event::CommittedEvent;
+use crate::journal::effect::{
+    EffectIntent, EffectKey, EffectKind, EffectState, EffectSubject, EffectWrite,
+};
 use crate::journal::event_notifier::EventNotifier;
 use crate::journal::event_repository::EventRepository;
 use crate::journal::execution_context::RootWorkerInputs;
@@ -89,6 +92,7 @@ use crate::journal::turn_attempt::{
     TurnAttemptSchemaError,
 };
 use crate::journal::turn_attempt_store::TurnAttemptStore;
+use crate::journal::{Guard, Rejected, Transition, TurnAttemptId, TurnAttemptWrite};
 
 // ─────────────────────────────────────────────────────────────────────
 // Store dependencies
@@ -1781,7 +1785,7 @@ async fn run_boundary_injection_call(
         inputs,
         definition,
         super::user_input::BOUNDARY_INJECTION_AUDIT_PROMPT,
-        deps.attempt_store,
+        deps,
         now,
         None,
     )
@@ -2048,7 +2052,7 @@ async fn execute_root_turn_inner(
         &inputs,
         definition,
         &audit_prompt,
-        deps.attempt_store,
+        deps,
         pre_call.main_attempt_opened_at,
         root_otel_ids.clone(),
     )
@@ -2292,10 +2296,7 @@ async fn commit_text_only_turn(
                 worker_id: inputs.bootstrap.worker_id.clone(),
                 lease_id: inputs.bootstrap.lease_id.clone(),
             }),
-            extra_writes: vec![Write::SettleTask {
-                task: task_id.clone(),
-                outcome: Settle::CompleteWithoutResult,
-            }],
+            extra_writes: completed_root_writes(task_id, &attempt.id),
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -2304,6 +2305,7 @@ async fn commit_text_only_turn(
     )
     .await
     .context("commit completed turn")?;
+    record_llm_request_finished(&attempt, now);
 
     // Prepend the durable per-turn admission events (`UserInput`
     // when present + `Start`) committed before streaming so the
@@ -2794,7 +2796,7 @@ async fn open_attempt(
     inputs: &RootWorkerInputs,
     definition: &AgentDefinition,
     user_prompt: &str,
-    attempt_store: &dyn TurnAttemptStore,
+    deps: &RootTurnDeps<'_>,
     now: OffsetDateTime,
     otel_ids: Option<(String, String)>,
 ) -> Result<TurnAttempt> {
@@ -2805,22 +2807,22 @@ async fn open_attempt(
         "system_prompt_len": definition.system_prompt.len(),
     });
 
-    let existing = attempt_store
+    let existing = deps
+        .attempt_store
         .list_by_task(task_id)
         .await
         .context("list existing attempts")?;
     // Leftover OPEN attempts from a predecessor execution are left
-    // alone: after a lease expiry, the old worker
-    // may still be live — executing, unaware of its heartbeat
-    // rejection — and closing its attempt here would permanently
-    // record zero usage where the provider's real billed usage
-    // belongs (its own close then loses to `AlreadyClosed`). The old
-    // worker's own exit paths settle the attempt with real usage; a
-    // hard-crashed worker's attempt stays open, the same pre-existing
-    // audit residual every crash-requeue has. Duplicate-commit
-    // protection does not depend on closing here: the expected-turn
-    // CAS inside `ThreadStore::commit_turn` rejects a stale late
-    // commit atomically on every backend.
+    // alone: after a lease expiry, the old worker may still be live —
+    // executing, unaware of its heartbeat rejection — and closing its
+    // attempt here would permanently record zero usage where the
+    // provider's real billed usage belongs. A hard-crashed worker's
+    // attempt is closed through its LLM request's effect instead: when
+    // the task ends, the store abandons the still-started request and
+    // closes the attempt row it names in the same transaction. Duplicate-
+    // commit protection does not depend on closing here: the expected-turn
+    // CAS inside `ThreadStore::commit_turn` rejects a stale late commit
+    // atomically on every backend.
     let attempt_number = u32::try_from(existing.len()).context("attempt count overflow")? + 1;
 
     let (otel_trace_id, otel_span_id) = match otel_ids {
@@ -2828,23 +2830,102 @@ async fn open_attempt(
         None => (None, None),
     };
 
-    attempt_store
-        .open_attempt(OpenAttemptParams {
-            task_id: task_id.clone(),
-            attempt_number,
-            provenance,
-            request_blob,
-            now,
-            // The root `invoke_agent` span's ids, persisted on the first
-            // attempt so the resume path and child tool tasks can
-            // re-parent under it across the daemon's task hops (see
-            // `execute_root_turn_inner`). `None` on retry / resume
-            // attempts and when the worker runs without an OTel exporter.
-            otel_trace_id,
-            otel_span_id,
-        })
-        .await
-        .context("open_attempt via store")
+    let attempt = TurnAttempt::open(OpenAttemptParams {
+        task_id: task_id.clone(),
+        attempt_number,
+        provenance,
+        request_blob,
+        now,
+        // The root `invoke_agent` span's ids, persisted on the first
+        // attempt so the resume path and child tool tasks can
+        // re-parent under it across the daemon's task hops (see
+        // `execute_root_turn_inner`). `None` on retry / resume
+        // attempts and when the worker runs without an OTel exporter.
+        otel_trace_id,
+        otel_span_id,
+    });
+    begin_llm_request(inputs, definition, deps, &attempt, now).await?;
+    Ok(attempt)
+}
+
+/// Commit `attempt` with the start of its LLM request as one transition,
+/// under the root's lease: the attempt row and a `Started` `LlmRequest`
+/// effect keyed by the attempt (`llm:{task}:{attempt}`). A crash after this
+/// leaves a started request that recovery can see; the attempt is never
+/// open without one. The turn's `UserInput` and `Start` events keep their
+/// own earlier commits.
+async fn begin_llm_request(
+    inputs: &RootWorkerInputs,
+    definition: &AgentDefinition,
+    deps: &RootTurnDeps<'_>,
+    attempt: &TurnAttempt,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let bootstrap = &inputs.bootstrap;
+    let key = EffectKey::llm(&bootstrap.task_id, attempt.id.as_str());
+    let intent = EffectIntent {
+        key: key.clone(),
+        replay: ToolReplay::Safe,
+        owner: bootstrap.task_id.clone(),
+        thread: bootstrap.thread_id.clone(),
+        subject: EffectSubject::Llm {
+            turn_attempt_id: attempt.id.as_str().to_owned(),
+            provider: definition.provider.clone(),
+            model: definition.model.clone(),
+        },
+        attempt: attempt.attempt_number,
+    };
+    let transition = Transition {
+        guards: vec![
+            Guard::TaskIs {
+                task: bootstrap.task_id.clone(),
+                status: TaskStatus::Running,
+                lease: Some((bootstrap.worker_id.clone(), bootstrap.lease_id.clone())),
+            },
+            Guard::EffectFree { key },
+        ],
+        writes: vec![
+            Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(attempt.clone()))),
+            Write::Effect(EffectWrite::Start(intent)),
+        ],
+    };
+    if let Err(rejected) = deps.task_store.commit(transition, now).await {
+        if matches!(rejected, Rejected::Guard { .. }) {
+            crate::journal::effect::record_effect(EffectKind::LlmRequest, "refused");
+        }
+        return Err(anyhow::Error::from(rejected))
+            .context("open the turn attempt and start its LLM request");
+    }
+    crate::journal::effect::record_effect(EffectKind::LlmRequest, "started");
+    Ok(())
+}
+
+/// Count the LLM request of `attempt` finished `Completed` by its turn's
+/// commit at `now`, with its run time since the attempt opened.
+fn record_llm_request_finished(attempt: &TurnAttempt, now: OffsetDateTime) {
+    let duration = (now - attempt.opened_at).as_seconds_f64().max(0.0);
+    crate::journal::effect::record_effect_finished(
+        EffectKind::LlmRequest,
+        EffectState::Completed.outcome_label(),
+        duration,
+    );
+}
+
+/// A completed root turn's extra writes: the finish of the LLM request
+/// `attempt` made, then the root's settle (which would abandon a request
+/// still started).
+fn completed_root_writes(task: &AgentTaskId, attempt: &TurnAttemptId) -> Vec<Write> {
+    vec![
+        Write::Effect(EffectWrite::Finish {
+            key: EffectKey::llm(task, attempt.as_str()),
+            owner: task.clone(),
+            state: EffectState::Completed,
+        }),
+        Write::SettleTask {
+            task: task.clone(),
+            outcome: Settle::CompleteWithoutResult,
+        },
+    ]
 }
 
 /// Only a re-acquired task (`attempt > 1`) can find its own earlier commit.
@@ -4098,7 +4179,7 @@ async fn wait_out_connectivity_loss(params: RecoverableRetryParams<'_>) -> Resul
             inputs,
             definition,
             attempt_audit_prompt,
-            deps.attempt_store,
+            deps,
             OffsetDateTime::now_utc(),
             None,
         )
@@ -4202,7 +4283,7 @@ async fn back_off_transient_stream_error(
         inputs,
         definition,
         attempt_audit_prompt,
-        deps.attempt_store,
+        deps,
         OffsetDateTime::now_utc(),
         None,
     )
@@ -4352,7 +4433,7 @@ async fn try_recover_with_compaction(
         inputs,
         definition,
         attempt_audit_prompt,
-        deps.attempt_store,
+        deps,
         OffsetDateTime::now_utc(),
         None,
     )
@@ -7880,7 +7961,7 @@ async fn stage_resume_call(
         inputs,
         definition,
         &resume_audit,
-        deps.attempt_store,
+        deps,
         pre_call.main_attempt_opened_at,
         None,
     )
@@ -8058,10 +8139,7 @@ async fn commit_resumed_turn(
                 worker_id: inputs.bootstrap.worker_id.clone(),
                 lease_id: inputs.bootstrap.lease_id.clone(),
             }),
-            extra_writes: vec![Write::SettleTask {
-                task: task_id.clone(),
-                outcome: Settle::CompleteWithoutResult,
-            }],
+            extra_writes: completed_root_writes(task_id, &attempt.id),
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -8070,6 +8148,7 @@ async fn commit_resumed_turn(
     )
     .await
     .context("commit resumed turn")?;
+    record_llm_request_finished(attempt, now);
 
     let committed_events = commit.committed_events.clone();
 
@@ -9689,7 +9768,7 @@ async fn stage_and_call_steering_llm(
         inputs,
         definition,
         &resume_audit,
-        deps.attempt_store,
+        deps,
         pre_call.main_attempt_opened_at,
         None,
     )

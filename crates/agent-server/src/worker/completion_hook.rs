@@ -222,6 +222,7 @@ const fn write_name(write: &Write) -> &'static str {
         Write::Effect(_) => "Effect",
         Write::EnqueueSteeringResume { .. } => "EnqueueSteeringResume",
         Write::BeginEpoch(_) => "BeginEpoch",
+        Write::TurnAttempt(_) => "TurnAttempt",
     }
 }
 

@@ -75,8 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §6: unsafe tool, safe tool, LLM stream, fork, cancel tree, human waits,
   hung child, two overlapping hosts), boots a fresh daemon on the same
   database, and checks what recovery did. Each scenario runs on SQLite and
-  on Postgres (`TEST_DATABASE_URL`). Scenarios that fail today (S3: the
-  crashed LLM attempt stays open)
+  on Postgres (`TEST_DATABASE_URL`). Scenarios that fail (none since
+  P2-3b1 closed S3's crashed LLM attempt; the hung tool and subagent cases
+  pass since #514 and #521)
   are ignored and run as expected failures: they pass while the documented
   failure still reproduces, and fail once it is fixed, so the fix must
   un-ignore them. With `AGENT_SDK_CRASH_MATRIX_KNOWN_FAILURES` set they
@@ -372,6 +373,53 @@ long as it needs. No migration, table, `Write` variant or protocol change.
     writes no documents.
 
 ### Crash safety, Phase 2: effects
+
+- **Breaking: every LLM request of a root turn is an effect (P2-3b1).**
+  - **Start.** The worker opens each turn attempt with one transition
+    under the root's lease: the attempt row (the new
+    `Write::TurnAttempt(TurnAttemptWrite::Open)`, built by the caller with
+    `TurnAttempt::open` so it knows the id) and a `Started` `LlmRequest`
+    effect keyed `llm:{task}:{attempt}` (`EffectKey::llm`). An attempt is
+    never open without its request. A worker that lost its lease now
+    fails before it calls the model. The turn's `UserInput` and `Start`
+    events keep their own earlier commits (a recorded deviation from the
+    design, which put them in this transaction).
+  - **Finish.** A completed turn finishes its request (`Completed`) in its
+    own transaction, before the root's settle:
+    `CompletedTurnCommit::validate_extra_writes` now also admits the task's
+    own effect finishes, and the in-memory store checks them before its
+    first write. The tool-boundary suspension, retry, boundary-injection,
+    steering and question paths finish theirs in P2-3b2; until then those
+    requests stay `Started` until the root ends and are then abandoned
+    (their attempt rows are already closed by the worker).
+  - **A crashed attempt is closed (crash matrix S3).** When a task ends,
+    the stores abandon its still-started effects (#507). For an
+    `LlmRequest` effect they now also close the still-open attempt row it
+    names, in the same transaction (outcome `Cancelled`, no usage,
+    `response_blob.abandoned`). On Postgres that row is taken
+    `FOR UPDATE SKIP LOCKED`, so the close never waits behind a completing
+    turn, which locks its attempt before its task.
+  - **The abandoned close is provisional.** `TurnAttempt::close` replaces
+    an abandoned close (`TurnAttempt::closed_as_abandoned`): a worker that
+    was still live when its task ended, such as a cancel landing
+    mid-stream, still records the provider's real usage. Any other closed
+    row stays final.
+  - **Recovery after a plain lease expiry is unchanged.** A predecessor's
+    open attempt is still left alone at re-acquire, since that worker may
+    be live. Its request is abandoned, and its attempt closed, when the
+    root ends.
+  - **Migration.** Exhaustive matches on `Write` add a
+    `Write::TurnAttempt(_)` arm. An in-memory `InMemoryAgentTaskStore` that
+    runs root turns needs an attempt store: `with_completed_turns` wires
+    its sink's, and the new `with_attempt_store` wires one directly.
+    `TurnAttemptStore` gains two hidden methods with defaults
+    (`put_open_attempt`, `close_abandoned_attempt`) that only the
+    in-memory store implements. Attempts opened before this release have
+    no effect and are not closed this way.
+  - **Tests.** The crash matrix's S3 (`tests/crash_matrix.rs`) passes on
+    SQLite and Postgres and is no longer an expected failure.
+    Conformance `llm_request_effect_lifecycle` runs on all three backends,
+    and `effect.start_written` crash tests run on SQLite and Postgres.
 
 - **Breaking: a completed root turn and the root's terminal row commit
   together** (design I2; reconciliation C2). Before, `commit_completed_turn`

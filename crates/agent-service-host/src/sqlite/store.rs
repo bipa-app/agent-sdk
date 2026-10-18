@@ -1680,6 +1680,24 @@ WHERE id = ?1
         Ok(())
     }
 
+    /// Close the still-open attempt row an abandoned LLM request names, in
+    /// the transaction that abandons the request: its task ended before the
+    /// request finished, so nothing will close it later (crash matrix S3).
+    async fn close_abandoned_attempt_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &TurnAttemptId,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let Some(attempt) = Self::get_attempt_tx(tx, id).await? else {
+            return Ok(());
+        };
+        if attempt.outcome.is_some() {
+            return Ok(());
+        }
+        let closed = attempt.close(CloseAttemptParams::abandoned(), now)?;
+        Self::update_attempt_tx(tx, &closed).await
+    }
+
     /// End the still-`Started` effects of a task that just became
     /// terminal as `Abandoned`, in the same transaction: a `Started`
     /// record's owner is live. Every write of a task's status goes through
@@ -1698,7 +1716,8 @@ SET status     = ?1,
     updated_at = ?4
 WHERE child_task_id = ?5
   AND status IN ('pending', 'started')
-RETURNING operation_id AS "operation_id!", effect_kind AS "effect_kind!"
+RETURNING operation_id AS "operation_id!", effect_kind AS "effect_kind!",
+          tool_call_id AS "tool_call_id!"
 "#,
             columns.status,
             columns.error,
@@ -1726,6 +1745,18 @@ RETURNING operation_id AS "operation_id!", effect_kind AS "effect_kind!"
                     &row.operation_id,
                     task.id.as_str(),
                 );
+            }
+            if row.effect_kind
+                == agent_server::journal::effect::kind_wire(
+                    agent_server::journal::effect::EffectKind::LlmRequest,
+                )
+            {
+                Self::close_abandoned_attempt_tx(
+                    tx,
+                    &TurnAttemptId::from_string(row.tool_call_id.clone()),
+                    task.updated_at,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -3738,6 +3769,9 @@ impl SqliteDurableStore {
             }
             Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
             Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
+            Write::TurnAttempt(agent_server::journal::TurnAttemptWrite::Open(attempt)) => {
+                Self::insert_attempt_tx(tx, &attempt).await?;
+            }
             Write::AppendCompaction {
                 thread,
                 messages,

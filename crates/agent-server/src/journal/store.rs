@@ -2905,6 +2905,10 @@ struct Inner {
     invocation_by_child_root: HashMap<AgentTaskId, AgentTaskId>,
     /// Effect records, keyed as the SQL backends' intents table.
     effects: BTreeMap<super::effect::EffectKey, super::effect::EffectRecord>,
+    /// The completed-turn sink's attempt store, under this lock so a
+    /// transition's attempt write and an ended task's abandoned LLM
+    /// requests reach their attempt rows in the same locked step.
+    attempts: Option<Arc<dyn super::turn_attempt_store::TurnAttemptStore>>,
 }
 
 /// In-memory reference implementation of [`AgentTaskStore`].
@@ -3238,8 +3242,28 @@ impl InMemoryAgentTaskStore {
     /// A completed turn also needs [`Self::with_cancellation_markers`] and
     /// [`Self::with_message_store`].
     #[must_use]
-    pub fn with_completed_turns(mut self, sink: CompletedTurnSink) -> Self {
-        self.turn_sink = Some(Arc::new(sink));
+    pub fn with_completed_turns(self, sink: CompletedTurnSink) -> Self {
+        let mut store = self.with_attempt_store(Arc::clone(&sink.attempt_store));
+        store.turn_sink = Some(Arc::new(sink));
+        store
+    }
+
+    /// Wire the attempt store a transition's
+    /// [`Write::TurnAttempt`](super::transition::Write::TurnAttempt) writes
+    /// to, and whose open attempts a task's end closes when it abandons
+    /// their LLM requests. [`Self::with_completed_turns`] wires its sink's.
+    #[must_use]
+    pub fn with_attempt_store(
+        self,
+        attempts: Arc<dyn super::turn_attempt_store::TurnAttemptStore>,
+    ) -> Self {
+        match self.inner.try_write() {
+            Ok(mut inner) => inner.attempts = Some(attempts),
+            // A builder runs on a store no one else holds yet.
+            Err(_) => log::error!(
+                "with_attempt_store: the in-memory store is locked; no attempt store wired"
+            ),
+        }
         self
     }
 
@@ -4078,6 +4102,18 @@ impl Inner {
                 record.state = super::effect::EffectState::Abandoned;
                 record.updated_at = task.updated_at;
                 super::effect::report_abandoned(record, &task);
+                if let (
+                    super::effect::EffectSubject::Llm {
+                        turn_attempt_id, ..
+                    },
+                    Some(attempts),
+                ) = (&record.subject, &self.attempts)
+                {
+                    attempts.close_abandoned_attempt(
+                        &super::turn_attempt::TurnAttemptId::from_string(turn_attempt_id.clone()),
+                        task.updated_at,
+                    );
+                }
             }
         }
         self.by_id.insert(id, task);
@@ -5364,6 +5400,7 @@ impl InMemoryAgentTaskStore {
         let (sink, message_store) = self.transition_handles(&transition)?;
         self.check_spawns_unlocked(&transition).await?;
         let mut lock = MixedSpawnRollbackGuard::begin(self.inner.write().await);
+        Self::require_attempt_store(&lock.inner, &transition)?;
         let mut document_plans = self.check_locked(&lock.inner, &transition).await?;
         let anchors = self.effect_anchors(&transition).await?;
         let mut committed = Committed::default();
@@ -5425,6 +5462,7 @@ impl InMemoryAgentTaskStore {
                     let anchor = anchors.get(effect.key()).copied();
                     Self::apply_effect_locked(inner, effect, anchor, now);
                 }
+                Write::TurnAttempt(attempt) => Self::apply_attempt_locked(inner, attempt)?,
                 write @ Write::AppendCompaction { .. } => committed
                     .compacted
                     .push(append_compaction(message_store, write, now).await?),
@@ -5838,7 +5876,8 @@ impl InMemoryAgentTaskStore {
                 | Write::SpawnChildren { .. }
                 | Write::Document(_)
                 | Write::EnqueueSteeringResume { .. }
-                | Write::BeginEpoch(_) => {}
+                | Write::BeginEpoch(_)
+                | Write::TurnAttempt(_) => {}
             }
         }
         Ok(anchors)
@@ -5895,8 +5934,42 @@ impl InMemoryAgentTaskStore {
         Ok(committed)
     }
 
-    /// Apply a completed turn's settle, the one extra write
-    /// [`super::commit::CompletedTurnCommit::validate_extra_writes`] admits.
+    /// Apply a transition's attempt write through the wired attempt store
+    /// (checked by [`Self::require_attempt_store`] before the first write).
+    fn apply_attempt_locked(
+        inner: &Inner,
+        attempt: super::transition::TurnAttemptWrite,
+    ) -> Result<()> {
+        let super::transition::TurnAttemptWrite::Open(attempt) = attempt;
+        inner
+            .attempts
+            .as_ref()
+            .context("checked before the first write")?
+            .put_open_attempt(*attempt)
+    }
+
+    /// Refuse, before the first write, a transition with an attempt write
+    /// when no attempt store is wired.
+    fn require_attempt_store(
+        inner: &Inner,
+        transition: &super::transition::Transition,
+    ) -> Result<(), super::transition::Rejected> {
+        if inner.attempts.is_none()
+            && transition
+                .writes
+                .iter()
+                .any(|write| matches!(write, super::transition::Write::TurnAttempt(_)))
+        {
+            return Err(super::transition::Rejected::Store(anyhow!(
+                "a turn-attempt write needs the in-memory store wired with_attempt_store"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply a completed turn's extra writes, the ones
+    /// [`super::commit::CompletedTurnCommit::validate_extra_writes`] admits:
+    /// its own effects' finishes, then its settle.
     async fn settle_completed_turn_locked(
         &self,
         inner: &mut Inner,
@@ -5905,11 +5978,27 @@ impl InMemoryAgentTaskStore {
     ) -> Result<Option<(AgentTask, Option<AgentTask>)>> {
         let mut settled = None;
         for write in extra.writes.iter().cloned() {
-            if let super::transition::Write::SettleTask { task, outcome } = write {
-                settled = Some(
-                    self.apply_settle_locked(inner, extra, &task, outcome, now)
-                        .await?,
-                );
+            match write {
+                super::transition::Write::SettleTask { task, outcome } => {
+                    settled = Some(
+                        self.apply_settle_locked(inner, extra, &task, outcome, now)
+                            .await?,
+                    );
+                }
+                super::transition::Write::Effect(effect) => {
+                    Self::apply_effect_locked(inner, effect, None, now);
+                }
+                // `validate_extra_writes` refuses every other write.
+                super::transition::Write::RejectConfirmation { .. }
+                | super::transition::Write::PauseOnConfirmation { .. }
+                | super::transition::Write::ReparkAfterSteering { .. }
+                | super::transition::Write::AppendCompaction { .. }
+                | super::transition::Write::AppendEvents { .. }
+                | super::transition::Write::SpawnChildren { .. }
+                | super::transition::Write::Document(_)
+                | super::transition::Write::EnqueueSteeringResume { .. }
+                | super::transition::Write::BeginEpoch(_)
+                | super::transition::Write::TurnAttempt(_) => {}
             }
         }
         Ok(settled)
@@ -6523,6 +6612,11 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         let extra = params.extra_transition();
         let mut inner = self.inner.write().await;
         inner.enforce_commit_owner_guard(&params.task_id, params.owner_guard.as_ref())?;
+        // The effect finishes are checked before the first write, as every
+        // transition's are (C15): the attempt close below is the first.
+        extra
+            .check_effects(|key| inner.effects.get(key))
+            .map_err(|rejected| anyhow!("{rejected}"))?;
         let committed_turns = match marker_sink.thread_store.get(&params.thread_id).await? {
             Some(thread) => {
                 thread
@@ -7711,7 +7805,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
 
     async fn clear(&self) -> Result<()> {
         let mut inner = self.inner.write().await;
+        let attempts = inner.attempts.take();
         *inner = Inner::default();
+        inner.attempts = attempts;
         drop(inner);
         Ok(())
     }

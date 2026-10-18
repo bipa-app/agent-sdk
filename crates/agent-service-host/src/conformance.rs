@@ -968,6 +968,287 @@ mod tests {
         }
     }
 
+    /// A thread's first completed turn, by `root` in `attempt`, under
+    /// `guard`, with `extra_writes`.
+    fn first_turn_commit(
+        tid: &ThreadId,
+        root: &AgentTaskId,
+        attempt: &agent_server::journal::turn_attempt::TurnAttempt,
+        extra_writes: Vec<Write>,
+        guard: CommitOwnerGuard,
+    ) -> CompletedTurnCommit {
+        CompletedTurnCommit {
+            extra_writes,
+            delivered_injection_ids: Vec::new(),
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: tid.clone(),
+            task_id: root.clone(),
+            expected_turn: 1,
+            turn_attempt_id: attempt.id.clone(),
+            close_attempt_params: evidence_close_params(),
+            messages: vec![agent_sdk_foundation::llm::Message::assistant("done")],
+            turn_usage: TokenUsage::default(),
+            agent_state_snapshot: serde_json::json!({}),
+            events: vec![AgentEvent::text("m1", "done")],
+            outbox_max_attempts: 3,
+            owner_guard: Some(guard),
+            now: t_plus(55),
+        }
+    }
+
+    /// The transition the root worker commits to open `attempt` and start
+    /// its LLM request under `lease`.
+    fn llm_request_begin(
+        root: &AgentTaskId,
+        thread: &ThreadId,
+        lease: (WorkerId, LeaseId),
+        attempt: &agent_server::journal::turn_attempt::TurnAttempt,
+    ) -> Transition {
+        let key = EffectKey::llm(root, attempt.id.as_str());
+        Transition {
+            guards: vec![
+                Guard::TaskIs {
+                    task: root.clone(),
+                    status: TaskStatus::Running,
+                    lease: Some(lease),
+                },
+                Guard::EffectFree { key: key.clone() },
+            ],
+            writes: vec![
+                Write::TurnAttempt(agent_server::journal::TurnAttemptWrite::Open(Box::new(
+                    attempt.clone(),
+                ))),
+                Write::Effect(EffectWrite::Start(EffectIntent {
+                    key,
+                    replay: agent_sdk_foundation::ToolReplay::Safe,
+                    owner: root.clone(),
+                    thread: thread.clone(),
+                    subject: EffectSubject::Llm {
+                        turn_attempt_id: attempt.id.as_str().to_owned(),
+                        provider: "anthropic".into(),
+                        model: "claude-sonnet-5-5".into(),
+                    },
+                    attempt: attempt.attempt_number,
+                })),
+            ],
+        }
+    }
+
+    /// An LLM request's effect and its attempt row (crash matrix S3): the
+    /// attempt and its `Started` effect commit together under the lease, or
+    /// not at all; a completed turn finishes its own request and, by settling
+    /// the root, abandons a crashed predecessor's request and closes that
+    /// request's attempt row in the same transaction; and the predecessor's
+    /// own late close, had it been live, replaces that provisional close.
+    async fn test_llm_request_effect_lifecycle(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+    ) -> Result<()> {
+        use agent_server::journal::turn_attempt::TurnAttempt;
+
+        let tid = thread_id("conformance-llm-effect");
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let begin = |attempt: &TurnAttempt, lease: LeaseId| {
+            llm_request_begin(&root.id, &tid, (worker.clone(), lease), attempt)
+        };
+
+        // The crashed predecessor's attempt: a stale lease writes nothing.
+        let crashed = TurnAttempt::open(sample_open_attempt(&root.id, t_plus(52)));
+        anyhow::ensure!(
+            task_store
+                .commit(begin(&crashed, LeaseId::new()), t_plus(52))
+                .await
+                .is_err(),
+            "a stale lease must refuse the attempt and its request"
+        );
+        anyhow::ensure!(
+            TurnAttemptStore::get(attempt_store, &crashed.id)
+                .await?
+                .is_none(),
+            "a refused begin writes no attempt row"
+        );
+        let crashed_key = EffectKey::llm(&root.id, crashed.id.as_str());
+        anyhow::ensure!(task_store.effect(&crashed_key).await?.is_none());
+        task_store
+            .commit(begin(&crashed, lease.clone()), t_plus(52))
+            .await?;
+        let started = task_store.effect(&crashed_key).await?.context("effect")?;
+        anyhow::ensure!(started.state.is_started(), "{:?}", started.state);
+
+        // The successor attempt completes the turn and settles the root.
+        let mut current_params = sample_open_attempt(&root.id, t_plus(53));
+        current_params.attempt_number = 2;
+        let current = TurnAttempt::open(current_params);
+        task_store
+            .commit(begin(&current, lease.clone()), t_plus(53))
+            .await?;
+        let current_key = EffectKey::llm(&root.id, current.id.as_str());
+        let extra_writes = vec![
+            Write::Effect(EffectWrite::Finish {
+                key: current_key.clone(),
+                owner: root.id.clone(),
+                state: EffectState::Completed,
+            }),
+            Write::SettleTask {
+                task: root.id.clone(),
+                outcome: Settle::CompleteWithoutResult,
+            },
+        ];
+        let guard = CommitOwnerGuard {
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+        };
+        let turn = first_turn_commit(&tid, &root.id, &current, extra_writes, guard);
+        let outcome = commit_completed_turn(turn, task_store).await?;
+        assert_eq!(
+            outcome.settled.context("settled")?.0.status,
+            TaskStatus::Completed
+        );
+        let finished = task_store.effect(&current_key).await?.context("effect")?;
+        assert_eq!(finished.state, EffectState::Completed);
+        let abandoned = task_store.effect(&crashed_key).await?.context("effect")?;
+        assert_eq!(abandoned.state, EffectState::Abandoned);
+        let closed = TurnAttemptStore::get(attempt_store, &crashed.id)
+            .await?
+            .context("crashed attempt")?;
+        assert_eq!(closed.outcome, Some(TurnAttemptOutcome::Cancelled));
+        assert!(closed.closed_as_abandoned(), "{closed:?}");
+
+        // Had the predecessor been live, its real close replaces that one.
+        let replaced = attempt_store
+            .close_attempt(&crashed.id, evidence_close_params(), t_plus(56))
+            .await?;
+        assert!(!replaced.closed_as_abandoned());
+        assert_eq!(replaced.outcome, Some(evidence_close_params().outcome));
+        anyhow::ensure!(
+            attempt_store
+                .close_attempt(&crashed.id, evidence_close_params(), t_plus(57))
+                .await
+                .is_err(),
+            "a real close stays final"
+        );
+        Ok(())
+    }
+
+    /// Reconciliation C15: a completed turn's effect finishes are checked
+    /// before its first write. A finish of an absent request, or of one
+    /// already finished, refuses the whole turn, which writes nothing: the
+    /// attempt stays open, the thread at no committed turn, the root
+    /// running and the request as it was.
+    async fn test_completed_turn_refuses_a_bad_finish(
+        task_store: &dyn AgentTaskStore,
+        thread_store: &dyn ThreadStore,
+        attempt_store: &dyn TurnAttemptStore,
+    ) -> Result<()> {
+        use agent_server::journal::turn_attempt::TurnAttempt;
+
+        let tid = thread_id("conformance-bad-finish");
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let attempt = TurnAttempt::open(sample_open_attempt(&root.id, t_plus(52)));
+        let begin = llm_request_begin(&root.id, &tid, (worker.clone(), lease.clone()), &attempt);
+        task_store.commit(begin, t_plus(52)).await?;
+        let key = EffectKey::llm(&root.id, attempt.id.as_str());
+        let guard = CommitOwnerGuard {
+            worker_id: worker.clone(),
+            lease_id: lease.clone(),
+        };
+        let finish = |key: EffectKey| {
+            vec![
+                Write::Effect(EffectWrite::Finish {
+                    key,
+                    owner: root.id.clone(),
+                    state: EffectState::Completed,
+                }),
+                Write::SettleTask {
+                    task: root.id.clone(),
+                    outcome: Settle::CompleteWithoutResult,
+                },
+            ]
+        };
+        let refused = |why: &'static str, expected: EffectState| {
+            let (tid, root, attempt, key) = (&tid, &root, &attempt, &key);
+            async move {
+                let stored = task_store.get(&root.id).await?.context("root")?;
+                anyhow::ensure!(
+                    stored.status == TaskStatus::Running,
+                    "{why}: {:?}",
+                    stored.status
+                );
+                let open = TurnAttemptStore::get(attempt_store, &attempt.id)
+                    .await?
+                    .context("attempt")?;
+                anyhow::ensure!(open.closed_at.is_none(), "{why}: the attempt closed");
+                let turns = ThreadStore::get(thread_store, tid)
+                    .await?
+                    .map_or(0, |thread| thread.committed_turns);
+                anyhow::ensure!(turns == 0, "{why}: {turns} committed turns");
+                let request = task_store.effect(key).await?.context("request")?;
+                anyhow::ensure!(request.state == expected, "{why}: {:?}", request.state);
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+
+        let absent = first_turn_commit(
+            &tid,
+            &root.id,
+            &attempt,
+            finish(EffectKey::llm(&root.id, "no-such-attempt")),
+            guard.clone(),
+        );
+        anyhow::ensure!(
+            commit_completed_turn(absent, task_store).await.is_err(),
+            "a finish of an absent request must refuse the turn"
+        );
+        refused("absent request", EffectState::Started).await?;
+
+        task_store
+            .commit(
+                Transition {
+                    guards: vec![Guard::TaskIs {
+                        task: root.id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((worker.clone(), lease.clone())),
+                    }],
+                    writes: vec![Write::Effect(EffectWrite::Finish {
+                        key: key.clone(),
+                        owner: root.id.clone(),
+                        state: EffectState::Completed,
+                    })],
+                },
+                t_plus(53),
+            )
+            .await?;
+        let twice = first_turn_commit(&tid, &root.id, &attempt, finish(key.clone()), guard);
+        anyhow::ensure!(
+            commit_completed_turn(twice, task_store).await.is_err(),
+            "a finish of a finished request must refuse the turn"
+        );
+        refused("finished request", EffectState::Completed).await?;
+        Ok(())
+    }
+
     /// Design I2: a completed turn settles its own task inside its
     /// transaction. A settle without the owner guard, a settle of another
     /// task, and any other extra write are refused before anything is
@@ -6695,6 +6976,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_llm_request_effect_lifecycle() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_llm_request_effect_lifecycle(s.task.as_ref(), s.attempt.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_completed_turn_refuses_a_bad_finish() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_completed_turn_refuses_a_bad_finish(
+            s.task.as_ref(),
+            s.thread.as_ref(),
+            s.attempt.as_ref(),
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_completed_turn_settles_its_task() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_completed_turn_settles_its_task(s.task.as_ref(), s.attempt.as_ref()).await
@@ -7343,6 +7641,20 @@ mod tests {
     async fn conformance_sqlite_subagent_spawn_is_fenced_by_a_purge() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_subagent_spawn_is_fenced_by_a_purge(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_llm_request_effect_lifecycle() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_llm_request_effect_lifecycle(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_completed_turn_refuses_a_bad_finish() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_completed_turn_refuses_a_bad_finish(&store, &store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -8121,6 +8433,24 @@ mod tests {
             return Ok(());
         };
         test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_llm_request_effect_lifecycle() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_llm_request_effect_lifecycle(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_completed_turn_refuses_a_bad_finish() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_completed_turn_refuses_a_bad_finish(&store, &store, &store).await
     }
 
     #[cfg(feature = "postgres")]
