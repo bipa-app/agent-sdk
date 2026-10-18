@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed: a SQLite write no longer fails at `BEGIN` on a long-held lock
+
+- `SqliteDurableStore` retries a `BEGIN IMMEDIATE` that found the database
+  locked past the connection's `busy_timeout` (5 s): 3 retries, after 50 ms,
+  200 ms and 800 ms. Before, the transaction failed at once. Under three bip
+  sessions on one daemon, an effect claim failed with `begin sqlite
+  durable-core transaction: (code: 5) database is locked`, so its tool never
+  ran.
+- The retry is in the one place every write transaction begins, so it covers
+  transitions (effect claims included), lease acquisition and the other store
+  writes. Nothing has run before `BEGIN`, so a retry is always safe.
+- Each retry counts on `agent_server.journal.transition.lock_conflict_retries{backend="sqlite"}`.
+  A write that is still locked after the last retry fails with
+  `LockConflict { retries: 3 }`, counted as `outcome=lock_conflict`. Before,
+  it failed with `retries: 0`.
+- No schema or API change.
+
 ### Tests: fan-in conformance
 
 - Add proptest-generated settle, cancel, spawn and lease-expiry schedules on
