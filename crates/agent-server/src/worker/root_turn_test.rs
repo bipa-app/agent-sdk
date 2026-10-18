@@ -15877,3 +15877,102 @@ async fn a_retried_request_is_not_salvaged() -> Result<()> {
     assert!(sent.iter().all(|m| text_of(m) != PARTIAL), "{sent:?}");
     Ok(())
 }
+
+/// A turn that calls a tool makes two LLM requests, the tool round and the
+/// final answer, and both finish `Completed`: neither is left started to be
+/// abandoned when the root ends, and the next turn salvages nothing (crash
+/// matrix S10 counted the tool round as abandoned).
+#[tokio::test]
+async fn a_tool_turn_finishes_both_of_its_llm_requests() -> Result<()> {
+    use crate::journal::DurableStore;
+    use crate::journal::effect::{EffectKind, EffectState, is_aborted_response_note};
+
+    let stores = TestStores::new();
+    let child_results = vec![(
+        "call_1".to_owned(),
+        agent_sdk_foundation::ToolResult {
+            success: true,
+            output: "hello world".to_owned(),
+            artifact: None,
+            data: None,
+            documents: Vec::new(),
+            duration_ms: Some(25),
+        },
+    )];
+    let (parent, continuation, suspended_messages) = Box::pin(suspend_and_complete_children(
+        &stores,
+        vec![(
+            "call_1".into(),
+            "bash".into(),
+            serde_json::json!({"command": "echo hello world"}),
+        )],
+        &child_results,
+    ))
+    .await?;
+    let acquired = stores
+        .tasks
+        .try_acquire_task(
+            &parent.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(900),
+            t_plus(20),
+        )
+        .await?
+        .context("re-acquire")?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(acquired),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(20),
+    )
+    .await?;
+    Box::pin(resume_root_turn(
+        inputs,
+        continuation,
+        suspended_messages,
+        child_results,
+        &MockTextProvider::new("Output: hello world"),
+        &stores.deps(),
+        t_plus(25),
+    ))
+    .await?;
+
+    let requests: Vec<_> = stores
+        .tasks
+        .effects_for_task(&parent.id)
+        .await?
+        .into_iter()
+        .filter(|record| record.kind() == EffectKind::LlmRequest)
+        .collect();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|record| record.state == EffectState::Completed),
+        "{requests:?}"
+    );
+
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(next),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(
+        inputs,
+        "next question",
+        &provider,
+        &stores.deps(),
+        t_plus(40),
+    )
+    .await?;
+    let sent = provider.captured()?;
+    assert!(!sent.iter().any(is_aborted_response_note), "{sent:?}");
+    Ok(())
+}

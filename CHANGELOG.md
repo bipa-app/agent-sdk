@@ -626,6 +626,23 @@ long as it needs. No migration, table, `Write` variant or protocol change.
 
 ### Crash safety, Phase 2: effects
 
+- **Fix: a tool round's LLM request finishes `Completed`.** A response the
+  turn suspends on (its tool calls), injects at, or re-parks with is
+  consumed. Its request is now finished `Completed` right after its attempt
+  closes. Before, it stayed `Started` and was abandoned when the root ended,
+  so `agent_server.effects{kind="llm_request"}` counted every tool round as
+  abandoned (crash matrix S10: 16 started, 8 finished, 8 abandoned). Salvage
+  never took those rounds, because their attempts were closed `Success`.
+  The finish is its own transaction after the close; P2-3b2 folds it into
+  the spawn's.
+  - **Crash matrix S11** (`s11_consumed_request`, SQLite and Postgres,
+    `failpoints`). The failpoint `llm_request.consumed.before_finish` holds
+    the process after the close, and the test kills it there. The crashed
+    request is then abandoned once at the root's end and never salvaged,
+    and the re-run's two requests are `Completed`. With
+    `AGENT_SDK_CRASH_MATRIX_OBS`, recovery counts 2 finished and 1
+    abandoned.
+
 - **A cut-off LLM response is salvaged (P2-3c).** A response cut off by a
   crash or a cancel used to be lost to the model: its text was streamed and
   journaled, but its turn never committed. Now the turn that continues sends
