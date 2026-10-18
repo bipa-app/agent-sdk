@@ -590,8 +590,62 @@ FOR UPDATE SKIP LOCKED
             .fetch_all(&mut **tx)
             .await
             .context("load leases of older epochs")?,
+            LeaseRecoveryScope::SupersededEpochs => {
+                Self::load_superseded_leases_tx(tx, batch).await?
+            }
         };
         Ok(rows)
+    }
+
+    /// Up to `batch` running rows whose lease epoch was superseded, locked
+    /// for the reclaim.
+    async fn load_superseded_leases_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        batch: i64,
+    ) -> Result<Vec<TaskRecord>> {
+        sqlx::query_as!(
+            TaskRecord,
+            r"
+SELECT
+    id,
+    kind,
+    status,
+    parent_id,
+    root_id,
+    depth,
+    thread_id,
+    submitted_input_json,
+    caller_metadata_json,
+    worker_id,
+    lease_id,
+    lease_expires_at,
+    last_heartbeat_at,
+    state_json,
+    attempt,
+    max_attempts,
+    last_error,
+    terminal_reason_json,
+    pending_child_count,
+    spawn_index,
+    result_payload,
+    otel_traceparent,
+    created_at,
+    updated_at,
+    completed_at,
+    last_activity_at,
+    after_siblings_json
+FROM agent_sdk_tasks
+WHERE status = 'running'
+  AND lease_epoch IN (SELECT epoch_id FROM agent_sdk_host_epochs WHERE superseded_at IS NOT NULL)
+ORDER BY lease_expires_at, id
+LIMIT $1
+FOR UPDATE SKIP LOCKED
+",
+            batch,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("load leases of superseded epochs")
     }
 
     /// The epoch new leases record, if one has begun.
@@ -615,14 +669,30 @@ FOR UPDATE SKIP LOCKED
         record: &agent_server::journal::EpochRecord,
     ) -> Result<()> {
         sqlx::query!(
-            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES ($1, $2, $3)",
+            "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label, recovery) \
+             VALUES ($1, $2, $3, $4)",
             record.id.as_str(),
             record.started_at,
             record.label.as_deref(),
+            record.recovery.as_deref(),
         )
         .execute(&mut **tx)
         .await
         .with_context(|| format!("begin epoch {}", record.id))?;
+        if record.is_exclusive() {
+            let [single_host, postgres_leader] = agent_server::journal::EXCLUSIVE_RECOVERY;
+            sqlx::query!(
+                "UPDATE agent_sdk_host_epochs SET superseded_at = $1 \
+                 WHERE epoch_id <> $2 AND superseded_at IS NULL AND recovery IN ($3, $4)",
+                record.started_at,
+                record.id.as_str(),
+                single_host,
+                postgres_leader,
+            )
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("supersede the exclusive epochs before {}", record.id))?;
+        }
         Ok(())
     }
 
@@ -642,12 +712,50 @@ FOR UPDATE SKIP LOCKED
         Ok(epoch.flatten().map(EpochId::from_string))
     }
 
-    /// Record that `task`'s new lease was granted under `epoch`.
+    /// Whether `epoch` was superseded by a newer exclusive epoch.
+    async fn epoch_superseded_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        epoch: &EpochId,
+    ) -> Result<bool> {
+        let superseded = sqlx::query_scalar!(
+            r#"SELECT superseded_at IS NOT NULL AS "superseded!" FROM agent_sdk_host_epochs WHERE epoch_id = $1"#,
+            epoch.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load whether epoch {epoch} is superseded"))?;
+        Ok(superseded.unwrap_or(false))
+    }
+
+    /// Whether `task`'s lease was granted under a superseded epoch.
+    async fn lease_superseded_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        task: &AgentTaskId,
+    ) -> Result<bool> {
+        let superseded = sqlx::query_scalar!(
+            r#"SELECT e.superseded_at IS NOT NULL AS "superseded!" FROM agent_sdk_tasks t
+               JOIN agent_sdk_host_epochs e ON e.epoch_id = t.lease_epoch WHERE t.id = $1"#,
+            task.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load whether the lease epoch of {task} is superseded"))?;
+        Ok(superseded.unwrap_or(false))
+    }
+
+    /// Record that `task`'s new lease was granted under `epoch`. Refused,
+    /// rolling the grant back, when a newer exclusive epoch superseded
+    /// `epoch`: the process no longer leads its store.
     async fn stamp_lease_epoch_tx(
         tx: &mut Transaction<'_, Postgres>,
         task: &AgentTaskId,
         epoch: Option<&EpochId>,
     ) -> Result<()> {
+        if let Some(epoch) = epoch
+            && Self::epoch_superseded_tx(tx, epoch).await?
+        {
+            return Err(agent_server::journal::EpochSuperseded::new(epoch).into());
+        }
         sqlx::query!(
             "UPDATE agent_sdk_tasks SET lease_epoch = $1 WHERE id = $2",
             epoch.map(EpochId::as_str),
@@ -4479,6 +4587,27 @@ fn is_lock_conflict(error: &anyhow::Error) -> bool {
 impl PostgresDurableStore {
     /// Steps 1–3 of `commit_once`: lock the threads, then the tasks, and
     /// check every guard.
+    /// Check each task guard against its locked row, and refuse a leased
+    /// guard whose lease belongs to a superseded epoch.
+    async fn check_task_guards_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        transition: &agent_server::journal::Transition,
+        stored: &BTreeMap<AgentTaskId, AgentTask>,
+    ) -> Result<(), agent_server::journal::Rejected> {
+        for (index, guard) in transition.guards.iter().enumerate() {
+            if let Some(task) = guard.task() {
+                guard.check(index, stored.get(task))?;
+                if guard.leased() && Self::lease_superseded_tx(tx, task).await? {
+                    return Err(agent_server::journal::Rejected::Guard {
+                        index,
+                        reason: agent_server::journal::EpochSuperseded::of_lease(task).to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn lock_and_check_guards_tx(
         tx: &mut Transaction<'_, Postgres>,
         transition: &agent_server::journal::Transition,
@@ -4575,11 +4704,7 @@ impl PostgresDurableStore {
             }
             stored.insert(row.id.clone(), row);
         }
-        for (index, guard) in transition.guards.iter().enumerate() {
-            if let Some(task) = guard.task() {
-                guard.check(index, stored.get(task))?;
-            }
-        }
+        Self::check_task_guards_tx(tx, transition, &stored).await?;
         Self::check_effects_tx(tx, transition).await?;
         for (fence, thread_id, locked) in fenced_after_guards {
             fence.check(thread_id, locked.as_ref())?;
@@ -5981,6 +6106,12 @@ ORDER BY held.created_at, held.id
         now: OffsetDateTime,
     ) -> Result<AgentTask> {
         let mut tx = self.begin().await?;
+        if Self::lease_superseded_tx(&mut tx, id).await? {
+            anyhow::bail!(
+                "heartbeat rejected: {}",
+                agent_server::journal::EpochSuperseded::of_lease(id)
+            );
+        }
         // Single guarded UPDATE of only the lease columns — never reload
         // (FOR UPDATE) and rewrite the whole 25-column row (re-serialising
         // submitted_input / state JSON blobs) on a per-tick heartbeat.

@@ -387,6 +387,30 @@ pub enum EpochRecovery {
     /// guarantees this host is the sole process on its store, for example
     /// with a single-instance lock.
     SingleHost,
+    /// One worker host per Postgres store, for overlapping hosts and
+    /// rolling deploys.
+    ///
+    /// Before its epoch begins, the host takes the store's session advisory
+    /// lock on a dedicated connection and holds it for its life; while
+    /// another host holds it, this one waits ready with no workers. Its
+    /// epoch supersedes the earlier exclusive epochs: the store refuses
+    /// their acquires, heartbeats and lease-guarded commits from then on.
+    /// It waits out a lost leader's detection window and abort grace
+    /// (about 6 s, only when leases are live), then reclaims at once the
+    /// leases of superseded epochs. Leases of other modes, and of no epoch,
+    /// wait for expiry.
+    ///
+    /// Switch-over: a deploy that moves a store from `LeaseExpiry` to this
+    /// mode may overlap. The first leader leaves the old hosts' leases
+    /// alone until they expire, as `LeaseExpiry` does. Once every host runs
+    /// this mode, keep all of them on it.
+    ///
+    /// The lock costs one server connection beyond the pool and does not
+    /// work behind a transaction-mode pooler (`PgBouncer`). A host whose
+    /// lock connection dies stops acquiring at once and shuts down with an
+    /// error. On `SQLite` and in memory there is no lock, and the mode
+    /// behaves as [`Self::SingleHost`].
+    PostgresLeader,
 }
 
 impl EpochRecovery {
@@ -397,6 +421,7 @@ impl EpochRecovery {
         match self {
             Self::LeaseExpiry => "lease_expiry",
             Self::SingleHost => "single_host",
+            Self::PostgresLeader => "postgres_leader",
         }
     }
 }

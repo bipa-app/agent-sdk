@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT e.superseded_at IS NOT NULL AS \"superseded!\" FROM agent_sdk_tasks t\n               JOIN agent_sdk_host_epochs e ON e.epoch_id = t.lease_epoch WHERE t.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "superseded!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3fd384379c6962486d4de034c97fbe88788a8fb418404ec84eea61ee25d4875d"
+}

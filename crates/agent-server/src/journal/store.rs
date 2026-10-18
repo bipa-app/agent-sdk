@@ -214,7 +214,9 @@ use agent_sdk_foundation::{
     ContinuationEnvelope, ListenExecutionContext, QuestionAnswer, QuestionPayload, TerminalReason,
     ThreadId, TokenUsage,
 };
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+
+use super::epoch::EpochSuperseded;
 use async_trait::async_trait;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
@@ -2896,6 +2898,9 @@ struct Inner {
     /// (`agent_sdk_tasks.lease_epoch`). A row with no entry was leased
     /// before any epoch began.
     lease_epochs: HashMap<AgentTaskId, EpochId>,
+    /// Exclusive epochs a newer exclusive epoch superseded
+    /// (`agent_sdk_host_epochs.superseded_at`).
+    superseded_epochs: HashSet<EpochId>,
     /// Phase 10 · E durable idempotency table, keyed by `request_id`.
     /// Mirrors the `agent_sdk_idempotency` row the SQL backends own so
     /// in-memory tests exercise the same dedup contract.
@@ -4618,8 +4623,35 @@ impl Inner {
     }
 
     fn begin_epoch(&mut self, record: EpochRecord) {
+        if record.is_exclusive() {
+            let older: Vec<EpochId> = self
+                .epochs
+                .values()
+                .filter(|epoch| epoch.is_exclusive())
+                .map(|epoch| epoch.id.clone())
+                .collect();
+            self.superseded_epochs.extend(older);
+        }
         self.current_epoch = Some(record.id.clone());
         self.epochs.insert(record.id.clone(), record);
+    }
+
+    /// Refuse a lease grant once a newer exclusive epoch superseded this
+    /// store's own.
+    fn require_live_epoch(&self) -> Result<()> {
+        if let Some(epoch) = &self.current_epoch
+            && self.superseded_epochs.contains(epoch)
+        {
+            bail!(EpochSuperseded::new(epoch));
+        }
+        Ok(())
+    }
+
+    /// Whether `id`'s lease was granted under a superseded epoch.
+    fn lease_superseded(&self, id: &AgentTaskId) -> bool {
+        self.lease_epochs
+            .get(id)
+            .is_some_and(|epoch| self.superseded_epochs.contains(epoch))
     }
 
     /// Record that `id`'s new lease was granted under the current epoch.
@@ -4649,11 +4681,16 @@ impl Inner {
                 .take(LEASE_RELEASE_BATCH)
                 .cloned()
                 .collect(),
-            LeaseRecoveryScope::ForeignEpoch(_) => self
+            LeaseRecoveryScope::ForeignEpoch(_) | LeaseRecoveryScope::SupersededEpochs => self
                 .leased_by_expiry
                 .iter()
                 .filter(|(expires_at, id)| {
-                    scope.reclaims(Some(*expires_at), self.lease_epochs.get(id), now)
+                    scope.reclaims(
+                        Some(*expires_at),
+                        self.lease_epochs.get(id),
+                        |epoch| self.superseded_epochs.contains(epoch),
+                        now,
+                    )
                 })
                 .take(LEASE_RELEASE_BATCH)
                 .cloned()
@@ -5749,6 +5786,12 @@ impl InMemoryAgentTaskStore {
         for (index, guard) in transition.guards.iter().enumerate() {
             if let Some(task) = guard.task() {
                 guard.check(index, inner.by_id.get(task))?;
+                if guard.leased() && inner.lease_superseded(task) {
+                    return Err(super::transition::Rejected::Guard {
+                        index,
+                        reason: EpochSuperseded::of_lease(task).to_string(),
+                    });
+                }
             }
         }
         transition.check_effects(|key| inner.effects.get(key))?;
@@ -7162,6 +7205,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
                 .await?;
         }
         let mut inner = self.inner.write().await;
+        inner.require_live_epoch()?;
         let Some(old) = inner.by_id.get(id).cloned() else {
             return Ok(None);
         };
@@ -7217,6 +7261,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
+        self.inner.read().await.require_live_epoch()?;
         if self.held_probe.probes_first()
             && let Some(task) = self
                 .acquire_ready_held(worker.clone(), lease.clone(), expires_at, now)
@@ -7270,6 +7315,9 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("heartbeat rejected: task {id} does not exist"))?;
+        if inner.lease_superseded(id) {
+            bail!("heartbeat rejected: {}", EpochSuperseded::of_lease(id));
+        }
 
         // Drive the row through the pure transition helper: it enforces
         // `status == Running`, the worker CAS, and the lease CAS, and
@@ -7857,6 +7905,7 @@ impl AgentTaskStore for InMemoryAgentTaskStore {
         now: OffsetDateTime,
     ) -> Result<(AgentTask, Option<ListenExecutionContext>)> {
         let mut inner = self.inner.write().await;
+        inner.require_live_epoch()?;
         let old = inner
             .by_id
             .get(id)

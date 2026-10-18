@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label, recovery) VALUES (?1, ?2, ?3, ?4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "671472131749c7bdcf2a1a0be193f14ea993217483160cc56276759d8f509559"
+}

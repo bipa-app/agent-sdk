@@ -232,6 +232,9 @@ Prompt-row spans (`agent_service_host::prompts`, `grpc::prompt_rpc`):
 Ids are on spans only, never on the counter. A host opens a row inside its own transition, so it counts its own opens.
 | `agent_server.fence.refused` | Counter | `writer`, `thread_status` | `[agent-server]` (+ the `agent_server.fence.refused` tracing event with `thread.id` from the SQL backends) | crash-safety P2-1 |
 | `agent_server.epoch.reclaims` | Counter | `scope`, `action` | `[agent-server]` (recorded by the host drain; start-up OTel span `agent_server.epoch.begin` with `agent_server.epoch.{id,recovery,requeued,failed_interrupted}` and `outcome`) | crash-safety P2-4 |
+| `agent_server.leader` | Counter | `state` (`waiting`, `acquired`, `lost`, `released`) | `[agent-service-host]` (OTel span `leader.acquire` with `agent_server.leader.waited_ms`) | crash-matrix (#523) |
+| `agent_server.leader.is_leader` | UpDownCounter | — | `[agent-service-host]` (+1 on `acquired`, −1 on `released`; summed per store, more than 1 means two leaders) | crash-matrix (#523) |
+| `agent_server.epoch.reclaims{scope=superseded_epoch}` | (label of the row above) | `scope` | `[agent-server]` (the `PostgresLeader` boot reclaim) | crash-matrix (#523) |
 
 ### 4.4 Agent-service-host metrics
 

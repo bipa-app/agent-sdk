@@ -1164,6 +1164,14 @@ pub fn wrapper_error(method: &str, rejected: Rejected) -> anyhow::Error {
 }
 
 impl Guard {
+    /// Whether the guard names a lease ([`Self::TaskIs`] with `lease`):
+    /// the store then also refuses it when that lease's epoch is
+    /// superseded.
+    #[must_use]
+    pub const fn leased(&self) -> bool {
+        matches!(self, Self::TaskIs { lease: Some(_), .. })
+    }
+
     /// Check a [`Self::TaskIs`] guard against the stored row of its task.
     /// An effect guard passes here; [`Transition::check_effects`] checks
     /// it against its effect row.

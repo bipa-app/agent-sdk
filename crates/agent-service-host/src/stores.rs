@@ -729,7 +729,7 @@ impl StoreRegistry {
     /// (without `feature = "otel"`) never need to call this — the
     /// accessor is feature-gated to avoid leaking the sqlx type
     /// into builds that don't want the metric pipeline.
-    #[cfg(all(feature = "postgres", feature = "otel"))]
+    #[cfg(feature = "postgres")]
     #[must_use]
     pub fn postgres_pool(&self) -> Option<&sqlx::PgPool> {
         match &self.backend {

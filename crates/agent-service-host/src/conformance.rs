@@ -681,6 +681,124 @@ mod tests {
     /// the current epoch (and before any epoch), fails closed the one at
     /// its budget, leaves the current epoch's lease alone, and refuses an
     /// epoch the store did not begin. Lease expiry is unaffected.
+    async fn begin_exclusive_epoch(
+        task_store: &dyn AgentTaskStore,
+        recovery: &str,
+        secs: i64,
+    ) -> Result<EpochId> {
+        let record = EpochRecord::begin(t_plus(secs), Some("conformance".to_owned()))
+            .with_recovery(recovery);
+        let epoch = record.id.clone();
+        task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: Vec::new(),
+                    writes: vec![agent_server::journal::Write::BeginEpoch(record)],
+                },
+                t_plus(secs),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(epoch)
+    }
+
+    /// An exclusive epoch supersedes the exclusive epochs before it: their
+    /// leases can no longer heartbeat or settle, and only they are taken
+    /// by the `SupersededEpochs` reclaim. A non-exclusive epoch's lease is
+    /// neither fenced nor taken early.
+    async fn test_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        let _shared = begin_exclusive_epoch(task_store, "lease_expiry", 400).await?;
+        let shared_root = fresh_root("conformance-fence-shared", 401);
+        let shared_lease = lease_for_an_hour(task_store, &shared_root, 402).await?;
+        let _old = begin_exclusive_epoch(task_store, "postgres_leader", 403).await?;
+        let old_root = fresh_root("conformance-fence-old", 404);
+        let old_lease = lease_for_an_hour(task_store, &old_root, 405).await?;
+        let worker = WorkerId::from_string("worker-0");
+
+        // Before a newer exclusive epoch, the lease beats.
+        task_store
+            .heartbeat_task(
+                &old_root.id,
+                &worker,
+                &old_lease,
+                t_plus(4_000),
+                None,
+                t_plus(406),
+            )
+            .await?;
+
+        let _new = begin_exclusive_epoch(task_store, "postgres_leader", 407).await?;
+        let beat = task_store
+            .heartbeat_task(
+                &old_root.id,
+                &worker,
+                &old_lease,
+                t_plus(4_000),
+                None,
+                t_plus(408),
+            )
+            .await;
+        assert!(
+            beat.as_ref()
+                .is_err_and(|error| format!("{error:#}").contains("superseded")),
+            "a superseded epoch's lease does not beat: {beat:?}"
+        );
+        let settle = task_store
+            .commit(
+                agent_server::journal::Transition::settle_only(
+                    old_root.id.clone(),
+                    worker.clone(),
+                    old_lease.clone(),
+                    agent_server::journal::Settle::Fail {
+                        error: "late".into(),
+                    },
+                ),
+                t_plus(409),
+            )
+            .await;
+        assert!(
+            matches!(
+                &settle,
+                Err(agent_server::journal::Rejected::Guard { reason, .. }) if reason.contains("superseded")
+            ),
+            "a superseded epoch's lease does not settle: {settle:?}"
+        );
+        assert_eq!(
+            task_store.get(&old_root.id).await?.context("row")?.status,
+            TaskStatus::Running,
+            "the refused settle changed nothing"
+        );
+        // A lease of a non-exclusive epoch is not fenced.
+        task_store
+            .heartbeat_task(
+                &shared_root.id,
+                &worker,
+                &shared_lease,
+                t_plus(4_000),
+                None,
+                t_plus(410),
+            )
+            .await?;
+
+        let reclaimed = task_store
+            .release_expired_leases(t_plus(411), LeaseRecoveryScope::SupersededEpochs)
+            .await?;
+        let ids: Vec<_> = reclaimed.iter().map(|record| record.id.clone()).collect();
+        assert_eq!(ids, vec![old_root.id.clone()], "{reclaimed:?}");
+        assert_eq!(
+            task_store
+                .get(&shared_root.id)
+                .await?
+                .context("row")?
+                .status,
+            TaskStatus::Running,
+            "a non-exclusive epoch's lease waits for expiry"
+        );
+        Ok(())
+    }
+
     async fn test_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs(
         task_store: &dyn AgentTaskStore,
     ) -> Result<()> {
@@ -717,6 +835,7 @@ mod tests {
                         id: current.clone(),
                         started_at: t_plus(310),
                         label: None,
+                        recovery: None,
                     })],
                 },
                 t_plus(310),
@@ -7401,6 +7520,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one()
+    -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
     -> Result<()> {
         let s = fresh_in_memory_stores();
@@ -8317,6 +8443,14 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one()
+    -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_a_new_epoch_reclaims_only_the_leases_of_earlier_epochs()
     -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
@@ -9127,6 +9261,16 @@ mod tests {
             return Ok(());
         };
         test_lease_expiry_sweep(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one()
+    -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_a_newer_exclusive_epoch_fences_the_leases_of_the_old_one(&store).await
     }
 
     #[cfg(feature = "postgres")]

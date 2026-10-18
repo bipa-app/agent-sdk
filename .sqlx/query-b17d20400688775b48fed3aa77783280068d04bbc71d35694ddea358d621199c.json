@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT superseded_at IS NOT NULL AS \"superseded!: bool\" FROM agent_sdk_host_epochs WHERE epoch_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "superseded!: bool",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b17d20400688775b48fed3aa77783280068d04bbc71d35694ddea358d621199c"
+}

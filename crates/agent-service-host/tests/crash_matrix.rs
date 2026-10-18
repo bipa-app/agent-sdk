@@ -97,27 +97,37 @@ enum Scenario {
     /// S6 confirmation on a `SingleHost` daemon, which reclaims the dead
     /// process's leases at boot (crash matrix F4).
     ConfirmationSingleHost,
+    /// S6 confirmation on `PostgresLeader` daemons.
+    ConfirmationLeader,
     Fork,
     CancelTree,
     HungTool,
     HungSubagent,
     Overlap,
+    /// S8 on `PostgresLeader` daemons: the new host waits for the lock.
+    OverlapLeader,
+    /// S8 on `PostgresLeader` daemons, where the old leader's lock
+    /// connection dies while it lives (a failover, an idle-session kill).
+    LockLossLeader,
     MergeBack,
 }
 
 impl Scenario {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 15] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
         Self::Question,
         Self::Confirmation,
         Self::ConfirmationSingleHost,
+        Self::ConfirmationLeader,
         Self::Fork,
         Self::CancelTree,
         Self::HungTool,
         Self::HungSubagent,
         Self::Overlap,
+        Self::OverlapLeader,
+        Self::LockLossLeader,
         Self::MergeBack,
     ];
 
@@ -129,11 +139,14 @@ impl Scenario {
             Self::Question => "s6_question",
             Self::Confirmation => "s6_confirmation",
             Self::ConfirmationSingleHost => "s6_confirmation_single_host",
+            Self::ConfirmationLeader => "s6_confirmation_leader",
             Self::Fork => "s4_fork",
             Self::CancelTree => "s5_cancel_tree",
             Self::HungTool => "s7_hung_tool",
             Self::HungSubagent => "s7_hung_subagent",
             Self::Overlap => "s8_overlap",
+            Self::OverlapLeader => "s8_overlap_leader",
+            Self::LockLossLeader => "s8_lock_loss_leader",
             Self::MergeBack => "s9_merge_back",
         }
     }
@@ -150,7 +163,9 @@ impl Scenario {
         match self {
             Self::UnsafeTool => tool_use(UNSAFE_TOOL, json!({})),
             Self::SafeTool => tool_use(SAFE_TOOL, json!({})),
-            Self::Confirmation | Self::ConfirmationSingleHost => tool_use(CONFIRM_TOOL, json!({})),
+            Self::Confirmation | Self::ConfirmationSingleHost | Self::ConfirmationLeader => {
+                tool_use(CONFIRM_TOOL, json!({}))
+            }
             Self::Question => tool_use(QUESTION_TOOL, json!({"question": "Which target?"})),
             Self::LlmStream | Self::Fork => text(FINAL_TEXT),
             Self::CancelTree => tool_uses(
@@ -161,7 +176,7 @@ impl Scenario {
             ),
             Self::HungTool => tool_use(HANG_TOOL, json!({})),
             Self::HungSubagent | Self::MergeBack => tool_use(SUBAGENT_TOOL, json!({})),
-            Self::Overlap => tool_uses(vec![
+            Self::Overlap | Self::OverlapLeader | Self::LockLossLeader => tool_uses(vec![
                 ("cm-call-1".to_owned(), UNSAFE_TOOL),
                 ("cm-call-2".to_owned(), SAFE_TOOL),
             ]),
@@ -292,9 +307,49 @@ impl CaseDir {
             .create(true)
             .append(true)
             .open(self.runs())?;
-        writeln!(file, "{tool}")?;
+        // One write per line: concurrent tool children append to the same
+        // file, and `writeln!` would split the text and the newline.
+        file.write_all(format!("{tool}\n").as_bytes())?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// `+name` when a tool body starts and `-name` when it ends (returns,
+    /// is cancelled, or is dropped), so a case can tell whether two runs
+    /// of one tool overlapped.
+    fn spans(&self) -> PathBuf {
+        self.0.join("spans")
+    }
+
+    fn record_span(&self, mark: &str) -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.spans())?;
+        file.write_all(format!("{mark}\n").as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// The most runs of `tool` that were in flight at once.
+    #[cfg(feature = "postgres")]
+    fn max_concurrent(&self, tool: &str) -> Result<usize> {
+        let text = match std::fs::read_to_string(self.spans()) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let (mut now, mut most) = (0usize, 0usize);
+        for line in text.lines() {
+            if line.strip_prefix('+') == Some(tool) {
+                now += 1;
+                most = most.max(now);
+            } else if line.strip_prefix('-') == Some(tool) {
+                now = now.saturating_sub(1);
+            }
+        }
+        Ok(most)
     }
 
     fn run_lines(&self) -> Result<Vec<String>> {
@@ -495,6 +550,7 @@ impl ToolCallExecutor for MatrixTools {
         let name = bootstrap.tool_call.name.as_str();
         // The protected side effect happens before the crash point.
         self.dir.record_run(name)?;
+        let _span = Span::start(&self.dir, name)?;
         if name == HANG_TOOL || (self.phase == Phase::Crash && name != CONFIRM_TOOL) {
             self.dir.signal_ready(bootstrap.task_id.as_str())?;
             tokio::select! {
@@ -504,6 +560,28 @@ impl ToolCallExecutor for MatrixTools {
             bail!("the tool was not killed");
         }
         Ok(ToolResult::success(format!("{name} ran")))
+    }
+}
+
+/// Writes a tool body's start mark now and its end mark when dropped.
+struct Span<'a> {
+    dir: &'a CaseDir,
+    name: String,
+}
+
+impl<'a> Span<'a> {
+    fn start(dir: &'a CaseDir, name: &str) -> Result<Self> {
+        dir.record_span(&format!("+{name}"))?;
+        Ok(Self {
+            dir,
+            name: name.to_owned(),
+        })
+    }
+}
+
+impl Drop for Span<'_> {
+    fn drop(&mut self) {
+        let _ = self.dir.record_span(&format!("-{}", self.name));
     }
 }
 
@@ -695,7 +773,28 @@ impl Backend {
 struct CaseDb {
     storage: StorageConfig,
     #[cfg(feature = "postgres")]
-    _schema: Option<PgSchema>,
+    pg_schema: Option<PgSchema>,
+}
+
+#[cfg(feature = "postgres")]
+impl CaseDb {
+    /// End the session that holds this schema's leader lock, the way a
+    /// failover or an idle-session kill does. Returns how many ended.
+    async fn end_leader_lock_session(&self) -> Result<usize> {
+        use sqlx::Connection;
+        let schema = self.pg_schema.as_ref().context("not a Postgres case")?;
+        let mut admin = sqlx::PgConnection::connect(&schema.database_url).await?;
+        let ended = sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_locks \
+             WHERE locktype = 'advisory' AND objsubid = 2 AND granted \
+               AND classid = (x'41474C44'::int)::oid \
+               AND objid = ((hashtext($1)::bigint) & 4294967295)::oid",
+        )
+        .bind(&schema.schema)
+        .fetch_all(&mut admin)
+        .await?;
+        Ok(ended.len())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -747,7 +846,7 @@ impl CaseDb {
                     ..StorageConfig::default()
                 },
                 #[cfg(feature = "postgres")]
-                _schema: None,
+                pg_schema: None,
             })),
             #[cfg(feature = "postgres")]
             Backend::Postgres => {
@@ -776,7 +875,7 @@ impl CaseDb {
                             max_connections: 8,
                         },
                     },
-                    _schema: Some(PgSchema {
+                    pg_schema: Some(PgSchema {
                         database_url,
                         schema,
                     }),
@@ -789,19 +888,29 @@ impl CaseDb {
 /// Short leases so a dead process's work is reclaimed within seconds.
 /// `SingleHost` scenarios also reclaim the dead process's leases at boot.
 fn service_config(storage: StorageConfig, scenario: Scenario) -> ServiceConfig {
+    // The lock-loss case runs production timing (30 s leases, 10 s
+    // heartbeats): with short ones, a lost leader notices before its
+    // successor re-runs anything, and the case would prove nothing.
+    let (lease_duration_secs, heartbeat_interval_secs) = if scenario == Scenario::LockLossLeader {
+        (30, 10)
+    } else {
+        (3, 1)
+    };
     ServiceConfig {
         storage,
         worker: WorkerConfig {
             pool_size: 4,
-            lease_duration_secs: 3,
-            heartbeat_interval_secs: 1,
+            lease_duration_secs,
+            heartbeat_interval_secs,
             sweep_interval_secs: 1,
             acquisition_interval_secs: 1,
             tool_stall_budget_secs: STALL_BUDGET.as_secs(),
-            epoch_recovery: if scenario == Scenario::ConfirmationSingleHost {
-                EpochRecovery::SingleHost
-            } else {
-                EpochRecovery::default()
+            epoch_recovery: match scenario {
+                Scenario::ConfirmationSingleHost => EpochRecovery::SingleHost,
+                Scenario::ConfirmationLeader
+                | Scenario::OverlapLeader
+                | Scenario::LockLossLeader => EpochRecovery::PostgresLeader,
+                _ => EpochRecovery::default(),
             },
             ..WorkerConfig::default()
         },
@@ -1276,7 +1385,9 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
             .await?;
             None
         }
-        Scenario::Confirmation | Scenario::ConfirmationSingleHost => {
+        Scenario::Confirmation
+        | Scenario::ConfirmationSingleHost
+        | Scenario::ConfirmationLeader => {
             let child = wait_for_child(&stores, &root, TaskStatus::AwaitingConfirmation).await?;
             Some(child)
         }
@@ -1288,6 +1399,8 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::HungTool
         | Scenario::HungSubagent
         | Scenario::Overlap
+        | Scenario::OverlapLeader
+        | Scenario::LockLossLeader
         | Scenario::MergeBack => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
             (scenario != Scenario::LlmStream).then(|| AgentTaskId::from_string(ready.trim()))
@@ -1364,7 +1477,9 @@ async fn answer_prompt(
             // The same request again is a retry, not a second answer.
             let _ = control.answer_question(answer).await;
         }
-        Scenario::Confirmation | Scenario::ConfirmationSingleHost => {
+        Scenario::Confirmation
+        | Scenario::ConfirmationSingleHost
+        | Scenario::ConfirmationLeader => {
             let child = tool_child.context("no confirmation child")?;
             wait_for_task(stores, child, "awaiting confirmation", |task| {
                 task.status == TaskStatus::AwaitingConfirmation
@@ -1394,6 +1509,8 @@ async fn answer_prompt(
         | Scenario::HungTool
         | Scenario::HungSubagent
         | Scenario::Overlap
+        | Scenario::OverlapLeader
+        | Scenario::LockLossLeader
         | Scenario::MergeBack => {}
     }
     Ok(())
@@ -1637,6 +1754,12 @@ async fn s6_confirmation(backend: Backend) -> Result<()> {
 /// narrow; run it with `--stress-count 32` to measure it.
 async fn s6_confirmation_single_host(backend: Backend) -> Result<()> {
     confirmation_case(backend, Scenario::ConfirmationSingleHost).await
+}
+
+/// S6 (tool confirmation) on `PostgresLeader` daemons: the restarted host
+/// takes the lock before it serves the approval.
+async fn s6_confirmation_leader(backend: Backend) -> Result<()> {
+    confirmation_case(backend, Scenario::ConfirmationLeader).await
 }
 
 async fn confirmation_case(backend: Backend, scenario: Scenario) -> Result<()> {
@@ -1955,13 +2078,25 @@ async fn s7_hung_subagent(backend: Backend) -> Result<()> {
 /// kill it reclaims them and the turn ends with nothing stuck.
 #[cfg(feature = "postgres")]
 async fn s8_overlap(backend: Backend) -> Result<()> {
+    s8_overlap_case(backend, Scenario::Overlap).await
+}
+
+/// S8 on `PostgresLeader` daemons: the new host waits for the lock with no
+/// workers, then reclaims the dead leader's leases by epoch.
+#[cfg(feature = "postgres")]
+async fn s8_overlap_leader(backend: Backend) -> Result<()> {
+    s8_overlap_case(backend, Scenario::OverlapLeader).await
+}
+
+#[cfg(feature = "postgres")]
+async fn s8_overlap_case(backend: Backend, scenario: Scenario) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let dir = Arc::new(CaseDir(temp.path().to_owned()));
     let Some(db) = CaseDb::create(backend, temp.path()).await? else {
         return Ok(());
     };
     let stores = inspection(&db.storage).await?;
-    let mut old = CrashedHost::spawn(Scenario::Overlap, &dir, &db.storage)?;
+    let mut old = CrashedHost::spawn(scenario, &dir, &db.storage)?;
     let mut control = connect(&old.endpoint(&dir).await?).await?;
     let (thread, root) = start_turn(&mut control).await?;
     poll("both tool children to start", WAIT, || async {
@@ -1979,7 +2114,7 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
     // not return from its start until it leads.
     let new = tokio::spawn(start_daemon(
         db.storage.clone(),
-        Scenario::Overlap,
+        scenario,
         Phase::Recover,
         Arc::clone(&dir),
     ));
@@ -2011,7 +2146,7 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
         wait_for_task(&stores, &root, "terminal", |task| task.status.is_terminal()).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let runs = dir.run_lines()?;
-    new.report(Scenario::Overlap.name());
+    new.report(scenario.name());
     drop(new);
     ensure!(
         runs_while_overlapping.len() == 2 && taken.is_empty(),
@@ -2029,6 +2164,78 @@ async fn s8_overlap(backend: Backend) -> Result<()> {
     );
     let live = live_rows(&stores, &thread).await?;
     ensure!(live.is_empty(), "rows left live: {live:?}");
+    Ok(())
+}
+
+/// S8 with a lock loss (revsdk523's B1 probe): the old leader runs a safe
+/// and an unsafe tool when its lock connection is ended while it lives. A
+/// standby takes the lock at once. The store then refuses the old epoch's
+/// acquires, heartbeats and settles, and the successor waits out the old
+/// leader's detection window before it reclaims, so the safe tool never
+/// runs on two hosts at once and the unsafe tool is not run again.
+#[cfg(feature = "postgres")]
+async fn s8_lock_loss_leader(backend: Backend) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = Arc::new(CaseDir(temp.path().to_owned()));
+    let Some(db) = CaseDb::create(backend, temp.path()).await? else {
+        return Ok(());
+    };
+    let stores = inspection(&db.storage).await?;
+    let scenario = Scenario::LockLossLeader;
+    let mut old = CrashedHost::spawn(scenario, &dir, &db.storage)?;
+    let mut control = connect(&old.endpoint(&dir).await?).await?;
+    let (thread, root) = start_turn(&mut control).await?;
+    poll("both tool children to start", WAIT, || async {
+        Ok((dir.run_lines()?.len() >= 2).then_some(()))
+    })
+    .await?;
+    let new = tokio::spawn(start_daemon(
+        db.storage.clone(),
+        scenario,
+        Phase::Recover,
+        Arc::clone(&dir),
+    ));
+    // Let the new host reach its standby wait.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ensure!(
+        db.end_leader_lock_session().await? == 1,
+        "expected the old host to hold the leader lock"
+    );
+    let new = tokio::time::timeout(WAIT, new)
+        .await
+        .context("the new host did not lead after the old one lost its lock")???;
+
+    let root = AgentTaskId::from_string(&root);
+    let root_row =
+        wait_for_task(&stores, &root, "terminal", |task| task.status.is_terminal()).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let runs = dir.run_lines()?;
+    let overlap = dir.max_concurrent(SAFE_TOOL)?;
+    new.report(scenario.name());
+    drop(new);
+    drop(control);
+    ensure!(
+        overlap <= 1,
+        "the safe tool ran on two hosts at once ({overlap} in flight): runs {runs:?}"
+    );
+    ensure!(
+        runs.iter().filter(|run| *run == UNSAFE_TOOL).count() == 1,
+        "the unsafe tool ran again: {runs:?}"
+    );
+    ensure!(
+        runs.iter().filter(|run| *run == SAFE_TOOL).count() <= 2,
+        "the old host ran the safe tool again after it lost its lock: {runs:?}"
+    );
+    ensure!(
+        root_row.status == TaskStatus::Completed,
+        "the root is {:?}: {:?}",
+        root_row.status,
+        root_row.last_error
+    );
+    let thread = ThreadId::from_string(&thread);
+    let live = live_rows(&stores, &thread).await?;
+    ensure!(live.is_empty(), "rows left live: {live:?}");
+    drop(old);
     Ok(())
 }
 
@@ -2129,6 +2336,7 @@ matrix!(
         s6_question,
         s6_confirmation,
         s6_confirmation_single_host,
+        s6_confirmation_leader,
         s7_hung_tool,
         s9_merge_back,
         s7_hung_subagent,
@@ -2149,11 +2357,17 @@ matrix!(
         s6_question,
         s6_confirmation,
         s6_confirmation_single_host,
+        s6_confirmation_leader,
         s7_hung_tool,
         s9_merge_back,
         s7_hung_subagent,
     ],
-    [s4_fork: "failpoints", s8_overlap: "postgres"],
+    [
+        s4_fork: "failpoints",
+        s8_overlap: "postgres",
+        s8_overlap_leader: "postgres",
+        s8_lock_loss_leader: "postgres",
+    ],
     [
     ]
 );
