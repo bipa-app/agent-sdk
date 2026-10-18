@@ -196,6 +196,56 @@ where
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
+/// What a running subagent is doing, as its live progress frame reports it.
+///
+/// The unknown sink keeps durable journal rows readable when a newer producer
+/// introduces another phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPhase {
+    /// The child's own turn is running.
+    Working,
+    /// The child's turn is parked on its tool calls.
+    WaitingOnTools,
+    /// The child has shown no sign of work for at least half its stall
+    /// budget. Reported only; nothing is cancelled.
+    Stalled,
+    /// A phase introduced by a newer producer.
+    #[serde(other)]
+    Unknown,
+}
+
+impl SubagentPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::WaitingOnTools => "waiting_on_tools",
+            Self::Stalled => "stalled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The live part of a periodic [`AgentEvent::SubagentProgress`] frame.
+///
+/// Only the frames the worker writes while the child runs carry it; the
+/// spawn and completion frames do not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentLiveness {
+    /// The newest sign of work in the child: its live activity beacon, the
+    /// durable `last_activity_at` of its thread's tasks, or its newest LLM
+    /// call.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_activity_at: Option<OffsetDateTime>,
+    pub phase: SubagentPhase,
+    /// LLM calls the child's root task has made, including the open one.
+    pub llm_calls: u64,
+    /// Output tokens over the child's finished LLM calls, including turns
+    /// that have not committed yet.
+    pub output_tokens_live: u64,
+}
+
 /// Why a daemon changed the OAuth account serving a provider request.
 ///
 /// The unknown sink keeps durable journal rows readable when a newer producer
@@ -623,7 +673,7 @@ pub enum AgentEvent {
         subagent_task_id: Option<String>,
         /// Maximum turns configured for this subagent
         max_turns: Option<u32>,
-        /// Current turn number of the subagent
+        /// The child's committed turns, plus one while it runs.
         current_turn: Option<u32>,
         /// Model being used by the subagent
         model: Option<String>,
@@ -635,7 +685,7 @@ pub enum AgentEvent {
         completed: bool,
         /// Whether the subagent succeeded (only meaningful if completed)
         success: bool,
-        /// Current total tool count for this subagent
+        /// The child's finished tool calls.
         tool_count: u32,
         /// Current total tokens used by this subagent (input + output).
         total_tokens: u64,
@@ -651,6 +701,10 @@ pub enum AgentEvent {
         /// Cumulative cache-creation input tokens used by the child thread.
         #[serde(default)]
         cache_creation_input_tokens: u64,
+        /// The child's live state, on the periodic frames written while it
+        /// runs. Boxed to keep every other event as small as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        liveness: Option<Box<SubagentLiveness>>,
     },
 }
 
@@ -1793,6 +1847,74 @@ mod tests {
     }
 
     #[test]
+    fn subagent_liveness_is_additive_on_the_journal_row() -> serde_json::Result<()> {
+        let mut row = serde_json::json!({
+            "type": "subagent_progress",
+            "subagent_id": "call-1",
+            "subagent_name": "explore",
+            "nickname": null,
+            "child_thread_id": null,
+            "child_root_task_id": null,
+            "subagent_task_id": null,
+            "max_turns": 3,
+            "current_turn": 1,
+            "model": "mock",
+            "tool_name": "explore",
+            "tool_context": "inspect",
+            "completed": false,
+            "success": false,
+            "tool_count": 0,
+            "total_tokens": 12,
+        });
+        let legacy: AgentEvent = serde_json::from_value(row.clone())?;
+        assert!(matches!(
+            legacy,
+            AgentEvent::SubagentProgress { liveness: None, .. }
+        ));
+        let rewritten = serde_json::to_value(&legacy)?;
+        assert!(
+            rewritten.get("liveness").is_none(),
+            "a frame without liveness writes no key: {rewritten}"
+        );
+
+        row["liveness"] = serde_json::json!({
+            "last_activity_at": "2026-10-18T12:00:00Z",
+            "phase": "waiting_on_tools",
+            "llm_calls": 2,
+            "output_tokens_live": 40,
+        });
+        let live: AgentEvent = serde_json::from_value(row.clone())?;
+        let AgentEvent::SubagentProgress {
+            liveness: Some(liveness),
+            ..
+        } = &live
+        else {
+            panic!("expected a live SubagentProgress, got {live:?}");
+        };
+        assert_eq!(liveness.phase, SubagentPhase::WaitingOnTools);
+        assert_eq!(liveness.llm_calls, 2);
+        assert_eq!(liveness.output_tokens_live, 40);
+        assert_eq!(
+            liveness
+                .last_activity_at
+                .map(OffsetDateTime::unix_timestamp),
+            Some(1_792_324_800)
+        );
+        assert_eq!(serde_json::to_value(&live)?["liveness"], row["liveness"]);
+
+        row["liveness"]["phase"] = serde_json::json!("finalizing");
+        let newer: AgentEvent = serde_json::from_value(row)?;
+        assert!(matches!(
+            newer,
+            AgentEvent::SubagentProgress {
+                liveness: Some(ref liveness),
+                ..
+            } if liveness.phase == SubagentPhase::Unknown
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn budget_exceeded_event_deserializes_legacy_duration_object() -> serde_json::Result<()> {
         // BudgetExceeded has no pre-rename durable rows, but the field uses
         // the same adapter — keep it uniformly lenient.
@@ -2050,6 +2172,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                liveness: None,
             },
         ]
     }

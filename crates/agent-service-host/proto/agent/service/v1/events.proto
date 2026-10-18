@@ -435,6 +435,34 @@ message SubagentProgressEvent {
   uint64 output_tokens = 17;
   uint64 cache_read_input_tokens = 18;
   uint64 cache_creation_input_tokens = 19;
+  // The child's live state. Present only on the periodic frames the worker
+  // writes while the child runs; absent on the spawn and completion frames
+  // and from older producers.
+  SubagentLiveness liveness = 20;
+}
+
+// What a running subagent is doing. UNSPECIFIED for a phase this build does
+// not know.
+enum SubagentPhase {
+  SUBAGENT_PHASE_UNSPECIFIED = 0;
+  // The child's own turn is running.
+  SUBAGENT_PHASE_WORKING = 1;
+  // The child's turn is parked on its tool calls.
+  SUBAGENT_PHASE_WAITING_ON_TOOLS = 2;
+  // No sign of work for at least half the child's stall budget. Reported
+  // only; nothing is cancelled.
+  SUBAGENT_PHASE_STALLED = 3;
+}
+
+message SubagentLiveness {
+  // The newest sign of work in the child; absent when it has none yet.
+  google.protobuf.Timestamp last_activity_at = 1;
+  SubagentPhase phase = 2;
+  // LLM calls the child's root task has made, including the open one.
+  uint64 llm_calls = 3;
+  // Output tokens over the child's finished LLM calls, including turns that
+  // have not committed yet.
+  uint64 output_tokens_live = 4;
 }
 
 // Auto-retry was initiated for a transient LLM error (rate limit,

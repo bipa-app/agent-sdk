@@ -353,6 +353,9 @@ pub struct WorkerConfig {
     /// default budget. Silence, not age: a tool that reports progress runs
     /// as long as it needs.
     pub tool_stall_budget_secs: u64,
+    /// The notice a plain root turn's heartbeat appends when the turn shows
+    /// no sign of work for a while; `None` appends none.
+    pub root_stall_notice: Option<RootStallNotice>,
     /// Seconds between idle worker acquisition polls.
     ///
     /// When a worker has no active task it sleeps for this duration
@@ -407,9 +410,29 @@ impl Default for WorkerConfig {
             sweep_interval_secs: 5,
             subagent_progress_interval_secs: 30,
             tool_stall_budget_secs: 900,
+            root_stall_notice: None,
             acquisition_interval_secs: 1,
             epoch_recovery: EpochRecovery::LeaseExpiry,
         }
+    }
+}
+
+/// A notice that a plain root turn appears stalled.
+///
+/// When a running root turn (not a subagent's child) shows no sign of work
+/// for `after_secs`, and again at four times that, its heartbeat appends a
+/// `ToolProgress` frame named `tool_name` to the turn's thread. The notice
+/// never stops the turn. Any sign of work starts a new episode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootStallNotice {
+    pub after_secs: u64,
+    pub tool_name: String,
+}
+
+impl RootStallNotice {
+    #[must_use]
+    pub const fn after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.after_secs)
     }
 }
 

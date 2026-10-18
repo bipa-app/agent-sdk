@@ -27,6 +27,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Signal: span `agent_service_host.daemon.pre_worker_gate` (`outcome`:
   `ok` / `error`), and an info or warn log with `elapsed_ms`.
 
+### The worker writes subagent progress and the root-turn stall notice (prim-wait W3)
+
+Progress the worker reports about a task now goes through a lease-guarded
+append, and covers the two cases bip filled with daemon sweeps
+(`subagent_progress_sweep`, `root_turn_stall`). No migration, table,
+`Write`/`Guard` variant or protocol number; agent.service.v1 gains one
+field and one message.
+
+- `Transition::append_owned(task, worker, lease, thread, events)`: append
+  events while `task` runs under `(worker, lease)`. A lost lease refuses it
+  at the guard, a purged thread at the append fence. The host commits it
+  straight to the store, not through the activity-tracking event
+  repository, so reporting progress is never evidence of work: a child
+  that only reports progress still stalls.
+- **Subagent progress.** The periodic `SubagentProgress` frame is appended
+  under the child root's lease instead of the unguarded `commit_event`.
+  While the child root is parked on tool children, the running tool child
+  with the lowest id writes it under its own lease (the others skip), so
+  frames continue through a long build and stop when nothing holds a lease.
+  A tool child's frame also requires the child root to still be parked, so
+  no frame lands after the child root resumes or ends.
+- **Count semantics, unified** (they never go backwards on live frames):
+  `tool_count` = finished (`Completed`/`Failed`) tool children, the
+  completion frame's rule; `total_tokens` = input + output; usage = the
+  committed turns, plus the open turn's usage the child root's continuation
+  carries, plus what the child root's beacon streamed since acquisition;
+  `current_turn` = committed + 1 while running. Before, a frame counted
+  running tool children and dropped the open turn's usage once the child
+  root parked.
+- **Breaking:** `AgentEvent::SubagentProgress` gains `liveness:
+  Option<SubagentLiveness>` (`#[serde(default)]`, omitted when `None`), set
+  on the periodic frames only: `last_activity_at` (the newest of the
+  emitter's beacon, the child thread's task `last_activity_at`s and the
+  child root's newest LLM call), `phase` (`SubagentPhase::Working`,
+  `WaitingOnTools`, or `Stalled` once silent for half the subagent's stall
+  budget; reported only, nothing is cancelled; unknown values read as
+  `Unknown`), `llm_calls` (the child root's attempt rows) and
+  `output_tokens_live` (output tokens over those rows). Code that builds the
+  variant as a struct literal adds `liveness: None`; patterns with `..` are
+  unchanged. `SubagentProgressSnapshot` gains the same field, and
+  `WorkerConfig` gains `root_stall_notice` (a struct literal without
+  `..Default::default()` adds it). Journal rows without it read as `None`.
+- agent.service.v1: `SubagentProgressEvent.liveness = 20` (message
+  `SubagentLiveness`, enum `SubagentPhase` with `_UNSPECIFIED = 0`). Older
+  decoders skip it.
+- **Root-turn stall notice.** `WorkerConfig::root_stall_notice:
+  Option<RootStallNotice { after_secs, tool_name }>`, default `None`. When a
+  plain root turn (not a subagent's child root) shows no sign of work on its
+  activity beacon for `after_secs`, and again at four times that, its own
+  heartbeat appends, under its lease, a `ToolProgress` frame with the same
+  id, name, stage, message and `data` JSON as bip's `root_turn_stall`
+  notice (`root-turn-stall-{task}`, `{since_ms, root_task_id}`). One notice
+  per threshold per silence; any sign of work starts a new one; the turn is
+  never stopped. Connectivity waits bump the beacon, so they suppress it.
+  `after_secs` must be > 0 (`ServiceHost::new` refuses 0).
+  `ViewConfig::stall_tool_name` reads it as before.
+- Signals: counters `agent_server.progress.events{kind=subagent_progress|root_stall_notice}`
+  and `agent_server.progress.refused{reason=lease_lost|purged|store}`
+  (`ServerMetrics::record_progress_event` / `record_progress_refused`),
+  plus `info`/`warn` logs with the task id. A tool child's frame skipped
+  because the child root resumed is not counted.
+- **bip (B-W2, after the pin bump):** add `liveness: None` where it builds
+  `SubagentProgress` literals (`subagent_liveness.rs` `build_spawn_accept_progress`
+  and the frame at `:722`, plus test helpers); set
+  `config.worker.root_stall_notice` from `root_turn_stall_threshold_secs`
+  with `tool_name = "bip_root_turn_stall"`; read fields 16–22 from
+  `liveness` at read time (cost from attempt rows or usage and model,
+  provider and effort from the thread context); then delete
+  `subagent_progress_sweep.rs` and `root_turn_stall.rs`. `total_tokens` on
+  live frames is now input + output, as on the completion frame; a card
+  that shows output only reads `output_tokens` or
+  `liveness.output_tokens_live`.
+- **satoshi:** builds unchanged. It matches `AgentEvent` with a wildcard,
+  builds no `SubagentProgress` or `WorkerConfig` literal, and leaves
+  `root_stall_notice` at `None`. Its `deep_research` subagents, while parked
+  on tool calls, now get periodic frames from their tool children (one per
+  `subagent_progress_interval_secs`, default 30 s): `satoshi-api`'s event
+  mapping ignores them, and the ACP mapper (`satoshi-host/src/acp.rs`)
+  turns each into an in-progress update of the subagent's row, as it does
+  the running child root's frames today.
+
 ### Primitive 10 (S-2): the subagent completion hook
 
 - **Breaking:** `SubagentResultDeps` gains `completion_hook:

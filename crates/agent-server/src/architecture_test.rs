@@ -36,7 +36,7 @@ const ALLOWED: &[(&str, usize)] = &[
     ("agent-server/src/worker/activity.rs", 2),
     ("agent-server/src/worker/root_turn.rs", 7),
     ("agent-service-host/src/grpc.rs", 1),
-    ("agent-service-host/src/host.rs", 4),
+    ("agent-service-host/src/host.rs", 3),
     ("agent-service-host/src/postgres/store.rs", 4),
     ("agent-service-host/src/sqlite/store.rs", 4),
 ];

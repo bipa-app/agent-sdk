@@ -598,6 +598,28 @@ impl Transition {
         }
     }
 
+    /// Append `events` to `thread` while `task` is running under
+    /// `(worker, lease)`: the write of an actor that reports on a task it
+    /// holds, such as a progress frame. A lost lease refuses it at the
+    /// guard, and a purged thread at the append fence.
+    #[must_use]
+    pub fn append_owned(
+        task: AgentTaskId,
+        worker: WorkerId,
+        lease: LeaseId,
+        thread: ThreadId,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task,
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            }],
+            writes: vec![Write::AppendEvents { thread, events }],
+        }
+    }
+
     /// Settle a running, leased task with no events.
     #[must_use]
     pub fn settle_only(
@@ -1245,6 +1267,28 @@ mod tests {
         assert!(transition.validate().is_ok());
         transition.guards.clear();
         assert!(matches!(transition.validate(), Err(Rejected::Store(_))));
+    }
+
+    #[test]
+    fn an_owned_append_holds_only_under_its_lease() {
+        let task = running("w1", "l1");
+        let transition = Transition::append_owned(
+            task.id.clone(),
+            WorkerId::from_string("w1"),
+            LeaseId::from_string("l1"),
+            task.thread_id.clone(),
+            vec![agent_sdk_foundation::AgentEvent::text("m-1", "progress")],
+        );
+        assert!(transition.validate().is_ok());
+        assert!(transition.guards_status(&task.id, TaskStatus::Running));
+        assert!(transition.appends_events());
+        let guard = guard_on(&task, "w1", "l1");
+        assert_eq!(transition.guards, vec![guard.clone()]);
+        let mut moved = task.clone();
+        moved.lease_id = Some(LeaseId::from_string("l2"));
+        assert!(guard.check(0, Some(&task)).is_ok());
+        assert!(guard.check(0, Some(&moved)).is_err());
+        assert!(guard.check(0, None).is_err());
     }
 
     #[test]

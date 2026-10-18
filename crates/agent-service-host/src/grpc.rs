@@ -610,7 +610,7 @@ async fn drive_approved_confirmation(params: DriveApprovedConfirmation) {
             // stall probe reads this row.
             deadline: crate::host::SubagentDeadlineState::Exempt,
             activity: bootstrap.activity.clone(),
-            tool_stall: Some(tool_stall),
+            stall: crate::host::StallLeg::tool(Some(tool_stall)),
         },
     ));
 
@@ -4028,13 +4028,13 @@ fn map_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event>
     if let Some(payload) = map_tool_event_payload(event)? {
         return Ok(payload);
     }
-    if let Some(payload) = map_subagent_event_payload(event) {
+    if let Some(payload) = map_subagent_event_payload(event)? {
         return Ok(payload);
     }
     map_lifecycle_event_payload(event)
 }
 
-fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::Event> {
+fn map_subagent_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
     let AgentEvent::SubagentProgress {
         subagent_id,
         subagent_name,
@@ -4055,11 +4055,12 @@ fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
+        liveness,
     } = event
     else {
-        return None;
+        return Ok(None);
     };
-    Some(pb::event_envelope::Event::SubagentProgress(
+    Ok(Some(pb::event_envelope::Event::SubagentProgress(
         pb::SubagentProgressEvent {
             subagent_id: subagent_id.clone(),
             subagent_name: subagent_name.clone(),
@@ -4080,8 +4081,30 @@ fn map_subagent_event_payload(event: &AgentEvent) -> Option<pb::event_envelope::
             output_tokens: *output_tokens,
             cache_read_input_tokens: *cache_read_input_tokens,
             cache_creation_input_tokens: *cache_creation_input_tokens,
+            liveness: liveness.as_deref().map(map_subagent_liveness).transpose()?,
         },
-    ))
+    )))
+}
+
+fn map_subagent_liveness(
+    liveness: &agent_sdk_foundation::SubagentLiveness,
+) -> RpcResult<pb::SubagentLiveness> {
+    Ok(pb::SubagentLiveness {
+        last_activity_at: map_optional_timestamp(liveness.last_activity_at)?,
+        phase: map_subagent_phase(liveness.phase).into(),
+        llm_calls: liveness.llm_calls,
+        output_tokens_live: liveness.output_tokens_live,
+    })
+}
+
+const fn map_subagent_phase(phase: agent_sdk_foundation::SubagentPhase) -> pb::SubagentPhase {
+    use agent_sdk_foundation::SubagentPhase;
+    match phase {
+        SubagentPhase::Working => pb::SubagentPhase::Working,
+        SubagentPhase::WaitingOnTools => pb::SubagentPhase::WaitingOnTools,
+        SubagentPhase::Stalled => pb::SubagentPhase::Stalled,
+        SubagentPhase::Unknown => pb::SubagentPhase::Unspecified,
+    }
 }
 
 fn map_message_event_payload(event: &AgentEvent) -> RpcResult<Option<pb::event_envelope::Event>> {
@@ -4560,53 +4583,8 @@ fn map_auto_retry_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::E
 /// Split from [`map_lifecycle_event_payload`] purely for length; any
 /// other variant is an internal error.
 fn map_subagent_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
-    let AgentEvent::SubagentProgress {
-        subagent_id,
-        subagent_name,
-        nickname,
-        child_thread_id,
-        child_root_task_id,
-        subagent_task_id,
-        max_turns,
-        current_turn,
-        model,
-        tool_name,
-        tool_context,
-        completed,
-        success,
-        tool_count,
-        total_tokens,
-        input_tokens,
-        output_tokens,
-        cache_read_input_tokens,
-        cache_creation_input_tokens,
-    } = event
-    else {
-        return Err(Status::internal("expected a subagent-progress event").into());
-    };
-    Ok(pb::event_envelope::Event::SubagentProgress(
-        pb::SubagentProgressEvent {
-            subagent_id: subagent_id.clone(),
-            subagent_name: subagent_name.clone(),
-            nickname: nickname.clone(),
-            child_thread_id: child_thread_id.as_ref().map(ToString::to_string),
-            child_root_task_id: child_root_task_id.clone(),
-            subagent_task_id: subagent_task_id.clone(),
-            max_turns: *max_turns,
-            current_turn: *current_turn,
-            model: model.clone(),
-            tool_name: tool_name.clone(),
-            tool_context: tool_context.clone(),
-            completed: *completed,
-            success: *success,
-            tool_count: *tool_count,
-            total_tokens: *total_tokens,
-            input_tokens: *input_tokens,
-            output_tokens: *output_tokens,
-            cache_read_input_tokens: *cache_read_input_tokens,
-            cache_creation_input_tokens: *cache_creation_input_tokens,
-        },
-    ))
+    map_subagent_event_payload(event)?
+        .ok_or_else(|| Status::internal("expected a subagent-progress event").into())
 }
 
 fn map_u64<T>(value: T, field: &'static str) -> RpcResult<u64>
@@ -12579,6 +12557,70 @@ mod tests {
             LegacySubagentProgressEvent::decode(progress.encode_to_vec().as_slice())?;
         assert_eq!(legacy_progress.subagent_id, "call-1");
         assert_eq!(legacy_progress.total_tokens, 30);
+        Ok(())
+    }
+
+    /// A live subagent frame's liveness rides field 20; the spawn and
+    /// completion frames carry none, and an older decoder skips it.
+    #[test]
+    fn subagent_liveness_maps_to_an_additive_field() -> Result<()> {
+        use agent_sdk_foundation::{SubagentLiveness, SubagentPhase};
+        use prost::Message;
+
+        let frame = |liveness| AgentEvent::SubagentProgress {
+            subagent_id: "call-1".into(),
+            subagent_name: "explore".into(),
+            nickname: None,
+            child_thread_id: None,
+            child_root_task_id: None,
+            subagent_task_id: None,
+            max_turns: None,
+            current_turn: Some(2),
+            model: None,
+            tool_name: "explore".into(),
+            tool_context: String::new(),
+            completed: false,
+            success: false,
+            tool_count: 3,
+            total_tokens: 30,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            liveness,
+        };
+        let at = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000);
+        let live = frame(Some(Box::new(SubagentLiveness {
+            last_activity_at: Some(at),
+            phase: SubagentPhase::WaitingOnTools,
+            llm_calls: 7,
+            output_tokens_live: 512,
+        })));
+        let Some(pb::event_envelope::Event::SubagentProgress(progress)) =
+            map_subagent_event_payload(&live)?
+        else {
+            bail!("a SubagentProgress maps to its payload");
+        };
+        let liveness = progress
+            .liveness
+            .context("the live frame carries liveness")?;
+        assert_eq!(liveness.phase(), pb::SubagentPhase::WaitingOnTools);
+        assert_eq!(liveness.llm_calls, 7);
+        assert_eq!(liveness.output_tokens_live, 512);
+        assert_eq!(
+            liveness.last_activity_at.map(|at| at.seconds),
+            Some(1_700_000_000)
+        );
+        let legacy = LegacySubagentProgressEvent::decode(progress.encode_to_vec().as_slice())?;
+        assert_eq!(legacy.subagent_id, "call-1");
+        assert_eq!(legacy.total_tokens, 30);
+
+        let Some(pb::event_envelope::Event::SubagentProgress(spawn)) =
+            map_subagent_event_payload(&frame(None))?
+        else {
+            bail!("a SubagentProgress maps to its payload");
+        };
+        assert!(spawn.liveness.is_none());
         Ok(())
     }
 
