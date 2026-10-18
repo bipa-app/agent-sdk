@@ -1798,8 +1798,16 @@ impl AgentControlService for GrpcControlService {
             })
             .await
             .map_err(|error| {
+                if matches!(error, SubmitRootTurnError::IdempotencyConflict) {
+                    observe_submit_claim(SubmitClaim::Conflict);
+                }
                 map_submit_root_error("SubmitThreadWork", &request.request_id, error)
             })?;
+        observe_submit_claim(if outcome.replayed {
+            SubmitClaim::Replay
+        } else {
+            SubmitClaim::Fresh
+        });
 
         Ok(Response::new(pb::SubmitThreadWorkResponse {
             thread: Some(self.shared.thread_view(&thread_id).await?),
@@ -1940,6 +1948,7 @@ impl AgentControlService for GrpcControlService {
                 &fingerprint,
             )
             .await
+            .inspect(|claim| observe_idempotency_claim(IdempotencyKind::DecideConfirmation, claim))
             .map_err(internal_status("decide-confirmation idempotency lookup"))?
         {
             IdempotencyClaim::Conflict => {
@@ -3234,6 +3243,30 @@ fn observe_idempotency_claim(kind: IdempotencyKind, claim: &IdempotencyClaim) {
     crate::observability::HostMetrics::global().record_idempotency_claim(kind, claim);
     #[cfg(not(feature = "otel"))]
     let _ = (kind, claim);
+}
+
+/// What a submit's claim found. The store resolves it inside the submit
+/// transaction, so it never sees `in_flight`.
+#[derive(Clone, Copy)]
+enum SubmitClaim {
+    Fresh,
+    Replay,
+    Conflict,
+}
+
+/// Counts a submit's claim on `agent_service_host.idempotency.claims`.
+fn observe_submit_claim(claim: SubmitClaim) {
+    #[cfg(feature = "otel")]
+    crate::observability::HostMetrics::global().record_idempotency_outcome(
+        IdempotencyKind::SubmitWork,
+        match claim {
+            SubmitClaim::Fresh => "fresh",
+            SubmitClaim::Replay => "replay",
+            SubmitClaim::Conflict => "conflict",
+        },
+    );
+    #[cfg(not(feature = "otel"))]
+    let _ = claim;
 }
 
 fn idempotency_conflict_status(method: &str, request_id: &str) -> Status {
@@ -6564,6 +6597,68 @@ mod tests {
         result
     }
 
+    /// A re-sent confirmation decision records `replay` for
+    /// `decide_confirmation`, like the crash matrix's S6 retry.
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_resent_decision_records_a_replay_claim() -> Result<()> {
+        let meter = crate::observability::test_meter::TestMeter::install().await;
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(vec![
+            confirm_transfer_tool(),
+        ])));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![
+                tool_use_response(
+                    "resp_claim_1",
+                    "tool_call_1",
+                    "transfer",
+                    json!({"amount": 1}),
+                ),
+                text_response("resp_claim_2", "denied"),
+            ])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let daemon = LocalDaemon::start(ServiceConfig::default(), registry, runtime).await?;
+        let result = async {
+            let (mut control, _events) = connect_clients(&daemon.endpoint()).await?;
+            let thread_id = create_thread(&mut control, "create-claim-decide").await?;
+            submit_text_work(
+                &mut control,
+                "submit-claim-decide",
+                &thread_id,
+                "transfer 1",
+            )
+            .await?;
+            let parked = wait_for_awaiting_confirmation(&control, &thread_id).await?;
+            for _ in 0..2 {
+                control
+                    .decide_confirmation(approval_request(
+                        "decide-claim",
+                        &thread_id,
+                        &parked.task_id,
+                        false,
+                    ))
+                    .await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result?;
+
+        // Lower bounds: under plain `cargo test` other tests in this binary
+        // record into the same global meter (nextest runs one per process).
+        let claims = |claim: &str| {
+            meter.counter(
+                "agent_service_host.idempotency.claims",
+                &[("kind", "decide_confirmation"), ("claim", claim)],
+            )
+        };
+        assert!(claims("fresh") >= 1, "the first decision claims fresh");
+        assert!(claims("replay") >= 1, "the re-sent decision replays");
+        Ok(())
+    }
+
     fn confirm_transfer_tool() -> Tool {
         Tool {
             name: "transfer".into(),
@@ -8750,12 +8845,12 @@ mod tests {
         Ok(compacted.messages)
     }
 
-    /// Retried creates and forks record their claim kind on
+    /// Retried creates, submits and forks record their claim kind on
     /// `agent_service_host.idempotency.claims`: the first `fresh`, the retry
     /// `replay`.
     #[cfg(feature = "otel")]
     #[tokio::test]
-    async fn retried_creates_and_forks_record_a_replay_claim() -> Result<()> {
+    async fn retried_creates_submits_and_forks_record_a_replay_claim() -> Result<()> {
         let meter = crate::observability::test_meter::TestMeter::install().await;
         let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
             Vec::new(),
@@ -8777,6 +8872,12 @@ mod tests {
             let mut stream =
                 open_stream(&mut events, &source, None, pb::FollowMode::ReplayAndFollow).await?;
             let _ = collect_until_closed(&mut stream).await?;
+            submit_text_work(&mut control, "claim-submit", &source, "first").await?;
+            let reused = submit_text_work(&mut control, "claim-submit", &source, "other").await;
+            anyhow::ensure!(
+                reused.is_err(),
+                "a reused request id with other text conflicts"
+            );
             fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
             fork_thread(&mut control, "claim-fork-key", &source, 1).await?;
             anyhow::Ok(())
@@ -8803,6 +8904,12 @@ mod tests {
         );
         assert!(claims("fork_thread", "fresh") >= 1, "fork_thread, fresh");
         assert!(claims("fork_thread", "replay") >= 1, "fork_thread, replay");
+        assert!(claims("submit_work", "fresh") >= 1, "submit_work, fresh");
+        assert!(claims("submit_work", "replay") >= 1, "submit_work, replay");
+        assert!(
+            claims("submit_work", "conflict") >= 1,
+            "submit_work, conflict"
+        );
         Ok(())
     }
 

@@ -4175,7 +4175,7 @@ impl PostgresDurableStore {
                     tokio::time::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)))
                         .await;
                 }
-                result => return result,
+                result => return mark_lock_conflict(result, attempt),
             }
         }
     }
@@ -4184,6 +4184,23 @@ impl PostgresDurableStore {
 /// How many times [`PostgresDurableStore::commit`] retries a transition
 /// Postgres aborted for a lock conflict.
 const COMMIT_LOCK_CONFLICT_RETRIES: u32 = 3;
+
+/// Marks a commit that still failed with a lock conflict after `retries`
+/// retries with [`agent_server::journal::LockConflict`], so telemetry counts
+/// it as `outcome=lock_conflict` instead of a generic store failure.
+fn mark_lock_conflict(
+    result: Result<agent_server::journal::Committed, agent_server::journal::Rejected>,
+    retries: u32,
+) -> Result<agent_server::journal::Committed, agent_server::journal::Rejected> {
+    match result {
+        Err(agent_server::journal::Rejected::Store(error)) if is_lock_conflict(&error) => {
+            Err(agent_server::journal::Rejected::Store(
+                error.context(agent_server::journal::LockConflict { retries }),
+            ))
+        }
+        result => result,
+    }
+}
 
 /// Whether `error` is a Postgres deadlock (`40P01`) or serialization
 /// failure (`40001`), which abort the transaction without writing.
@@ -8903,6 +8920,105 @@ mod tests {
                 database_url,
             },
         )))
+    }
+
+    /// A transition that keeps hitting lock conflicts is retried up to the
+    /// budget, then returned marked [`agent_server::journal::LockConflict`],
+    /// so telemetry records `outcome=lock_conflict`. A trigger makes every
+    /// event insert fail with SQLSTATE 40P01, the real deadlock code.
+    #[tokio::test]
+    async fn a_transition_that_keeps_deadlocking_is_marked_a_lock_conflict() -> Result<()> {
+        let Some((store, _schema)) = test_store().await? else {
+            return Ok(());
+        };
+        let thread_id = ThreadId::from_string("keeps-deadlocking");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+        sqlx::query(
+            "CREATE FUNCTION force_deadlock() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced deadlock' USING ERRCODE = '40P01'; END $$",
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER force_deadlock BEFORE INSERT ON agent_sdk_committed_events \
+             FOR EACH ROW EXECUTE FUNCTION force_deadlock()",
+        )
+        .execute(store.pool())
+        .await?;
+
+        let rejected = agent_server::journal::DurableStore::commit(
+            &store,
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::AppendEvents {
+                    thread: thread_id,
+                    events: vec![AgentEvent::text("m1", "never lands")],
+                }],
+            },
+            t0(),
+        )
+        .await;
+        let Err(agent_server::journal::Rejected::Store(error)) = rejected else {
+            anyhow::bail!("expected a store error, got {rejected:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<agent_server::journal::LockConflict>(),
+            Some(&agent_server::journal::LockConflict {
+                retries: COMMIT_LOCK_CONFLICT_RETRIES
+            }),
+            "{error:#}"
+        );
+        assert_eq!(
+            store.lock_conflict_retries(),
+            u64::from(COMMIT_LOCK_CONFLICT_RETRIES)
+        );
+        Ok(())
+    }
+
+    /// Any other database error is neither retried nor marked: it stays a
+    /// plain store failure (`outcome=store`).
+    #[tokio::test]
+    async fn a_transition_that_fails_otherwise_is_not_a_lock_conflict() -> Result<()> {
+        let Some((store, _schema)) = test_store().await? else {
+            return Ok(());
+        };
+        let thread_id = ThreadId::from_string("fails-otherwise");
+        ThreadStore::get_or_create(&store, &thread_id, t0()).await?;
+        sqlx::query(
+            "CREATE FUNCTION force_failure() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'forced failure' USING ERRCODE = 'P0001'; END $$",
+        )
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER force_failure BEFORE INSERT ON agent_sdk_committed_events \
+             FOR EACH ROW EXECUTE FUNCTION force_failure()",
+        )
+        .execute(store.pool())
+        .await?;
+
+        let rejected = agent_server::journal::DurableStore::commit(
+            &store,
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::AppendEvents {
+                    thread: thread_id,
+                    events: vec![AgentEvent::text("m1", "never lands")],
+                }],
+            },
+            t0(),
+        )
+        .await;
+        let Err(agent_server::journal::Rejected::Store(error)) = rejected else {
+            anyhow::bail!("expected a store error, got {rejected:?}");
+        };
+        assert_eq!(
+            error.downcast_ref::<agent_server::journal::LockConflict>(),
+            None,
+            "{error:#}"
+        );
+        assert_eq!(store.lock_conflict_retries(), 0);
+        Ok(())
     }
 
     /// The child-thread link a root's undelivered input is classified by
