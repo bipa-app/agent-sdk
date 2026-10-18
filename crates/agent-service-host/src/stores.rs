@@ -349,6 +349,18 @@ pub struct StoreRegistry {
     backend: RegistryBackend,
 }
 
+/// What a host sets on its concrete stores before [`StoreRegistry`] shares
+/// them.
+#[derive(Clone, Default)]
+pub struct StoreOptions {
+    /// Runs inside every transition and completed-turn commit (see
+    /// [`agent_server::journal::TransitionExtension`]).
+    pub transition_extension: Option<Arc<dyn agent_server::journal::TransitionExtension>>,
+    /// The session view settings (reconciliation C3). Off by default; the
+    /// view storage reads them once it exists.
+    pub view: agent_sdk_foundation::view::ViewConfig,
+}
+
 /// Registry of live cancellation tokens for detached
 /// approved-confirmation drives, keyed by the Confirm-tier tool task
 /// id.
@@ -474,11 +486,26 @@ impl StoreRegistry {
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
     ) -> Result<Self> {
+        Self::from_config_with(config, definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::from_config`] with host options applied to the concrete
+    /// store before it is shared: a decorating store wraps the `Arc`s
+    /// afterwards and cannot reach inside the store's transactions.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::from_config`].
+    pub fn from_config_with(
+        config: &StorageConfig,
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Result<Self> {
         match config.backend {
-            StorageBackend::InMemory => Ok(Self::in_memory(definition_registry)),
+            StorageBackend::InMemory => Ok(Self::in_memory_with(definition_registry, options)),
             #[cfg(feature = "postgres")]
             StorageBackend::Postgres => {
-                Self::postgres(config.postgres_settings()?, definition_registry)
+                Self::postgres(config.postgres_settings()?, definition_registry, options)
             }
             #[cfg(not(feature = "postgres"))]
             StorageBackend::Postgres => {
@@ -487,7 +514,7 @@ impl StoreRegistry {
             StorageBackend::Sqlite { .. } => {
                 #[cfg(feature = "sqlite")]
                 {
-                    Self::sqlite(config, definition_registry)
+                    Self::sqlite(config, definition_registry, options)
                 }
                 #[cfg(not(feature = "sqlite"))]
                 {
@@ -554,6 +581,15 @@ impl StoreRegistry {
     /// empty instance.
     #[must_use]
     pub fn in_memory(definition_registry: Arc<dyn AgentDefinitionRegistry>) -> Self {
+        Self::in_memory_with(definition_registry, StoreOptions::default())
+    }
+
+    /// [`Self::in_memory`] with host options.
+    #[must_use]
+    pub fn in_memory_with(
+        definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
+    ) -> Self {
         // The task store's `cancel_tree` commits terminal `Cancelled`
         // markers (+ outbox advisories) through these shared stores —
         // the in-memory analogue of the durable backends committing
@@ -588,6 +624,10 @@ impl StoreRegistry {
                 attempt_store: attempt_store.clone(),
                 checkpoint_store: checkpoint_store.clone(),
             });
+        let task_store = match options.transition_extension {
+            Some(extension) => task_store.with_transition_extension(extension),
+            None => task_store,
+        };
         let event_repo: Arc<dyn EventRepository> = Arc::new(PurgeFencedEventRepository::new(
             event_repo,
             thread_store.clone(),
@@ -619,8 +659,9 @@ impl StoreRegistry {
     fn postgres(
         config: &PostgresStorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
     ) -> Result<Self> {
-        let durable_store = build_postgres_store(config)?;
+        let durable_store = build_postgres_store(config, options)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -651,9 +692,11 @@ impl StoreRegistry {
     fn sqlite(
         config: &StorageConfig,
         definition_registry: Arc<dyn AgentDefinitionRegistry>,
+        options: StoreOptions,
     ) -> Result<Self> {
         let database_url = config.sqlite_database_url()?;
-        let durable_store = build_sqlite_store(&database_url, config.sqlite_max_connections()?)?;
+        let durable_store =
+            build_sqlite_store(&database_url, config.sqlite_max_connections()?, options)?;
         let tool_audit_store: Arc<dyn ToolAuditEventStore> = Arc::new(
             RedactingToolAuditEventStore::baseline(durable_store.clone()),
         );
@@ -819,12 +862,19 @@ impl StoreRegistry {
 }
 
 #[cfg(feature = "postgres")]
-fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDurableStore>> {
+fn build_postgres_store(
+    config: &PostgresStorageConfig,
+    options: StoreOptions,
+) -> Result<Arc<PostgresDurableStore>> {
     let database_url = config.resolved_database_url()?;
     let max_connections = config.max_connections;
     let schema = config.schema.clone();
     let build = || {
         PostgresDurableStore::connect_lazy(&database_url, max_connections, schema.as_deref())
+            .map(|store| match options.transition_extension {
+                Some(extension) => store.with_transition_extension(extension),
+                None => store,
+            })
             .map(Arc::new)
     };
 
@@ -843,6 +893,7 @@ fn build_postgres_store(config: &PostgresStorageConfig) -> Result<Arc<PostgresDu
 fn build_sqlite_store(
     database_url: &str,
     max_connections: Option<u32>,
+    options: StoreOptions,
 ) -> Result<Arc<SqliteDurableStore>> {
     // SqliteDurableStore::connect is async (runs PRAGMAs and
     // migrations), but `from_config` is a sync constructor.  We
@@ -862,6 +913,10 @@ fn build_sqlite_store(
             .block_on(async {
                 SqliteDurableStore::connect_with_max_connections(&url, max_connections)
                     .await
+                    .map(|store| match options.transition_extension {
+                        Some(extension) => store.with_transition_extension(extension),
+                        None => store,
+                    })
                     .map(Arc::new)
                     .context("connect sqlite durable store")
             })
@@ -1159,5 +1214,132 @@ mod tests {
             !registry.cancel(&task_id),
             "the unwound drive's entry must have been deregistered",
         );
+    }
+
+    /// Adds one host document to every transition it sees.
+    struct MarkCommits;
+
+    impl agent_server::journal::TransitionExtension for MarkCommits {
+        fn extend(
+            &self,
+            _view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            let Ok(kind) = agent_server::journal::DocKind::new("registry.mark") else {
+                return Vec::new();
+            };
+            vec![agent_server::journal::Write::Document(
+                agent_server::journal::DocumentWrite::put(
+                    agent_server::journal::DocumentKey::new(
+                        agent_server::journal::DocScope::Host,
+                        kind,
+                        "",
+                    ),
+                    1,
+                    agent_server::journal::DocExpect::Any,
+                    serde_json::json!(true),
+                ),
+            )]
+        }
+    }
+
+    fn with_mark() -> StoreOptions {
+        StoreOptions {
+            transition_extension: Some(Arc::new(MarkCommits)),
+            ..StoreOptions::default()
+        }
+    }
+
+    /// The registry built with options installs the extension on the
+    /// store it shares: a commit through `task_store` carries the
+    /// extension's document, read back through `document_store`.
+    async fn assert_registry_runs_the_extension(stores: &StoreRegistry) -> anyhow::Result<()> {
+        stores.initialize().await?;
+        stores
+            .task_store
+            .commit(
+                agent_server::journal::Transition::default(),
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mark = agent_server::journal::DocumentKey::new(
+            agent_server::journal::DocScope::Host,
+            agent_server::journal::DocKind::new("registry.mark")?,
+            "",
+        );
+        anyhow::ensure!(
+            stores.document_store.get_document(&mark).await?.is_some(),
+            "the {} registry did not install the extension",
+            stores.backend_name()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn in_memory_registry_installs_the_extension() -> anyhow::Result<()> {
+        assert_registry_runs_the_extension(&StoreRegistry::in_memory_with(
+            sample_registry(),
+            with_mark(),
+        ))
+        .await?;
+        let config = StorageConfig::default();
+        assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_registry_installs_the_extension() -> anyhow::Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let config = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(tmp.path().display().to_string()),
+                max_connections: None,
+            },
+            ..StorageConfig::default()
+        };
+        assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_registry_installs_the_extension() -> anyhow::Result<()> {
+        use sqlx::Connection;
+
+        let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let schema = format!("reg_ext_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = sqlx::postgres::PgConnection::connect(&database_url).await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&mut admin)
+            .await?;
+        let config = StorageConfig {
+            backend: StorageBackend::Postgres,
+            postgres: PostgresStorageConfig {
+                database_url: Some(database_url),
+                schema: Some(schema.clone()),
+                max_connections: 2,
+            },
+        };
+        let result = assert_registry_runs_the_extension(&StoreRegistry::from_config_with(
+            &config,
+            sample_registry(),
+            with_mark(),
+        )?)
+        .await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&mut admin)
+            .await?;
+        result
     }
 }

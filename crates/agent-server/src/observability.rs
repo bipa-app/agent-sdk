@@ -220,6 +220,10 @@ pub mod attrs {
     /// longer parked).
     pub const OUTCOME_WOKEN: &str = "woken";
     pub const OUTCOME_DECLINED: &str = "declined";
+    /// Where a transition extension ran: `commit` / `completed_turn`.
+    pub const EXTENSION_POINT: &str = "extension.point";
+    pub const EXTENSION_POINT_COMMIT: &str = "commit";
+    pub const EXTENSION_POINT_COMPLETED_TURN: &str = "completed_turn";
 
     pub const OP_PUT: &str = "put";
     pub const OP_RETIRE: &str = "retire";
@@ -330,6 +334,10 @@ pub struct ServerMetrics {
     /// `agent_server.journal.steering_resumes`: steering wakes committed,
     /// by backend and outcome.
     pub(crate) steering_resumes: Counter<u64>,
+    /// `agent_server.journal.extension.{writes,refused}`: what a transition
+    /// extension added, and the commits refused for a write it may not add.
+    pub(crate) extension_writes: Counter<u64>,
+    pub(crate) extension_refused: Counter<u64>,
     /// `agent_server.effects`: effect transitions, by kind.
     pub(crate) effects: Counter<u64>,
     /// `agent_server.effect.duration`: started to finished, by kind and
@@ -576,7 +584,30 @@ impl ServerMetrics {
                 ],
             );
         }
-        for document in &committed.documents {
+        self.record_documents(backend, &committed.documents);
+    }
+
+    /// Count what a transition extension did on one commit: the writes it
+    /// added, or a refusal of a write it may not add.
+    pub fn record_extension(&self, point: &'static str, added: usize, refused: bool) {
+        let attributes = [KeyValue::new(attrs::EXTENSION_POINT, point)];
+        if refused {
+            self.extension_refused.add(1, &attributes);
+        } else if added > 0 {
+            self.extension_writes
+                .add(u64::try_from(added).unwrap_or(u64::MAX), &attributes);
+        }
+    }
+
+    /// Count each committed document write on
+    /// `agent_server.journal.documents.written`, from a transition or from a
+    /// completed turn's extra writes.
+    pub fn record_documents(
+        &self,
+        backend: &'static str,
+        documents: &[crate::journal::DocumentOutcome],
+    ) {
+        for document in documents {
             let op = if document.revision.is_some() {
                 attrs::OP_PUT
             } else {
@@ -968,6 +999,7 @@ impl ServerMetrics {
             .build();
         let steering_resumes = steering_resumes_counter(&meter);
         let documents_written = documents_written_counter(&meter);
+        let (extension_writes, extension_refused) = extension_instruments(&meter);
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
@@ -994,6 +1026,8 @@ impl ServerMetrics {
             transition_lock_conflict_retries,
             documents_written,
             steering_resumes,
+            extension_writes,
+            extension_refused,
             effects,
             effect_duration,
             completed_turn_commits,
@@ -1170,6 +1204,22 @@ fn steering_resumes_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u6
             "Steering wakes committed, attributed by backend and outcome (woken or declined).",
         )
         .build()
+}
+
+/// The transition extension's counters: the writes it added, and the
+/// commits refused for a write it may not add.
+fn extension_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
+    let extension_writes = meter
+        .u64_counter("agent_server.journal.extension.writes")
+        .with_description("Writes a transition extension added, attributed by extension point.")
+        .build();
+    let extension_refused = meter
+        .u64_counter("agent_server.journal.extension.refused")
+        .with_description(
+            "Commits refused because the transition extension returned a write it may not add.",
+        )
+        .build();
+    (extension_writes, extension_refused)
 }
 
 // ─────────────────────────────────────────────────────────────────────
