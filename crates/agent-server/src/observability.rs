@@ -717,14 +717,46 @@ impl ServerMetrics {
     /// `agent_server.subagent.invocation.attempts{attempt}`. A run with
     /// `attempt` above 1 is a retry after a crash or an expired lease.
     pub fn record_invocation_attempt(&self, attempt: u32) {
-        let label = match attempt {
-            0 | 1 => "1",
-            2 => "2",
-            3 => "3",
-            _ => "4+",
-        };
         self.invocation_attempts
-            .add(1, &[KeyValue::new(attrs::ATTEMPT, label)]);
+            .add(1, &[KeyValue::new(attrs::ATTEMPT, attempt_label(attempt))]);
+    }
+
+    /// Count one run of a tool call on `agent_server.tool.attempts{attempt}`
+    /// and, for a run above attempt 1 (its task was requeued after a crash
+    /// or an expired lease, and a `Safe` tool runs again), emit the span
+    /// `agent_server.tool.retry` with the task's id, attempt and budget and
+    /// the tool's name. The counter is built on use (the SDK returns the
+    /// same instrument), once per tool call.
+    pub fn record_tool_attempt(&self, task: &crate::journal::AgentTask, tool_name: &str) {
+        use opentelemetry::trace::{Span, Tracer};
+
+        self.meter
+            .u64_counter("agent_server.tool.attempts")
+            .with_description("Tool call runs, by the task's attempt.")
+            .build()
+            .add(
+                1,
+                &[KeyValue::new(attrs::ATTEMPT, attempt_label(task.attempt))],
+            );
+        if task.attempt <= 1 {
+            return;
+        }
+        let mut span = global::tracer("agent-server").start("agent_server.tool.retry");
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_ID,
+            task.id.as_str().to_owned(),
+        ));
+        span.set_attribute(KeyValue::new(attrs::SPAN_TASK_KIND, attrs::KIND_TOOL));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_ATTEMPT,
+            i64::from(task.attempt),
+        ));
+        span.set_attribute(KeyValue::new(
+            attrs::SPAN_TASK_MAX_ATTEMPTS,
+            i64::from(task.max_attempts),
+        ));
+        span.set_attribute(KeyValue::new(attrs::SPAN_TOOL_NAME, tool_name.to_owned()));
+        span.end();
     }
 
     /// Count a subagent invocation the lease sweep failed closed at its
@@ -1174,6 +1206,16 @@ fn write_cached(value: Arc<ServerMetrics>) {
     // handle on the floor. Both copies are functionally equivalent
     // (same scope, same global meter), so the duplicate is
     // harmless.
+}
+
+/// The bounded `attempt` label: `1`, `2`, `3` or `4+`.
+const fn attempt_label(attempt: u32) -> &'static str {
+    match attempt {
+        0 | 1 => "1",
+        2 => "2",
+        3 => "3",
+        _ => "4+",
+    }
 }
 
 const fn failure_reason_label(reason: FailureReason) -> &'static str {
