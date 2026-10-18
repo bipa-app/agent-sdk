@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests: fan-in conformance
+
+- Add proptest-generated settle, cancel, spawn and lease-expiry schedules on
+  in-memory, SQLite and Postgres task trees. Check persisted parent/child and
+  cross-thread subagent links after each operation: no `WaitingOnChildren`
+  task may have zero live children, and its stored count must match them.
+- Run 16 bounded cases by default. Each case prints its seed; replay with
+  `FAN_IN_SEED=<seed> FAN_IN_CASES=1`, or raise `FAN_IN_CASES` for a longer run.
+  These serial schedules test fan-in after committed operations, not concurrent
+  lock races. Test-only; no runtime or schema change.
+
 ### Primitive 10 (S-3): the local daemon's store handles and pre-worker gate
 
 - `LocalDaemon::builder(config, registry, runtime)` returns a

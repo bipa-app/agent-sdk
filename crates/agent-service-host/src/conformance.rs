@@ -10071,6 +10071,7 @@ mod tests {
         Ok(())
     }
 
+    mod fan_in;
     mod settlement;
 
     // ── prompt rows ──────────────────────────────────────────────────
