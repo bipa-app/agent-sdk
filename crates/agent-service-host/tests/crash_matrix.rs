@@ -110,10 +110,13 @@ enum Scenario {
     /// connection dies while it lives (a failover, an idle-session kill).
     LockLossLeader,
     MergeBack,
+    /// S10 (SQLite): concurrent writers while an outside connection holds
+    /// the write lock past `busy_timeout`.
+    Contention,
 }
 
 impl Scenario {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
@@ -129,6 +132,7 @@ impl Scenario {
         Self::OverlapLeader,
         Self::LockLossLeader,
         Self::MergeBack,
+        Self::Contention,
     ];
 
     const fn name(self) -> &'static str {
@@ -148,6 +152,7 @@ impl Scenario {
             Self::OverlapLeader => "s8_overlap_leader",
             Self::LockLossLeader => "s8_lock_loss_leader",
             Self::MergeBack => "s9_merge_back",
+            Self::Contention => "s10_sqlite_contention",
         }
     }
 
@@ -161,7 +166,7 @@ impl Scenario {
     /// The model's first response: the call the crash interrupts.
     fn first_response(self) -> ChatResponse {
         match self {
-            Self::UnsafeTool => tool_use(UNSAFE_TOOL, json!({})),
+            Self::UnsafeTool | Self::Contention => tool_use(UNSAFE_TOOL, json!({})),
             Self::SafeTool => tool_use(SAFE_TOOL, json!({})),
             Self::Confirmation | Self::ConfirmationSingleHost | Self::ConfirmationLeader => {
                 tool_use(CONFIRM_TOOL, json!({}))
@@ -1401,6 +1406,7 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::Overlap
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
+        | Scenario::Contention
         | Scenario::MergeBack => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
             (scenario != Scenario::LlmStream).then(|| AgentTaskId::from_string(ready.trim()))
@@ -1511,6 +1517,7 @@ async fn answer_prompt(
         | Scenario::Overlap
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
+        | Scenario::Contention
         | Scenario::MergeBack => {}
     }
     Ok(())
@@ -2330,6 +2337,176 @@ async fn s9_merge_back(backend: Backend) -> Result<()> {
     Ok(())
 }
 
+/// Turns that S10 runs at once while an outside writer holds the lock.
+#[cfg(feature = "sqlite")]
+const CONTENTION_TURNS: usize = 8;
+
+/// How long the outside writer holds SQLite's write lock: past the store's
+/// 5 s `busy_timeout`, so a write that does not retry its `BEGIN` fails.
+#[cfg(feature = "sqlite")]
+const CONTENTION_HOLD: Duration = Duration::from_secs(7);
+
+/// Start S10's turns at once: create (and retry the create), then submit.
+#[cfg(feature = "sqlite")]
+fn start_contended_turns(
+    control: &ControlClient,
+) -> tokio::task::JoinSet<Result<(String, String)>> {
+    let mut turns = tokio::task::JoinSet::new();
+    for n in 0..CONTENTION_TURNS {
+        let mut control = control.clone();
+        turns.spawn(async move {
+            let create = pb::CreateThreadRequest {
+                request_id: format!("cm-contention-create-{n}"),
+                thread_id: String::new(),
+            };
+            let thread_of = |response: pb::CreateThreadResponse| {
+                response
+                    .thread
+                    .and_then(|view| view.thread)
+                    .map(|thread| thread.thread_id)
+                    .context("create_thread returned no thread")
+            };
+            let thread = thread_of(
+                control
+                    .create_thread(create.clone())
+                    .await
+                    .with_context(|| format!("turn {n}: create_thread under the lock"))?
+                    .into_inner(),
+            )?;
+            let again = thread_of(
+                control
+                    .create_thread(create)
+                    .await
+                    .with_context(|| format!("turn {n}: create_thread retry"))?
+                    .into_inner(),
+            )?;
+            ensure!(
+                again == thread,
+                "turn {n}: a retried CreateThread made a second thread"
+            );
+            let task = control
+                .submit_thread_work(pb::SubmitThreadWorkRequest {
+                    request_id: format!("cm-contention-submit-{n}"),
+                    thread_id: thread.clone(),
+                    input: vec![pb::UserInputItem {
+                        item: Some(pb::user_input_item::Item::Text("run the tool".into())),
+                    }],
+                    caller_metadata: String::new(),
+                    disposition: pb::SubmitDisposition::NextTurn as i32,
+                })
+                .await
+                .with_context(|| format!("turn {n}: submit_thread_work under the lock"))?
+                .into_inner()
+                .task
+                .context("submit_thread_work returned no task")?;
+            anyhow::Ok((thread, task.task_id))
+        });
+    }
+    turns
+}
+
+/// One S10 turn completed, left nothing live, and finished its effects.
+#[cfg(feature = "sqlite")]
+async fn check_contended_turn(stores: &StoreRegistry, thread: &str, root: &str) -> Result<()> {
+    let root_row = wait_for_task(
+        stores,
+        &AgentTaskId::from_string(root),
+        "terminal",
+        |task| task.status.is_terminal(),
+    )
+    .await?;
+    ensure!(
+        root_row.status == TaskStatus::Completed,
+        "a turn under contention ended {:?}: {:?}",
+        root_row.status,
+        root_row.last_error
+    );
+    let thread = ThreadId::from_string(thread);
+    let live = live_rows(stores, &thread).await?;
+    ensure!(live.is_empty(), "rows left live: {live:?}");
+    for child in stores
+        .task_store
+        .list_by_thread(&thread)
+        .await?
+        .into_iter()
+        .filter(|row| row.parent_id.is_some())
+    {
+        let record = stores
+            .task_store
+            .effect(&EffectKey::tool(&child.id, CALL_ID))
+            .await?
+            .with_context(|| format!("no effect record for tool child {}", child.id))?;
+        ensure!(
+            record.state == EffectState::Completed,
+            "a tool effect under contention ended {:?}",
+            record.state
+        );
+    }
+    Ok(())
+}
+
+/// S10 (SQLite, #532): N concurrent writers while one outside connection
+/// holds the write lock past `busy_timeout`. Every `CreateThread` succeeds
+/// and a retry with its `request_id` returns the same thread (the
+/// idempotency claim and record survive the lock), every turn completes,
+/// and each turn's unsafe tool ran exactly once with its effect record
+/// completed: no effect is lost to a `database is locked` at `BEGIN`.
+#[cfg(feature = "sqlite")]
+async fn s10_sqlite_contention(backend: Backend) -> Result<()> {
+    use sqlx::Connection;
+
+    let temp = tempfile::tempdir()?;
+    let dir = Arc::new(CaseDir(temp.path().to_owned()));
+    let Some(db) = CaseDb::create(backend, temp.path()).await? else {
+        return Ok(());
+    };
+    let agent_service_host::config::StorageBackend::Sqlite {
+        path: Some(path), ..
+    } = &db.storage.backend
+    else {
+        return Ok(());
+    };
+    let url = format!("sqlite://{path}?mode=rwc");
+    let stores = inspection(&db.storage).await?;
+    let daemon = start_daemon(
+        db.storage.clone(),
+        Scenario::Contention,
+        Phase::Recover,
+        Arc::clone(&dir),
+    )
+    .await?;
+    let control = connect(&daemon.host.endpoint()).await?;
+
+    // The outside writer takes the lock first and holds it past the
+    // store's busy timeout.
+    let mut holder = sqlx::SqliteConnection::connect(&url).await?;
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut holder).await?;
+    let held = tokio::spawn(async move {
+        tokio::time::sleep(CONTENTION_HOLD).await;
+        sqlx::query("COMMIT").execute(&mut holder).await?;
+        anyhow::Ok(())
+    });
+
+    let mut turns = start_contended_turns(&control);
+    let mut started = Vec::new();
+    while let Some(turn) = turns.join_next().await {
+        started.push(turn??);
+    }
+    held.await??;
+
+    for (thread, root) in &started {
+        check_contended_turn(&stores, thread, root).await?;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let runs = dir.run_lines()?;
+    ensure!(
+        runs.iter().filter(|run| *run == UNSAFE_TOOL).count() == CONTENTION_TURNS,
+        "expected {CONTENTION_TURNS} tool runs, one per turn: {runs:?}"
+    );
+    daemon.report(Scenario::Contention.name());
+    Ok(())
+}
+
 macro_rules! matrix {
     ($backend:ident, $feature:literal, [$($scenario:ident),* $(,)?], [$($gated:ident: $gate:literal),* $(,)?], [$($known:ident: $why:literal),* $(,)?]) => {
         #[cfg(feature = $feature)]
@@ -2373,6 +2550,7 @@ matrix!(
         s7_hung_tool,
         s9_merge_back,
         s7_hung_subagent,
+        s10_sqlite_contention,
     ],
     [s4_fork: "failpoints"],
     [

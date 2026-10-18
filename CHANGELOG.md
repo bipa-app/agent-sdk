@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests: crash matrix S10, SQLite contention
+
+- `s10_sqlite_contention` runs a real `LocalDaemon` on SQLite while an
+  outside connection holds the write lock (`BEGIN IMMEDIATE`) for 7 s, past
+  the store's 5 s `busy_timeout`. Eight clients meanwhile create a thread
+  (and retry the create with its `request_id`), then run a turn that calls
+  an unsafe tool. Every RPC succeeds, every retried create returns the same
+  thread, every turn completes, and each tool runs exactly once with its
+  effect record `Completed`. Without #532's `BEGIN` retry it fails at the
+  first `CreateThread`.
+
 ### Host: one leader per Postgres store, and epoch fencing
 
 - **Breaking:** `EpochRecovery::PostgresLeader`. Before it begins its
