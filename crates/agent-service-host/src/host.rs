@@ -461,6 +461,8 @@ impl ServiceHost {
         let watch_handle = self.spawn_watch_scheduler();
         let janitor_handle = self.spawn_retention_janitor();
         let http_health_handle = self.spawn_http_health().await?;
+        #[cfg(feature = "otel")]
+        record_parked_waits(&self.stores).await;
 
         self.mark_healthy();
         info!(
@@ -947,6 +949,32 @@ async fn settle_orphaned_descendants(
     #[cfg(feature = "otel")]
     super::observability::HostMetrics::global().record_orphan_settlement(settled);
     Ok(settled)
+}
+
+/// Records the waits on a human the journal holds at start (see
+/// [`super::observability::HostMetrics::record_parked_waits`]). A failed read
+/// is logged and records nothing.
+#[cfg(feature = "otel")]
+async fn record_parked_waits(stores: &StoreRegistry) {
+    let count = |status| async move {
+        stores
+            .task_store
+            .list_by_status(status)
+            .await
+            .map(|tasks| tasks.len())
+    };
+    match (
+        count(TaskStatus::AwaitingQuestion).await,
+        count(TaskStatus::AwaitingConfirmation).await,
+    ) {
+        (Ok(questions), Ok(confirmations)) => {
+            super::observability::HostMetrics::global()
+                .record_parked_waits(questions, confirmations);
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            warn!(error = %error, "could not count parked waits at start");
+        }
+    }
 }
 
 /// The recorder a host starts with: with the `otel` feature it also exports
