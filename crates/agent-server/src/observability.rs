@@ -1015,20 +1015,8 @@ impl ServerMetrics {
             .u64_counter("agent_server.tool_audit.outcome")
             .with_description("Tool audit events recorded, attributed by lifecycle outcome.")
             .build();
-        let transition_duration = meter
-            .f64_histogram("agent_server.journal.transition.duration")
-            .with_unit("s")
-            .with_description(
-                "Duration of DurableStore::commit, attributed by backend and outcome.",
-            )
-            .with_boundaries(COMMIT_DURATION_BUCKETS_S.to_vec())
-            .build();
-        let transition_lock_conflict_retries = meter
-            .u64_counter("agent_server.journal.transition.lock_conflict_retries")
-            .with_description(
-                "Transitions the store retried after a deadlock or serialization failure.",
-            )
-            .build();
+        let (transition_duration, transition_lock_conflict_retries) =
+            transition_instruments(&meter);
         let steering_resumes = steering_resumes_counter(&meter);
         let documents_written = documents_written_counter(&meter);
         let (extension_writes, extension_refused) = extension_instruments(&meter);
@@ -1128,6 +1116,24 @@ fn epoch_reclaims_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64>
              scope and what recovery did with the row.",
         )
         .build()
+}
+
+/// `agent_server.journal.transition.duration` and
+/// `agent_server.journal.transition.lock_conflict_retries`.
+fn transition_instruments(meter: &opentelemetry::metrics::Meter) -> (Histogram<f64>, Counter<u64>) {
+    let duration = meter
+        .f64_histogram("agent_server.journal.transition.duration")
+        .with_unit("s")
+        .with_description("Duration of DurableStore::commit, attributed by backend and outcome.")
+        .with_boundaries(COMMIT_DURATION_BUCKETS_S.to_vec())
+        .build();
+    let lock_conflict_retries = meter
+        .u64_counter("agent_server.journal.transition.lock_conflict_retries")
+        .with_description(
+            "Transitions the store retried after a deadlock or serialization failure.",
+        )
+        .build();
+    (duration, lock_conflict_retries)
 }
 
 /// `agent_server.progress.events` and `agent_server.progress.refused`.
