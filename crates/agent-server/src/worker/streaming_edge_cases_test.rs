@@ -911,6 +911,7 @@ async fn truncated_tool_stream_is_retried_then_suspends() -> Result<()> {
 
     let outcome = run_turn(&stores, &provider).await?;
     let RootTurnOutcome::Suspended {
+        parent_task,
         child_tasks,
         committed_events,
         ..
@@ -934,6 +935,26 @@ async fn truncated_tool_stream_is_retried_then_suspends() -> Result<()> {
     assert_eq!(start.0, "tc_ok");
     assert_eq!(start.1, "get_weather");
     assert_eq!(start.2, serde_json::json!({"city": "SF"}));
+
+    // The truncated attempt's request finishes `Failed`, the retried tool
+    // round's `Completed`: neither is left started (P2-3b2, #540).
+    let mut states: Vec<crate::journal::effect::EffectState> =
+        crate::journal::DurableStore::effects_for_task(&stores.tasks, &parent_task.id)
+            .await?
+            .into_iter()
+            .filter(|record| record.kind() == crate::journal::effect::EffectKind::LlmRequest)
+            .map(|record| record.state)
+            .collect();
+    states.sort_by_key(crate::journal::effect::EffectState::outcome_label);
+    assert_eq!(
+        states,
+        vec![
+            crate::journal::effect::EffectState::Completed,
+            crate::journal::effect::EffectState::Failed {
+                error: "server_error".into()
+            },
+        ]
+    );
 
     Ok(())
 }
