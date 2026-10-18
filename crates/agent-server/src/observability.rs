@@ -1264,7 +1264,7 @@ fn durability_instruments(
             "Effect transitions by kind: started (its record committed), refused (the \
              claim did not commit), continued (a requeued owner continues its started \
              record), finished, reclaimed (recovery ended it without \
-             running it again), abandoned (its owner became terminal first).",
+             running it again), abandoned (its owner became terminal first), salvaged (a cut-off LLM response committed with the turn that continues).",
         )
         .build();
     let effect_duration = meter

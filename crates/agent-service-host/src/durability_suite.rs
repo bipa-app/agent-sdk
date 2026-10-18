@@ -1312,4 +1312,397 @@ mod tests {
         drop(store);
         Ok(())
     }
+
+    /// Crash safety Phase 2, P2-3c (failpoint rule): a crash inside the
+    /// completed-turn transaction that carries a salvage `Finish(Salvaged)`
+    /// leaves the request started, and the retry lands the cut-off text
+    /// exactly once. Each failpoint fires after the salvage finish is
+    /// written; `effect.finish_written` counts the finishes reached inside
+    /// the crashed transaction (the salvage's is first in the extras).
+    ///
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    #[cfg(feature = "failpoints")]
+    mod salvage_crash {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use agent_sdk_foundation::llm::{
+            self, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
+        };
+        use agent_sdk_foundation::{AgentEvent, ThreadId};
+        use agent_sdk_providers::LlmProvider;
+        use agent_server::journal::checkpoint_store::CheckpointStore;
+        use agent_server::journal::event_notifier::EventNotifier;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::execution_context::build_root_worker_inputs;
+        use agent_server::journal::message_store::MessageProjectionStore;
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
+        use agent_server::journal::thread_store::ThreadStore;
+        use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+        use agent_server::journal::{
+            DurableStore, EffectIntent, EffectKey, EffectState, EffectSubject, EffectWrite, Guard,
+            OpenAttemptParams, Transition, TurnAttempt, TurnAttemptWrite, Write,
+            is_aborted_response_note,
+        };
+        use agent_server::worker::bootstrap::WorkerBootstrapContext;
+        use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+        use agent_server::worker::{RootTurnDeps, execute_root_turn};
+        use anyhow::{Context, Result, ensure};
+        use async_trait::async_trait;
+        use time::OffsetDateTime;
+
+        use crate::fail;
+
+        /// A store that hosts a whole root turn.
+        pub(super) trait Store:
+            AgentTaskStore
+            + ThreadStore
+            + MessageProjectionStore
+            + TurnAttemptStore
+            + CheckpointStore
+            + EventRepository
+        {
+        }
+
+        impl<T> Store for T where
+            T: AgentTaskStore
+                + ThreadStore
+                + MessageProjectionStore
+                + TurnAttemptStore
+                + CheckpointStore
+                + EventRepository
+        {
+        }
+
+        const PARTIAL: &str = "half an answer the crash cut";
+        const THREAD: &str = "salvage-crash";
+
+        fn at(secs: i64) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs)
+        }
+
+        fn definition() -> AgentDefinition {
+            AgentDefinition {
+                provider: "crash-test".into(),
+                model: "crash-test-model".into(),
+                system_prompt: "Answer.".into(),
+                max_tokens: 256,
+                tools: Vec::new(),
+                thinking: ThinkingPolicy::default(),
+                thinking_display: None,
+                tools_fn: None,
+                tool_input_sanitizer: None,
+                request_context_fn: None,
+                policy: RuntimePolicy::server_default(),
+            }
+        }
+
+        struct TextProvider;
+
+        #[async_trait]
+        impl LlmProvider for TextProvider {
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+                Ok(ChatOutcome::Success(ChatResponse {
+                    id: "r".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "final answer".into(),
+                    }],
+                    model: "crash-test-model".into(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Usage {
+                        served_speed: None,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        request_input_tokens: None,
+                    },
+                }))
+            }
+            fn model(&self) -> &'static str {
+                "crash-test-model"
+            }
+            fn provider(&self) -> &'static str {
+                "crash-test"
+            }
+        }
+
+        fn deps<'a, S: Store>(store: &'a S, notifier: &'a EventNotifier) -> RootTurnDeps<'a> {
+            RootTurnDeps {
+                task_store: store,
+                thread_store: store,
+                message_store: store,
+                attempt_store: store,
+                checkpoint_store: store,
+                event_repo: store,
+                event_notifier: notifier,
+                subagent_spawn_selector: None,
+                compaction_config: None,
+                compaction_provider: None,
+                compaction_artifact_store: None,
+                cancel: None,
+                wakeup: None,
+                activity: None,
+                connectivity_waits: None,
+            }
+        }
+
+        /// A leased root with a cut-off LLM request (attempt open, effect started,
+        /// one journaled delta), as a crash mid-stream leaves it.
+        async fn seed<S: Store>(store: &S) -> Result<(AgentTask, EffectKey, TurnAttempt)> {
+            let thread = ThreadId::from_string(THREAD);
+            ThreadStore::get_or_create(store, &thread, at(0)).await?;
+            MessageProjectionStore::get_or_create(store, &thread, at(0)).await?;
+            let root = AgentTask::new_root_turn(thread.clone(), at(0), 3);
+            store.submit_root_turn(root.clone()).await?;
+            let root = store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("w"),
+                    LeaseId::from_string("l"),
+                    at(600),
+                    at(0),
+                )
+                .await?
+                .context("acquire")?;
+            let attempt = TurnAttempt::open(OpenAttemptParams {
+                task_id: root.id.clone(),
+                attempt_number: 1,
+                provenance: agent_sdk_foundation::audit::AuditProvenance::new("crash-test", "m"),
+                request_blob: serde_json::json!({}),
+                now: at(1),
+                otel_trace_id: None,
+                otel_span_id: None,
+            });
+            let key = EffectKey::llm(&root.id, attempt.id.as_str());
+            DurableStore::commit(
+                store,
+                Transition {
+                    guards: vec![
+                        Guard::TaskIs {
+                            task: root.id.clone(),
+                            status: TaskStatus::Running,
+                            lease: Some((WorkerId::from_string("w"), LeaseId::from_string("l"))),
+                        },
+                        Guard::EffectFree { key: key.clone() },
+                    ],
+                    writes: vec![
+                        Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(attempt.clone()))),
+                        Write::Effect(EffectWrite::Start(EffectIntent {
+                            key: key.clone(),
+                            replay: agent_sdk_foundation::ToolReplay::Safe,
+                            owner: root.id.clone(),
+                            thread: thread.clone(),
+                            subject: EffectSubject::Llm {
+                                turn_attempt_id: attempt.id.as_str().to_owned(),
+                                provider: "crash-test".into(),
+                                model: "m".into(),
+                            },
+                            attempt: 1,
+                        })),
+                    ],
+                },
+                at(1),
+            )
+            .await?;
+            EventRepository::commit_event(
+                store,
+                &thread,
+                AgentEvent::TextDelta {
+                    message_id: "m-cut".into(),
+                    delta: PARTIAL.into(),
+                    emitter_task_id: Some(root.id.to_string()),
+                },
+                at(2),
+            )
+            .await?;
+            Ok((root, key, attempt))
+        }
+
+        async fn run_turn<S: Store>(store: &S, root: &AgentTask) -> Result<()> {
+            let thread = ThreadId::from_string(THREAD);
+            let task = AgentTaskStore::get(store, &root.id)
+                .await?
+                .context("root")?;
+            let bootstrap = WorkerBootstrapContext {
+                thread_id: thread,
+                task_id: root.id.clone(),
+                task,
+                worker_id: WorkerId::from_string("w"),
+                lease_id: LeaseId::from_string("l"),
+                definition: definition(),
+            };
+            let inputs = build_root_worker_inputs(bootstrap, store, store, store, at(3)).await?;
+            let notifier = EventNotifier::new();
+            execute_root_turn(
+                inputs,
+                "the question",
+                &TextProvider,
+                &deps(store, &notifier),
+                at(4),
+            )
+            .await?;
+            Ok(())
+        }
+
+        fn text_of(message: &llm::Message) -> String {
+            match &message.content {
+                llm::Content::Text(text) => text.clone(),
+                llm::Content::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            }
+        }
+
+        async fn state<S: Store>(store: &S, key: &EffectKey) -> Result<EffectState> {
+            Ok(DurableStore::effect(store, key)
+                .await?
+                .context("effect")?
+                .state)
+        }
+
+        pub(super) const AFTER_SALVAGE_WRITE: &[&str] = &[
+            "effect.finish_written",
+            "transition.settle_written",
+            "commit.completed_turn.settled",
+            "commit.completed_turn.extra_written",
+        ];
+
+        /// Crash the turn at `failpoint` on `store`, then reopen with
+        /// `reopen` and check the retry.
+        pub(super) async fn crash_then_retry<S: Store>(
+            failpoint: &str,
+            store: S,
+            reopen: impl std::future::Future<Output = Result<S>>,
+        ) -> Result<()> {
+            let (root, key, attempt) = seed(&store).await?;
+
+            // Count the finishes written before the crash; the first finish of
+            // the completed turn is the salvage (it precedes the turn's own).
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&finishes);
+            if failpoint == "effect.finish_written" {
+                fail::cfg_callback("effect.finish_written", move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    panic!("crash at effect.finish_written");
+                })
+                .map_err(anyhow::Error::msg)?;
+            } else {
+                fail::cfg_callback("effect.finish_written", move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                })
+                .map_err(anyhow::Error::msg)?;
+                fail::cfg(failpoint, "panic").map_err(anyhow::Error::msg)?;
+            }
+            let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_turn(
+                &store, &root,
+            )))
+            .await;
+            fail::remove("effect.finish_written");
+            fail::remove(failpoint);
+            ensure!(crashed.is_err(), "{failpoint}: the failpoint must fire");
+            let reached = finishes.load(Ordering::SeqCst);
+            if failpoint == "effect.finish_written" {
+                ensure!(reached == 1, "{failpoint}: finishes {reached}");
+            } else {
+                // The salvage finish and the turn's own request finish.
+                ensure!(
+                    reached == 2,
+                    "{failpoint}: finishes before the crash {reached}"
+                );
+            }
+            drop(store);
+
+            let store = reopen.await?;
+            let thread = ThreadId::from_string(THREAD);
+            let row = AgentTaskStore::get(&store, &root.id)
+                .await?
+                .context("root")?;
+            ensure!(
+                row.status == TaskStatus::Running,
+                "{failpoint}: root {:?}",
+                row.status
+            );
+            let turns = ThreadStore::get(&store, &thread)
+                .await?
+                .map_or(0, |thread| thread.committed_turns);
+            ensure!(turns == 0, "{failpoint}: turn landed: {turns}");
+            ensure!(
+                state(&store, &key).await? == EffectState::Started,
+                "{failpoint}: salvaged request after the crash: {:?}",
+                state(&store, &key).await?
+            );
+
+            run_turn(&store, &root).await?;
+            let messages = MessageProjectionStore::get(&store, &thread)
+                .await?
+                .context("projection")?
+                .messages;
+            let texts: Vec<String> = messages.iter().map(text_of).collect();
+            let partials = texts.iter().filter(|text| text.contains(PARTIAL)).count();
+            ensure!(
+                partials == 1,
+                "{failpoint}: partial count {partials}: {texts:?}"
+            );
+            let at_partial = texts.iter().position(|t| t.contains(PARTIAL)).unwrap_or(0);
+            ensure!(
+                messages
+                    .get(at_partial + 1)
+                    .is_some_and(is_aborted_response_note),
+                "{failpoint}: note after partial: {texts:?}"
+            );
+            ensure!(
+                matches!(state(&store, &key).await?, EffectState::Salvaged { .. }),
+                "{failpoint}: {:?}",
+                state(&store, &key).await?
+            );
+            let closed = TurnAttemptStore::get(&store, &attempt.id)
+                .await?
+                .context("attempt")?;
+            ensure!(closed.closed_as_abandoned(), "{failpoint}: {closed:?}");
+            let row = AgentTaskStore::get(&store, &root.id)
+                .await?
+                .context("root")?;
+            ensure!(
+                row.status == TaskStatus::Completed,
+                "{failpoint}: {:?}",
+                row.status
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_salvage_failpoints_never_lose_or_double_the_cut_off_text() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in salvage_crash::AFTER_SALVAGE_WRITE {
+            let temp = tempfile::tempdir()?;
+            let url = format!("sqlite://{}?mode=rwc", temp.path().join("s.db").display());
+            let store = SqliteDurableStore::connect(&url).await?;
+            salvage_crash::crash_then_retry(failpoint, store, SqliteDurableStore::connect(&url))
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_salvage_failpoints_never_lose_or_double_the_cut_off_text() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in salvage_crash::AFTER_SALVAGE_WRITE {
+            let Some(schema) = PgSchema::create().await? else {
+                return Ok(());
+            };
+            let store = schema.open_store().await?;
+            salvage_crash::crash_then_retry(failpoint, store, schema.open_store()).await?;
+        }
+        Ok(())
+    }
 }

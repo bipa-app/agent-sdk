@@ -1822,7 +1822,7 @@ async fn run_boundary_injection_call(
     // once from the final response — fold, or the checkpoint under-reports.
     add_attempt_usage(&mut streamed.response.usage, &acc.streamed.response.usage);
     acc.streamed = streamed;
-    acc.close_input = resume_input;
+    acc.close_input = resume_input.keep_salvage_finishes(&acc.close_input);
     Ok(acc)
 }
 
@@ -1838,7 +1838,7 @@ async fn stage_boundary_exchange(
     drained: &DrainedInjections,
 ) -> Result<Vec<llm::Message>> {
     let thread_id = &inputs.bootstrap.thread_id;
-    let mut staged: Vec<llm::Message> = close_input.clone().into_message().into_iter().collect();
+    let mut staged: Vec<llm::Message> = close_input.clone().into_messages();
     staged.push(build_assistant_message(&streamed.response));
     staged.extend(drained.messages.iter().cloned());
     for message in &staged {
@@ -2027,6 +2027,20 @@ async fn execute_root_turn_inner(
     //      result, before compaction and the first provider request.
     let closing = close_undelivered_calls(&inputs, deps, now).await?;
 
+    // 2.4c Salvage the cut-off LLM requests this turn continues: its own,
+    //      when the task was re-acquired after a crash, and those of a
+    //      cancelled earlier root. Their messages ride with the prompt and
+    //      commit with the turn (see `super::salvage`).
+    let salvaged = super::salvage::collect(
+        deps.task_store,
+        deps.attempt_store,
+        deps.event_repo,
+        thread_id,
+        &inputs.bootstrap.task_id,
+    )
+    .await?;
+    let user_input = user_input.with_salvage(salvaged);
+
     // 2.5 Pre-call auto-compaction, on its own `<context-compaction>`
     //     attempt opened before the main attempt.
     //
@@ -2188,7 +2202,9 @@ async fn execute_root_turn_inner(
     // commit only the consolidated content events, `TurnComplete`, and
     // `Done` — atomically, with the message-projection write.
     if suspends {
-        return Box::pin(suspend_at_tool_boundary(
+        let salvage_finishes = close_input.salvage_finishes();
+        let salvaged = close_input.salvaged().to_vec();
+        let outcome = Box::pin(suspend_at_tool_boundary(
             inputs,
             &close_input,
             response,
@@ -2198,6 +2214,12 @@ async fn execute_root_turn_inner(
             close_ctx,
         ))
         .await;
+        if outcome.is_ok()
+            && finish_salvaged_after_suspension(deps, salvage_finishes, commit_now).await
+        {
+            super::salvage::report_salvaged(&salvaged);
+        }
+        return outcome;
     }
 
     // ── Text-only path (Phase 4.3) ──────────────────────────────
@@ -2228,6 +2250,7 @@ async fn commit_text_only_turn(
     now: OffsetDateTime,
     close_ctx: TurnCloseContext,
 ) -> Result<RootTurnOutcome> {
+    let salvaged = user_input.salvaged().to_vec();
     let thread_id = &inputs.bootstrap.thread_id;
     let task_id = &inputs.bootstrap.task_id;
     let response_text = response.first_text().unwrap_or("").to_owned();
@@ -2296,7 +2319,7 @@ async fn commit_text_only_turn(
                 worker_id: inputs.bootstrap.worker_id.clone(),
                 lease_id: inputs.bootstrap.lease_id.clone(),
             }),
-            extra_writes: completed_root_writes(task_id, &attempt.id),
+            extra_writes: completed_root_writes(task_id, &attempt.id, &salvaged),
             now,
         },
         &inputs.bootstrap.worker_id,
@@ -2306,6 +2329,7 @@ async fn commit_text_only_turn(
     .await
     .context("commit completed turn")?;
     record_llm_request_finished(&attempt, now);
+    super::salvage::report_salvaged(&salvaged);
 
     // Prepend the durable per-turn admission events (`UserInput`
     // when present + `Start`) committed before streaming so the
@@ -2911,11 +2935,46 @@ fn record_llm_request_finished(attempt: &TurnAttempt, now: OffsetDateTime) {
     );
 }
 
-/// A completed root turn's extra writes: the finish of the LLM request
-/// `attempt` made, then the root's settle (which would abandon a request
-/// still started).
-fn completed_root_writes(task: &AgentTaskId, attempt: &TurnAttemptId) -> Vec<Write> {
-    vec![
+/// Finish the requests a suspended turn salvaged. Its messages are already
+/// in the suspension's durable payload, so this runs after the spawn
+/// commits: a crash between leaves the requests unfinished, and the next
+/// turn that continues may salvage them again (never lose them). A failure
+/// is logged, with the same outcome.
+async fn finish_salvaged_after_suspension(
+    deps: &RootTurnDeps<'_>,
+    finishes: Vec<Write>,
+    now: OffsetDateTime,
+) -> bool {
+    if finishes.is_empty() {
+        return false;
+    }
+    let transition = Transition {
+        guards: Vec::new(),
+        writes: finishes,
+    };
+    match deps.task_store.commit(transition, now).await {
+        Ok(_) => true,
+        Err(error) => {
+            log::warn!("finish the requests a suspended turn salvaged: {error:#}");
+            false
+        }
+    }
+}
+
+/// A completed root turn's extra writes: the finishes of the cut-off
+/// requests it salvaged (their messages commit with the turn), the finish of
+/// the LLM request `attempt` made, then the root's settle (which would
+/// abandon a request still started).
+fn completed_root_writes(
+    task: &AgentTaskId,
+    attempt: &TurnAttemptId,
+    salvaged: &[super::salvage::SalvagedRequest],
+) -> Vec<Write> {
+    let mut writes: Vec<Write> = salvaged
+        .iter()
+        .map(super::salvage::SalvagedRequest::finish)
+        .collect();
+    writes.extend([
         Write::Effect(EffectWrite::Finish {
             key: EffectKey::llm(task, attempt.as_str()),
             owner: task.clone(),
@@ -2925,7 +2984,8 @@ fn completed_root_writes(task: &AgentTaskId, attempt: &TurnAttemptId) -> Vec<Wri
             task: task.clone(),
             outcome: Settle::CompleteWithoutResult,
         },
-    ]
+    ]);
+    writes
 }
 
 /// Only a re-acquired task (`attempt > 1`) can find its own earlier commit.
@@ -3242,8 +3302,9 @@ async fn assemble_provider_request_messages(
         .get_history(thread_id)
         .await
         .context("get staged history")?;
-    if let Some(message) = user_input.clone().into_message() {
-        messages.push(message);
+    messages.extend(user_input.clone().into_messages());
+    if user_input.salvages() {
+        messages = super::salvage::merge_adjacent_roles(messages);
     }
     let request_context =
         definition.resolve_request_context(&super::definition::RequestContextInput {
@@ -5080,7 +5141,13 @@ async fn call_llm_once_inner(
     // before any early return so a failed/cancelled attempt still lands
     // its partial transcript in the journal.
     let mut pending_deltas: Vec<AgentEvent> = Vec::new();
-    let mut last_flush = std::time::Instant::now();
+    // As if a flush interval had passed: the stream's first delta reaches
+    // the journal at once, so a response cut off right after it is still
+    // there to salvage (see `super::salvage`), and clients see the first
+    // token without the batch delay.
+    let mut last_flush = std::time::Instant::now()
+        .checked_sub(STREAMING_DELTA_FLUSH_INTERVAL)
+        .unwrap_or_else(std::time::Instant::now);
     // Latched on the first yielded item that is not a keep-alive; selects
     // which stall budget the next poll runs under (see `stream_stall_budget`).
     let mut received_first_event = false;
@@ -5520,7 +5587,7 @@ async fn buffer_turn_messages(
     // alongside the text content. Resume inputs (`user_input.is_resume()`)
     // produce no message; the staged store already contains the
     // suspended-turn history that the resume path buffered earlier.
-    if let Some(message) = user_input.clone().into_message() {
+    for message in user_input.clone().into_messages() {
         staged_messages
             .append(thread_id, message)
             .await
@@ -5811,9 +5878,7 @@ fn initial_suspended_messages(
 ) -> Vec<llm::Message> {
     let mut messages = staged_prefix.to_vec();
     messages.reserve(2);
-    if let Some(user_message) = user_input.clone().into_message() {
-        messages.push(user_message);
-    }
+    messages.extend(user_input.clone().into_messages());
     messages.push(build_full_assistant_message(response));
     messages
 }
@@ -8139,7 +8204,7 @@ async fn commit_resumed_turn(
                 worker_id: inputs.bootstrap.worker_id.clone(),
                 lease_id: inputs.bootstrap.lease_id.clone(),
             }),
-            extra_writes: completed_root_writes(task_id, &attempt.id),
+            extra_writes: completed_root_writes(task_id, &attempt.id, &[]),
             now,
         },
         &inputs.bootstrap.worker_id,

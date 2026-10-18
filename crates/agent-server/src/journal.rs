@@ -611,9 +611,9 @@ pub use document::{
     DocumentWrite,
 };
 pub use effect::{
-    ABORTED_RESPONSE_NOTE, EffectIntent, EffectKey, EffectKind, EffectRecord, EffectRun,
-    EffectState, EffectSubject, EffectWrite, TOOL_INTERRUPTED_PREFIX, is_aborted_response_note,
-    run_effect,
+    ABORTED_RESPONSE_NOTE, CANCELLED_RESPONSE_NOTE, EffectIntent, EffectKey, EffectKind,
+    EffectRecord, EffectRun, EffectState, EffectSubject, EffectWrite, TOOL_INTERRUPTED_PREFIX,
+    is_aborted_response_note, run_effect,
 };
 pub use epoch::{EXCLUSIVE_RECOVERY, EpochId, EpochRecord, EpochSuperseded, LeaseRecoveryScope};
 pub use event_notifier::{EventNotifier, EventReceiver};

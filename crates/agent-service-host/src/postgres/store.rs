@@ -2467,20 +2467,40 @@ WHERE id = $1
         id: &TurnAttemptId,
         now: OffsetDateTime,
     ) -> Result<()> {
-        let record = sqlx::query_as::<_, TurnAttemptRecord>(
+        let record = sqlx::query_as!(
+            TurnAttemptRecord,
             r"
-SELECT id, task_id, attempt_number, provider, requested_model,
-       request_blob, response_blob, response_id, response_model,
-       stop_reason, outcome, input_tokens, output_tokens,
-       cached_input_tokens, cache_creation_input_tokens, route_provider,
-       thinking_mode, thinking_budget_tokens, thinking_effort, opened_at, closed_at, duration_ms,
-       otel_trace_id, otel_span_id
+SELECT
+    id,
+    task_id,
+    attempt_number,
+    provider,
+    requested_model,
+    request_blob,
+    response_blob,
+    response_id,
+    response_model,
+    stop_reason,
+    outcome,
+    input_tokens,
+    output_tokens,
+    cached_input_tokens,
+    cache_creation_input_tokens,
+    route_provider,
+    thinking_mode,
+    thinking_budget_tokens,
+    thinking_effort,
+    opened_at,
+    closed_at,
+    duration_ms,
+    otel_trace_id,
+    otel_span_id
 FROM agent_sdk_turn_attempts
 WHERE id = $1 AND closed_at IS NULL
 FOR UPDATE SKIP LOCKED
 ",
+            id.as_str(),
         )
-        .bind(id.as_str())
         .fetch_optional(&mut **tx)
         .await
         .with_context(|| format!("lock abandoned attempt {id}"))?;
@@ -3226,8 +3246,8 @@ ON CONFLICT (operation_id) DO NOTHING
         now: OffsetDateTime,
     ) -> Result<()> {
         let columns = state.columns();
-        let result = sqlx::query!(
-            r"
+        let finished = sqlx::query!(
+            r#"
 UPDATE agent_sdk_execution_intents
 SET status          = $3,
     error           = $4,
@@ -3236,8 +3256,9 @@ SET status          = $3,
     updated_at      = $7
 WHERE operation_id = $1
   AND child_task_id = $2
-  AND status IN ('pending', 'started')
-",
+  AND (status IN ('pending', 'started') OR (resolution = 'abandoned' AND $5 = 'salvaged'))
+RETURNING effect_kind, tool_call_id AS "tool_call_id!"
+"#,
             key.as_str(),
             owner.as_str(),
             columns.status,
@@ -3246,14 +3267,27 @@ WHERE operation_id = $1
             columns.captured_output,
             now,
         )
-        .execute(&mut **tx)
+        .fetch_all(&mut **tx)
         .await
         .with_context(|| format!("finish effect {key}"))?;
-        ensure!(
-            result.rows_affected() == 1,
-            "finish effect {key} affected {} rows",
-            result.rows_affected(),
-        );
+        let [row] = finished.as_slice() else {
+            anyhow::bail!("finish effect {key} affected {} rows", finished.len());
+        };
+        // An LLM request that ends closes its attempt if it is still open
+        // (provisionally, as an abandoned close: a live worker's own close
+        // replaces it).
+        if row.effect_kind
+            == agent_server::journal::effect::kind_wire(
+                agent_server::journal::effect::EffectKind::LlmRequest,
+            )
+        {
+            Self::close_abandoned_attempt_tx(
+                tx,
+                &TurnAttemptId::from_string(row.tool_call_id.clone()),
+                now,
+            )
+            .await?;
+        }
         Ok(())
     }
 

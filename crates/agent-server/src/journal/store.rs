@@ -6021,6 +6021,22 @@ impl InMemoryAgentTaskStore {
                 if let Some(record) = inner.effects.get_mut(&key) {
                     record.state = state;
                     record.updated_at = now;
+                    // An LLM request that ends closes its attempt if it is
+                    // still open, as the SQL backends do in the finish.
+                    if let (
+                        super::effect::EffectSubject::Llm {
+                            turn_attempt_id, ..
+                        },
+                        Some(attempts),
+                    ) = (&record.subject, &inner.attempts)
+                    {
+                        attempts.close_abandoned_attempt(
+                            &super::turn_attempt::TurnAttemptId::from_string(
+                                turn_attempt_id.clone(),
+                            ),
+                            now,
+                        );
+                    }
                 }
             }
         }

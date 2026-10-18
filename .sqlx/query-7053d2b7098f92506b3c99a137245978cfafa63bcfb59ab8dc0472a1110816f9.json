@@ -1,0 +1,304 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\nSELECT\n    id,\n    task_id,\n    attempt_number,\n    provider,\n    requested_model,\n    request_blob,\n    response_blob,\n    response_id,\n    response_model,\n    stop_reason,\n    outcome,\n    input_tokens,\n    output_tokens,\n    cached_input_tokens,\n    cache_creation_input_tokens,\n    route_provider,\n    thinking_mode,\n    thinking_budget_tokens,\n    thinking_effort,\n    opened_at,\n    closed_at,\n    duration_ms,\n    otel_trace_id,\n    otel_span_id\nFROM agent_sdk_turn_attempts\nWHERE id = $1 AND closed_at IS NULL\nFOR UPDATE SKIP LOCKED\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "task_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "task_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "attempt_number",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "attempt_number"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "provider",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "provider"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "requested_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "requested_model"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "request_blob",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "request_blob"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "response_blob",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "response_blob"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "response_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "response_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "response_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "response_model"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "stop_reason",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "stop_reason"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "outcome",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "outcome"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "input_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "input_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "output_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "output_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "cached_input_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "cached_input_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "cache_creation_input_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "cache_creation_input_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "route_provider",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "route_provider"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "thinking_mode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_mode"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "thinking_budget_tokens",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_budget_tokens"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "thinking_effort",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "thinking_effort"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "opened_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "opened_at"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "closed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "closed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "duration_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "duration_ms"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "otel_trace_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "otel_trace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "otel_span_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_turn_attempts",
+            "name": "otel_span_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "7053d2b7098f92506b3c99a137245978cfafa63bcfb59ab8dc0472a1110816f9"
+}

@@ -2308,3 +2308,42 @@ async fn llm_request_signals_count_start_finish_and_refusal() -> Result<()> {
     );
     Ok(())
 }
+
+/// A committed salvage counts `agent_server.effects{kind="llm_request",
+/// transition="salvaged"}` once per salvaged request.
+#[tokio::test]
+async fn a_salvaged_request_is_counted() -> Result<()> {
+    use agent_server::journal::effect::EffectKey;
+    use agent_server::journal::task::AgentTaskId;
+    use agent_server::worker::salvage::{SalvagedRequest, report_salvaged};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let _ = ServerMetrics::global();
+    let owner = AgentTaskId::from_string("task_salvaged");
+    report_salvaged(&[SalvagedRequest {
+        key: EffectKey::llm(&owner, "attempt_1"),
+        owner,
+        own: true,
+        messages: vec![agent_sdk_foundation::llm::Message::assistant("half")],
+    }]);
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let counts = collect_u64_counter(&snapshots, "agent_server.effects");
+    let salvaged: u64 = counts
+        .iter()
+        .filter(|(set, _)| {
+            matches_all(
+                set,
+                &[
+                    (attrs::KIND, "llm_request"),
+                    (attrs::TRANSITION, "salvaged"),
+                ],
+            )
+        })
+        .map(|(_, value)| value)
+        .sum();
+    assert_eq!(salvaged, 1, "{counts:?}");
+    Ok(())
+}

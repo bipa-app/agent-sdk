@@ -1334,11 +1334,20 @@ mod tests {
         Ok(())
     }
 
+    async fn attempt_row(
+        attempt_store: &dyn TurnAttemptStore,
+        id: &agent_server::journal::TurnAttemptId,
+    ) -> Result<agent_server::journal::TurnAttempt> {
+        TurnAttemptStore::get(attempt_store, id)
+            .await?
+            .context("attempt")
+    }
+
     /// Reconciliation C15: a completed turn's effect finishes are checked
     /// before its first write. A finish of an absent request, or of one
     /// already finished, refuses the whole turn, which writes nothing: the
-    /// attempt stays open, the thread at no committed turn, the root
-    /// running and the request as it was.
+    /// attempt, the request and the root stay as they were, and the thread
+    /// at no committed turn.
     async fn test_completed_turn_refuses_a_bad_finish(
         task_store: &dyn AgentTaskStore,
         thread_store: &dyn ThreadStore,
@@ -1380,7 +1389,7 @@ mod tests {
                 },
             ]
         };
-        let refused = |why: &'static str, expected: EffectState| {
+        let refused = |why: &'static str, expected: EffectState, before: TurnAttempt| {
             let (tid, root, attempt, key) = (&tid, &root, &attempt, &key);
             async move {
                 let stored = task_store.get(&root.id).await?.context("root")?;
@@ -1389,10 +1398,12 @@ mod tests {
                     "{why}: {:?}",
                     stored.status
                 );
-                let open = TurnAttemptStore::get(attempt_store, &attempt.id)
-                    .await?
-                    .context("attempt")?;
-                anyhow::ensure!(open.closed_at.is_none(), "{why}: the attempt closed");
+                let open = attempt_row(attempt_store, &attempt.id).await?;
+                anyhow::ensure!(
+                    (&open.outcome, open.closed_at, &open.response_blob)
+                        == (&before.outcome, before.closed_at, &before.response_blob),
+                    "{why}: the attempt changed: {open:?}"
+                );
                 let turns = ThreadStore::get(thread_store, tid)
                     .await?
                     .map_or(0, |thread| thread.committed_turns);
@@ -1403,6 +1414,7 @@ mod tests {
             }
         };
 
+        let before = attempt_row(attempt_store, &attempt.id).await?;
         let absent = first_turn_commit(
             &tid,
             &root.id,
@@ -1414,7 +1426,7 @@ mod tests {
             commit_completed_turn(absent, task_store).await.is_err(),
             "a finish of an absent request must refuse the turn"
         );
-        refused("absent request", EffectState::Started).await?;
+        refused("absent request", EffectState::Started, before).await?;
 
         task_store
             .commit(
@@ -1433,12 +1445,78 @@ mod tests {
                 t_plus(53),
             )
             .await?;
+        // The finish closed the attempt; the refused turn leaves it so.
+        let before = attempt_row(attempt_store, &attempt.id).await?;
         let twice = first_turn_commit(&tid, &root.id, &attempt, finish(key.clone()), guard);
         anyhow::ensure!(
             commit_completed_turn(twice, task_store).await.is_err(),
             "a finish of a finished request must refuse the turn"
         );
-        refused("finished request", EffectState::Completed).await?;
+        refused("finished request", EffectState::Completed, before).await?;
+        Ok(())
+    }
+
+    /// An abandoned LLM request (its owner ended mid-stream) is still
+    /// salvaged by the next turn on its thread, once: `Abandoned` finishes
+    /// as `Salvaged` and as nothing else, and `Salvaged` is final.
+    async fn test_an_abandoned_request_is_salvaged_once(
+        task_store: &dyn AgentTaskStore,
+    ) -> Result<()> {
+        use agent_server::journal::turn_attempt::TurnAttempt;
+
+        let tid = thread_id("conformance-salvage-once");
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let attempt = TurnAttempt::open(sample_open_attempt(&root.id, t_plus(52)));
+        let begin = llm_request_begin(&root.id, &tid, (worker, lease), &attempt);
+        task_store.commit(begin, t_plus(52)).await?;
+        task_store.cancel_tree(&root.id, t_plus(53)).await?;
+        let key = EffectKey::llm(&root.id, attempt.id.as_str());
+        let state = |key: EffectKey| async move {
+            Ok::<_, anyhow::Error>(task_store.effect(&key).await?.context("request")?.state)
+        };
+        anyhow::ensure!(state(key.clone()).await? == EffectState::Abandoned);
+
+        let finish = |state: EffectState| Transition {
+            guards: Vec::new(),
+            writes: vec![Write::Effect(EffectWrite::Finish {
+                key: key.clone(),
+                owner: root.id.clone(),
+                state,
+            })],
+        };
+        anyhow::ensure!(
+            task_store
+                .commit(finish(EffectState::Completed), t_plus(54))
+                .await
+                .is_err(),
+            "an abandoned request must not finish as completed"
+        );
+        anyhow::ensure!(state(key.clone()).await? == EffectState::Abandoned);
+        let salvaged = EffectState::Salvaged {
+            captured_output: None,
+        };
+        task_store
+            .commit(finish(salvaged.clone()), t_plus(55))
+            .await?;
+        anyhow::ensure!(state(key.clone()).await? == salvaged);
+        anyhow::ensure!(
+            task_store
+                .commit(finish(salvaged), t_plus(56))
+                .await
+                .is_err(),
+            "a salvaged request must not be salvaged twice"
+        );
         Ok(())
     }
 
@@ -7589,6 +7667,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_an_abandoned_request_is_salvaged_once() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_an_abandoned_request_is_salvaged_once(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_completed_turn_refuses_a_bad_finish() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_completed_turn_refuses_a_bad_finish(
@@ -8508,6 +8592,13 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_an_abandoned_request_is_salvaged_once() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_an_abandoned_request_is_salvaged_once(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_completed_turn_refuses_a_bad_finish() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_completed_turn_refuses_a_bad_finish(&store, &store, &store).await
@@ -9326,6 +9417,15 @@ mod tests {
             return Ok(());
         };
         test_llm_request_effect_lifecycle(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_an_abandoned_request_is_salvaged_once() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_an_abandoned_request_is_salvaged_once(&store).await
     }
 
     #[cfg(feature = "postgres")]

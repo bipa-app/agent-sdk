@@ -615,6 +615,67 @@ long as it needs. No migration, table, `Write` variant or protocol change.
 
 ### Crash safety, Phase 2: effects
 
+- **A cut-off LLM response is salvaged (P2-3c).** A response cut off by a
+  crash or a cancel used to be lost to the model: its text was streamed and
+  journaled, but its turn never committed. Now the turn that continues sends
+  it back as an `assistant` message followed by `ABORTED_RESPONSE_NOTE` as a
+  `user` message, and commits both with the turn.
+  - **Which requests.**
+    - The turn's own `Started` requests, when its root task is re-acquired
+      after a crash or a lease expiry.
+    - The `Abandoned` requests of a cancelled earlier root on the thread.
+    - Only requests that were cut off: the attempt is still open, or closed
+      `Cancelled`. A retried request, or one that suspended on tool calls,
+      is left alone.
+  - **What the messages hold.** The request's `TextDelta`s from its journal
+    anchor up to the next request's, one text block per message id.
+    Thinking is dropped, since its signature is never journaled.
+  - **Two notes.** After a crash, `ABORTED_RESPONSE_NOTE` asks the model to
+    continue. After a user's stop (a cancelled root's request),
+    `CANCELLED_RESPONSE_NOTE` says the user stopped it, and asks for
+    nothing. `is_aborted_response_note` matches both.
+  - **Where they go.** The turn's own salvage goes after its prompt. An
+    earlier root's goes before the prompt, and a request with salvage
+    merges adjacent same-role messages.
+  - **Atomicity.** The request's `Finish(Salvaged)` commits with the
+    messages, in the completed turn's transaction. A turn that suspends on
+    tools finishes its salvaged requests right after its spawn commits.
+    Until then the request stays unfinished and its text stays in the
+    journal, so a turn that dies again salvages it again, and it is never
+    lost.
+  - **Effect state.** An `Abandoned` LLM request may finish `Salvaged`,
+    once (`EffectState::can_finish_as`). An LLM request that finishes out
+    of `Started` or `Abandoned` closes its attempt row if it is still open,
+    as a provisional abandoned close.
+  - **Streaming.** A stream's first delta reaches the journal at once,
+    instead of after the batch window, so a response cut off right after it
+    can still be salvaged. Clients also see the first token sooner.
+  - **Tests.**
+    - The crash matrix's S3 now requires the cut-off text in the transcript
+      exactly once, followed by the note, and the crashed request
+      `Salvaged`.
+    - Worker tests cover the re-acquired turn, the cancelled root and a
+      retried request.
+    - Conformance `an_abandoned_request_is_salvaged_once` runs on all three
+      backends.
+    - `salvage_failpoints_never_lose_or_double_the_cut_off_text` (SQLite and
+      Postgres) crashes the continuing turn at each failpoint after the
+      salvage finish is written. The request stays started, and the retry
+      lands the text exactly once.
+  - **Not covered yet.**
+    - A crash during a resumed (post-tool) turn: the resume path resends
+      from its suspended draft without salvaging.
+    - A root that failed closed (budget exhaustion).
+    - An unpaired trailing `tool_use` is not repaired at salvage time, and
+      salvage itself never creates one: it emits text only, and a partial
+      tool call is never journaled. The in-process cancel paths already
+      close theirs (`repair_tool_sequence_in_place`), and after a crash the
+      SQLite startup repair sweep does. The remaining case, a root parked
+      on a tool batch that ends cancelled without its cancel commit, on
+      Postgres or with no restart, existed before this release. It is
+      refused at the pre-send check, not sent wrong.
+    - The provider-validation suite through the three request builders.
+
 - **Breaking: every LLM request of a root turn is an effect (P2-3b1).**
   - **Start.** The worker opens each turn attempt with one transition
     under the root's lease: the attempt row (the new
