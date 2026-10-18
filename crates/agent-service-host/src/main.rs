@@ -98,6 +98,11 @@ fn main() -> Result<()> {
             host.initialize()
                 .await
                 .context("initializing service host")?;
+            // Before the transport serves a write: a lease granted before
+            // the epoch begins would be reclaimed as foreign at start.
+            host.begin_epoch()
+                .await
+                .context("beginning the host's epoch")?;
             if grpc_enabled {
                 let grpc = GrpcTransport::with_admission(
                     stores,

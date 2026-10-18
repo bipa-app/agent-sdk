@@ -47,10 +47,10 @@ mod tests {
     use super::migrations::{
         AWAITING_QUESTION_MIGRATION_VERSION, DOCUMENTS_MIGRATION_VERSION, DURABLE_CORE_MIGRATOR,
         EFFECTS_MIGRATION_VERSION, HISTORY_GENERATION_MIGRATION_VERSION,
-        INPUT_INJECTION_KIND_MIGRATION_VERSION, PURGE_SEED_MIGRATION_VERSION,
-        TASK_AFTER_SIBLINGS_MIGRATION_VERSION, TASK_TERMINAL_REASON_MIGRATION_VERSION,
-        THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION, durable_core_migrations,
-        outbox_message_kind_migration, task_after_siblings_migration,
+        HOST_EPOCHS_MIGRATION_VERSION, INPUT_INJECTION_KIND_MIGRATION_VERSION,
+        PURGE_SEED_MIGRATION_VERSION, TASK_AFTER_SIBLINGS_MIGRATION_VERSION,
+        TASK_TERMINAL_REASON_MIGRATION_VERSION, THREAD_PURGE_LIFECYCLE_MIGRATION_VERSION,
+        durable_core_migrations, outbox_message_kind_migration, task_after_siblings_migration,
     };
 
     #[test]
@@ -74,6 +74,7 @@ mod tests {
             "agent_sdk_execution_intents",
             "agent_sdk_tool_audit_events",
             "agent_sdk_documents",
+            "agent_sdk_host_epochs",
         ];
 
         for table in expected_tables {
@@ -154,6 +155,11 @@ mod tests {
             versions.contains(&EFFECTS_MIGRATION_VERSION),
             "bundle is missing this PR's migration \
              {EFFECTS_MIGRATION_VERSION}, got {versions:?}",
+        );
+        ensure!(
+            versions.contains(&HOST_EPOCHS_MIGRATION_VERSION),
+            "bundle is missing this PR's migration \
+             {HOST_EPOCHS_MIGRATION_VERSION}, got {versions:?}",
         );
         Ok(())
     }
@@ -508,6 +514,7 @@ mod tests {
             "agent_sdk_idempotency",
             "agent_sdk_applied_repairs",
             "agent_sdk_documents",
+            "agent_sdk_host_epochs",
         ]
         .into_iter()
         .map(String::from)

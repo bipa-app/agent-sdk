@@ -283,7 +283,10 @@ async fn recover_like_a_host(
     let reclaimed_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
     let records = stores
         .task_store
-        .release_expired_leases(reclaimed_at)
+        .release_expired_leases(
+            reclaimed_at,
+            agent_server::journal::LeaseRecoveryScope::Expired,
+        )
         .await?;
     let child = stores
         .task_store

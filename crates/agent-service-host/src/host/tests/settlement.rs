@@ -29,6 +29,8 @@ use crate::host::{
     settle_orphaned_descendants,
 };
 use crate::stores::StoreRegistry;
+#[cfg(feature = "sqlite")]
+use crate::{config::EpochRecovery, host::begin_epoch_and_reclaim};
 
 use super::FlakyTaskStore;
 
@@ -633,7 +635,13 @@ async fn the_lease_sweep_forwards_what_its_fail_close_settled() -> Result<()> {
     let child_thread = task(&stores, &tool).await?.thread_id;
     let mut follower = stores.event_notifier.subscribe(&child_thread);
 
-    drain_expired_leases(&stores, None, OffsetDateTime::now_utc()).await?;
+    drain_expired_leases(
+        &stores,
+        None,
+        OffsetDateTime::now_utc(),
+        &agent_server::journal::LeaseRecoveryScope::Expired,
+    )
+    .await?;
 
     assert_eq!(task(&stores, &root).await?.status, TaskStatus::Failed);
     let cancelled = task(&stores, &tool).await?;
@@ -970,7 +978,10 @@ async fn a_crash_before_the_hook_settle_keeps_its_record_started_for_the_next_at
     anyhow::ensure!(completed_progress().await? == 0);
 
     let later = now + time::Duration::minutes(1);
-    stores.task_store.release_expired_leases(later).await?;
+    stores
+        .task_store
+        .release_expired_leases(later, agent_server::journal::LeaseRecoveryScope::Expired)
+        .await?;
     let bootstrap = acquire(later).await?;
     let outcome = agent_server::worker::execute_subagent_task(bootstrap, &deps, later).await?;
     let runs = hook.runs.lock().ok().context("runs lock")?.clone();
@@ -1031,4 +1042,138 @@ async fn completed_subagent_progress(stores: &StoreRegistry, thread: &ThreadId) 
             )
         })
         .count())
+}
+
+/// A previous process on an `SQLite` file leased a root for an hour and
+/// died. The next process begins its epoch at start; with
+/// [`EpochRecovery::SingleHost`] it requeues the dead lease before any
+/// worker runs, and with [`EpochRecovery::LeaseExpiry`] it leaves the
+/// lease to expire.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_new_process_reclaims_a_dead_processs_lease_only_as_the_single_host() -> Result<()> {
+    for (recovery, reclaimed) in [
+        (EpochRecovery::SingleHost, true),
+        (EpochRecovery::LeaseExpiry, false),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = StorageConfig {
+            backend: StorageBackend::Sqlite {
+                path: Some(dir.path().join("epoch.db").display().to_string()),
+                max_connections: None,
+            },
+            ..StorageConfig::default()
+        };
+        let now = OffsetDateTime::now_utc();
+        let (root, lease) = {
+            let previous = StoreRegistry::from_config(&storage, super::sample_registry())?;
+            previous.initialize().await?;
+            begin_epoch_and_reclaim(&previous, recovery, now).await?;
+            let root = AgentTask::new_root_turn(ThreadId::from_string("t-epoch"), now, 3);
+            previous.task_store.submit_root_turn(root.clone()).await?;
+            let lease = LeaseId::new();
+            previous
+                .task_store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("worker-0"),
+                    lease.clone(),
+                    now + time::Duration::hours(1),
+                    now,
+                )
+                .await?
+                .context("the previous process leases the root")?;
+            (root, lease)
+        };
+
+        let next = StoreRegistry::from_config(&storage, super::sample_registry())?;
+        next.initialize().await?;
+        begin_epoch_and_reclaim(&next, recovery, now + time::Duration::seconds(1)).await?;
+        let row = task(&next, &root.id).await?;
+        if reclaimed {
+            assert_eq!(row.status, TaskStatus::Pending, "{recovery:?}");
+            assert!(row.lease_id.is_none(), "{recovery:?}");
+        } else {
+            assert_eq!(row.status, TaskStatus::Running, "{recovery:?}");
+            assert_eq!(row.lease_id, Some(lease), "{recovery:?}");
+        }
+    }
+    Ok(())
+}
+
+/// The start-up span reaches OpenTelemetry, not only the logs: a
+/// `SingleHost` begin that reclaims one earlier lease exports
+/// `agent_server.epoch.begin` with the epoch id, the mode and the counts.
+#[cfg(feature = "otel")]
+#[tokio::test]
+async fn the_epoch_begin_span_is_exported_with_what_the_reclaim_did() -> Result<()> {
+    use opentelemetry::Value;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+
+    let exporter = InMemorySpanExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    let stores = StoreRegistry::from_config(
+        &crate::config::StorageConfig::default(),
+        super::sample_registry(),
+    )?;
+    stores.initialize().await?;
+    let now = OffsetDateTime::now_utc();
+    crate::host::begin_epoch_and_reclaim(&stores, crate::config::EpochRecovery::SingleHost, now)
+        .await?;
+    let root = AgentTask::new_root_turn(ThreadId::from_string("t-epoch-span"), now, 3);
+    stores.task_store.submit_root_turn(root.clone()).await?;
+    stores
+        .task_store
+        .try_acquire_task(
+            &root.id,
+            WorkerId::from_string("worker-0"),
+            LeaseId::new(),
+            now + time::Duration::hours(1),
+            now,
+        )
+        .await?
+        .context("the earlier epoch leases the root")?;
+    let epoch = crate::host::begin_epoch_and_reclaim(
+        &stores,
+        crate::config::EpochRecovery::SingleHost,
+        now + time::Duration::seconds(1),
+    )
+    .await?;
+    provider.force_flush()?;
+
+    let spans = exporter.get_finished_spans()?;
+    let span = spans
+        .iter()
+        .filter(|span| span.name.as_ref() == "agent_server.epoch.begin")
+        .find(|span| {
+            span.attributes.iter().any(|kv| {
+                kv.key.as_str() == "agent_server.epoch.id"
+                    && kv.value == Value::from(epoch.as_str().to_owned())
+            })
+        })
+        .with_context(|| format!("an agent_server.epoch.begin span for {epoch}: {spans:?}"))?;
+    let attribute = |key: &str| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.clone())
+    };
+    assert_eq!(
+        attribute("agent_server.epoch.recovery"),
+        Some(Value::from("single_host"))
+    );
+    assert_eq!(
+        attribute("agent_server.epoch.requeued"),
+        Some(Value::I64(1))
+    );
+    assert_eq!(
+        attribute("agent_server.epoch.failed_interrupted"),
+        Some(Value::I64(0))
+    );
+    assert_eq!(attribute("outcome"), Some(Value::from("ok")));
+    Ok(())
 }

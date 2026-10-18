@@ -289,7 +289,10 @@ async fn a_requeued_invocation_continues_its_effect_and_the_last_attempt_inspect
         assert_eq!(completed_progress(&stores, &invocation.thread_id).await?, 0);
         let records = stores
             .tasks
-            .release_expired_leases(t_plus(secs + 6))
+            .release_expired_leases(
+                t_plus(secs + 6),
+                crate::journal::LeaseRecoveryScope::Expired,
+            )
             .await?;
         assert!(
             records.iter().any(

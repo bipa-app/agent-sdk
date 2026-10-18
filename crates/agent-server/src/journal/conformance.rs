@@ -351,8 +351,12 @@ mod in_memory_bundle {
                 .heartbeat_task(task_id, worker, lease, expires_at, activity, now)
                 .await
         }
-        async fn release_expired_leases(&self, now: OffsetDateTime) -> Result<Vec<RecoveryRecord>> {
-            self.task.release_expired_leases(now).await
+        async fn release_expired_leases(
+            &self,
+            now: OffsetDateTime,
+            scope: crate::journal::LeaseRecoveryScope,
+        ) -> Result<Vec<RecoveryRecord>> {
+            self.task.release_expired_leases(now, scope).await
         }
         async fn pause_on_children(
             &self,

@@ -706,7 +706,8 @@ impl Transition {
             | Write::AppendEvents { .. }
             | Write::SpawnChildren { .. }
             | Write::Document(_)
-            | Write::EnqueueSteeringResume { .. } => None,
+            | Write::EnqueueSteeringResume { .. }
+            | Write::BeginEpoch(_) => None,
         })
     }
 

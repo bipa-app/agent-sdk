@@ -305,7 +305,7 @@ impl Simulation {
         }
         let _records = self
             .store
-            .release_expired_leases(self.clock)
+            .release_expired_leases(self.clock, crate::journal::LeaseRecoveryScope::Expired)
             .await
             .context("dst: release_expired_leases")?;
         Ok(())
