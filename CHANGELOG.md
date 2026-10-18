@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Primitive 10 (S-3): the local daemon's store handles and pre-worker gate
+
+- `LocalDaemon::builder(config, registry, runtime)` returns a
+  `LocalDaemonBuilder` with three optional steps:
+  - `decorate_stores`: the `start_with_store_decorator` contract;
+  - `before_workers(gate)`: an async gate that gets the daemon's own
+    (decorated, initialized) `StoreRegistry`. It is awaited before the
+    `ServiceHost` and the transport exist, so no worker, sweep or RPC runs
+    before it returns. An `Err` fails the start, and nothing is spawned.
+  - `configure_transport`: adjusts the `GrpcTransport` (view config,
+    prompt handler, stall budget) before it serves.
+- `LocalDaemon::stores()` returns the registry the daemon mounted, with
+  the same `Arc` handles its workers and transport use.
+- `SubmitThreadWork` wakes a parked worker when it admits a fresh runnable
+  root turn, instead of leaving it to the next acquisition poll.
+- **Breaking (minor):** `start_with_store_decorator`'s closure must now be
+  `'static`.
+- Signal: span `agent_service_host.daemon.pre_worker_gate` (`outcome`:
+  `ok` / `error`), and an info or warn log with `elapsed_ms`.
+
 ### Primitive 10 (S-2): the subagent completion hook
 
 - **Breaking:** `SubagentResultDeps` gains `completion_hook:

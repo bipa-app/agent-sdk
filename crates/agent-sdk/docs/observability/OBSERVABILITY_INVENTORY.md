@@ -233,6 +233,7 @@ Ids are on spans only, never on the counter. A host opens a row inside its own t
 
 | Instrument | Type | Attributes | Fix lives in | Card |
 | --- | --- | --- | --- | --- |
+| span `agent_service_host.daemon.pre_worker_gate` | Span | `outcome` (`ok`, `error`); error status on failure. A log line carries `elapsed_ms` | `[agent-service-host]` `LocalDaemonBuilder::start` | primitive 10 (S-3) |
 | `rpc.server.duration` (per OTel RPC semconv) | Histogram (s) | `rpc.system=grpc`, `rpc.service`, `rpc.method`, `rpc.grpc.status_code` | `[agent-service-host]` | B5 |
 | `db.pool.connections.active` | UpDownCounter | `pool.name`, `db.system` | `[agent-service-host]` | B5 |
 | `db.pool.connections.idle` | UpDownCounter | `pool.name`, `db.system` | `[agent-service-host]` | B5 |
