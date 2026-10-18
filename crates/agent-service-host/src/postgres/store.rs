@@ -546,7 +546,8 @@ FOR UPDATE SKIP LOCKED
             .fetch_all(&mut **tx)
             .await
             .context("load expired leases")?,
-            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as::<_, TaskRecord>(
+            LeaseRecoveryScope::ForeignEpoch(epoch) => sqlx::query_as!(
+                TaskRecord,
                 r"
 SELECT
     id,
@@ -583,9 +584,9 @@ ORDER BY lease_expires_at, id
 LIMIT $2
 FOR UPDATE SKIP LOCKED
 ",
+                epoch.as_str(),
+                batch,
             )
-            .bind(epoch.as_str())
-            .bind(batch)
             .fetch_all(&mut **tx)
             .await
             .context("load leases of older epochs")?,
@@ -613,12 +614,12 @@ FOR UPDATE SKIP LOCKED
         tx: &mut Transaction<'_, Postgres>,
         record: &agent_server::journal::EpochRecord,
     ) -> Result<()> {
-        sqlx::query(
+        sqlx::query!(
             "INSERT INTO agent_sdk_host_epochs (epoch_id, started_at, label) VALUES ($1, $2, $3)",
+            record.id.as_str(),
+            record.started_at,
+            record.label.as_deref(),
         )
-        .bind(record.id.as_str())
-        .bind(record.started_at)
-        .bind(record.label.as_deref())
         .execute(&mut **tx)
         .await
         .with_context(|| format!("begin epoch {}", record.id))?;
@@ -631,12 +632,13 @@ FOR UPDATE SKIP LOCKED
         tx: &mut Transaction<'_, Postgres>,
         task: &AgentTaskId,
     ) -> Result<Option<EpochId>> {
-        let epoch: Option<Option<String>> =
-            sqlx::query_scalar("SELECT lease_epoch FROM agent_sdk_tasks WHERE id = $1")
-                .bind(task.as_str())
-                .fetch_optional(&mut **tx)
-                .await
-                .with_context(|| format!("load the lease epoch of {task}"))?;
+        let epoch: Option<Option<String>> = sqlx::query_scalar!(
+            "SELECT lease_epoch FROM agent_sdk_tasks WHERE id = $1",
+            task.as_str(),
+        )
+        .fetch_optional(&mut **tx)
+        .await
+        .with_context(|| format!("load the lease epoch of {task}"))?;
         Ok(epoch.flatten().map(EpochId::from_string))
     }
 
@@ -646,12 +648,14 @@ FOR UPDATE SKIP LOCKED
         task: &AgentTaskId,
         epoch: Option<&EpochId>,
     ) -> Result<()> {
-        sqlx::query("UPDATE agent_sdk_tasks SET lease_epoch = $1 WHERE id = $2")
-            .bind(epoch.map(EpochId::as_str))
-            .bind(task.as_str())
-            .execute(&mut **tx)
-            .await
-            .with_context(|| format!("stamp the lease epoch of {task}"))?;
+        sqlx::query!(
+            "UPDATE agent_sdk_tasks SET lease_epoch = $1 WHERE id = $2",
+            epoch.map(EpochId::as_str),
+            task.as_str(),
+        )
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("stamp the lease epoch of {task}"))?;
         Ok(())
     }
 

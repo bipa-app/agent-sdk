@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE agent_sdk_tasks SET lease_epoch = ?1 WHERE id = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "19ffb26ea99d524d9b8fd0976acae4c9e1db0ae833759739fa898f8293b6eb02"
+}

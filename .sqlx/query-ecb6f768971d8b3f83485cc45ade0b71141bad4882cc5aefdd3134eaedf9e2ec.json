@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT lease_epoch FROM agent_sdk_tasks WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_epoch",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "agent_sdk_tasks",
+            "name": "lease_epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "ecb6f768971d8b3f83485cc45ade0b71141bad4882cc5aefdd3134eaedf9e2ec"
+}
