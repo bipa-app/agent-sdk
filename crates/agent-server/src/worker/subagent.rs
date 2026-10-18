@@ -2227,6 +2227,9 @@ pub struct SubagentProgressSnapshot<'a> {
     pub current_turn: u32,
     pub tool_count: u32,
     pub usage: TokenUsage,
+    /// The live state a periodic frame reports; `None` on the spawn and
+    /// completion frames.
+    pub liveness: Option<agent_sdk_foundation::SubagentLiveness>,
 }
 
 /// The single constructor for a parent-facing `SubagentProgress` event.
@@ -2256,6 +2259,7 @@ pub fn build_parent_progress_event(snapshot: &SubagentProgressSnapshot<'_>) -> A
         output_tokens: u64::from(snapshot.usage.output_tokens),
         cache_read_input_tokens: u64::from(snapshot.usage.cached_input_tokens),
         cache_creation_input_tokens: u64::from(snapshot.usage.cache_creation_input_tokens),
+        liveness: snapshot.liveness.clone().map(Box::new),
     }
 }
 
@@ -2403,6 +2407,7 @@ pub(super) fn completed_progress_event(
         current_turn: summary.total_turns,
         tool_count: summary.tool_count,
         usage: summary.total_usage.clone(),
+        liveness: None,
     })
 }
 

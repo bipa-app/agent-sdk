@@ -792,6 +792,7 @@ async fn emit_subagent_progress<Ctx: Send + Sync + 'static>(
             output_tokens: u64::from(total_usage.output_tokens),
             cache_read_input_tokens: u64::from(total_usage.cached_input_tokens),
             cache_creation_input_tokens: u64::from(total_usage.cache_creation_input_tokens),
+            liveness: None,
         })
         .await
 }

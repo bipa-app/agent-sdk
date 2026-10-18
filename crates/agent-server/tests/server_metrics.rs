@@ -1279,6 +1279,46 @@ async fn tool_stall_signals_count_by_outcome_without_the_tool_name() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn progress_events_and_refusals_carry_only_their_bounded_label() -> Result<()> {
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let metrics = ServerMetrics::global();
+
+    metrics.record_progress_event(attrs::PROGRESS_SUBAGENT);
+    metrics.record_progress_event(attrs::PROGRESS_SUBAGENT);
+    metrics.record_progress_event(attrs::PROGRESS_ROOT_STALL_NOTICE);
+    metrics.record_progress_refused(attrs::PROGRESS_LEASE_LOST);
+    metrics.record_progress_refused(attrs::PROGRESS_PURGED);
+    metrics.record_progress_refused(attrs::PROGRESS_STORE);
+    metrics.record_progress_refused(attrs::PROGRESS_LEASE_LOST);
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let sum = |name: &str, key: &str, value: &str| -> u64 {
+        collect_u64_counter(&snapshots, name)
+            .iter()
+            .filter(|(set, _)| matches_all(set, &[(key, value)]))
+            .map(|(_, count)| count)
+            .sum()
+    };
+    let events = "agent_server.progress.events";
+    assert_eq!(sum(events, attrs::KIND, "subagent_progress"), 2);
+    assert_eq!(sum(events, attrs::KIND, "root_stall_notice"), 1);
+    let refused = "agent_server.progress.refused";
+    assert_eq!(sum(refused, attrs::REASON, "lease_lost"), 2);
+    assert_eq!(sum(refused, attrs::REASON, "purged"), 1);
+    assert_eq!(sum(refused, attrs::REASON, "store"), 1);
+    for name in [events, refused] {
+        let points = collect_u64_counter(&snapshots, name);
+        assert!(
+            points.iter().all(|(set, _)| set.len() == 1),
+            "{name} carries only its one bounded label: {points:?}"
+        );
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // fence.refused counts each refused writer by thread status
 // ─────────────────────────────────────────────────────────────────────

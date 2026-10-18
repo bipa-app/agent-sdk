@@ -147,6 +147,19 @@ pub mod attrs {
     /// `outcome` of `agent_server.tool.stalls`: the tool's run ignored the
     /// stop, so the heartbeat settled the call.
     pub const STALL_FALLBACK_SETTLED: &str = "fallback_settled";
+    /// `kind` of `agent_server.progress.events`: a periodic subagent
+    /// progress frame on the parent's thread.
+    pub const PROGRESS_SUBAGENT: &str = "subagent_progress";
+    /// `kind` of `agent_server.progress.events`: a root turn's stall notice.
+    pub const PROGRESS_ROOT_STALL_NOTICE: &str = "root_stall_notice";
+    /// `reason` of `agent_server.progress.refused`: the emitter no longer
+    /// holds the lease it writes under.
+    pub const PROGRESS_LEASE_LOST: &str = "lease_lost";
+    /// `reason` of `agent_server.progress.refused`: the target thread is
+    /// being purged or was purged.
+    pub const PROGRESS_PURGED: &str = "purged";
+    /// `reason` of `agent_server.progress.refused`: the store failed.
+    pub const PROGRESS_STORE: &str = "store";
     pub const SPAN_STALL_BUDGET_MS: &str = "agent_server.tool.stall_budget_ms";
     pub const SPAN_STALL_SILENT_FOR_MS: &str = "agent_server.tool.silent_for_ms";
     /// Span-only: the `RunMode` of a subagent completion hook run
@@ -365,6 +378,11 @@ pub struct ServerMetrics {
     /// `agent_server.fence.refused`: writes outside a transition the purge
     /// fence refused, by writer and thread status.
     pub(crate) fence_refused: Counter<u64>,
+    /// `agent_server.progress.events`: progress events the worker appended
+    /// under a lease, by kind.
+    pub(crate) progress_events: Counter<u64>,
+    /// `agent_server.progress.refused`: progress appends refused, by reason.
+    pub(crate) progress_refused: Counter<u64>,
     /// `agent_server.subagent.completion_hook.refused`: hook outputs the
     /// SDK refused, by `reason`.
     pub(crate) completion_hook_refused: Counter<u64>,
@@ -872,6 +890,21 @@ impl ServerMetrics {
         );
     }
 
+    /// Count a progress event appended under a lease, by `kind`
+    /// ([`attrs::PROGRESS_SUBAGENT`] or [`attrs::PROGRESS_ROOT_STALL_NOTICE`]).
+    pub fn record_progress_event(&self, kind: &'static str) {
+        self.progress_events
+            .add(1, &[KeyValue::new(attrs::KIND, kind)]);
+    }
+
+    /// Count a refused progress append, by `reason`
+    /// ([`attrs::PROGRESS_LEASE_LOST`], [`attrs::PROGRESS_PURGED`] or
+    /// [`attrs::PROGRESS_STORE`]).
+    pub fn record_progress_refused(&self, reason: &'static str) {
+        self.progress_refused
+            .add(1, &[KeyValue::new(attrs::REASON, reason)]);
+    }
+
     /// Count a tool call that starts with no stall budget, and record the
     /// `agent_server.tool.stall_budget_unbounded` event on a short
     /// `agent_server.tool.stall` span.
@@ -1008,6 +1041,7 @@ impl ServerMetrics {
         let (tool_stalls, tool_stall_unbounded, subagent_stalls) =
             Self::build_stall_instruments(&meter);
         let fence_refused = fence_refused_counter(&meter);
+        let (progress_events, progress_refused) = progress_instruments(&meter);
 
         let (view_fold_duration, view_folded_events, view_stream) = view_instruments(&meter);
 
@@ -1040,6 +1074,8 @@ impl ServerMetrics {
             tool_stalls,
             tool_stall_unbounded,
             fence_refused,
+            progress_events,
+            progress_refused,
             completion_hook_refused,
             subagent_stalls,
             meter,
@@ -1093,6 +1129,25 @@ fn epoch_reclaims_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64>
              scope and what recovery did with the row.",
         )
         .build()
+}
+
+/// `agent_server.progress.events` and `agent_server.progress.refused`.
+fn progress_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
+    let events = meter
+        .u64_counter("agent_server.progress.events")
+        .with_description(
+            "Progress events the worker appended under the lease of the task it reports on, \
+             by kind: subagent_progress or root_stall_notice.",
+        )
+        .build();
+    let refused = meter
+        .u64_counter("agent_server.progress.refused")
+        .with_description(
+            "Progress appends refused, by reason: lease_lost (the emitter no longer holds its \
+             lease), purged (the thread is purged) or store (the store failed).",
+        )
+        .build();
+    (events, refused)
 }
 
 /// `agent_server.fence.refused`.

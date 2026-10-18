@@ -65,8 +65,7 @@ use agent_server::journal::task::{
 use agent_server::journal::task_state::TaskState;
 use agent_server::worker::{
     ActivityBeacon, AgentDefinitionRegistry, FailRootTurnParams, RootStreamFailure,
-    RootTurnOutcome, SubagentProgressSnapshot, SubagentTaskOutcome, ToolTaskOutcome,
-    best_effort_close_open_attempts, build_parent_progress_event, canonical_subagent_name,
+    RootTurnOutcome, SubagentTaskOutcome, ToolTaskOutcome, best_effort_close_open_attempts,
     execute_subagent_task, fail_root_turn_leaving_attempts_open_with_reason,
     fail_root_turn_with_reason, pause_tool_for_confirmation, resolve_bootstrap_context,
     resolve_subagent_bootstrap, resolve_tool_bootstrap, resume_for_steering, resume_from_children,
@@ -85,6 +84,8 @@ use super::stores::StoreRegistry;
 use super::wakeup::WakeupScheduler;
 use super::watch::ThreadEventsWatchScheduler;
 
+mod progress;
+mod root_stall;
 #[cfg(feature = "otel")]
 mod subagent_stall;
 mod tool_stall;
@@ -95,6 +96,7 @@ use agent_server::journal::{
     NotifierThreadEventsWatchHandler, TaskWakeupHandler, ThreadEventsWatchHandler, Transition,
     WakeupSignal, Write,
 };
+use root_stall::RootStallLeg;
 pub(crate) use tool_stall::ToolStallWatch;
 use tool_stall::{ToolStallLeg, ToolStallTick};
 
@@ -192,6 +194,18 @@ impl ServiceHost {
         })
     }
 
+    /// A zero threshold would write a notice on every tick.
+    fn validate_root_stall_notice(worker: &crate::config::WorkerConfig) -> Result<()> {
+        anyhow::ensure!(
+            worker
+                .root_stall_notice
+                .as_ref()
+                .is_none_or(|notice| notice.after_secs > 0),
+            "worker.root_stall_notice.after_secs must be > 0"
+        );
+        Ok(())
+    }
+
     fn validate_config(config: &ServiceConfig) -> Result<()> {
         anyhow::ensure!(
             config.worker.sweep_interval_secs > 0,
@@ -201,6 +215,7 @@ impl ServiceHost {
             config.worker.subagent_progress_interval_secs > 0,
             "worker.subagent_progress_interval_secs must be > 0"
         );
+        Self::validate_root_stall_notice(&config.worker)?;
         anyhow::ensure!(config.worker.pool_size > 0, "worker.pool_size must be > 0");
         anyhow::ensure!(
             config.worker.acquisition_interval_secs > 0,
@@ -564,6 +579,7 @@ impl ServiceHost {
                 heartbeat_interval: self.config.worker.heartbeat_interval(),
                 progress_interval: self.config.worker.subagent_progress_interval(),
                 tool_stall_budget: self.config.worker.tool_stall_budget(),
+                root_stall_notice: self.config.worker.root_stall_notice.clone(),
                 poll_interval: self.config.worker.acquisition_interval(),
                 wakeup_signal: Arc::clone(wakeup_signal),
                 cancel: self.shutdown.clone(),
@@ -1364,6 +1380,7 @@ struct WorkerLoopParams {
     heartbeat_interval: std::time::Duration,
     progress_interval: std::time::Duration,
     tool_stall_budget: Option<std::time::Duration>,
+    root_stall_notice: Option<crate::config::RootStallNotice>,
     poll_interval: std::time::Duration,
     wakeup_signal: Arc<WakeupSignal>,
     cancel: CancellationToken,
@@ -1375,6 +1392,7 @@ struct TaskRunIntervals {
     progress: std::time::Duration,
     /// The default stall budget of a tool child's call.
     tool_stall_budget: Option<std::time::Duration>,
+    root_stall_notice: Option<crate::config::RootStallNotice>,
 }
 
 /// A single worker's acquisition loop.
@@ -1400,6 +1418,7 @@ async fn worker_loop(params: WorkerLoopParams) {
         heartbeat_interval,
         progress_interval,
         tool_stall_budget,
+        root_stall_notice,
         poll_interval,
         wakeup_signal,
         cancel,
@@ -1478,6 +1497,7 @@ async fn worker_loop(params: WorkerLoopParams) {
                         heartbeat: heartbeat_interval,
                         progress: progress_interval,
                         tool_stall_budget,
+                        root_stall_notice: root_stall_notice.clone(),
                     },
                 )
                 .await;
@@ -1579,6 +1599,7 @@ async fn run_task_with_heartbeat(
         heartbeat: heartbeat_interval,
         progress: progress_interval,
         tool_stall_budget,
+        root_stall_notice,
     } = intervals;
     let task_id = task.id.clone();
     let thread_id = task.thread_id.clone();
@@ -1636,6 +1657,7 @@ async fn run_task_with_heartbeat(
     // a beacon bumped in one task's execution but persisted by another
     // task's heartbeat would record activity against the wrong row.
     let activity = ActivityBeacon::new();
+    let holder = progress::LeaseHolder::new(&task_id, worker_id, &lease_id);
     let heartbeat_handle = tokio::spawn(heartbeat_loop(HeartbeatLoopParams {
         stores: stores.clone(),
         task_id: task_id.clone(),
@@ -1648,15 +1670,17 @@ async fn run_task_with_heartbeat(
         task_cancel: task_cancel.clone(),
         deadline: initial_deadline,
         activity: activity.clone(),
-        tool_stall: tool_stall.clone(),
+        stall: StallLeg::of(&task, &holder, tool_stall.as_ref(), root_stall_notice),
     }));
-    let progress_handle = tokio::spawn(subagent_progress_loop(
-        stores.clone(),
-        task_id.clone(),
-        thread_id.clone(),
-        progress_interval,
-        activity.clone(),
-        heartbeat_cancel.clone(),
+    let progress_handle = tokio::spawn(progress::subagent_progress_loop(
+        progress::SubagentProgressParams {
+            stores: stores.clone(),
+            task: task.clone(),
+            holder,
+            interval: progress_interval,
+            activity: activity.clone(),
+            cancel: heartbeat_cancel.clone(),
+        },
     ));
 
     // No up-front stall check: under stall semantics acquisition is itself
@@ -2396,9 +2420,55 @@ pub(crate) struct HeartbeatLoopParams {
     /// tool child's activity is what keeps its PARKED subagent parent
     /// alive, and that parent has no heartbeat of its own while it waits.
     pub(crate) activity: ActivityBeacon,
-    /// The stall budget of the tool call this loop's task runs, for a tool
-    /// child; `None` for every other task.
-    pub(crate) tool_stall: Option<ToolStallWatch>,
+    /// The stall leg of this loop's task.
+    pub(crate) stall: StallLeg,
+}
+
+/// The stall leg a task's heartbeat runs after each renewal, by its kind.
+pub(crate) enum StallLeg {
+    None,
+    /// A tool child's call stops when its tool shows no progress for its
+    /// stall budget.
+    Tool(ToolStallLeg),
+    /// A plain root turn gets a notice when it shows no sign of work.
+    RootNotice(RootStallLeg),
+}
+
+impl StallLeg {
+    pub(crate) fn tool(watch: Option<ToolStallWatch>) -> Self {
+        watch.map_or(Self::None, |watch| Self::Tool(ToolStallLeg::new(watch)))
+    }
+
+    fn of(
+        task: &AgentTask,
+        holder: &progress::LeaseHolder,
+        tool_stall: Option<&ToolStallWatch>,
+        root_stall_notice: Option<crate::config::RootStallNotice>,
+    ) -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        RootStallLeg::new(root_stall_notice, task, holder.clone(), now)
+            .map_or_else(|| Self::tool(tool_stall.cloned()), Self::RootNotice)
+    }
+
+    async fn tick(
+        &mut self,
+        stores: &StoreRegistry,
+        observed: Option<time::OffsetDateTime>,
+        min_budget_ms: u64,
+        now: time::OffsetDateTime,
+    ) -> ToolStallTick {
+        match self {
+            Self::None => ToolStallTick::Continue,
+            Self::Tool(leg) => {
+                let min_budget = std::time::Duration::from_millis(min_budget_ms);
+                leg.tick(stores, observed, min_budget, now).await
+            }
+            Self::RootNotice(leg) => {
+                leg.tick(stores, observed, now).await;
+                ToolStallTick::Continue
+            }
+        }
+    }
 }
 
 pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
@@ -2414,9 +2484,8 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
         task_cancel,
         mut deadline,
         activity,
-        tool_stall,
+        mut stall,
     } = params;
-    let mut tool_stall = tool_stall.map(ToolStallLeg::new);
     let mut ticker = tokio::time::interval(heartbeat_interval);
     // The stall probe runs under the lease this loop renews each tick; bound
     // it to half that lease (capped) so a slow store or large subtree can
@@ -2528,169 +2597,17 @@ pub(crate) async fn heartbeat_loop(params: HeartbeatLoopParams) {
             DeadlineTick::Continue(next) => deadline = next,
         }
 
-        if let Some(leg) = tool_stall.as_mut() {
-            let min_budget = std::time::Duration::from_millis(min_budget_ms);
-            match leg.tick(&stores, observed_activity, min_budget, now).await {
-                ToolStallTick::Continue => {}
-                ToolStallTick::Stop => {
-                    task_cancel.cancel();
-                    return;
-                }
-            }
-        }
-    }
-}
-
-async fn subagent_progress_loop(
-    stores: StoreRegistry,
-    child_root_id: AgentTaskId,
-    thread_id: agent_sdk_foundation::ThreadId,
-    interval: std::time::Duration,
-    activity: ActivityBeacon,
-    cancel: CancellationToken,
-) {
-    // Gate: this loop is spawned for EVERY acquired task, but only a
-    // subagent child root has a parent to report progress to. Resolving
-    // the linkage once here turns a plain root turn's cost from three
-    // store queries per tick, forever, into a single query at dispatch.
-    //
-    // A transient store error is NOT treated as "no linkage": failing
-    // open (entering the loop, where each tick retries) costs a few
-    // wasted queries, while failing closed would silently blind a real
-    // subagent's progress stream for the whole turn.
-    match stores
-        .task_store
-        .find_subagent_invocation_for_child_root(&child_root_id)
-        .await
-    {
-        Ok(None) => return,
-        Ok(Some(_)) => {}
-        Err(err) => warn!(
-            task_id = %child_root_id,
-            %thread_id,
-            error = %err,
-            "subagent linkage probe failed; entering progress loop and retrying per tick",
-        ),
-    }
-
-    let mut ticker = tokio::time::interval(interval);
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            _ = ticker.tick() => {}
-        }
-
-        if let Err(err) = emit_periodic_subagent_progress(
-            &stores,
-            &child_root_id,
-            &activity,
-            time::OffsetDateTime::now_utc(),
-        )
-        .await
+        match stall
+            .tick(&stores, observed_activity, min_budget_ms, now)
+            .await
         {
-            if err
-                .downcast_ref::<agent_server::journal::thread::ThreadStateConflict>()
-                .is_some()
-            {
-                info!(
-                    task_id = %child_root_id,
-                    %thread_id,
-                    error = %err,
-                    "the parent thread was purged; periodic subagent progress stops",
-                );
+            ToolStallTick::Continue => {}
+            ToolStallTick::Stop => {
+                task_cancel.cancel();
                 return;
             }
-            warn!(
-                task_id = %child_root_id,
-                %thread_id,
-                error = %err,
-                "periodic subagent progress emission failed; retrying next interval",
-            );
         }
     }
-}
-
-async fn emit_periodic_subagent_progress(
-    stores: &StoreRegistry,
-    child_root_id: &AgentTaskId,
-    activity: &ActivityBeacon,
-    now: time::OffsetDateTime,
-) -> Result<()> {
-    let Some(invocation) = stores
-        .task_store
-        .find_subagent_invocation_for_child_root(child_root_id)
-        .await
-        .context("find invocation for periodic subagent progress")?
-    else {
-        return Ok(());
-    };
-    let linkage = invocation
-        .state
-        .subagent_invocation()
-        .context("periodic progress invocation missing linkage")?;
-    let parent_id = invocation
-        .parent_id
-        .as_ref()
-        .context("periodic progress invocation missing parent")?;
-    let parent = stores
-        .task_store
-        .get(parent_id)
-        .await
-        .context("load periodic progress parent")?
-        .context("periodic progress parent no longer exists")?;
-    let spawn_index = usize::try_from(
-        invocation
-            .spawn_index
-            .context("periodic progress invocation missing spawn_index")?,
-    )
-    .context("periodic progress spawn_index exceeds usize")?;
-    let pending_tool = parent
-        .state
-        .continuation()
-        .and_then(|continuation| continuation.payload.pending_tool_calls.get(spawn_index))
-        .context("periodic progress parent missing pending subagent tool")?;
-    let child_thread = stores
-        .thread_store
-        .get(&linkage.child_thread_id)
-        .await
-        .context("load periodic progress child thread")?
-        .context("periodic progress child thread no longer exists")?;
-    let mut usage = child_thread.total_usage;
-    usage.add(&activity.usage());
-    let tool_count = u32::try_from(
-        stores
-            .task_store
-            .list_by_thread(&linkage.child_thread_id)
-            .await
-            .context("list periodic progress child tasks")?
-            .into_iter()
-            .filter(|task| task.kind == TaskKind::ToolRuntime)
-            .count(),
-    )
-    .context("periodic progress tool count exceeds u32")?;
-    let event = build_parent_progress_event(&SubagentProgressSnapshot {
-        subagent_id: &pending_tool.id,
-        subagent_name: canonical_subagent_name(&pending_tool.name),
-        spec: &linkage.spec,
-        child_thread_id: &linkage.child_thread_id,
-        child_root_task_id: &linkage.child_root_task_id,
-        subagent_task_id: &invocation.id,
-        completed: false,
-        success: false,
-        current_turn: child_thread.committed_turns.saturating_add(1),
-        tool_count,
-        usage,
-    });
-    let committed = stores
-        .event_repo
-        .commit_event(&parent.thread_id, event, now)
-        .await
-        .context("commit periodic subagent progress")?;
-    stores
-        .event_notifier
-        .notify(std::slice::from_ref(&committed));
-    Ok(())
 }
 
 /// Outcome of one heartbeat tick's subagent-deadline handling.
@@ -5860,7 +5777,7 @@ mod tests {
             task_cancel: CancellationToken::new(),
             deadline: SubagentDeadlineState::Exempt,
             activity: ActivityBeacon::new(),
-            tool_stall: None,
+            stall: StallLeg::None,
         }));
 
         // Auto-advance the synthetic clock past two heartbeat ticks.
@@ -5929,7 +5846,7 @@ mod tests {
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Exempt,
             activity: ActivityBeacon::new(),
-            tool_stall: None,
+            stall: StallLeg::None,
         }));
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -8513,6 +8430,7 @@ mod tests {
                 current_turn: outcome.subagent_result.summary.total_turns,
                 tool_count: outcome.subagent_result.summary.tool_count,
                 usage: outcome.subagent_result.summary.total_usage.clone(),
+                liveness: None,
             })],
         );
         let committed = recording.committed_transitions()?;
@@ -9786,7 +9704,7 @@ mod tests {
             task_cancel: CancellationToken::new(),
             deadline: SubagentDeadlineState::Enforced(deadline),
             activity: agent_server::worker::ActivityBeacon::new(),
-            tool_stall: None,
+            stall: StallLeg::None,
         }));
 
         // Wait until the probe is in-flight (its stall has begun): the beat
@@ -12130,7 +12048,7 @@ mod tests {
                 created_at: child_root.created_at,
             },
             activity: ActivityBeacon::new(),
-            tool_stall: None,
+            stall: StallLeg::None,
         }));
 
         // Two injected lookup failures burn two ticks; the third tick
@@ -12208,7 +12126,7 @@ mod tests {
             task_cancel: task_cancel.clone(),
             deadline: SubagentDeadlineState::Enforced(deadline),
             activity: ActivityBeacon::new(),
-            tool_stall: None,
+            stall: StallLeg::None,
         }));
 
         // Tick 1's fail hits the injected error; tick 2 retries and
@@ -12644,6 +12562,7 @@ mod tests {
                 heartbeat: std::time::Duration::from_millis(50),
                 progress: std::time::Duration::from_secs(30),
                 tool_stall_budget: None,
+                root_stall_notice: None,
             },
         )
         .await;
@@ -12816,6 +12735,7 @@ mod tests {
                     heartbeat: std::time::Duration::from_millis(50),
                     progress: std::time::Duration::from_secs(30),
                     tool_stall_budget: None,
+                    root_stall_notice: None,
                 },
             )
             .await;
@@ -12947,6 +12867,7 @@ mod tests {
         Ok(())
     }
 
+    mod progress;
     mod settlement;
     mod tool_stall;
 }

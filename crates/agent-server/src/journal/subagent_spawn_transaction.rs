@@ -76,6 +76,7 @@ pub fn started_event_from_invocation(
         output_tokens: 0,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        liveness: None,
     })
 }
 
@@ -107,5 +108,6 @@ pub fn subagent_started_event(
         output_tokens: 0,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        liveness: None,
     }
 }
