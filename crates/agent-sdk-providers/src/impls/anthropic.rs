@@ -341,6 +341,22 @@ impl AnthropicProvider {
         }
     }
 
+    /// A provider for a gateway that serves Claude Code requests on the
+    /// Anthropic accounts it holds.
+    ///
+    /// `bearer` rides `Authorization: Bearer`, and every request is shaped as
+    /// an OAuth request is: the Claude Code identity headers and betas, system
+    /// prompt and tool names. The bearer is the gateway's own credential, not
+    /// an Anthropic OAuth token, so nothing here refreshes it.
+    #[must_use]
+    pub fn claude_code_gateway(bearer: impl Into<String>, model: impl Into<String>) -> Self {
+        let mut provider = Self::new(bearer, model);
+        provider.auth_mode = AuthMode::OAuth {
+            session_id: uuid::Uuid::new_v4().to_string(),
+        };
+        provider
+    }
+
     /// Returns whether this provider is using OAuth authentication.
     #[must_use]
     pub const fn is_oauth(&self) -> bool {
@@ -2200,6 +2216,48 @@ mod tests {
         let session_id = header_str(&headers, CLAUDE_CODE_SESSION_ID_HEADER)
             .context("OAuth requests must carry a Claude Code session id")?;
         uuid::Uuid::parse_str(session_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_claude_code_gateway_bearer_is_shaped_as_claude_code() -> anyhow::Result<()> {
+        let bearer = "gateway-bearer-not-an-oauth-token";
+        let provider = AnthropicProvider::claude_code_gateway(bearer, MODEL_OPUS_55);
+        assert!(provider.is_oauth());
+
+        let headers = auth_headers(&provider, false)?;
+        assert_eq!(
+            header_str(&headers, "authorization"),
+            Some(format!("Bearer {bearer}").as_str())
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert_eq!(
+            header_str(&headers, "user-agent"),
+            Some(format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").as_str())
+        );
+        assert_eq!(header_str(&headers, "x-app"), Some("cli"));
+        assert!(
+            header_str(&headers, "anthropic-beta").is_some_and(|betas| betas.contains(OAUTH_BETA)),
+            "the OAuth betas: {headers:?}"
+        );
+        let oauth = auth_headers(
+            &AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55),
+            false,
+        )?;
+        assert_eq!(
+            header_str(&headers, "anthropic-beta"),
+            header_str(&oauth, "anthropic-beta"),
+            "the same betas as a Claude Code login"
+        );
+        let system = serde_json::to_value(
+            provider.build_system_prompt_for_request("You are a coding agent.", None),
+        )?;
+        assert_eq!(
+            system[0]["text"],
+            AnthropicProvider::OAUTH_IDENTITY,
+            "the Claude Code identity leads the system prompt: {system}"
+        );
+        assert_eq!(system[1]["text"], "You are a coding agent.");
         Ok(())
     }
 
