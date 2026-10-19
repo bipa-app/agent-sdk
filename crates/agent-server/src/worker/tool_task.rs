@@ -434,11 +434,14 @@ where
 
     let run = run_tool_executor(&bootstrap, executor).await;
     let transition = settle_transition(&bootstrap, &run)?;
-    let committed = task_store
-        .commit(transition, run.finished_at)
-        .await
-        .map_err(anyhow::Error::from)
-        .with_context(|| run.settle_failure(&bootstrap.task_id))?;
+    let committed = crate::worker::tool_phase::observe(
+        crate::worker::tool_phase::ToolPhase::Settlement,
+        &bootstrap,
+        task_store.commit(transition, run.finished_at),
+    )
+    .await
+    .map_err(anyhow::Error::from)
+    .with_context(|| run.settle_failure(&bootstrap.task_id))?;
     settled_outcome(run, committed)
 }
 

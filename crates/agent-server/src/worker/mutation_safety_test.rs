@@ -67,6 +67,9 @@ use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "otel")]
+mod tool_phase;
+
 // ═════════════════════════════════════════════════════════════════════
 // Shared test infrastructure
 // ═════════════════════════════════════════════════════════════════════

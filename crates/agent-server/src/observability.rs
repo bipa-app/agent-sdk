@@ -74,6 +74,12 @@ const TASK_DURATION_BUCKETS_S: &[f64] = &[0.01, 0.04, 0.16, 0.64, 2.56, 10.24, 4
 /// so the boundaries are tighter at the short end.
 const COMMIT_DURATION_BUCKETS_S: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0];
 
+/// Bucket boundaries for `agent_server.tool.phase.duration` (seconds).
+/// A store round-trip lands in the first buckets; the tail reaches past the
+/// 900-second tool stall budget, where a stalled phase shows up.
+const TOOL_PHASE_BUCKETS_S: &[f64] =
+    &[0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0, 60.0, 300.0, 900.0];
+
 /// Bucket boundaries for
 /// `agent_server.thread_events_watch.lag_ms`. Tuned for AMQP
 /// advisory consumer lag; we expect the bulk of healthy lag to land
@@ -144,6 +150,15 @@ pub mod attrs {
     pub const ATTEMPT: &str = "attempt";
     /// The tool a stalled call ran (span-only: tool names are unbounded).
     pub const SPAN_TOOL_NAME: &str = "agent_server.tool.name";
+    /// A tool call's store-side phase, on `agent_server.tool.phase` spans:
+    /// `lookup` / `claim` / `settlement` (bip #980's `bip.tool.phase` values).
+    pub const SPAN_TOOL_PHASE: &str = "agent_server.tool.phase";
+    /// The same phase as a label of `agent_server.tool.phase.duration`.
+    pub const PHASE: &str = "phase";
+    /// `outcome` of a tool phase: the boundary completed.
+    pub const OUTCOME_SUCCESS: &str = "success";
+    /// `outcome` of a tool phase: its future was dropped before it ended.
+    pub const OUTCOME_INTERRUPTED: &str = "interrupted";
     /// `outcome` of `agent_server.tool.stalls`: the heartbeat found the tool
     /// silent for its budget and stopped it.
     pub const STALL_TRIPPED: &str = "tripped";
@@ -378,6 +393,9 @@ pub struct ServerMetrics {
     /// `agent_server.tool.stall_budget.unbounded`: tool calls that run
     /// with no stall budget.
     pub(crate) tool_stall_unbounded: Counter<u64>,
+    /// `agent_server.tool.phase.duration`: a tool call's store-side phase
+    /// (lookup, claim, settlement), by phase and outcome.
+    pub(crate) tool_phase_duration: Histogram<f64>,
     /// `agent_server.fence.refused`: writes outside a transition the purge
     /// fence refused, by writer and thread status.
     pub(crate) fence_refused: Counter<u64>,
@@ -842,6 +860,23 @@ impl ServerMetrics {
         );
     }
 
+    /// Record one tool call phase on `agent_server.tool.phase.duration`.
+    /// The ids stay on the phase's span; the labels are bounded.
+    pub(crate) fn record_tool_phase(
+        &self,
+        phase: &'static str,
+        outcome: &'static str,
+        duration_secs: f64,
+    ) {
+        self.tool_phase_duration.record(
+            duration_secs,
+            &[
+                KeyValue::new(attrs::PHASE, phase),
+                KeyValue::new(attrs::OUTCOME, outcome),
+            ],
+        );
+    }
+
     /// Count a subagent completion hook output the SDK refused, by `reason`:
     /// `extra_write` (a write other than `Document` or `AppendEvents`),
     /// `park` (unsupported in this release) or `state` (a `Started` finish).
@@ -1048,6 +1083,16 @@ impl ServerMetrics {
             invocation_instruments(&meter);
         let (tool_stalls, tool_stall_unbounded, subagent_stalls) =
             Self::build_stall_instruments(&meter);
+        let tool_phase_duration = meter
+            .f64_histogram("agent_server.tool.phase.duration")
+            .with_unit("s")
+            .with_description(
+                "A tool call's store-side phase: lookup (the prior-effect read), claim (the \
+                 effect-start commit) or settlement (the settle commit), by phase and outcome \
+                 (success, error, interrupted).",
+            )
+            .with_boundaries(TOOL_PHASE_BUCKETS_S.to_vec())
+            .build();
         let fence_refused = fence_refused_counter(&meter);
         let (progress_events, progress_refused) = progress_instruments(&meter);
 
@@ -1081,6 +1126,7 @@ impl ServerMetrics {
             prompts,
             tool_stalls,
             tool_stall_unbounded,
+            tool_phase_duration,
             fence_refused,
             progress_events,
             progress_refused,

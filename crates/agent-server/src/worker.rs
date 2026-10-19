@@ -97,6 +97,7 @@ pub mod salvage;
 pub mod subagent;
 pub mod subagent_spawn_selector;
 pub mod tool_effect;
+mod tool_phase;
 pub mod tool_stall;
 pub mod tool_task;
 pub mod user_input;
