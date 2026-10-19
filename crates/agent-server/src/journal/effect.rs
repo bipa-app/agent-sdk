@@ -73,11 +73,111 @@ pub const ABORTED_RESPONSE_NOTE: &str = "[interrupted: the response above was cu
 pub const CANCELLED_RESPONSE_NOTE: &str =
     "[interrupted: the user stopped the response above before it finished.]";
 
+/// Why a root turn failed, as the note after its salvaged work says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedTurnClass {
+    /// The model provider failed the request.
+    Provider,
+    /// The process running the turn stopped, and its attempts ran out.
+    Restarts,
+    /// A turn, token, cost or retry budget ran out.
+    Budget,
+    /// The turn stopped making progress.
+    Stall,
+    /// Anything else: an internal error, an unsafe recovery.
+    Internal,
+}
+
+impl FailedTurnClass {
+    const ALL: [Self; 5] = [
+        Self::Provider,
+        Self::Restarts,
+        Self::Budget,
+        Self::Stall,
+        Self::Internal,
+    ];
+
+    /// The class of a failed root turn: its terminal reason, and for a
+    /// budget the recovery prefix of its `last_error` that says the budget
+    /// was its attempts.
+    #[must_use]
+    pub fn of(task: &AgentTask) -> Self {
+        match &task.terminal_reason {
+            Some(TerminalReason::ProviderError { .. }) => Self::Provider,
+            Some(TerminalReason::Budget) => {
+                let restarts = [
+                    super::recovery::FailureReason::RetryBudgetExhausted,
+                    super::recovery::FailureReason::LeaseExpiredBudgetExhausted,
+                ]
+                .into_iter()
+                .any(|reason| {
+                    task.last_error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(reason.error_prefix()))
+                });
+                if restarts {
+                    Self::Restarts
+                } else {
+                    Self::Budget
+                }
+            }
+            Some(TerminalReason::WatchdogStall) => Self::Stall,
+            _ => Self::Internal,
+        }
+    }
+
+    /// The `user` message after the work a failed root turn left: the tool
+    /// calls and results it completed (its draft), then its cut-off response
+    /// if one was streaming, then this note. Model context only,
+    /// like [`ABORTED_RESPONSE_NOTE`].
+    #[must_use]
+    pub const fn note(self) -> &'static str {
+        match self {
+            Self::Provider => FAILED_TURN_NOTE_PROVIDER,
+            Self::Restarts => FAILED_TURN_NOTE_RESTARTS,
+            Self::Budget => FAILED_TURN_NOTE_BUDGET,
+            Self::Stall => FAILED_TURN_NOTE_STALL,
+            Self::Internal => FAILED_TURN_NOTE_INTERNAL,
+        }
+    }
+}
+
+macro_rules! failed_turn_note {
+    ($class:literal) => {
+        concat!(
+            "[interrupted: the previous turn failed before it finished (",
+            $class,
+            "). What it did is above, up to where it stopped; nothing after that happened. \
+             Check the current state before you continue.]"
+        )
+    };
+}
+
+const FAILED_TURN_NOTE_PROVIDER: &str = failed_turn_note!("the model provider returned an error");
+const FAILED_TURN_NOTE_RESTARTS: &str =
+    failed_turn_note!("the process running it stopped and its retries ran out");
+const FAILED_TURN_NOTE_BUDGET: &str = failed_turn_note!("it ran out of budget");
+const FAILED_TURN_NOTE_STALL: &str = failed_turn_note!("it stopped making progress");
+const FAILED_TURN_NOTE_INTERNAL: &str = failed_turn_note!("an internal error");
+
+/// Whether `text` is one of the [`FailedTurnClass::note`]s.
+#[must_use]
+pub fn is_failed_turn_note_text(text: &str) -> bool {
+    FailedTurnClass::ALL
+        .iter()
+        .any(|class| class.note() == text)
+}
+
 /// Whether `message` is a note recovery appended after a salvaged response:
-/// [`ABORTED_RESPONSE_NOTE`] or [`CANCELLED_RESPONSE_NOTE`].
+/// [`ABORTED_RESPONSE_NOTE`], [`CANCELLED_RESPONSE_NOTE`] or a
+/// [`FailedTurnClass::note`].
 #[must_use]
 pub fn is_aborted_response_note(message: &llm::Message) -> bool {
-    let is_note = |text: &str| text == ABORTED_RESPONSE_NOTE || text == CANCELLED_RESPONSE_NOTE;
+    let is_note = |text: &str| {
+        text == ABORTED_RESPONSE_NOTE
+            || text == CANCELLED_RESPONSE_NOTE
+            || is_failed_turn_note_text(text)
+    };
     message.role == llm::Role::User
         && match &message.content {
             llm::Content::Text(text) => is_note(text),

@@ -575,6 +575,10 @@ pub struct FailRootTurnParams<'a> {
 /// This function handles the durable side: marking the task terminal
 /// and closing open attempts.
 ///
+/// The turn's work is not lost: the thread's next turn finds the failed
+/// root and carries its draft, its cut-off response and a note that it
+/// failed (see [`super::salvage`]).
+///
 /// # Errors
 ///
 /// Returns an error if the store rejects the transition (e.g. task is
@@ -2029,14 +2033,23 @@ async fn execute_root_turn_inner(
 
     // 2.4c Salvage the cut-off LLM requests this turn continues: its own,
     //      when the task was re-acquired after a crash, and those of a
-    //      cancelled earlier root. Their messages ride with the prompt and
-    //      commit with the turn (see `super::salvage`).
+    //      cancelled or failed earlier root, with a failed root's note.
+    //      Their messages ride with the prompt and commit with the turn
+    //      (see `super::salvage`).
     let salvaged = super::salvage::collect(
         deps.task_store,
         deps.attempt_store,
         deps.event_repo,
         thread_id,
         &inputs.bootstrap.task_id,
+        super::salvage::SalvageScope::new(
+            inputs
+                .recovery_view
+                .latest_checkpoint
+                .as_ref()
+                .map(|checkpoint| &checkpoint.task_id),
+            &inputs.recovery_view.draft_messages,
+        ),
     )
     .await?;
     let user_input = user_input.with_salvage(salvaged);
@@ -2972,7 +2985,7 @@ fn completed_root_writes(
 ) -> Vec<Write> {
     let mut writes: Vec<Write> = salvaged
         .iter()
-        .map(super::salvage::SalvagedRequest::finish)
+        .filter_map(super::salvage::SalvagedRequest::finish)
         .collect();
     writes.extend([
         Write::Effect(EffectWrite::Finish {
