@@ -16119,3 +16119,564 @@ async fn a_stopped_request_stays_started_and_is_salvaged_by_the_next_turn() -> R
     ));
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// P2-3c2: a failed root turn's work reaches the next turn once
+// ─────────────────────────────────────────────────────────────────────
+
+/// A root on thread A, acquired by the worker and lease the cut-off
+/// request helper guards on, with `max_attempts` attempts.
+async fn acquire_root(stores: &TestStores, max_attempts: u32) -> Result<AgentTask> {
+    let task = AgentTask::new_root_turn(thread_a(), t0(), max_attempts);
+    let id = task.id.clone();
+    stores
+        .tasks
+        .submit_root_turn(task)
+        .await
+        .context("submit")?;
+    stores
+        .tasks
+        .try_acquire_task(
+            &id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(4),
+            t0(),
+        )
+        .await
+        .context("acquire")?
+        .context("acquirable")
+}
+
+/// The tool round a failed turn completed before it failed: what its last
+/// suspension left in the draft.
+async fn seed_tool_round(stores: &TestStores) -> Result<()> {
+    use agent_sdk_foundation::llm::Message;
+
+    stores
+        .messages
+        .set_draft(
+            &thread_a(),
+            vec![
+                Message::user("first question"),
+                Message::assistant_with_tool_use(None, "tu_1", "read", serde_json::json!({})),
+                Message::tool_result("tu_1", "file contents", false),
+            ],
+            t_plus(1),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn fail_with(stores: &TestStores, task: &AgentTask, reason: TerminalReason) -> Result<()> {
+    let failed = super::root_turn::fail_root_turn_with_reason(
+        super::root_turn::FailRootTurnParams {
+            task_id: &task.id,
+            worker_id: &WorkerId::from_string("worker_test"),
+            lease_id: &LeaseId::from_string("lease_test"),
+            thread_id: &task.thread_id,
+            error: &anyhow::anyhow!("the turn failed"),
+            reason,
+        },
+        &stores.deps(),
+        t_plus(3),
+    )
+    .await;
+    anyhow::ensure!(failed.task?.status == TaskStatus::Failed);
+    Ok(())
+}
+
+/// Run a fresh root turn on thread A and return what it sent the model.
+async fn next_turn(
+    stores: &TestStores,
+    prompt: &str,
+) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(next),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(inputs, prompt, &provider, &stores.deps(), t_plus(5)).await?;
+    provider.captured()
+}
+
+async fn committed(stores: &TestStores) -> Result<Vec<agent_sdk_foundation::llm::Message>> {
+    Ok(stores
+        .messages
+        .get(&thread_a())
+        .await?
+        .context("projection")?
+        .messages)
+}
+
+fn count_text(messages: &[agent_sdk_foundation::llm::Message], text: &str) -> usize {
+    messages.iter().filter(|m| text_of(m) == text).count()
+}
+
+fn count_result_messages(messages: &[agent_sdk_foundation::llm::Message]) -> usize {
+    messages
+        .iter()
+        .filter(|m| {
+            matches!(&m.content, agent_sdk_foundation::llm::Content::Blocks(blocks)
+                if blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })))
+        })
+        .count()
+}
+
+/// A root that failed with its last request cut off leaves the next turn
+/// its tool round, its cut-off response and a note that it failed and why,
+/// before the new prompt. They commit once with that turn, and the turn
+/// after it gets nothing more. (Staged with the attempt still open, as a
+/// worker error or a crash leaves it; a provider error's close is below.)
+#[tokio::test]
+async fn the_next_turn_keeps_a_failed_roots_work_and_says_it_failed() -> Result<()> {
+    use crate::journal::effect::{EffectState, FailedTurnClass, is_aborted_response_note};
+
+    let stores = TestStores::new();
+    let failed = acquire_root(&stores, 3).await?;
+    seed_tool_round(&stores).await?;
+    let cut = start_cut_off_request(&stores, &failed, PARTIAL).await?;
+    fail_with(
+        &stores,
+        &failed,
+        TerminalReason::ProviderError {
+            kind: "overloaded".into(),
+        },
+    )
+    .await?;
+    let note = FailedTurnClass::Provider.note();
+
+    let sent = next_turn(&stores, "next question").await?;
+    let tail: Vec<String> = sent.iter().rev().take(2).rev().map(text_of).collect();
+    assert_eq!(tail[0], PARTIAL, "{sent:?}");
+    assert_eq!(tail[1], format!("{note}|next question"), "{sent:?}");
+    assert_eq!(count_result_messages(&sent), 1, "{sent:?}");
+    assert!(matches!(
+        request_state(&stores, &failed.id, &cut).await?,
+        EffectState::Salvaged { .. }
+    ));
+
+    let history = committed(&stores).await?;
+    assert_eq!(count_text(&history, PARTIAL), 1, "{history:?}");
+    assert_eq!(count_text(&history, note), 1, "{history:?}");
+    assert_eq!(count_result_messages(&history), 1, "{history:?}");
+    // Persisted unmerged, so clients can hide it.
+    let at_note = history
+        .iter()
+        .position(|m| text_of(m) == note)
+        .context("note")?;
+    assert!(is_aborted_response_note(&history[at_note]));
+
+    let sent = next_turn(&stores, "third question").await?;
+    assert_eq!(count_text(&sent, note), 1, "{sent:?}");
+    assert_eq!(count_text(&sent, PARTIAL), 1, "{sent:?}");
+    let history = committed(&stores).await?;
+    assert_eq!(count_text(&history, note), 1, "{history:?}");
+    assert_eq!(count_text(&history, PARTIAL), 1, "{history:?}");
+    Ok(())
+}
+
+/// A root that failed between requests, with no response streaming, still
+/// leaves its note.
+#[tokio::test]
+async fn a_failed_root_with_no_cut_off_response_still_says_it_failed() -> Result<()> {
+    use crate::journal::effect::FailedTurnClass;
+
+    let stores = TestStores::new();
+    let failed = acquire_root(&stores, 3).await?;
+    seed_tool_round(&stores).await?;
+    fail_with(&stores, &failed, TerminalReason::InternalError).await?;
+
+    let sent = next_turn(&stores, "next question").await?;
+    let last = sent.last().context("a prompt")?;
+    assert_eq!(
+        text_of(last),
+        format!("{}|next question", FailedTurnClass::Internal.note())
+    );
+    assert_eq!(count_result_messages(&sent), 1, "{sent:?}");
+    Ok(())
+}
+
+/// The store fails a root closed when its attempts run out: at
+/// acquisition, in the lease sweep and in an epoch reclaim. Each leaves the
+/// next turn the note, and the two that cut a stream off its response.
+#[tokio::test]
+async fn every_fail_close_leaves_the_next_turn_its_note() -> Result<()> {
+    use crate::journal::LeaseRecoveryScope;
+    use crate::journal::effect::FailedTurnClass;
+
+    let note = FailedTurnClass::Restarts.note();
+    for path in ["acquisition", "lease sweep", "epoch reclaim"] {
+        let stores = TestStores::new();
+        let streamed = if path == "acquisition" {
+            // A root whose attempts ran out, back in the queue: what the
+            // acquisition check fails closed.
+            let mut spent = AgentTask::new_root_turn(thread_a(), t0(), 1);
+            spent.attempt = spent.max_attempts;
+            let id = spent.id.clone();
+            AgentTaskStore::insert(&stores.tasks, spent).await?;
+            let leased = stores
+                .tasks
+                .try_acquire_task(
+                    &id,
+                    WorkerId::from_string("worker_test"),
+                    LeaseId::from_string("lease_test"),
+                    t_plus(4),
+                    t0(),
+                )
+                .await?;
+            anyhow::ensure!(leased.is_none(), "{path}: a spent root was leased");
+
+            false
+        } else {
+            let root = acquire_root(&stores, 1).await?;
+            seed_tool_round(&stores).await?;
+            start_cut_off_request(&stores, &root, PARTIAL).await?;
+            let scope = if path == "lease sweep" {
+                LeaseRecoveryScope::Expired
+            } else {
+                // A host restarted as the store's sole process: its new
+                // epoch reclaims the dead one's lease.
+                let epoch = crate::journal::epoch::EpochRecord::begin(t_plus(5), None);
+                let id = epoch.id.clone();
+                crate::journal::DurableStore::commit(
+                    &stores.tasks,
+                    crate::journal::Transition {
+                        guards: Vec::new(),
+                        writes: vec![crate::journal::Write::BeginEpoch(epoch)],
+                    },
+                    t_plus(5),
+                )
+                .await?;
+                LeaseRecoveryScope::ForeignEpoch(id)
+            };
+            let swept = stores
+                .tasks
+                .release_expired_leases(t_plus(5), scope)
+                .await?;
+            anyhow::ensure!(
+                swept.len() == 1 && swept[0].action.is_fail_closed(),
+                "{path}: {swept:?}"
+            );
+            true
+        };
+
+        let sent = next_turn(&stores, "next question").await?;
+        let last = sent.last().context("a prompt")?;
+        assert_eq!(
+            text_of(last),
+            format!("{note}|next question"),
+            "{path}: {sent:?}"
+        );
+        assert_eq!(
+            count_text(&sent, PARTIAL),
+            usize::from(streamed),
+            "{path}: {sent:?}"
+        );
+        let history = committed(&stores).await?;
+        assert_eq!(count_text(&history, note), 1, "{path}: {history:?}");
+    }
+    Ok(())
+}
+
+/// Commit an ordinary turn for `task` straight through the store, as a
+/// release without failed-root salvage committed the turn after a failure.
+async fn commit_turn_without_salvage(stores: &TestStores, task: AgentTask) -> Result<()> {
+    use agent_sdk_foundation::llm::Message;
+
+    let attempt = stores
+        .attempts
+        .open_attempt(OpenAttemptParams {
+            task_id: task.id.clone(),
+            attempt_number: 1,
+            provenance: AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({}),
+            now: t_plus(4),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+        .await?;
+    crate::journal::commit::commit_completed_turn(
+        crate::journal::commit::CompletedTurnCommit {
+            extra_writes: vec![crate::journal::transition::Write::SettleTask {
+                task: task.id.clone(),
+                outcome: crate::journal::Settle::CompleteWithoutResult,
+            }],
+            delivered_injection_ids: Vec::new(),
+            checkpoint_kind: CheckpointKind::FullTurn,
+            thread_id: thread_a(),
+            task_id: task.id,
+            expected_turn: 1,
+            turn_attempt_id: attempt.id,
+            close_attempt_params: salvage_close_params(),
+            messages: vec![
+                Message::user("older question"),
+                Message::assistant("older answer"),
+            ],
+            turn_usage: TokenUsage::default(),
+            agent_state_snapshot: serde_json::to_value(AgentState::new(thread_a()))?,
+            events: Vec::new(),
+            outbox_max_attempts: 3,
+            owner_guard: Some(crate::journal::commit::CommitOwnerGuard {
+                worker_id: WorkerId::from_string("worker_test"),
+                lease_id: LeaseId::from_string("lease_test"),
+            }),
+            now: t_plus(4),
+        },
+        &stores.tasks,
+    )
+    .await?;
+    Ok(())
+}
+
+/// A root that failed before the thread's latest commit is history: its
+/// failure was the business of the turn that committed after it.
+#[tokio::test]
+async fn a_root_that_failed_before_the_last_commit_leaves_nothing() -> Result<()> {
+    let stores = TestStores::new();
+    let failed = acquire_root(&stores, 3).await?;
+    start_cut_off_request(&stores, &failed, PARTIAL).await?;
+    // Failed as a release without this change would have left it: settled,
+    // its request abandoned, and then a turn committed after it.
+    fail_with(&stores, &failed, TerminalReason::InternalError).await?;
+    let committed_turn = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    commit_turn_without_salvage(&stores, committed_turn).await?;
+
+    let sent = next_turn(&stores, "next question").await?;
+    assert!(sent.iter().all(|m| text_of(m) != PARTIAL), "{sent:?}");
+    assert!(
+        sent.iter()
+            .all(|m| !text_of(m).starts_with("[interrupted: the previous turn failed")),
+        "{sent:?}"
+    );
+    Ok(())
+}
+
+/// A turn that adds a failed root's note and suspends carries the note in
+/// its draft. The turn that continues after that turn failed too notes
+/// only the second failure.
+#[tokio::test]
+async fn a_note_the_draft_already_holds_is_not_added_again() -> Result<()> {
+    use crate::journal::effect::FailedTurnClass;
+    use agent_sdk_foundation::llm::Message;
+
+    let stores = TestStores::new();
+    let first = acquire_root(&stores, 3).await?;
+    fail_with(&stores, &first, TerminalReason::InternalError).await?;
+    // The second root salvaged the first one's note, suspended on a tool
+    // call and then failed with a provider error.
+    let second = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    stores
+        .messages
+        .set_draft(
+            &thread_a(),
+            vec![
+                Message::user(FailedTurnClass::Internal.note()),
+                Message::user("second question"),
+                Message::assistant_with_tool_use(None, "tu_2", "read", serde_json::json!({})),
+                Message::tool_result("tu_2", "more contents", false),
+            ],
+            t_plus(4),
+        )
+        .await?;
+    fail_with(
+        &stores,
+        &second,
+        TerminalReason::ProviderError {
+            kind: "overloaded".into(),
+        },
+    )
+    .await?;
+
+    let sent = next_turn(&stores, "third question").await?;
+    let first_notes = sent
+        .iter()
+        .filter(|m| text_of(m).contains(FailedTurnClass::Internal.note()))
+        .count();
+    assert_eq!(first_notes, 1, "{sent:?}");
+    let last = sent.last().context("a prompt")?;
+    assert_eq!(
+        text_of(last),
+        format!("{}|third question", FailedTurnClass::Provider.note())
+    );
+    Ok(())
+}
+
+/// A fork's thread starts from its source's latest checkpoint, whose owner
+/// is a task of the source thread. A root that fails on the fork before the
+/// fork's first commit is still salvaged and noted, once.
+#[tokio::test]
+async fn a_forks_failed_first_turn_reaches_the_next_turn_once() -> Result<()> {
+    use crate::journal::checkpoint::NewCheckpointParams;
+    use crate::journal::checkpoint_store::CheckpointStore as _;
+    use crate::journal::effect::FailedTurnClass;
+    use crate::journal::thread_store::ThreadStore as _;
+    use agent_sdk_foundation::llm::Message;
+
+    let stores = TestStores::new();
+    // What `ForkThread` leaves: one committed turn whose checkpoint names
+    // the source thread's task.
+    stores.threads.get_or_create(&thread_a(), t0()).await?;
+    stores
+        .threads
+        .commit_turn(&thread_a(), 1, &TokenUsage::default(), t0())
+        .await?;
+    stores
+        .checkpoints
+        .commit_checkpoint(NewCheckpointParams {
+            thread_id: thread_a(),
+            turn_number: 1,
+            task_id: AgentTaskId::from_string("task_of_the_source_thread"),
+            messages: vec![
+                Message::user("older question"),
+                Message::assistant("older answer"),
+            ],
+            agent_state_snapshot: serde_json::to_value(AgentState::new(thread_a()))?,
+            turn_usage: TokenUsage::default(),
+            kind: CheckpointKind::FullTurn,
+            now: t0(),
+        })
+        .await?;
+    let failed = acquire_root(&stores, 3).await?;
+    start_cut_off_request(&stores, &failed, PARTIAL).await?;
+    fail_with(&stores, &failed, TerminalReason::InternalError).await?;
+    let note = FailedTurnClass::Internal.note();
+
+    let sent = next_turn(&stores, "next question").await?;
+    let last = sent.last().context("a prompt")?;
+    assert_eq!(text_of(last), format!("{note}|next question"), "{sent:?}");
+    // The request merges the partial into the answer before it.
+    let partials = sent.iter().filter(|m| text_of(m).contains(PARTIAL)).count();
+    assert_eq!(partials, 1, "{sent:?}");
+
+    // The fork's own commit is the checkpoint now: the failure is reported.
+    let sent = next_turn(&stores, "third question").await?;
+    assert_eq!(count_text(&sent, note), 1, "{sent:?}");
+    assert_eq!(count_text(&sent, PARTIAL), 1, "{sent:?}");
+    let history = committed(&stores).await?;
+    assert_eq!(count_text(&history, note), 1, "{history:?}");
+    Ok(())
+}
+
+/// Close `attempt` as the provider failing it, as the stream path does.
+async fn close_as_provider_error(
+    stores: &TestStores,
+    attempt: &crate::journal::TurnAttempt,
+) -> Result<()> {
+    let mut close = crate::journal::CloseAttemptParams::abandoned();
+    close.response_blob = serde_json::json!({"error": "overloaded"});
+    close.outcome = crate::journal::TurnAttemptOutcome::ServerError;
+    stores
+        .attempts
+        .close_attempt(&attempt.id, close, t_plus(2))
+        .await?;
+    Ok(())
+}
+
+/// A root the provider failed: its last request's attempt closed with the
+/// provider error, and nothing retried it. Its streamed text reaches the
+/// next turn once, whether the root's end abandoned the request (it never
+/// finished) or the request finished `Failed` first.
+#[tokio::test]
+async fn a_provider_failed_last_response_reaches_the_next_turn_once() -> Result<()> {
+    use crate::journal::effect::{EffectKey, EffectState, EffectWrite, FailedTurnClass};
+    use crate::journal::{DurableStore, Transition, Write};
+
+    let note = FailedTurnClass::Provider.note();
+    for finished_failed in [false, true] {
+        let case = if finished_failed {
+            "finished Failed"
+        } else {
+            "abandoned"
+        };
+        let stores = TestStores::new();
+        let failed = acquire_root(&stores, 3).await?;
+        let attempt = start_cut_off_request(&stores, &failed, PARTIAL).await?;
+        close_as_provider_error(&stores, &attempt).await?;
+        let key = EffectKey::llm(&failed.id, attempt.id.as_str());
+        if finished_failed {
+            stores
+                .tasks
+                .commit(
+                    Transition {
+                        guards: Vec::new(),
+                        writes: vec![Write::Effect(EffectWrite::Finish {
+                            key: key.clone(),
+                            owner: failed.id.clone(),
+                            state: EffectState::Failed {
+                                error: "server_error".into(),
+                            },
+                        })],
+                    },
+                    t_plus(2),
+                )
+                .await?;
+        }
+        fail_with(
+            &stores,
+            &failed,
+            TerminalReason::ProviderError {
+                kind: "overloaded".into(),
+            },
+        )
+        .await?;
+
+        let sent = next_turn(&stores, "next question").await?;
+        let tail: Vec<String> = sent.iter().rev().take(2).rev().map(text_of).collect();
+        assert_eq!(tail[0], PARTIAL, "{case}: {sent:?}");
+        assert_eq!(tail[1], format!("{note}|next question"), "{case}: {sent:?}");
+        let state = request_state(&stores, &failed.id, &attempt).await?;
+        if finished_failed {
+            assert!(
+                matches!(state, EffectState::Failed { .. }),
+                "{case}: {state:?}"
+            );
+        } else {
+            assert!(
+                matches!(state, EffectState::Salvaged { .. }),
+                "{case}: {state:?}"
+            );
+        }
+
+        next_turn(&stores, "third question").await?;
+        let history = committed(&stores).await?;
+        assert_eq!(count_text(&history, PARTIAL), 1, "{case}: {history:?}");
+        assert_eq!(count_text(&history, note), 1, "{case}: {history:?}");
+    }
+    Ok(())
+}
+
+/// Only the failed root's last request is salvaged for the provider's
+/// failure: an earlier one the provider failed was retried, and its text
+/// superseded.
+#[tokio::test]
+async fn a_failed_roots_retried_request_is_not_salvaged() -> Result<()> {
+    let stores = TestStores::new();
+    let failed = acquire_root(&stores, 3).await?;
+    let retried = start_cut_off_request(&stores, &failed, "the retried attempt's text").await?;
+    close_as_provider_error(&stores, &retried).await?;
+    let last = start_cut_off_request(&stores, &failed, PARTIAL).await?;
+    close_as_provider_error(&stores, &last).await?;
+    fail_with(
+        &stores,
+        &failed,
+        TerminalReason::ProviderError {
+            kind: "overloaded".into(),
+        },
+    )
+    .await?;
+
+    let sent = next_turn(&stores, "next question").await?;
+    assert_eq!(count_text(&sent, PARTIAL), 1, "{sent:?}");
+    assert_eq!(
+        count_text(&sent, "the retried attempt's text"),
+        0,
+        "{sent:?}"
+    );
+    Ok(())
+}

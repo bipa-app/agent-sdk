@@ -118,10 +118,16 @@ enum Scenario {
     Contention,
     ParkCrash,
     WakeCrash,
+    /// S12: a root with one attempt, killed mid-stream, is failed closed by
+    /// the restarted `SingleHost` daemon's epoch reclaim; the thread's next
+    /// turn gets its cut-off response and the failed-turn note once. (A crash
+    /// in the response after a tool round resumes instead: a resume charges
+    /// no attempt.)
+    FailedRoot,
 }
 
 impl Scenario {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 20] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
@@ -140,6 +146,7 @@ impl Scenario {
         Self::LockLossLeader,
         Self::MergeBack,
         Self::Contention,
+        Self::FailedRoot,
         Self::ConsumedRequest,
     ];
 
@@ -163,6 +170,7 @@ impl Scenario {
             Self::LockLossLeader => "s8_lock_loss_leader",
             Self::MergeBack => "s9_merge_back",
             Self::Contention => "s10_sqlite_contention",
+            Self::FailedRoot => "s12_failed_root",
             Self::ConsumedRequest => "s11_consumed_request",
         }
     }
@@ -183,7 +191,7 @@ impl Scenario {
                 tool_use(CONFIRM_TOOL, json!({}))
             }
             Self::Question => tool_use(QUESTION_TOOL, json!({"question": "Which target?"})),
-            Self::LlmStream | Self::Fork => text(FINAL_TEXT),
+            Self::LlmStream | Self::Fork | Self::FailedRoot => text(FINAL_TEXT),
             Self::CancelTree => tool_uses(
                 (1..=CANCEL_TOOL_CALLS)
                     .map(|n| (format!("cm-call-{n}"), UNSAFE_TOOL))
@@ -446,7 +454,9 @@ impl LlmProvider for MatrixProvider {
                 yield Err(anyhow::anyhow!("the subagent stream was not killed"));
             });
         }
-        if self.scenario != Scenario::LlmStream || self.phase != Phase::Crash {
+        let cut_here = self.phase == Phase::Crash
+            && matches!(self.scenario, Scenario::LlmStream | Scenario::FailedRoot);
+        if !cut_here {
             return response_stream(self.respond(&request));
         }
         Box::pin(async_stream::stream! {
@@ -840,6 +850,16 @@ fn subagent_spec() -> agent_server::worker::EffectiveSubagentSpec {
 }
 
 fn definition() -> AgentDefinition {
+    definition_for(None)
+}
+
+/// The definition `scenario`'s daemons run: S12's root has one attempt, so
+/// the recovering process fails it closed instead of running it again.
+fn definition_for(scenario: Option<Scenario>) -> AgentDefinition {
+    let mut policy = RuntimePolicy::server_default();
+    if scenario == Some(Scenario::FailedRoot) {
+        policy.max_attempts = 1;
+    }
     AgentDefinition {
         provider: "cm".into(),
         model: "cm-model".into(),
@@ -851,7 +871,7 @@ fn definition() -> AgentDefinition {
         tools_fn: None,
         tool_input_sanitizer: None,
         request_context_fn: None,
-        policy: RuntimePolicy::server_default(),
+        policy,
     }
 }
 
@@ -1017,7 +1037,9 @@ fn service_config(storage: StorageConfig, scenario: Scenario) -> ServiceConfig {
             acquisition_interval_secs: 1,
             tool_stall_budget_secs: STALL_BUDGET.as_secs(),
             epoch_recovery: match scenario {
-                Scenario::ConfirmationSingleHost => EpochRecovery::SingleHost,
+                Scenario::ConfirmationSingleHost | Scenario::FailedRoot => {
+                    EpochRecovery::SingleHost
+                }
                 Scenario::ConfirmationLeader
                 | Scenario::OverlapLeader
                 | Scenario::LockLossLeader => EpochRecovery::PostgresLeader,
@@ -1244,7 +1266,9 @@ async fn start_daemon(
         )
         .with_subagent_spawn_selector(Arc::new(MatrixSelector)),
     );
-    let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(definition()));
+    let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(definition_for(Some(
+        scenario,
+    ))));
     let config_backend = storage.backend.clone();
     let parks = matches!(scenario, Scenario::ParkCrash | Scenario::WakeCrash);
     let hook = (scenario == Scenario::MergeBack || parks).then(|| {
@@ -1557,10 +1581,6 @@ struct Recovered {
     tool_child: Option<AgentTaskId>,
     runs: Vec<String>,
     requests: Vec<Vec<(String, bool)>>,
-    #[cfg_attr(
-        not(feature = "failpoints"),
-        expect(dead_code, reason = "read by S11, which needs failpoints")
-    )]
     daemon: Daemon,
     _db: CaseDb,
     _temp: tempfile::TempDir,
@@ -1609,12 +1629,16 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
         | Scenario::Contention
+        | Scenario::FailedRoot
         | Scenario::MergeBack
         | Scenario::ParkCrash
         | Scenario::WakeCrash => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
-            (scenario != Scenario::LlmStream && scenario != Scenario::ConsumedRequest)
-                .then(|| AgentTaskId::from_string(ready.trim()))
+            (!matches!(
+                scenario,
+                Scenario::LlmStream | Scenario::ConsumedRequest | Scenario::FailedRoot
+            ))
+            .then(|| AgentTaskId::from_string(ready.trim()))
         }
     };
     drop(control);
@@ -1724,6 +1748,7 @@ async fn answer_prompt(
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
         | Scenario::Contention
+        | Scenario::FailedRoot
         | Scenario::MergeBack
         | Scenario::ParkCrash
         | Scenario::WakeCrash => {}
@@ -2043,6 +2068,92 @@ async fn s11_consumed_request(backend: Backend) -> Result<()> {
             "recovery counted finished={finished} abandoned={abandoned}"
         );
     }
+    Ok(())
+}
+
+/// S12: the root killed mid-stream is failed closed when the daemon
+/// restarts, its one attempt spent. The thread's next turn sends the model
+/// the cut-off response and the note that the turn failed, and the
+/// transcript holds each once.
+async fn s12_failed_root(backend: Backend) -> Result<()> {
+    let Some(case) = crash_and_recover(backend, Scenario::FailedRoot).await? else {
+        return Ok(());
+    };
+    ensure!(
+        case.root.status == TaskStatus::Failed,
+        "the root turn is {:?}: {:?}",
+        case.root.status,
+        case.root.last_error
+    );
+    let mut control = connect(&case.daemon.host.endpoint()).await?;
+    let next = control
+        .submit_thread_work(pb::SubmitThreadWorkRequest {
+            request_id: "cm-follow-up".into(),
+            thread_id: case.thread.to_string(),
+            input: vec![pb::UserInputItem {
+                item: Some(pb::user_input_item::Item::Text("follow up".into())),
+            }],
+            caller_metadata: String::new(),
+            disposition: pb::SubmitDisposition::NextTurn as i32,
+        })
+        .await?
+        .into_inner()
+        .task
+        .context("submit_thread_work returned no task")?;
+    let next = AgentTaskId::from_string(&next.task_id);
+    let done = wait_for_task(&case.stores, &next, "terminal", |task| {
+        task.status.is_terminal()
+    })
+    .await?;
+    ensure!(
+        done.status == TaskStatus::Completed,
+        "the next turn is {:?}: {:?}",
+        done.status,
+        done.last_error
+    );
+
+    let messages = case
+        .stores
+        .message_store
+        .get(&case.thread)
+        .await?
+        .context("no transcript")?
+        .messages;
+    let note = agent_server::journal::effect::FailedTurnClass::Restarts.note();
+    let user_texts: Vec<String> = messages
+        .iter()
+        .filter(|message| message.role == llm::Role::User)
+        .flat_map(|message| match &message.content {
+            llm::Content::Text(text) => vec![text.clone()],
+            llm::Content::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect(),
+        })
+        .collect();
+    let notes = user_texts.iter().filter(|text| *text == note).count();
+    ensure!(
+        notes == 1,
+        "expected the failed-turn note once: {user_texts:?}"
+    );
+    let partials = assistant_texts(&messages)
+        .iter()
+        .filter(|text| text.contains(PARTIAL_TEXT))
+        .count();
+    ensure!(
+        partials == 1,
+        "the cut-off text must be kept once: {messages:?}"
+    );
+    let finals = assistant_texts(&messages)
+        .iter()
+        .filter(|text| text.contains(FINAL_TEXT))
+        .count();
+    ensure!(finals == 1, "expected one final answer: {messages:?}");
+    let live = live_rows(&case.stores, &case.thread).await?;
+    ensure!(live.is_empty(), "rows left live: {live:?}");
     Ok(())
 }
 
@@ -3140,6 +3251,7 @@ matrix!(
         s9_merge_back,
         s7_hung_subagent,
         s10_sqlite_contention,
+        s12_failed_root,
     ],
     [
         s4_fork: "failpoints",
@@ -3166,6 +3278,7 @@ matrix!(
         s7_hung_tool,
         s9_merge_back,
         s7_hung_subagent,
+        s12_failed_root,
     ],
     [
         s4_fork: "failpoints",

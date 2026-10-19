@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Server: a failed root turn's work reaches the next turn
+
+- A root turn that ends `Failed` now leaves the thread's next turn what a
+  cancelled one does, plus a note.
+  - **Which paths:** however the root failed: a provider error, a worker
+    error, or a fail-close when its attempts ran out (at acquisition, in the
+    lease sweep or in an epoch reclaim).
+  - **Tool calls:** the ones it completed were already in that turn's
+    context through the draft. They still commit with that turn, as before.
+  - **Cut-off response:** if a response was still streaming when the root
+    ended (its attempt open, or closed `Cancelled` by the failure), it is
+    salvaged as for a cancelled root (its request `Abandoned` → `Salvaged`
+    in that turn's commit).
+  - **Provider-failed response:** when the provider failed the root's last
+    request (its attempt closed `ServerError`, `RateLimited` or
+    `InvalidRequest`), nothing retried it, so its streamed text is salvaged
+    too. That covers both a request the root's end abandoned and one that
+    finished `Failed` first (as #542 makes it). A `Failed` request can't
+    become `Salvaged`, so its text is kept to one report by the commit, as
+    the note is. An earlier, retried request's text stays superseded.
+  - **The note:** then `FailedTurnClass::note()` says the turn failed and
+    why: the provider, a restart whose attempts ran out, a budget, a stall,
+    or an internal error.
+  - **Exactly once:** only roots from the thread's latest checkpoint's owner
+    on are salvaged or noted, so a failure the next commit already reported
+    is never reported again. On a fork that has not committed a turn of its
+    own, the checkpoint (and its owner) came from the source, so every root
+    on the fork counts. Roots whose note a suspended turn's draft already
+    holds are skipped.
+- **Breaking:**
+  - `salvage::collect` takes a `SalvageScope` (the latest checkpoint's owner
+    and the draft);
+  - `SalvagedRequest::key` is an `Option` (`None` for a note);
+  - `SalvagedRequest::finish` returns `Option<Write>`.
+- `is_aborted_response_note` also matches the failed-turn notes, so clients
+  that hide the salvage notes hide these too.
+- **Tests:**
+  - worker tests for each fail path, the commit boundary, the draft and a
+    fork's failed first turn;
+  - the fork case through the store's own fork commit on SQLite and
+    Postgres;
+  - SQLite and Postgres crash cases at every failpoint after the salvage
+    writes, and inside the failing transaction;
+  - crash matrix S12 (a kill -9 mid-stream, then a `SingleHost` epoch
+    reclaim with the attempt spent) on both backends.
+
 ### Host: store options through `LocalDaemonBuilder`, and root-turn metrics
 
 - `LocalDaemonBuilder::store_options(StoreOptions)`: `start` builds the

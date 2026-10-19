@@ -2322,7 +2322,7 @@ async fn a_salvaged_request_is_counted() -> Result<()> {
     let _ = ServerMetrics::global();
     let owner = AgentTaskId::from_string("task_salvaged");
     report_salvaged(&[SalvagedRequest {
-        key: EffectKey::llm(&owner, "attempt_1"),
+        key: Some(EffectKey::llm(&owner, "attempt_1")),
         owner,
         own: true,
         messages: vec![agent_sdk_foundation::llm::Message::assistant("half")],

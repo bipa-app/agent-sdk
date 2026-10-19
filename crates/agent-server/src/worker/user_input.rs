@@ -188,7 +188,7 @@ impl UserInput {
     pub fn salvage_finishes(&self) -> Vec<crate::journal::transition::Write> {
         self.salvaged
             .iter()
-            .map(super::salvage::SalvagedRequest::finish)
+            .filter_map(super::salvage::SalvagedRequest::finish)
             .collect()
     }
 

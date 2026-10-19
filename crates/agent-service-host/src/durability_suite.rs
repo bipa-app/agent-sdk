@@ -1329,7 +1329,7 @@ mod tests {
         use agent_sdk_foundation::llm::{
             self, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Usage,
         };
-        use agent_sdk_foundation::{AgentEvent, ThreadId};
+        use agent_sdk_foundation::{AgentEvent, TerminalReason, ThreadId};
         use agent_sdk_providers::LlmProvider;
         use agent_server::journal::checkpoint_store::CheckpointStore;
         use agent_server::journal::event_notifier::EventNotifier;
@@ -1451,17 +1451,27 @@ mod tests {
         /// A leased root with a cut-off LLM request (attempt open, effect started,
         /// one journaled delta), as a crash mid-stream leaves it.
         async fn seed<S: Store>(store: &S) -> Result<(AgentTask, EffectKey, TurnAttempt)> {
+            seed_with(store, 3, at(600)).await
+        }
+
+        /// [`seed`] with `max_attempts` attempts and a lease that expires at
+        /// `lease_until`.
+        async fn seed_with<S: Store>(
+            store: &S,
+            max_attempts: u32,
+            lease_until: time::OffsetDateTime,
+        ) -> Result<(AgentTask, EffectKey, TurnAttempt)> {
             let thread = ThreadId::from_string(THREAD);
             ThreadStore::get_or_create(store, &thread, at(0)).await?;
             MessageProjectionStore::get_or_create(store, &thread, at(0)).await?;
-            let root = AgentTask::new_root_turn(thread.clone(), at(0), 3);
+            let root = AgentTask::new_root_turn(thread.clone(), at(0), max_attempts);
             store.submit_root_turn(root.clone()).await?;
             let root = store
                 .try_acquire_task(
                     &root.id,
                     WorkerId::from_string("w"),
                     LeaseId::from_string("l"),
-                    at(600),
+                    lease_until,
                     at(0),
                 )
                 .await?
@@ -1521,7 +1531,14 @@ mod tests {
         }
 
         async fn run_turn<S: Store>(store: &S, root: &AgentTask) -> Result<()> {
-            let thread = ThreadId::from_string(THREAD);
+            run_turn_on(store, root, ThreadId::from_string(THREAD)).await
+        }
+
+        async fn run_turn_on<S: Store>(
+            store: &S,
+            root: &AgentTask,
+            thread: ThreadId,
+        ) -> Result<()> {
             let task = AgentTaskStore::get(store, &root.id)
                 .await?
                 .context("root")?;
@@ -1565,6 +1582,295 @@ mod tests {
                 .await?
                 .context("effect")?
                 .state)
+        }
+
+        /// The failpoints a turn that continues a failed root crashes at:
+        /// after its projection write (the failed root's response and note)
+        /// and the salvage finish, before the commit.
+        pub(super) const AFTER_FAILED_ROOT_SALVAGE: &[&str] = &[
+            "commit.before_event_commit",
+            "effect.finish_written",
+            "transition.settle_written",
+            "commit.completed_turn.settled",
+            "commit.completed_turn.extra_written",
+        ];
+
+        /// A root that ran a tool round, was streaming its next response
+        /// when its process died, and was failed closed by the lease sweep
+        /// with its one attempt spent. Returns it and its cut-off request.
+        async fn seed_failed_root<S: Store>(store: &S) -> Result<(AgentTask, EffectKey)> {
+            let (failed, key, _attempt) = seed_with(store, 1, at(2)).await?;
+            let thread = ThreadId::from_string(THREAD);
+            MessageProjectionStore::set_draft(
+                store,
+                &thread,
+                vec![
+                    llm::Message::user("first question"),
+                    llm::Message::assistant_with_tool_use(
+                        None,
+                        "tu_1",
+                        "read",
+                        serde_json::json!({}),
+                    ),
+                    llm::Message::tool_result("tu_1", "file contents", false),
+                ],
+                at(1),
+            )
+            .await?;
+            let swept = store
+                .release_expired_leases(at(3), agent_server::journal::LeaseRecoveryScope::Expired)
+                .await?;
+            ensure!(
+                swept.len() == 1 && swept[0].action.is_fail_closed(),
+                "the sweep did not fail the root closed: {swept:?}"
+            );
+            Ok((failed, key))
+        }
+
+        /// The root that continues the thread after the failed one.
+        async fn next_root<S: Store>(store: &S) -> Result<AgentTask> {
+            let next = AgentTask::new_root_turn(ThreadId::from_string(THREAD), at(3), 3);
+            store.submit_root_turn(next.clone()).await?;
+            store
+                .try_acquire_task(
+                    &next.id,
+                    WorkerId::from_string("w"),
+                    LeaseId::from_string("l"),
+                    at(600),
+                    at(3),
+                )
+                .await?
+                .context("acquire the next root")
+        }
+
+        /// The failed root's work is in the transcript exactly once: its
+        /// tool round, its cut-off response and the note that it failed.
+        async fn failed_root_salvaged_once<S: Store>(
+            store: &S,
+            key: &EffectKey,
+            case: &str,
+        ) -> Result<()> {
+            let thread = ThreadId::from_string(THREAD);
+            let messages = MessageProjectionStore::get(store, &thread)
+                .await?
+                .context("projection")?
+                .messages;
+            let texts: Vec<String> = messages.iter().map(text_of).collect();
+            let note = agent_server::journal::effect::FailedTurnClass::Restarts.note();
+            for (what, wanted) in [("partial", PARTIAL), ("note", note)] {
+                let count = texts.iter().filter(|text| *text == wanted).count();
+                ensure!(count == 1, "{case}: {what} count {count}: {texts:?}");
+            }
+            let results = messages
+                .iter()
+                .filter(|message| {
+                    matches!(&message.content, llm::Content::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { .. })))
+                })
+                .count();
+            ensure!(results == 1, "{case}: tool results {results}: {texts:?}");
+            ensure!(
+                matches!(state(store, key).await?, EffectState::Salvaged { .. }),
+                "{case}: {:?}",
+                state(store, key).await?
+            );
+            Ok(())
+        }
+
+        /// Crash the turn that continues a failed root at `failpoint`, then
+        /// reopen with `reopen` and check the retry salvages it once.
+        pub(super) async fn crash_after_a_failed_root<S: Store>(
+            failpoint: &str,
+            store: S,
+            reopen: impl std::future::Future<Output = Result<S>>,
+        ) -> Result<()> {
+            let (_failed, key) = seed_failed_root(&store).await?;
+            let next = next_root(&store).await?;
+
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&finishes);
+            let crash_at_finish = failpoint == "effect.finish_written";
+            fail::cfg_callback("effect.finish_written", move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                assert!(!crash_at_finish, "crash at effect.finish_written");
+            })
+            .map_err(anyhow::Error::msg)?;
+            if !crash_at_finish {
+                fail::cfg(failpoint, "panic").map_err(anyhow::Error::msg)?;
+            }
+            let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_turn(
+                &store, &next,
+            )))
+            .await;
+            fail::remove("effect.finish_written");
+            fail::remove(failpoint);
+            ensure!(crashed.is_err(), "{failpoint}: the failpoint must fire");
+            // The failed root's finish comes first in the turn's writes: by any
+            // failpoint after it, it was written in the crashed transaction.
+            let reached = finishes.load(Ordering::SeqCst);
+            match failpoint {
+                "commit.before_event_commit" => {
+                    ensure!(reached == 0, "{failpoint}: finishes {reached}");
+                }
+                "effect.finish_written" => ensure!(reached == 1, "{failpoint}: finishes {reached}"),
+                _ => ensure!(reached == 2, "{failpoint}: finishes {reached}"),
+            }
+            drop(store);
+
+            let store = reopen.await?;
+            let thread = ThreadId::from_string(THREAD);
+            let turns = ThreadStore::get(&store, &thread)
+                .await?
+                .map_or(0, |thread| thread.committed_turns);
+            ensure!(turns == 0, "{failpoint}: turn landed: {turns}");
+            ensure!(
+                state(&store, &key).await? == EffectState::Abandoned,
+                "{failpoint}: the failed root's request after the crash: {:?}",
+                state(&store, &key).await?
+            );
+
+            run_turn(&store, &next).await?;
+            failed_root_salvaged_once(&store, &key, failpoint).await
+        }
+
+        /// Make the case's thread a fork of a source thread with one committed
+        /// turn, through the store's own fork commit as `ForkThread` builds it:
+        /// the fork's checkpoint is the source's, its owner a source task.
+        async fn fork_onto_thread<S: Store>(store: &S) -> Result<()> {
+            let source = ThreadId::from_string("salvage-crash-source");
+            ThreadStore::get_or_create(store, &source, at(0)).await?;
+            MessageProjectionStore::get_or_create(store, &source, at(0)).await?;
+            let root = AgentTask::new_root_turn(source.clone(), at(0), 3);
+            store.submit_root_turn(root.clone()).await?;
+            let root = store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("w"),
+                    LeaseId::from_string("l"),
+                    at(600),
+                    at(0),
+                )
+                .await?
+                .context("acquire the source root")?;
+            run_turn_on(store, &root, source.clone()).await?;
+            let checkpoint = CheckpointStore::get_latest_by_thread(store, &source)
+                .await?
+                .context("the source's checkpoint")?;
+            let thread = ThreadId::from_string(THREAD);
+            ThreadStore::commit_fork(
+                store,
+                agent_server::journal::fork_transaction::ForkCommitParams {
+                    source_thread_id: source.clone(),
+                    new_thread_id: thread.clone(),
+                    creation: None,
+                    now: at(1),
+                    committed_turns: checkpoint.turn_number,
+                    cumulative_total_usage: agent_sdk_foundation::TokenUsage::default(),
+                    messages: checkpoint.messages.clone(),
+                    checkpoint: Some(agent_server::journal::checkpoint::NewCheckpointParams {
+                        thread_id: thread.clone(),
+                        turn_number: checkpoint.turn_number,
+                        task_id: checkpoint.task_id.clone(),
+                        messages: checkpoint.messages,
+                        agent_state_snapshot: serde_json::to_value(
+                            agent_sdk_foundation::AgentState::new(thread.clone()),
+                        )?,
+                        turn_usage: checkpoint.turn_usage,
+                        kind: checkpoint.kind,
+                        now: at(1),
+                    }),
+                    events: vec![AgentEvent::thread_created(
+                        thread,
+                        Some(source),
+                        Some(checkpoint.turn_number),
+                    )],
+                    outbox_max_attempts: 3,
+                },
+            )
+            .await?;
+            Ok(())
+        }
+
+        /// A fork whose first turn fails, before the fork commits a turn of its
+        /// own, leaves the next turn that turn's work once.
+        pub(super) async fn a_forks_failed_first_turn_is_salvaged<S: Store>(
+            store: S,
+        ) -> Result<()> {
+            fork_onto_thread(&store).await?;
+            let (_failed, key) = seed_failed_root(&store).await?;
+            let next = next_root(&store).await?;
+            run_turn(&store, &next).await?;
+            failed_root_salvaged_once(&store, &key, "fork").await
+        }
+
+        /// A crash inside the failing transaction rolls the failure back: the
+        /// root is still leased, the lease sweep fails it closed later, and the
+        /// next turn salvages it once.
+        pub(super) async fn crash_while_failing<S: Store>(
+            store: S,
+            reopen: impl std::future::Future<Output = Result<S>>,
+        ) -> Result<()> {
+            let (failed, key, _attempt) = seed_with(&store, 1, at(2)).await?;
+            let thread = ThreadId::from_string(THREAD);
+            MessageProjectionStore::set_draft(
+                &store,
+                &thread,
+                vec![
+                    llm::Message::user("first question"),
+                    llm::Message::assistant_with_tool_use(
+                        None,
+                        "tu_1",
+                        "read",
+                        serde_json::json!({}),
+                    ),
+                    llm::Message::tool_result("tu_1", "file contents", false),
+                ],
+                at(1),
+            )
+            .await?;
+            fail::cfg("transition.settle_written", "panic").map_err(anyhow::Error::msg)?;
+            let notifier = EventNotifier::new();
+            let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                agent_server::worker::root_turn::fail_root_turn_with_reason(
+                    agent_server::worker::root_turn::FailRootTurnParams {
+                        task_id: &failed.id,
+                        worker_id: &WorkerId::from_string("w"),
+                        lease_id: &LeaseId::from_string("l"),
+                        thread_id: &thread,
+                        error: &anyhow::anyhow!("the process stopped"),
+                        reason: TerminalReason::InternalError,
+                    },
+                    &deps(&store, &notifier),
+                    at(2),
+                ),
+            ))
+            .await;
+            fail::remove("transition.settle_written");
+            ensure!(
+                crashed.is_err(),
+                "the failpoint must fire in the failing transaction"
+            );
+            drop(store);
+
+            let store = reopen.await?;
+            let row = AgentTaskStore::get(&store, &failed.id)
+                .await?
+                .context("root")?;
+            ensure!(
+                row.status == TaskStatus::Running,
+                "the failure landed: {:?}",
+                row.status
+            );
+            let swept = store
+                .release_expired_leases(at(3), agent_server::journal::LeaseRecoveryScope::Expired)
+                .await?;
+            ensure!(
+                swept.len() == 1 && swept[0].action.is_fail_closed(),
+                "the sweep did not fail the root closed: {swept:?}"
+            );
+            let next = next_root(&store).await?;
+            run_turn(&store, &next).await?;
+            failed_root_salvaged_once(&store, &key, "transition.settle_written while failing").await
         }
 
         pub(super) const AFTER_SALVAGE_WRITE: &[&str] = &[
@@ -1690,6 +1996,65 @@ mod tests {
                 .await?;
         }
         Ok(())
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_failed_roots_work_survives_every_crash_once() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in salvage_crash::AFTER_FAILED_ROOT_SALVAGE {
+            let temp = tempfile::tempdir()?;
+            let url = format!("sqlite://{}?mode=rwc", temp.path().join("s.db").display());
+            let store = SqliteDurableStore::connect(&url).await?;
+            salvage_crash::crash_after_a_failed_root(
+                failpoint,
+                store,
+                SqliteDurableStore::connect(&url),
+            )
+            .await?;
+        }
+        let temp = tempfile::tempdir()?;
+        let url = format!("sqlite://{}?mode=rwc", temp.path().join("s.db").display());
+        let store = SqliteDurableStore::connect(&url).await?;
+        salvage_crash::crash_while_failing(store, SqliteDurableStore::connect(&url)).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_forks_failed_first_turn_is_salvaged() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let url = format!("sqlite://{}?mode=rwc", temp.path().join("s.db").display());
+        salvage_crash::a_forks_failed_first_turn_is_salvaged(
+            SqliteDurableStore::connect(&url).await?,
+        )
+        .await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_a_forks_failed_first_turn_is_salvaged() -> Result<()> {
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        salvage_crash::a_forks_failed_first_turn_is_salvaged(schema.open_store().await?).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_a_failed_roots_work_survives_every_crash_once() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in salvage_crash::AFTER_FAILED_ROOT_SALVAGE {
+            let Some(schema) = PgSchema::create().await? else {
+                return Ok(());
+            };
+            let store = schema.open_store().await?;
+            salvage_crash::crash_after_a_failed_root(failpoint, store, schema.open_store()).await?;
+        }
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let store = schema.open_store().await?;
+        salvage_crash::crash_while_failing(store, schema.open_store()).await
     }
 
     #[cfg(all(feature = "postgres", feature = "failpoints"))]
