@@ -522,6 +522,29 @@ message AccountPoolExhaustedEvent {
   optional uint32 retry_after_seconds = 4;
 }
 
+// An LLM call of a durable root turn closed, committed with its attempt
+// row's close. Hosts price it; `usage` is the call's billed usage (failed and
+// cancelled calls included), `turn_usage` the billed usage of every closed
+// attempt of `task_id`, this one included.
+message UsageProgressEvent {
+  string task_id = 1;
+  string attempt_id = 2;
+  uint32 attempt_number = 3;
+  // The provider identity the attempt was opened against (the API shape).
+  string provider = 4;
+  // The model the attempt requested.
+  string model = 5;
+  // The model the provider said it served.
+  optional string response_model = 6;
+  // The route that served the attempt, when known.
+  optional string route_provider = 7;
+  TokenUsage usage = 8;
+  TokenUsage turn_usage = 9;
+  // Prompt tokens of the call's last physical request (its context
+  // occupancy), when the provider reported them.
+  optional uint32 context_tokens = 10;
+}
+
 // A single committed event in per-thread sequence order.
 message EventEnvelope {
   string event_id = 1;
@@ -553,6 +576,7 @@ message EventEnvelope {
     QuestionAskedEvent question_asked = 30;
     AccountRotationEvent account_rotation = 31;
     AccountPoolExhaustedEvent account_pool_exhausted = 32;
+    UsageProgressEvent usage_progress = 33;
   }
 }
 

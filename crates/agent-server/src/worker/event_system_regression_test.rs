@@ -259,6 +259,7 @@ fn event_type_names(events: &[crate::journal::committed_event::CommittedEvent]) 
             AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
             AgentEvent::ToolProgress { .. } => "ToolProgress",
             AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::UsageProgress { .. } => "UsageProgress",
             AgentEvent::Done { .. } => "Done",
             AgentEvent::Error { .. } => "Error",
             AgentEvent::Refusal { .. } => "Refusal",
@@ -438,9 +439,8 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
 
     // Step 1: Execute root turn → suspends with tool call.
     let outcome = execute_root_turn(inputs, "run command", &provider, &stores.deps(), t0()).await?;
-    let child_tasks = match outcome {
-        RootTurnOutcome::Suspended { child_tasks, .. } => child_tasks,
-        RootTurnOutcome::Completed { .. } => panic!("expected Suspended"),
+    let RootTurnOutcome::Suspended { child_tasks, .. } = outcome else {
+        panic!("expected Suspended");
     };
 
     // Step 2: Execute the child tool task.
@@ -513,17 +513,20 @@ async fn monotonic_ordering_across_full_lifecycle() -> Result<()> {
     // tool task, and the *streamed* resume turn.  The turn leads with
     // its `UserInput` admission record before `Start`, and the resume
     // `Text` is preceded by its streamed `TextDelta`:
-    //   UserInput → Start → ToolCallStart → ToolCallEnd
-    //            → TextDelta → Text → TurnComplete → Done
+    //   UserInput → Start → UsageProgress → ToolCallStart → ToolCallEnd
+    //            → TextDelta → Text → UsageProgress → TurnComplete → Done
+    // Each closed attempt commits its `UsageProgress` with its close.
     assert_eq!(
         event_type_names(&events),
         vec![
             "UserInput",
             "Start",
+            "UsageProgress",
             "ToolCallStart",
             "ToolCallEnd",
             "TextDelta",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ],
@@ -691,12 +694,13 @@ async fn replay_to_live_handoff_during_worker_execution() -> Result<()> {
     // Push every event the turn committed (seqs ≥ 2) to the live tail.
     // The full journal — not just the outcome's consolidated projection
     // — carries the streamed `TextDelta`, so the handoff must deliver it:
-    //   UserInput → Start → TextDelta → Text → TurnComplete → Done.
+    //   UserInput → Start → TextDelta → Text → UsageProgress → TurnComplete
+    //   → Done.
     let all = stores.events.get_events(&thread_reg()).await?;
     let turn_events: Vec<_> = all.iter().filter(|e| e.sequence >= 2).cloned().collect();
     notifier.notify(&turn_events);
     let expected_count = turn_events.len();
-    assert_eq!(expected_count, 6, "streamed text turn commits 6 events");
+    assert_eq!(expected_count, 7, "streamed text turn commits 7 events");
 
     let mut live_seen = Vec::new();
     for _ in 0..expected_count {
@@ -1050,16 +1054,19 @@ async fn concurrent_child_progress_events_ordered() -> Result<()> {
     // matching `Start` (it's the durable per-turn admission
     // record consumers replay from). Subsequent assertions shift
     // by one to accommodate the new leading event.
+    // The suspended attempt's `UsageProgress` commits with its close,
+    // before the tool calls start.
     let types = event_type_names(&all);
     assert_eq!(types[0], "UserInput");
     assert_eq!(types[1], "Start");
-    assert_eq!(types[2], "ToolCallStart");
+    assert_eq!(types[2], "UsageProgress");
     assert_eq!(types[3], "ToolCallStart");
-    assert_eq!(types[4], "ToolProgress");
-    assert_eq!(types[5], "ToolCallEnd");
-    assert_eq!(types[6], "ToolProgress");
+    assert_eq!(types[4], "ToolCallStart");
+    assert_eq!(types[5], "ToolProgress");
+    assert_eq!(types[6], "ToolCallEnd");
     assert_eq!(types[7], "ToolProgress");
-    assert_eq!(types[8], "ToolCallEnd");
+    assert_eq!(types[8], "ToolProgress");
+    assert_eq!(types[9], "ToolCallEnd");
 
     Ok(())
 }
@@ -1176,10 +1183,10 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
     // The resume outcome carries the consolidated content + lifecycle
     // edges only; the streamed `TextDelta` is committed to the journal
     // out-of-band and is not threaded back into the outcome vec.
-    assert_eq!(resume_events.len(), 3);
+    assert_eq!(resume_events.len(), 4);
     assert_eq!(
         event_type_names(&resume_events),
-        vec!["Text", "TurnComplete", "Done"]
+        vec!["Text", "UsageProgress", "TurnComplete", "Done"]
     );
 
     // Full thread event stream is contiguous and carries the streamed
@@ -1191,10 +1198,12 @@ async fn resumed_root_turn_events_span_suspend_and_resume() -> Result<()> {
         vec![
             "UserInput",
             "Start",
+            "UsageProgress",
             "ToolCallStart",
             "ToolCallEnd",
             "TextDelta",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ]
@@ -1622,5 +1631,138 @@ async fn committed_only_events_invisible_until_replay() -> Result<()> {
     }
     assert_eq!(full, vec![0, 1, 2]);
 
+    Ok(())
+}
+
+/// A bash tool call that reports 300/20 tokens (100 cached, 50 written to
+/// the cache), then an answer that reports 450/30 (280 cached).
+fn usage_round_trip_provider() -> super::test_support::StreamingScriptedProvider {
+    use super::test_support::{StreamingScriptedProvider, TurnScript};
+
+    let usage = |input, output, cached, created| Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+        cache_creation_input_tokens: created,
+        served_speed: None,
+        request_input_tokens: Some(input),
+    };
+    let tool_call = TurnScript::from_deltas(vec![
+        StreamDelta::ToolUseStart {
+            id: "tc_usage".into(),
+            name: "bash".into(),
+            block_index: 0,
+            thought_signature: None,
+        },
+        StreamDelta::ToolInputDelta {
+            id: "tc_usage".into(),
+            delta: serde_json::json!({"command": "ls"}).to_string(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(usage(300, 20, 100, 50)),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::ToolUse),
+            served_route: None,
+            served_model: None,
+        },
+    ]);
+    let answer = TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "done".into(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(usage(450, 30, 280, 0)),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
+            served_model: None,
+        },
+    ]);
+    StreamingScriptedProvider::new(vec![tool_call, answer])
+}
+
+/// A tool round trip closes two attempts, the suspended call's and the
+/// resumed one's, and commits one `UsageProgress` for each. Their usages sum
+/// to the turn's `TurnComplete` usage, and the last one's `turn_usage` is
+/// that sum.
+#[tokio::test]
+async fn a_tool_round_trip_reports_each_attempt_and_their_sum_is_the_turn_usage() -> Result<()> {
+    use crate::journal::turn_attempt::TurnAttempt;
+    use crate::journal::turn_attempt_store::TurnAttemptStore;
+    use agent_sdk_foundation::TokenUsage;
+
+    let provider = usage_round_trip_provider();
+
+    let stores = TestStores::new();
+    let task = create_and_acquire(&stores.tasks, &thread_reg()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        bootstrap(task, definition_with_tools()),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let RootTurnOutcome::Suspended { child_tasks, .. } =
+        execute_root_turn(inputs, "usage", &provider, &stores.deps(), t0()).await?
+    else {
+        panic!("expected Suspended");
+    };
+    let RootTurnOutcome::Completed { .. } =
+        execute_child_and_resume_parent(&stores, &child_tasks, &provider, &thread_reg()).await?
+    else {
+        panic!("expected Completed after resume");
+    };
+
+    let events = stores.events.get_events(&thread_reg()).await?;
+    let mut reported: Vec<(String, TokenUsage, TokenUsage)> = Vec::new();
+    let mut turn_complete = None;
+    for committed in &events {
+        match &committed.event {
+            AgentEvent::UsageProgress {
+                attempt_id,
+                usage,
+                turn_usage,
+                ..
+            } => reported.push((attempt_id.clone(), usage.clone(), turn_usage.clone())),
+            AgentEvent::TurnComplete { usage, .. } => turn_complete = Some(usage.clone()),
+            _ => {}
+        }
+    }
+    let rows = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(TurnAttempt::is_closed));
+    assert_eq!(
+        reported
+            .iter()
+            .map(|(id, ..)| id.as_str())
+            .collect::<Vec<_>>(),
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        "one event per closed attempt, in order",
+    );
+    let mut sum = TokenUsage::default();
+    for (_, usage, _) in &reported {
+        sum.add(usage);
+    }
+    let turn_complete = turn_complete.context("the turn's TurnComplete")?;
+    assert_eq!(
+        turn_complete,
+        TokenUsage {
+            input_tokens: 750,
+            output_tokens: 50,
+            cached_input_tokens: 380,
+            cache_creation_input_tokens: 50,
+        }
+    );
+    assert_eq!(sum, turn_complete, "the attempts sum to the turn's usage");
+    assert_eq!(
+        reported[0].2, reported[0].1,
+        "the first call's turn usage is its own"
+    );
+    assert_eq!(
+        reported[1].2, turn_complete,
+        "the last turn usage is the turn's"
+    );
     Ok(())
 }

@@ -1407,6 +1407,7 @@ async fn progress_events_and_refusals_carry_only_their_bounded_label() -> Result
     metrics.record_progress_event(attrs::PROGRESS_SUBAGENT);
     metrics.record_progress_event(attrs::PROGRESS_SUBAGENT);
     metrics.record_progress_event(attrs::PROGRESS_ROOT_STALL_NOTICE);
+    metrics.record_progress_event(attrs::PROGRESS_USAGE);
     metrics.record_progress_refused(attrs::PROGRESS_LEASE_LOST);
     metrics.record_progress_refused(attrs::PROGRESS_PURGED);
     metrics.record_progress_refused(attrs::PROGRESS_STORE);
@@ -1424,6 +1425,7 @@ async fn progress_events_and_refusals_carry_only_their_bounded_label() -> Result
     let events = "agent_server.progress.events";
     assert_eq!(sum(events, attrs::KIND, "subagent_progress"), 2);
     assert_eq!(sum(events, attrs::KIND, "root_stall_notice"), 1);
+    assert_eq!(sum(events, attrs::KIND, "usage_progress"), 1);
     let refused = "agent_server.progress.refused";
     assert_eq!(sum(refused, attrs::REASON, "lease_lost"), 2);
     assert_eq!(sum(refused, attrs::REASON, "purged"), 1);

@@ -4489,8 +4489,44 @@ fn map_lifecycle_event_payload(event: &AgentEvent) -> RpcResult<pb::event_envelo
         AgentEvent::AutoRetryStart { .. } | AgentEvent::AutoRetryEnd { .. } => {
             map_auto_retry_payload(event)
         }
+        AgentEvent::UsageProgress { .. } => map_usage_progress_payload(event),
         _ => Err(Status::internal("unsupported event variant").into()),
     }
+}
+
+/// Map [`AgentEvent::UsageProgress`] onto its protobuf payload. Split from
+/// [`map_lifecycle_event_payload`] purely for length; any other variant is
+/// an internal error.
+fn map_usage_progress_payload(event: &AgentEvent) -> RpcResult<pb::event_envelope::Event> {
+    let AgentEvent::UsageProgress {
+        task_id,
+        attempt_id,
+        attempt_number,
+        provider,
+        model,
+        response_model,
+        route_provider,
+        usage,
+        turn_usage,
+        context_tokens,
+    } = event
+    else {
+        return Err(Status::internal("unsupported usage event variant").into());
+    };
+    Ok(pb::event_envelope::Event::UsageProgress(
+        pb::UsageProgressEvent {
+            task_id: task_id.clone(),
+            attempt_id: attempt_id.clone(),
+            attempt_number: *attempt_number,
+            provider: provider.clone(),
+            model: model.clone(),
+            response_model: response_model.clone(),
+            route_provider: route_provider.clone(),
+            usage: Some(map_token_usage(usage)),
+            turn_usage: Some(map_token_usage(turn_usage)),
+            context_tokens: *context_tokens,
+        },
+    ))
 }
 
 fn map_compaction_occupancy(
@@ -12813,6 +12849,58 @@ mod tests {
             bail!("a SubagentProgress maps to its payload");
         };
         assert!(spawn.liveness.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn usage_progress_maps_to_its_envelope_field() -> Result<()> {
+        use prost::Message;
+
+        let usage = |input, output, cached, created| TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: created,
+        };
+        let event = AgentEvent::UsageProgress {
+            task_id: "task_1".into(),
+            attempt_id: "attempt_1".into(),
+            attempt_number: 2,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            response_model: None,
+            route_provider: Some("openrouter".into()),
+            usage: usage(120, 7, 30, 11),
+            turn_usage: usage(300, 20, 100, 50),
+            context_tokens: Some(120),
+        };
+        let pb::event_envelope::Event::UsageProgress(progress) = map_event_payload(&event)? else {
+            bail!("a UsageProgress maps to its own envelope field");
+        };
+        assert_eq!(progress.task_id, "task_1");
+        assert_eq!(progress.attempt_id, "attempt_1");
+        assert_eq!(progress.attempt_number, 2);
+        assert_eq!(progress.model, "claude-sonnet-5-5");
+        assert_eq!(progress.response_model, None);
+        assert_eq!(progress.route_provider.as_deref(), Some("openrouter"));
+        assert_eq!(progress.context_tokens, Some(120));
+        let usage = progress.usage.context("usage")?;
+        assert_eq!(
+            (usage.input_tokens, usage.cache_creation_input_tokens),
+            (120, 11)
+        );
+        let turn = progress.turn_usage.context("turn usage")?;
+        assert_eq!((turn.input_tokens, turn.cached_input_tokens), (300, 100));
+
+        let envelope = pb::EventEnvelope {
+            event_id: "e".into(),
+            thread_id: "t".into(),
+            sequence: 9,
+            commit_time: None,
+            event: Some(pb::event_envelope::Event::UsageProgress(progress)),
+        };
+        let decoded = pb::EventEnvelope::decode(envelope.encode_to_vec().as_slice())?;
+        assert_eq!(decoded, envelope);
         Ok(())
     }
 

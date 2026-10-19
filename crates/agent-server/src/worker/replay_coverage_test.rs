@@ -411,12 +411,13 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
     // The turn streams both deltas (thinking then text) before
     // committing both consolidated blocks at turn close:
     //   UserInput → Start → ThinkingDelta → TextDelta
-    //            → Thinking → Text → TurnComplete → Done
+    //            → Thinking → Text → UsageProgress → TurnComplete → Done
     let events = stores.events.get_events(&thread_replay()).await?;
     assert_eq!(
         events.len(),
-        8,
-        "UserInput + Start + ThinkingDelta + TextDelta + Thinking + Text + TurnComplete + Done"
+        9,
+        "UserInput + Start + ThinkingDelta + TextDelta + Thinking + Text + UsageProgress + \
+         TurnComplete + Done"
     );
 
     assert!(matches!(&events[0].event, AgentEvent::UserInput { .. }));
@@ -425,8 +426,9 @@ async fn text_only_with_thinking_replays_in_order() -> Result<()> {
     assert!(matches!(&events[3].event, AgentEvent::TextDelta { .. }));
     assert!(matches!(&events[4].event, AgentEvent::Thinking { .. }));
     assert!(matches!(&events[5].event, AgentEvent::Text { .. }));
-    assert!(matches!(&events[6].event, AgentEvent::TurnComplete { .. }));
-    assert!(matches!(&events[7].event, AgentEvent::Done { .. }));
+    assert!(matches!(&events[6].event, AgentEvent::UsageProgress { .. }));
+    assert!(matches!(&events[7].event, AgentEvent::TurnComplete { .. }));
+    assert!(matches!(&events[8].event, AgentEvent::Done { .. }));
 
     // Verify content fidelity of the consolidated blocks.
     if let AgentEvent::Thinking { text, .. } = &events[4].event {
@@ -554,21 +556,23 @@ async fn tool_progress_events_are_durable() -> Result<()> {
     // Verify from the event repository: full thread replay order.
     // The first turn streams a tool call with no thinking, so the
     // journal leads with the `UserInput` admission record, then `Start`:
-    //   UserInput → Start → ToolCallStart → ToolProgress(running)
-    //            → ToolProgress(complete) → ToolCallEnd
+    //   UserInput → Start → UsageProgress → ToolCallStart
+    //            → ToolProgress(running) → ToolProgress(complete)
+    //            → ToolCallEnd
     let all = stores.events.get_events(&thread_replay()).await?;
     assert!(matches!(&all[0].event, AgentEvent::UserInput { .. }));
     assert!(matches!(&all[1].event, AgentEvent::Start { .. }));
-    assert!(matches!(&all[2].event, AgentEvent::ToolCallStart { .. }));
+    assert!(matches!(&all[2].event, AgentEvent::UsageProgress { .. }));
+    assert!(matches!(&all[3].event, AgentEvent::ToolCallStart { .. }));
     assert!(matches!(
-        &all[3].event,
+        &all[4].event,
         AgentEvent::ToolProgress { stage, .. } if stage == "running"
     ));
     assert!(matches!(
-        &all[4].event,
+        &all[5].event,
         AgentEvent::ToolProgress { stage, .. } if stage == "complete"
     ));
-    assert!(matches!(&all[5].event, AgentEvent::ToolCallEnd { .. }));
+    assert!(matches!(&all[6].event, AgentEvent::ToolCallEnd { .. }));
 
     // Sequences are contiguous.
     for (i, evt) in all.iter().enumerate() {
@@ -701,6 +705,7 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
             AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
             AgentEvent::ToolProgress { .. } => "ToolProgress",
             AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::UsageProgress { .. } => "UsageProgress",
             AgentEvent::Done { .. } => "Done",
             other => panic!("unexpected event type: {other:?}"),
         })
@@ -718,6 +723,7 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
             "UserInput",
             "Start",
             "ThinkingDelta", // streamed (first LLM call)
+            "UsageProgress", // the first call's attempt closes
             "Thinking",      // consolidated (first LLM call)
             "ToolCallStart",
             "ToolCallEnd",
@@ -725,6 +731,7 @@ async fn full_lifecycle_with_thinking_replays_across_root_and_tool() -> Result<(
             "TextDelta",     // streamed (resume LLM call)
             "Thinking",      // consolidated (resume LLM call)
             "Text",          // consolidated (resume LLM call)
+            "UsageProgress", // the resume call's attempt closes
             "TurnComplete",
             "Done",
         ],
@@ -841,25 +848,27 @@ async fn multiple_tool_tasks_interleave_correctly() -> Result<()> {
     }
 
     // Verify event stream (no thinking, so no `ThinkingDelta`):
-    //   UserInput → Start → ToolCallStart(read) → ToolCallStart(write)
-    //            → ToolCallEnd → ToolCallEnd
+    //   UserInput → Start → UsageProgress → ToolCallStart(read)
+    //            → ToolCallStart(write) → ToolCallEnd → ToolCallEnd
     let events = stores.events.get_events(&thread_replay()).await?;
 
-    // UserInput + Start + 2 ToolCallStart + 2 ToolCallEnd = 6 before resume.
-    assert!(events.len() >= 6);
+    // UserInput + Start + UsageProgress + 2 ToolCallStart + 2 ToolCallEnd =
+    // 7 before resume.
+    assert!(events.len() >= 7);
     assert!(matches!(&events[0].event, AgentEvent::UserInput { .. }));
     assert!(matches!(&events[1].event, AgentEvent::Start { .. }));
+    assert!(matches!(&events[2].event, AgentEvent::UsageProgress { .. }));
     assert!(matches!(
-        &events[2].event,
+        &events[3].event,
         AgentEvent::ToolCallStart { name, .. } if name == "read"
     ));
     assert!(matches!(
-        &events[3].event,
+        &events[4].event,
         AgentEvent::ToolCallStart { name, .. } if name == "write"
     ));
     // ToolCallEnd events follow (order depends on execution order).
-    assert!(matches!(&events[4].event, AgentEvent::ToolCallEnd { .. }));
     assert!(matches!(&events[5].event, AgentEvent::ToolCallEnd { .. }));
+    assert!(matches!(&events[6].event, AgentEvent::ToolCallEnd { .. }));
 
     // Sequences are contiguous.
     for (i, evt) in events.iter().enumerate() {

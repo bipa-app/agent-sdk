@@ -95,6 +95,29 @@ pub trait TurnAttemptStore: Send + Sync {
         ))
     }
 
+    /// Close the open attempt `id` of `task` a transition's
+    /// [`TurnAttemptWrite::Close`] carries, synchronously, for the in-memory
+    /// task store's commit (the SQL stores close it in their own
+    /// transaction). The default refuses.
+    ///
+    /// [`TurnAttemptWrite::Close`]: super::transition::TurnAttemptWrite::Close
+    ///
+    /// # Errors
+    /// A store that takes no close from a transition, an unknown attempt,
+    /// one of another task, or one already closed.
+    #[doc(hidden)]
+    fn close_owned_attempt(
+        &self,
+        id: &TurnAttemptId,
+        _task: &AgentTaskId,
+        _params: CloseAttemptParams,
+        _now: OffsetDateTime,
+    ) -> Result<()> {
+        Err(anyhow!(
+            "this attempt store takes no close of attempt {id} from a transition"
+        ))
+    }
+
     /// Close the still-open attempt `id` of an abandoned LLM request,
     /// synchronously, for the in-memory task store as it ends the attempt's
     /// task (the SQL stores close it in their own transaction). An unknown
@@ -198,6 +221,29 @@ impl TurnAttemptStore for InMemoryTurnAttemptStore {
             .or_default()
             .push(attempt.id.clone());
         inner.by_id.insert(attempt.id.clone(), attempt);
+        drop(inner);
+        Ok(())
+    }
+
+    fn close_owned_attempt(
+        &self,
+        id: &TurnAttemptId,
+        task: &AgentTaskId,
+        params: CloseAttemptParams,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        let attempt = inner
+            .by_id
+            .get(id)
+            .ok_or_else(|| anyhow!("attempt not found: {id}"))?;
+        anyhow::ensure!(
+            &attempt.task_id == task,
+            "attempt {id} belongs to task {}, not {task}",
+            attempt.task_id
+        );
+        let closed = attempt.clone().close(params, now)?;
+        inner.by_id.insert(closed.id.clone(), closed);
         drop(inner);
         Ok(())
     }

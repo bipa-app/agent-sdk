@@ -1982,6 +1982,25 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
         attempts.len()
     );
     s3_requests_ended(&case, &attempts).await?;
+    // The crashed attempt, which the store closed as abandoned, reports no
+    // usage; each attempt the worker closed reports its own, once.
+    let reported: Vec<String> = thread_events(&case.stores, &case.thread)
+        .await?
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentEvent::UsageProgress { attempt_id, .. } => Some(attempt_id),
+            _ => None,
+        })
+        .collect();
+    let closed_by_worker: Vec<String> = attempts
+        .iter()
+        .filter(|attempt| !attempt.closed_as_abandoned())
+        .map(|attempt| attempt.id.as_str().to_owned())
+        .collect();
+    ensure!(
+        reported == closed_by_worker,
+        "usage events {reported:?} for attempts closed by the worker {closed_by_worker:?}"
+    );
     let live = live_rows(&case.stores, &case.thread).await?;
     ensure!(live.is_empty(), "rows left live: {live:?}");
     Ok(())

@@ -29,13 +29,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration as StdDuration;
 
 use agent_sdk::context::{CompactionConfig, CompactionEngine};
-use agent_sdk_foundation::ThreadId;
 use agent_sdk_foundation::events::{
     AgentEvent, CompactionThreshold, CompactionTrigger, OccupancySource, ThresholdSource,
 };
 use agent_sdk_foundation::llm::{
     ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Message, StopReason, Usage,
 };
+use agent_sdk_foundation::{ThreadId, TokenUsage};
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_tools::stores::MessageStore;
 use anyhow::{Context, Result};
@@ -3325,6 +3325,95 @@ async fn compaction_and_main_spend_bill_on_distinct_truthful_rows() -> Result<()
     let total_input: u32 = attempts.iter().filter_map(|a| a.input_tokens).sum();
     let total_output: u32 = attempts.iter().filter_map(|a| a.output_tokens).sum();
     assert_eq!((total_input, total_output), (200, 100));
+    assert_compaction_usage_progress(&fixtures, compaction_row, main_row).await
+}
+
+/// The compaction call commits exactly one `UsageProgress`, priced under the
+/// summarizer's own model with no context occupancy, and the next frame's
+/// `turn_usage` (the main call's) counts it.
+async fn assert_compaction_usage_progress(
+    fixtures: &Fixtures,
+    compaction_row: &crate::journal::turn_attempt::TurnAttempt,
+    main_row: &crate::journal::turn_attempt::TurnAttempt,
+) -> Result<()> {
+    let mut events = fixtures.events.get_events(&thread_id()).await?;
+    events.sort_by_key(|event| event.sequence);
+    let frames: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            AgentEvent::UsageProgress {
+                attempt_id,
+                provider,
+                model,
+                response_model,
+                usage,
+                turn_usage,
+                context_tokens,
+                ..
+            } => Some((
+                attempt_id.as_str(),
+                provider.as_str(),
+                model.as_str(),
+                response_model.as_deref(),
+                usage,
+                turn_usage,
+                *context_tokens,
+            )),
+            _ => None,
+        })
+        .collect();
+    let frame_ids: Vec<&str> = frames.iter().map(|frame| frame.0).collect();
+    let compaction_id = compaction_row.id.as_str();
+    let compaction_frames: Vec<usize> = frame_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| **id == compaction_id)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        compaction_frames.len(),
+        1,
+        "the compaction call {compaction_id} commits exactly one UsageProgress; \
+         frames were for {frame_ids:?}",
+    );
+    let at = compaction_frames[0];
+    let (_, provider, model, response_model, compaction_usage, _, context_tokens) = frames[at];
+    assert_eq!(provider, "openai");
+    assert_eq!(model, "gpt-summarizer", "priced under the compaction model");
+    assert_eq!(response_model, Some("mock-model"));
+    assert_eq!(
+        context_tokens, None,
+        "a summary request's prompt is not the thread's context occupancy",
+    );
+    assert_eq!(
+        *compaction_usage,
+        TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        },
+    );
+
+    let (main_id, _, main_model, _, main_usage, main_turn_usage, _) = *frames
+        .get(at + 1)
+        .with_context(|| format!("no UsageProgress follows the compaction's: {frame_ids:?}"))?;
+    assert_eq!(
+        main_id,
+        main_row.id.as_str(),
+        "the next frame is the main call's"
+    );
+    assert_eq!(main_model, "mock-model");
+    let mut expected = compaction_usage.clone();
+    expected.add(main_usage);
+    assert_ne!(
+        main_turn_usage, main_usage,
+        "turn_usage counts more than the main call"
+    );
+    assert_eq!(
+        *main_turn_usage, expected,
+        "the main call's turn_usage includes the compaction call's usage",
+    );
     Ok(())
 }
 

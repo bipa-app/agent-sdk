@@ -1227,6 +1227,102 @@ mod tests {
         }
     }
 
+    /// A transition's attempt close (`TurnAttemptWrite::Close`): refused
+    /// under a stale lease, for an attempt of another task, and for an
+    /// attempt already closed (`AlreadyClosed`); under the live lease it
+    /// fills the row's response fields.
+    async fn test_turn_attempt_close_write(
+        task_store: &dyn AgentTaskStore,
+        attempt_store: &dyn TurnAttemptStore,
+    ) -> Result<()> {
+        use agent_server::journal::TurnAttemptSchemaError;
+        use agent_server::journal::turn_attempt::TurnAttempt;
+        use anyhow::ensure;
+
+        let acquire = |name: &'static str| async move {
+            let tid = thread_id(name);
+            let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+            let _ = task_store.submit_root_turn(root.clone()).await?;
+            let lease = (WorkerId::new(), LeaseId::new());
+            let _ = task_store
+                .try_acquire_task(
+                    &root.id,
+                    lease.0.clone(),
+                    lease.1.clone(),
+                    t_plus(80),
+                    t_plus(51),
+                )
+                .await?;
+            anyhow::Ok((tid, root.id, lease))
+        };
+        let (tid, root, lease) = acquire("conformance-attempt-close").await?;
+        let (_, other, other_lease) = acquire("conformance-attempt-close-other").await?;
+        let attempt = TurnAttempt::open(sample_open_attempt(&root, t_plus(52)));
+        task_store
+            .commit(
+                llm_request_begin(&root, &tid, lease.clone(), &attempt),
+                t_plus(52),
+            )
+            .await?;
+        let close = |task: &AgentTaskId, lease: (WorkerId, LeaseId)| Transition {
+            guards: vec![Guard::TaskIs {
+                task: task.clone(),
+                status: TaskStatus::Running,
+                lease: Some(lease),
+            }],
+            writes: vec![Write::TurnAttempt(
+                agent_server::journal::TurnAttemptWrite::Close {
+                    attempt: attempt.id.clone(),
+                    task: task.clone(),
+                    params: Box::new(evidence_close_params()),
+                },
+            )],
+        };
+        let open = |row: Option<TurnAttempt>| row.is_some_and(|row| !row.is_closed());
+
+        let stale = task_store
+            .commit(close(&root, (lease.0.clone(), LeaseId::new())), t_plus(53))
+            .await;
+        ensure!(
+            matches!(stale, Err(Rejected::Guard { index: 0, .. })),
+            "a stale lease is refused at the guard: {stale:?}"
+        );
+        ensure!(open(attempt_store.get(&attempt.id).await?));
+
+        let foreign = task_store
+            .commit(close(&other, other_lease), t_plus(53))
+            .await;
+        ensure!(
+            matches!(foreign, Err(Rejected::Store(_))),
+            "another task's attempt is refused: {foreign:?}"
+        );
+        ensure!(open(attempt_store.get(&attempt.id).await?));
+
+        task_store
+            .commit(close(&root, lease.clone()), t_plus(54))
+            .await?;
+        let closed = attempt_store
+            .get(&attempt.id)
+            .await?
+            .context("the closed attempt")?;
+        ensure!(closed.outcome == Some(TurnAttemptOutcome::Success));
+        ensure!(closed.input_tokens == Some(100) && closed.cache_creation_input_tokens == Some(40));
+        ensure!(closed.closed_at == Some(t_plus(54)));
+
+        let again = task_store.commit(close(&root, lease), t_plus(55)).await;
+        let Err(Rejected::Store(error)) = again else {
+            anyhow::bail!("a second close must be refused: {again:?}");
+        };
+        ensure!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<TurnAttemptSchemaError>()
+                    == Some(&TurnAttemptSchemaError::AlreadyClosed)),
+            "a second close reads AlreadyClosed: {error:#}"
+        );
+        Ok(())
+    }
+
     /// An LLM request's effect and its attempt row (crash matrix S3): the
     /// attempt and its `Started` effect commit together under the lease, or
     /// not at all; a completed turn finishes its own request and, by settling
@@ -8463,6 +8559,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_turn_attempt_close_write() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_turn_attempt_close_write(s.task.as_ref(), s.attempt.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_llm_request_effect_lifecycle() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_llm_request_effect_lifecycle(s.task.as_ref(), s.attempt.as_ref()).await
@@ -9679,6 +9781,13 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_turn_attempt_close_write() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_turn_attempt_close_write(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_llm_request_effect_lifecycle() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_llm_request_effect_lifecycle(&store, &store).await
@@ -10540,6 +10649,15 @@ mod tests {
             return Ok(());
         };
         test_requeue_owned_task(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_turn_attempt_close_write() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_turn_attempt_close_write(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

@@ -574,6 +574,13 @@ mod tests {
                 };
                 rt.block_on(async move {
                     if let Ok(mut conn) = sqlx::postgres::PgConnection::connect(&url).await {
+                        // A failed test can leave a crashed transaction
+                        // holding locks in the schema, on a pool whose
+                        // rollback needs the runtime this drop blocks. Give
+                        // up on the drop rather than hang the test.
+                        let _ = sqlx::query("SET lock_timeout = '10s'")
+                            .execute(&mut conn)
+                            .await;
                         let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
                             "DROP SCHEMA IF EXISTS {schema} CASCADE"
                         )))
@@ -2069,5 +2076,307 @@ mod tests {
             salvage_crash::crash_then_retry(failpoint, store, schema.open_store()).await?;
         }
         Ok(())
+    }
+
+    /// A suspending root turn closes its LLM attempt and commits the
+    /// attempt's `UsageProgress` in one transaction. The markers are armed
+    /// from inside the provider call, after the attempt's open committed, so
+    /// they see only the close's transaction: `transition.attempt_closed`
+    /// fires after the row's update and `transition.before_events` before
+    /// the event's insert, then `transition.before_commit` crashes. Nothing
+    /// of the close survives: the row is open and no `UsageProgress` is on
+    /// the thread. The same turn run again on the reopened store closes its
+    /// new attempt with exactly one event naming it; the crashed attempt,
+    /// which the store closes as abandoned, gets none.
+    ///
+    /// MUST run under nextest (process-global `fail-rs` registry).
+    #[cfg(feature = "failpoints")]
+    mod usage_crash {
+        use std::sync::{Arc, Mutex};
+
+        use agent_sdk_foundation::llm::{
+            ChatOutcome, ChatRequest, ChatResponse, ContentBlock, StopReason, Tool, Usage,
+        };
+        use agent_sdk_foundation::{AgentEvent, ThreadId, ToolTier};
+        use agent_sdk_providers::LlmProvider;
+        use agent_server::journal::event_notifier::EventNotifier;
+        use agent_server::journal::event_repository::EventRepository;
+        use agent_server::journal::execution_context::build_root_worker_inputs;
+        use agent_server::journal::message_store::MessageProjectionStore;
+        use agent_server::journal::store::AgentTaskStore;
+        use agent_server::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
+        use agent_server::journal::thread_store::ThreadStore;
+        use agent_server::journal::turn_attempt_store::TurnAttemptStore;
+        use agent_server::worker::bootstrap::WorkerBootstrapContext;
+        use agent_server::worker::definition::{AgentDefinition, RuntimePolicy, ThinkingPolicy};
+        use agent_server::worker::{RootTurnDeps, execute_root_turn};
+        use anyhow::{Context, Result, ensure};
+        use async_trait::async_trait;
+        use time::OffsetDateTime;
+
+        use super::salvage_crash::Store;
+        use crate::fail;
+
+        const THREAD: &str = "usage-crash";
+
+        /// Markers that fire inside the close's transaction, after each of
+        /// its writes applied.
+        const CLOSE_MARKERS: [&str; 2] = ["transition.attempt_closed", "transition.before_events"];
+
+        fn at(secs: i64) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(secs)
+        }
+
+        fn definition() -> AgentDefinition {
+            AgentDefinition {
+                provider: "crash-test".into(),
+                model: "crash-test-model".into(),
+                system_prompt: "Use the tool.".into(),
+                max_tokens: 256,
+                tools: vec![Tool {
+                    name: "probe".into(),
+                    description: "Probe".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    display_name: "Probe".into(),
+                    tier: ToolTier::Observe,
+                    concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                    replay: agent_sdk_foundation::ToolReplay::Safe,
+                }],
+                thinking: ThinkingPolicy::default(),
+                thinking_display: None,
+                tools_fn: None,
+                tool_input_sanitizer: None,
+                request_context_fn: None,
+                policy: RuntimePolicy::server_default(),
+            }
+        }
+
+        /// Calls the `probe` tool; runs `arm` once, inside its first call.
+        struct ToolCallProvider {
+            arm: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for ToolCallProvider {
+            async fn chat(&self, _request: ChatRequest) -> Result<ChatOutcome> {
+                let arm = self
+                    .arm
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("arm lock poisoned"))?
+                    .take();
+                if let Some(arm) = arm {
+                    arm();
+                }
+                Ok(ChatOutcome::Success(ChatResponse {
+                    id: "r".into(),
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_probe".into(),
+                        name: "probe".into(),
+                        input: serde_json::json!({}),
+                        thought_signature: None,
+                    }],
+                    model: "crash-test-model".into(),
+                    stop_reason: Some(StopReason::ToolUse),
+                    usage: Usage {
+                        served_speed: None,
+                        input_tokens: 120,
+                        output_tokens: 7,
+                        cached_input_tokens: 30,
+                        cache_creation_input_tokens: 11,
+                        request_input_tokens: Some(120),
+                    },
+                }))
+            }
+            fn model(&self) -> &'static str {
+                "crash-test-model"
+            }
+            fn provider(&self) -> &'static str {
+                "crash-test"
+            }
+        }
+
+        fn deps<'a, S: Store>(store: &'a S, notifier: &'a EventNotifier) -> RootTurnDeps<'a> {
+            RootTurnDeps {
+                task_store: store,
+                thread_store: store,
+                message_store: store,
+                attempt_store: store,
+                checkpoint_store: store,
+                event_repo: store,
+                event_notifier: notifier,
+                subagent_spawn_selector: None,
+                compaction_config: None,
+                compaction_provider: None,
+                compaction_artifact_store: None,
+                cancel: None,
+                wakeup: None,
+                activity: None,
+                connectivity_waits: None,
+            }
+        }
+
+        async fn seed<S: Store>(store: &S) -> Result<AgentTask> {
+            let thread = ThreadId::from_string(THREAD);
+            ThreadStore::get_or_create(store, &thread, at(0)).await?;
+            MessageProjectionStore::get_or_create(store, &thread, at(0)).await?;
+            let root = AgentTask::new_root_turn(thread, at(0), 3);
+            store.submit_root_turn(root.clone()).await?;
+            store
+                .try_acquire_task(
+                    &root.id,
+                    WorkerId::from_string("w"),
+                    LeaseId::from_string("l"),
+                    at(600),
+                    at(0),
+                )
+                .await?
+                .context("acquire")
+        }
+
+        async fn run_turn<S: Store>(
+            store: &S,
+            root: &AgentTask,
+            provider: &ToolCallProvider,
+        ) -> Result<()> {
+            let task = AgentTaskStore::get(store, &root.id)
+                .await?
+                .context("root")?;
+            let bootstrap = WorkerBootstrapContext {
+                thread_id: ThreadId::from_string(THREAD),
+                task_id: root.id.clone(),
+                task,
+                worker_id: WorkerId::from_string("w"),
+                lease_id: LeaseId::from_string("l"),
+                definition: definition(),
+            };
+            let inputs = build_root_worker_inputs(bootstrap, store, store, store, at(3)).await?;
+            let notifier = EventNotifier::new();
+            execute_root_turn(inputs, "probe it", provider, &deps(store, &notifier), at(4)).await?;
+            Ok(())
+        }
+
+        fn arm_close_markers(passed: &Arc<Mutex<Vec<&'static str>>>) {
+            for marker in CLOSE_MARKERS {
+                let passed = Arc::clone(passed);
+                let _ = fail::cfg_callback(marker, move || {
+                    if let Ok(mut passed) = passed.lock() {
+                        passed.push(marker);
+                    }
+                });
+            }
+            let passed = Arc::clone(passed);
+            let _ = fail::cfg_callback("transition.before_commit", move || {
+                if let Ok(mut passed) = passed.lock() {
+                    passed.push("transition.before_commit");
+                }
+                panic!("crash after the attempt close's writes, before its commit");
+            });
+        }
+
+        fn disarm_close_markers() {
+            for marker in CLOSE_MARKERS {
+                fail::remove(marker);
+            }
+            fail::remove("transition.before_commit");
+        }
+
+        /// The `UsageProgress` events on the thread, by attempt id.
+        async fn usage_attempts<S: Store>(store: &S) -> Result<Vec<String>> {
+            let events = EventRepository::get_events(store, &ThreadId::from_string(THREAD)).await?;
+            Ok(events
+                .into_iter()
+                .filter_map(|committed| match committed.event {
+                    AgentEvent::UsageProgress { attempt_id, .. } => Some(attempt_id),
+                    _ => None,
+                })
+                .collect())
+        }
+
+        pub(super) async fn crash_then_close<S: Store>(
+            store: S,
+            reopen: impl std::future::Future<Output = Result<S>>,
+        ) -> Result<()> {
+            let root = seed(&store).await?;
+            let passed = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let arm = {
+                let passed = Arc::clone(&passed);
+                move || arm_close_markers(&passed)
+            };
+            let provider = ToolCallProvider {
+                arm: Mutex::new(Some(Box::new(arm))),
+            };
+            let crashed = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run_turn(
+                &store, &root, &provider,
+            )))
+            .await;
+            disarm_close_markers();
+            ensure!(
+                crashed.is_err(),
+                "the failpoint after the close's writes must fire"
+            );
+            let mut passed = passed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("marker log poisoned"))?
+                .clone();
+            assert_eq!(
+                passed.pop(),
+                Some("transition.before_commit"),
+                "the crash came last"
+            );
+            assert_eq!(
+                passed,
+                vec!["transition.attempt_closed", "transition.before_events"],
+                "the crashed transaction closed the attempt and appended its event",
+            );
+            drop(store);
+
+            let store = reopen.await?;
+            let rows = TurnAttemptStore::list_by_task(&store, &root.id).await?;
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(!rows[0].is_closed(), "the close rolled back");
+            assert_eq!(usage_attempts(&store).await?, Vec::<String>::new());
+            let task = AgentTaskStore::get(&store, &root.id)
+                .await?
+                .context("root")?;
+            assert_eq!(task.status, TaskStatus::Running);
+
+            let provider = ToolCallProvider {
+                arm: Mutex::new(None),
+            };
+            run_turn(&store, &root, &provider).await?;
+            let rows = TurnAttemptStore::list_by_task(&store, &root.id).await?;
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows[1].is_closed());
+            assert_eq!(rows[1].input_tokens, Some(120));
+            assert_eq!(
+                usage_attempts(&store).await?,
+                vec![rows[1].id.as_str().to_owned()],
+                "one event, naming the closed attempt",
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_usage_close_failpoint_rolls_back_the_attempt_close_with_its_event() -> Result<()>
+    {
+        let _scenario = fail::FailScenario::setup();
+        let temp = tempfile::tempdir()?;
+        let url = format!("sqlite://{}?mode=rwc", temp.path().join("u.db").display());
+        let store = SqliteDurableStore::connect(&url).await?;
+        usage_crash::crash_then_close(store, SqliteDurableStore::connect(&url)).await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_usage_close_failpoint_rolls_back_the_attempt_close_with_its_event()
+    -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let store = schema.open_store().await?;
+        usage_crash::crash_then_close(store, schema.open_store()).await
     }
 }

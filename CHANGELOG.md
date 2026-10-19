@@ -209,6 +209,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Nothing else changes: no new table, `Write` variant, protocol number or
   behaviour.
 
+### Live usage: a root turn's LLM attempt closes with its `UsageProgress` (prim-wait W4)
+
+Each LLM call of a durable root turn now ends with an
+`AgentEvent::UsageProgress`, committed in the transaction that closes the
+call's attempt row, so a host prices live usage from the journal instead of
+polling attempt rows. No migration, table, `Write`/`Guard` variant or
+protocol number; agent.service.v1 gains one message and one oneof field.
+
+- **`TurnAttemptWrite::Close { attempt, task, params }`**, a sub-variant of
+  the existing `Write::TurnAttempt`, applied on the in-memory, SQLite and
+  Postgres stores. It needs a lease guard on `task` (as `Open` does) and
+  refuses an unknown attempt, one of another task, or one already closed
+  (`TurnAttemptSchemaError::AlreadyClosed`). `Transition::close_attempt_owned`
+  builds it with the `TaskIs { Running, lease }` guard and an
+  `AppendEvents`. `TurnAttemptStore` gains a hidden
+  `close_owned_attempt` (default: refuse) for the in-memory commit.
+- **The worker's closes** of the attempts it dispatched commit one
+  transition: the row's close and its `UsageProgress`. That covers a call
+  closed at a tool boundary (fresh or resumed turn, steering repark) or
+  before a boundary injection's next call, every
+  failure and cancel close (stream error, stall, truncation, invalid
+  request, cancel during a call, a retry wait or a connectivity wait), the
+  losing duplicate suspension, and compaction calls. A completed turn
+  already closes its attempt inside its commit; the event joins that
+  commit's events, before `TurnComplete`. Rows the worker did not dispatch
+  (a dead predecessor's, swept at cancel; the synthetic cancel-commit row;
+  the host's force-drop sweep) keep the plain close and get no event.
+- **A lost lease** refuses the transition: no event, and the transition
+  closes nothing. The worker then closes its own row as before, unguarded,
+  so its billed tokens survive (recovery would close it with zero). A
+  purged thread does the same.
+- **Breaking:** `AgentEvent::UsageProgress { task_id, attempt_id,
+  attempt_number, provider, model, response_model, route_provider, usage,
+  turn_usage, context_tokens }`. `usage` is the attempt's billed usage,
+  cache creation included, failed and cancelled calls included;
+  `turn_usage` sums every closed attempt of the task, this one included
+  (retries and compaction calls count), which is what the turn's
+  `TurnComplete` usage folds in; `context_tokens` is the call's last
+  physical request's prompt size (`Usage::request_input_tokens`), `None` when
+  unreported and for compaction calls. `AgentEvent` is `#[non_exhaustive]`;
+  in-workspace exhaustive matches gain an arm. The view fold ignores it.
+  A binary that predates the variant cannot deserialize a journal that
+  holds one, so do not roll back across it on a store that has run a turn.
+- agent.service.v1: `EventEnvelope.usage_progress = 33`
+  (`UsageProgressEvent`). Older decoders skip it.
+- One more `list_by_task` read per attempt close (the worker already reads
+  it at every open), for `turn_usage`.
+- Signals: `agent_server.progress.events{kind=usage_progress}` (the W3
+  counter, a new kind) on each committed event, and
+  `agent_server.progress.refused{reason=lease_lost|purged|store}` when the
+  event is not written; the close commits through the transition metrics
+  (`agent_server.journal.transition.*`). Failpoint marker
+  `transition.attempt_closed` after a `Close` write (SQLite and Postgres).
+- **bip, at the pin bump:** `event_conversion.rs`
+  `map_runtime_event_to_legacy` matches the generated
+  `pb::event_envelope::Event` exhaustively and needs an
+  `Event::UsageProgress` arm (to `AgentEvent::UsageProgress`).
+- **bip (B-W4, after the pin bump):** build the live `TurnUsage` from
+  committed `UsageProgress` events (per root task: the latest
+  `turn_usage`, plus the committed `total_usage` of the tree's threads),
+  priced through the same authority (`assemble_session_cost_ledger`); the
+  event names the attempt's provider, requested and served model and served
+  route, so no attempt-row read remains. Then delete `turn_usage_sweep.rs`
+  (production lines 1–770), its spawn and abort in `daemon_lifecycle.rs`,
+  and the in-process `TurnUsageTick` feed. Streams and journals now carry
+  one extra event per LLM call; code that maps events with a wildcard is
+  unaffected.
+- **satoshi:** builds unchanged (it matches `AgentEvent` with wildcards and
+  builds no `RootTurnDeps` or attempt writes). Its journal gains one
+  `UsageProgress` row per LLM call, which `satoshi-api`'s event mapping
+  and the ACP mapper ignore.
+
 ### Tests: crash matrix S10, SQLite contention
 
 - `s10_sqlite_contention` runs a real `LocalDaemon` on SQLite while an

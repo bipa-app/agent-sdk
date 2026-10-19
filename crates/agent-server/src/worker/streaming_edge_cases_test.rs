@@ -218,6 +218,7 @@ fn event_kinds(events: &[crate::journal::committed_event::CommittedEvent]) -> Ve
             AgentEvent::ToolCallStart { .. } => "ToolCallStart",
             AgentEvent::ToolCallEnd { .. } => "ToolCallEnd",
             AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::UsageProgress { .. } => "UsageProgress",
             AgentEvent::Done { .. } => "Done",
             AgentEvent::AutoRetryStart { .. } => "AutoRetryStart",
             AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
@@ -276,12 +277,9 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
             block_index: 2,
         },
         StreamDelta::Usage(agent_sdk_foundation::llm::Usage {
-            served_speed: None,
             input_tokens: 30,
             output_tokens: 20,
-            cached_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            request_input_tokens: None,
+            ..Default::default()
         }),
         StreamDelta::Done {
             stop_reason: Some(StopReason::ToolUse),
@@ -328,6 +326,7 @@ async fn interleaved_text_and_tool_deltas_suspend_with_balanced_history() -> Res
             "Start",
             "TextDelta",
             "TextDelta",
+            "UsageProgress",
             "Text",
             "ToolCallStart",
             "ToolCallStart",
@@ -728,6 +727,7 @@ async fn keep_alives_hold_a_silent_stream_past_both_stall_budgets() -> Result<()
             "Start",
             "TextDelta",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ],
@@ -993,6 +993,7 @@ async fn chunked_text_with_per_delta_delay_commits_in_order() -> Result<()> {
             "TextDelta",
             "TextDelta",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ],
@@ -1032,6 +1033,7 @@ async fn streamed_thinking_then_text_commits_both_blocks() -> Result<()> {
             "TextDelta",
             "Thinking",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ],
@@ -1110,5 +1112,338 @@ async fn leading_invalid_request_error_fails_without_retry() -> Result<()> {
         "no durable turn on a fatal error"
     );
 
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Live usage — one `UsageProgress` per closed attempt
+// ─────────────────────────────────────────────────────────────────────
+
+const fn usage(
+    input: u32,
+    output: u32,
+    cached: u32,
+    created: u32,
+) -> agent_sdk_foundation::llm::Usage {
+    agent_sdk_foundation::llm::Usage {
+        served_speed: None,
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+        cache_creation_input_tokens: created,
+        request_input_tokens: Some(input),
+    }
+}
+
+const fn token_usage(
+    input: u32,
+    output: u32,
+    cached: u32,
+    created: u32,
+) -> agent_sdk_foundation::TokenUsage {
+    agent_sdk_foundation::TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+        cache_creation_input_tokens: created,
+    }
+}
+
+/// The `UsageProgress` events of a journal, as (attempt id, attempt
+/// number, usage, turn usage, context tokens).
+fn usage_events(
+    events: &[crate::journal::committed_event::CommittedEvent],
+) -> Vec<(
+    String,
+    u32,
+    agent_sdk_foundation::TokenUsage,
+    agent_sdk_foundation::TokenUsage,
+    Option<u32>,
+)> {
+    events
+        .iter()
+        .filter_map(|committed| match &committed.event {
+            AgentEvent::UsageProgress {
+                attempt_id,
+                attempt_number,
+                usage,
+                turn_usage,
+                context_tokens,
+                ..
+            } => Some((
+                attempt_id.clone(),
+                *attempt_number,
+                usage.clone(),
+                turn_usage.clone(),
+                *context_tokens,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A retried turn reports both attempts: the failed one with the tokens it
+/// streamed before dying, the second with its own, and `turn_usage` sums
+/// the task's closed attempts. Each event names its attempt row and carries
+/// the row's tokens, provider and model.
+#[tokio::test(start_paused = true)]
+async fn each_closed_attempt_reports_its_usage_a_failed_one_included() -> Result<()> {
+    let stores = Stores::new();
+    let first = TurnScript::from_deltas(vec![
+        StreamDelta::Usage(usage(40, 3, 10, 5)),
+        StreamDelta::TextDelta {
+            delta: "partial".into(),
+            block_index: 0,
+        },
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
+            served_model: None,
+        },
+    ])
+    .fail_after(2, StreamErrorKind::ServerError, "upstream 503 mid-stream");
+    let second = TurnScript::from_deltas(vec![
+        StreamDelta::TextDelta {
+            delta: "recovered".into(),
+            block_index: 0,
+        },
+        StreamDelta::Usage(usage(70, 9, 20, 0)),
+        StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: None,
+            served_model: None,
+        },
+    ]);
+    let provider = StreamingScriptedProvider::new(vec![first, second]);
+    let outcome = run_turn(&stores, &provider).await?;
+    let RootTurnOutcome::Completed {
+        completed_task: task,
+        ..
+    } = outcome
+    else {
+        panic!("expected Completed after retry");
+    };
+
+    let events = stores.events.get_events(&thread_id()).await?;
+    let reported = usage_events(&events);
+    let rows = stores.attempts.list_by_task(&task.id).await?;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(reported.len(), rows.len(), "one event per closed attempt");
+    for ((attempt_id, number, usage, _, _), row) in reported.iter().zip(&rows) {
+        assert_eq!(attempt_id, row.id.as_str());
+        assert_eq!(*number, row.attempt_number);
+        assert_eq!(
+            usage,
+            &token_usage(
+                row.input_tokens.unwrap_or(0),
+                row.output_tokens.unwrap_or(0),
+                row.cached_input_tokens.unwrap_or(0),
+                row.cache_creation_input_tokens.unwrap_or(0),
+            ),
+            "the event carries its row's tokens",
+        );
+    }
+    assert_eq!(
+        reported[0].2,
+        token_usage(40, 3, 10, 5),
+        "the failed attempt bills"
+    );
+    assert_eq!(reported[0].3, token_usage(40, 3, 10, 5));
+    assert_eq!(reported[1].2, token_usage(70, 9, 20, 0));
+    assert_eq!(
+        reported[1].3,
+        token_usage(110, 12, 30, 5),
+        "turn usage sums both"
+    );
+    assert_eq!(
+        reported[1].4,
+        Some(70),
+        "context tokens are the request's prompt"
+    );
+    let turn_complete = events.iter().find_map(|committed| match &committed.event {
+        AgentEvent::TurnComplete { usage, .. } => Some(usage.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        turn_complete,
+        Some(reported[1].3.clone()),
+        "the last event's turn usage is the turn's usage, the failed call included",
+    );
+    let Some(AgentEvent::UsageProgress {
+        task_id,
+        provider,
+        model,
+        route_provider,
+        ..
+    }) = events
+        .iter()
+        .map(|committed| &committed.event)
+        .find(|event| matches!(event, AgentEvent::UsageProgress { .. }))
+    else {
+        panic!("a UsageProgress");
+    };
+    assert_eq!(task_id, task.id.as_str());
+    assert_eq!(provider, &rows[0].provider);
+    assert_eq!(model, &rows[0].requested_model);
+    assert_eq!(route_provider, &rows[0].route_provider);
+    Ok(())
+}
+
+/// Attempts 1 and 2 of `task`, each opened in its own transition under the
+/// task's lease.
+async fn open_two_attempts(
+    stores: &Stores,
+    task: &AgentTask,
+) -> Result<(
+    crate::journal::turn_attempt::TurnAttempt,
+    crate::journal::turn_attempt::TurnAttempt,
+)> {
+    use crate::journal::turn_attempt::{OpenAttemptParams, TurnAttempt};
+    use crate::journal::{DurableStore, Guard, Transition, TurnAttemptWrite, Write};
+
+    let open = |number| {
+        TurnAttempt::open(OpenAttemptParams {
+            task_id: task.id.clone(),
+            attempt_number: number,
+            provenance: agent_sdk_foundation::AuditProvenance::new("mock", "mock-model"),
+            request_blob: serde_json::json!({}),
+            now: t0(),
+            otel_trace_id: None,
+            otel_span_id: None,
+        })
+    };
+    let (lost, live) = (open(1), open(2));
+    for attempt in [&lost, &live] {
+        stores
+            .tasks
+            .commit(
+                Transition {
+                    guards: vec![Guard::TaskIs {
+                        task: task.id.clone(),
+                        status: crate::journal::task::TaskStatus::Running,
+                        lease: Some((
+                            WorkerId::from_string("worker_edge"),
+                            LeaseId::from_string("lease_edge"),
+                        )),
+                    }],
+                    writes: vec![Write::TurnAttempt(TurnAttemptWrite::Open(Box::new(
+                        attempt.clone(),
+                    )))],
+                },
+                t0(),
+            )
+            .await?;
+    }
+    Ok((lost, live))
+}
+
+/// A server-error close that billed 12/4 tokens (2 cached, 1 written to the
+/// cache).
+fn server_error_close() -> crate::journal::turn_attempt::CloseAttemptParams {
+    use crate::journal::turn_attempt::{CloseAttemptParams, TurnAttemptOutcome};
+
+    CloseAttemptParams {
+        response_blob: serde_json::json!(null),
+        response_id: None,
+        response_model: None,
+        stop_reason: None,
+        outcome: TurnAttemptOutcome::ServerError,
+        input_tokens: 12,
+        output_tokens: 4,
+        cached_input_tokens: 2,
+        cache_creation_input_tokens: 1,
+        route_provider: Some("mock".into()),
+        thinking_mode: None,
+        thinking_budget_tokens: None,
+        thinking_effort: None,
+    }
+}
+
+/// A close under a lease the task no longer holds commits no
+/// `UsageProgress`: the worker closes its own row unguarded instead, so the
+/// billed tokens survive. Under the live lease the event commits with the
+/// close.
+#[tokio::test]
+async fn a_lost_lease_writes_no_usage_event_and_the_row_keeps_its_usage() -> Result<()> {
+    use crate::journal::turn_attempt::TurnAttemptOutcome;
+    use crate::worker::usage_progress::{AttemptOwner, close_attempt_reporting_usage};
+
+    let stores = Stores::new();
+    let task = acquire_root(&stores).await?;
+    let (lost, live) = open_two_attempts(&stores, &task).await?;
+    let close = server_error_close();
+    let owner = |lease: &str| AttemptOwner {
+        task: task.id.clone(),
+        worker: WorkerId::from_string("worker_edge"),
+        lease: LeaseId::from_string(lease),
+        thread: thread_id(),
+    };
+    let deps = stores.deps();
+
+    close_attempt_reporting_usage(
+        &deps,
+        &owner("lease_stale"),
+        &lost,
+        close.clone(),
+        None,
+        t_plus(1),
+    )
+    .await?;
+    assert_eq!(
+        usage_events(&stores.events.get_events(&thread_id()).await?),
+        Vec::new(),
+        "a lost lease writes no event",
+    );
+    let row = stores
+        .attempts
+        .get(&lost.id)
+        .await?
+        .context("the lost row")?;
+    assert_eq!(row.outcome, Some(TurnAttemptOutcome::ServerError));
+    assert_eq!((row.input_tokens, row.output_tokens), (Some(12), Some(4)));
+
+    close_attempt_reporting_usage(
+        &deps,
+        &owner("lease_edge"),
+        &live,
+        close.clone(),
+        Some(9),
+        t_plus(2),
+    )
+    .await?;
+    let reported = usage_events(&stores.events.get_events(&thread_id()).await?);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0].0, live.id.as_str());
+    assert_eq!(reported[0].2, token_usage(12, 4, 2, 1));
+    assert_eq!(
+        reported[0].3,
+        token_usage(24, 8, 4, 2),
+        "the lost row's close counts"
+    );
+    assert_eq!(reported[0].4, Some(9));
+    let row = stores
+        .attempts
+        .get(&live.id)
+        .await?
+        .context("the live row")?;
+    assert_eq!(row.outcome, Some(TurnAttemptOutcome::ServerError));
+
+    // A row recovery already closed reads `AlreadyClosed` at the error's top
+    // level, as `close_attempt` returns it, and writes no second event.
+    let again =
+        close_attempt_reporting_usage(&deps, &owner("lease_edge"), &live, close, None, t_plus(3))
+            .await;
+    let Err(error) = again else {
+        panic!("a second close must fail");
+    };
+    assert_eq!(
+        error.downcast_ref::<crate::journal::TurnAttemptSchemaError>(),
+        Some(&crate::journal::TurnAttemptSchemaError::AlreadyClosed),
+        "{error:#}",
+    );
+    assert_eq!(
+        usage_events(&stores.events.get_events(&thread_id()).await?).len(),
+        1
+    );
     Ok(())
 }

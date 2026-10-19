@@ -29,7 +29,7 @@ use super::task::{
     AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, TaskStatus, WorkerId,
 };
 use super::thread::{Thread, ThreadOperation};
-use super::turn_attempt::TurnAttempt;
+use super::turn_attempt::{CloseAttemptParams, TurnAttempt, TurnAttemptId};
 
 /// Guards and writes applied in one transaction.
 #[derive(Clone, Debug, Default)]
@@ -199,6 +199,14 @@ pub enum TurnAttemptWrite {
     /// so it knows the attempt's id before the commit (an LLM request's
     /// effect names it).
     Open(Box<TurnAttempt>),
+    /// Fill the response fields of the open attempt `attempt`, which must
+    /// belong to `task`. An attempt that is already closed, unknown, or of
+    /// another task refuses the transition.
+    Close {
+        attempt: TurnAttemptId,
+        task: AgentTaskId,
+        params: Box<CloseAttemptParams>,
+    },
 }
 
 impl TurnAttemptWrite {
@@ -207,6 +215,7 @@ impl TurnAttemptWrite {
     pub const fn task(&self) -> &AgentTaskId {
         match self {
             Self::Open(attempt) => &attempt.task_id,
+            Self::Close { task, .. } => task,
         }
     }
 }
@@ -680,6 +689,34 @@ impl Transition {
                 lease: Some((worker, lease)),
             }],
             writes: vec![Write::AppendEvents { thread, events }],
+        }
+    }
+
+    /// Close `attempt` of `task` and append `events` to `thread` while
+    /// `task` is running under `(worker, lease)`: the attempt row and the
+    /// events commit together or not at all.
+    #[must_use]
+    pub fn close_attempt_owned(
+        (task, worker, lease): (AgentTaskId, WorkerId, LeaseId),
+        attempt: TurnAttemptId,
+        params: CloseAttemptParams,
+        thread: ThreadId,
+        events: Vec<AgentEvent>,
+    ) -> Self {
+        Self {
+            guards: vec![Guard::TaskIs {
+                task: task.clone(),
+                status: TaskStatus::Running,
+                lease: Some((worker, lease)),
+            }],
+            writes: vec![
+                Write::TurnAttempt(TurnAttemptWrite::Close {
+                    attempt,
+                    task,
+                    params: Box::new(params),
+                }),
+                Write::AppendEvents { thread, events },
+            ],
         }
     }
 

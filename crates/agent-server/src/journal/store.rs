@@ -5569,7 +5569,7 @@ impl InMemoryAgentTaskStore {
                     let anchor = anchors.get(effect.key()).copied();
                     Self::apply_effect_locked(inner, effect, anchor, now);
                 }
-                Write::TurnAttempt(attempt) => Self::apply_attempt_locked(inner, attempt)?,
+                Write::TurnAttempt(attempt) => Self::apply_attempt_locked(inner, attempt, now)?,
                 write @ Write::AppendCompaction { .. } => committed
                     .compacted
                     .push(append_compaction(message_store, write, now).await?),
@@ -6178,13 +6178,22 @@ impl InMemoryAgentTaskStore {
     fn apply_attempt_locked(
         inner: &Inner,
         attempt: super::transition::TurnAttemptWrite,
+        now: OffsetDateTime,
     ) -> Result<()> {
-        let super::transition::TurnAttemptWrite::Open(attempt) = attempt;
-        inner
+        let attempts = inner
             .attempts
             .as_ref()
-            .context("checked before the first write")?
-            .put_open_attempt(*attempt)
+            .context("checked before the first write")?;
+        match attempt {
+            super::transition::TurnAttemptWrite::Open(attempt) => {
+                attempts.put_open_attempt(*attempt)
+            }
+            super::transition::TurnAttemptWrite::Close {
+                attempt,
+                task,
+                params,
+            } => attempts.close_owned_attempt(&attempt, &task, *params, now),
+        }
     }
 
     /// Refuse, before the first write, a transition with an attempt write
