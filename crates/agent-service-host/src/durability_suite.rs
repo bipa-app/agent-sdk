@@ -1991,6 +1991,125 @@ mod tests {
         }
     }
 
+    mod tool_round;
+
+    /// Review of #534, B2: a root cancelled mid tool batch without its cancel
+    /// commit leaves no unpaired `tool_use` in the next root's request.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_the_next_turn_closes_a_cancelled_roots_call() -> Result<()> {
+        let store = SqliteDurableStore::connect("sqlite::memory:").await?;
+        tool_round::the_next_turn_closes_a_cancelled_roots_call(&store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn postgres_the_next_turn_closes_a_cancelled_roots_call() -> Result<()> {
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let store = schema.open_store().await?;
+        tool_round::the_next_turn_closes_a_cancelled_roots_call(&store).await
+    }
+
+    /// P2-3b2: a crash inside a tool round's spawn transaction, after its
+    /// LLM request's finish is written, rolls the finish back with the
+    /// spawn; the retry parks the root with its request `Completed`.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_crash_in_the_spawn_rolls_back_the_request_finish() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in tool_round::AFTER_SPAWN_FINISH {
+            let temp = tempfile::tempdir()?;
+            let url = format!("sqlite://{}?mode=rwc", temp.path().join("t.db").display());
+            let store = SqliteDurableStore::connect(&url).await?;
+            tool_round::crash_in_the_spawn_then_retry(
+                failpoint,
+                store,
+                SqliteDurableStore::connect(&url),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_a_crash_in_the_spawn_rolls_back_the_request_finish() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in tool_round::AFTER_SPAWN_FINISH {
+            let Some(schema) = PgSchema::create().await? else {
+                return Ok(());
+            };
+            let store = schema.open_store().await?;
+            tool_round::crash_in_the_spawn_then_retry(failpoint, store, schema.open_store())
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The same for a resumed turn that re-parks on its next tool call.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_crash_in_the_resumed_spawn_rolls_back_the_request_finish() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in tool_round::AFTER_SPAWN_FINISH {
+            let temp = tempfile::tempdir()?;
+            let url = format!("sqlite://{}?mode=rwc", temp.path().join("r.db").display());
+            let store = SqliteDurableStore::connect(&url).await?;
+            tool_round::crash_in_the_resumed_spawn_then_retry(
+                failpoint,
+                store,
+                SqliteDurableStore::connect(&url),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_a_crash_in_the_resumed_spawn_rolls_back_the_request_finish() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        for failpoint in tool_round::AFTER_SPAWN_FINISH {
+            let Some(schema) = PgSchema::create().await? else {
+                return Ok(());
+            };
+            let store = schema.open_store().await?;
+            Box::pin(tool_round::crash_in_the_resumed_spawn_then_retry(
+                failpoint,
+                store,
+                schema.open_store(),
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The closure of a cancelled root's call commits with the next turn and
+    /// a crash in that turn's transaction never doubles it.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_crash_in_the_closing_turn_keeps_one_closure() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let temp = tempfile::tempdir()?;
+        let url = format!("sqlite://{}?mode=rwc", temp.path().join("c.db").display());
+        let store = SqliteDurableStore::connect(&url).await?;
+        tool_round::crash_in_the_closing_turn_then_retry(store, SqliteDurableStore::connect(&url))
+            .await
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test]
+    async fn postgres_a_crash_in_the_closing_turn_keeps_one_closure() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some(schema) = PgSchema::create().await? else {
+            return Ok(());
+        };
+        let store = schema.open_store().await?;
+        tool_round::crash_in_the_closing_turn_then_retry(store, schema.open_store()).await
+    }
+
     #[cfg(all(feature = "sqlite", feature = "failpoints"))]
     #[tokio::test]
     async fn sqlite_salvage_failpoints_never_lose_or_double_the_cut_off_text() -> Result<()> {

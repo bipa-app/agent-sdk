@@ -1552,6 +1552,96 @@ mod tests {
         Ok(())
     }
 
+    /// A spawn through [`agent_server::journal::Preceded`] carries a root's
+    /// consumed LLM request finish (P2-3b2): the finish and the spawn
+    /// commit together, or neither does. A stale lease and a finish of an
+    /// absent request each refuse the whole transition before its first
+    /// write, so no child exists, the parent stays `Running` and the request
+    /// `Started`; a good one parks the parent on its child with the request
+    /// `Completed`.
+    async fn test_spawn_carries_a_request_finish(task_store: &dyn AgentTaskStore) -> Result<()> {
+        use agent_server::journal::Preceded;
+        use agent_server::journal::turn_attempt::TurnAttempt;
+
+        let name = "conformance-spawn-finish";
+        let tid = thread_id(name);
+        let root = AgentTask::new_root_turn(tid.clone(), t_plus(50), 3);
+        let _ = task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        let _ = task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(80),
+                t_plus(51),
+            )
+            .await?;
+        let attempt = TurnAttempt::open(sample_open_attempt(&root.id, t_plus(52)));
+        let begin = llm_request_begin(&root.id, &tid, (worker.clone(), lease.clone()), &attempt);
+        task_store.commit(begin, t_plus(52)).await?;
+        let key = EffectKey::llm(&root.id, attempt.id.as_str());
+        let finish = |key: &EffectKey| {
+            vec![Write::Effect(EffectWrite::Finish {
+                key: key.clone(),
+                owner: root.id.clone(),
+                state: EffectState::Completed,
+            })]
+        };
+        let spawn = |prelude: Vec<Write>, lease: LeaseId| {
+            let (root, worker) = (&root, &worker);
+            async move {
+                Preceded::new(task_store, prelude)
+                    .spawn_tool_children(
+                        &root.id,
+                        worker,
+                        &lease,
+                        vec![ChildSpawnSpec::new(3)],
+                        suspension_payload(name),
+                        None,
+                        Vec::new(),
+                        t_plus(53),
+                    )
+                    .await
+            }
+        };
+        let neither = |why: &'static str| {
+            let (root, key) = (&root, &key);
+            async move {
+                let stored = task_store.get(&root.id).await?.context("root")?;
+                anyhow::ensure!(
+                    stored.status == TaskStatus::Running,
+                    "{why}: {:?}",
+                    stored.status
+                );
+                let children = task_store.list_children(&root.id).await?;
+                anyhow::ensure!(children.is_empty(), "{why}: children {children:?}");
+                let request = task_store.effect(key).await?.context("request")?;
+                anyhow::ensure!(request.state.is_started(), "{why}: {:?}", request.state);
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+
+        anyhow::ensure!(
+            spawn(finish(&key), LeaseId::new()).await.is_err(),
+            "a stale lease must refuse the spawn and its finish"
+        );
+        neither("stale lease").await?;
+        let absent = EffectKey::llm(&root.id, "no-such-attempt");
+        anyhow::ensure!(
+            spawn(finish(&absent), lease.clone()).await.is_err(),
+            "a finish of an absent request must refuse the spawn"
+        );
+        neither("absent request").await?;
+
+        let (parent, children) = spawn(finish(&key), lease).await?;
+        assert_eq!(parent.status, TaskStatus::WaitingOnChildren);
+        assert_eq!(children.len(), 1);
+        let request = task_store.effect(&key).await?.context("request")?;
+        assert_eq!(request.state, EffectState::Completed);
+        Ok(())
+    }
+
     /// An abandoned LLM request (its owner ended mid-stream) is still
     /// salvaged by the next turn on its thread, once: `Abandoned` finishes
     /// as `Salvaged` and as nothing else, and `Salvaged` is final.
@@ -8571,6 +8661,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_spawn_carries_a_request_finish() -> Result<()> {
+        let s = fresh_in_memory_stores();
+        test_spawn_carries_a_request_finish(s.task.as_ref()).await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_an_abandoned_request_is_salvaged_once() -> Result<()> {
         let s = fresh_in_memory_stores();
         test_an_abandoned_request_is_salvaged_once(s.task.as_ref()).await
@@ -9795,6 +9891,13 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn conformance_sqlite_spawn_carries_a_request_finish() -> Result<()> {
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        test_spawn_carries_a_request_finish(&store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn conformance_sqlite_an_abandoned_request_is_salvaged_once() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_an_abandoned_request_is_salvaged_once(&store).await
@@ -10667,6 +10770,15 @@ mod tests {
             return Ok(());
         };
         test_llm_request_effect_lifecycle(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_spawn_carries_a_request_finish() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        test_spawn_carries_a_request_finish(&store).await
     }
 
     #[cfg(feature = "postgres")]
