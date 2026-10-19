@@ -96,6 +96,9 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EFFORT_BETA: &str = "effort-2025-11-24";
 const CLAUDE_CODE_SESSION_ID_HEADER: &str = "X-Claude-Code-Session-Id";
+/// Claude Code (and pi and omp, which reach a subscription the same way)
+/// sends this on every OAuth request.
+const DIRECT_BROWSER_ACCESS_HEADER: &str = "anthropic-dangerous-direct-browser-access";
 /// Beta header required alongside `speed: "fast"`. Fast mode is a research
 /// preview, so the API rejects the field without it.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
@@ -407,6 +410,7 @@ impl AnthropicProvider {
                     .header("anthropic-beta", self.oauth_betas(effort_on_wire).join(","))
                     .header("user-agent", claude_code_user_agent())
                     .header("x-app", "cli")
+                    .header(DIRECT_BROWSER_ACCESS_HEADER, "true")
                     .header(CLAUDE_CODE_SESSION_ID_HEADER, session_id),
             }
         };
@@ -2208,6 +2212,10 @@ mod tests {
         );
         assert_eq!(header_str(&headers, "x-app"), Some("cli"));
         assert_eq!(
+            header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
+            Some("true")
+        );
+        assert_eq!(
             header_str(&headers, "authorization"),
             Some(format!("Bearer {OAUTH_TEST_TOKEN}").as_str())
         );
@@ -2236,6 +2244,10 @@ mod tests {
             Some(format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").as_str())
         );
         assert_eq!(header_str(&headers, "x-app"), Some("cli"));
+        assert_eq!(
+            header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
+            Some("true")
+        );
         assert!(
             header_str(&headers, "anthropic-beta").is_some_and(|betas| betas.contains(OAUTH_BETA)),
             "the OAuth betas: {headers:?}"
@@ -2325,6 +2337,7 @@ mod tests {
             "x-app",
             "anthropic-beta",
             CLAUDE_CODE_SESSION_ID_HEADER,
+            DIRECT_BROWSER_ACCESS_HEADER,
         ] {
             assert!(
                 headers.get(name).is_none(),
