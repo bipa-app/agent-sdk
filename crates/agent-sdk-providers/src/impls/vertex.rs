@@ -745,6 +745,7 @@ impl VertexProvider {
         let max_tokens = self.effective_max_tokens(&request);
         let api_request = anthropic_data::ApiMessagesRequest {
             model: None, // model is in the URL for Vertex
+            metadata: None,
             max_tokens,
             system,
             messages: &messages,
@@ -870,6 +871,7 @@ impl VertexProvider {
                     let max_tokens = self.effective_max_tokens(&request);
                     let api_request = anthropic_data::ApiMessagesRequest {
                         model: None, // model is in the URL for Vertex
+                        metadata: None,
                         max_tokens,
                         system,
                         messages: &messages,
