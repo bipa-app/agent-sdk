@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Providers: Anthropic requests shaped as Claude Code
+
+- `AnthropicProvider`'s OAuth path and `claude_code_gateway` send
+  `anthropic-dangerous-direct-browser-access: true`, as Claude Code, pi and
+  omp do. API-key requests are unchanged.
+- `AnthropicProvider::claude_code_gateway(bearer, model)` (#545) shapes a
+  gateway bearer's requests as Claude Code, which is how an OAuth token's
+  are shaped:
+  - `Authorization: Bearer` and no `x-api-key`;
+  - the Claude Code betas;
+  - the `claude-cli` user agent, `x-app` and `X-Claude-Code-Session-Id`;
+  - the identity block first in `system`;
+  - Claude Code's tool names.
+
+  It does no OAuth refresh: the gateway owns upstream auth.
+
 ### Host: store options through `LocalDaemonBuilder`, and root-turn metrics
 
 - `LocalDaemonBuilder::store_options(StoreOptions)`: `start` builds the
