@@ -15976,3 +15976,146 @@ async fn a_tool_turn_finishes_both_of_its_llm_requests() -> Result<()> {
     assert!(!sent.iter().any(is_aborted_response_note), "{sent:?}");
     Ok(())
 }
+
+/// A request that fails with a server error and is retried finishes
+/// `Failed`, and the retry finishes `Completed`: neither stays started to
+/// be abandoned when the root ends (P2-3b2).
+#[tokio::test]
+async fn a_retried_request_finishes_failed_and_its_retry_completed() -> Result<()> {
+    use crate::journal::DurableStore;
+    use crate::journal::effect::{EffectKind, EffectState};
+
+    let stores = TestStores::new();
+    let provider = FlakyProvider::new(1, "Hello after retry!");
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    execute_root_turn(inputs, "ping", &provider, &stores.deps(), t_plus(1)).await?;
+
+    let mut states: Vec<EffectState> = stores
+        .tasks
+        .effects_for_task(&task_id)
+        .await?
+        .into_iter()
+        .filter(|record| record.kind() == EffectKind::LlmRequest)
+        .map(|record| record.state)
+        .collect();
+    states.sort_by_key(EffectState::outcome_label);
+    assert_eq!(
+        states,
+        vec![
+            EffectState::Completed,
+            EffectState::Failed {
+                error: "server_error".into()
+            },
+        ]
+    );
+    Ok(())
+}
+
+/// A user's stop mid-stream closes the attempt `Cancelled`, and that close
+/// leaves the request `Started`: it is a cut-off response for salvage, not
+/// a failure. The root's cancel then abandons it, and the next turn
+/// salvages its partial text under the stop note (#534).
+#[tokio::test]
+async fn a_stopped_request_stays_started_and_is_salvaged_by_the_next_turn() -> Result<()> {
+    use crate::journal::DurableStore;
+    use crate::journal::effect::{CANCELLED_RESPONSE_NOTE, EffectKind, EffectState};
+
+    let stores = TestStores::new();
+    let task = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let task_id = task.id.clone();
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(task),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let cancel = CancellationToken::new();
+    let provider = MidStreamCancelProvider {
+        cancel: cancel.clone(),
+        cancel_tree: None,
+    };
+    let mut deps = stores.deps();
+    deps.cancel = Some(&cancel);
+    let stopped = execute_root_turn(inputs, "the question", &provider, &deps, t_plus(5)).await;
+    assert!(stopped.is_err(), "a stopped turn returns an error");
+
+    let request_state = |stores: &TestStores| {
+        let tasks = stores.tasks.clone();
+        let task_id = task_id.clone();
+        async move {
+            let requests: Vec<_> = tasks
+                .effects_for_task(&task_id)
+                .await?
+                .into_iter()
+                .filter(|record| record.kind() == EffectKind::LlmRequest)
+                .collect();
+            let [request] = requests.as_slice() else {
+                anyhow::bail!("expected one request: {requests:?}");
+            };
+            Ok::<_, anyhow::Error>(request.state.clone())
+        }
+    };
+    let attempts = stores.attempts.list_by_task(&task_id).await?;
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|a| a.outcome.clone())
+            .collect::<Vec<_>>(),
+        vec![Some(TurnAttemptOutcome::Cancelled)]
+    );
+    assert_eq!(
+        request_state(&stores).await?,
+        EffectState::Started,
+        "the worker's Cancelled close leaves the request for salvage"
+    );
+
+    stores.tasks.cancel_tree(&task_id, t_plus(6)).await?;
+    assert_eq!(request_state(&stores).await?, EffectState::Abandoned);
+
+    let next = create_and_acquire_task(&stores.tasks, &thread_a()).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(next),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let capturing = CapturingProvider::new();
+    execute_root_turn(
+        inputs,
+        "next question",
+        &capturing,
+        &stores.deps(),
+        t_plus(10),
+    )
+    .await?;
+    let sent = capturing.captured()?;
+    let texts: Vec<String> = sent.iter().map(text_of).collect();
+    assert!(
+        texts.iter().any(|text| text.starts_with("partial")),
+        "the partial text is salvaged: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.starts_with(CANCELLED_RESPONSE_NOTE)),
+        "under the stop note: {texts:?}"
+    );
+    assert!(matches!(
+        request_state(&stores).await?,
+        EffectState::Salvaged { .. }
+    ));
+    Ok(())
+}

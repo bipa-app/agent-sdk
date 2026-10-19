@@ -642,6 +642,16 @@ long as it needs. No migration, table, `Write` variant or protocol change.
     and the re-run's two requests are `Completed`. With
     `AGENT_SDK_CRASH_MATRIX_OBS`, recovery counts 2 finished and 1
     abandoned.
+- **Fix: a failed LLM request finishes `Failed` (P2-3b2).** A request
+  whose attempt closes with a server error, a rate limit or an invalid
+  request is now finished `Failed { error: <outcome> }` right after the
+  close, and counted with its duration. That covers a request retried in
+  the same turn, and one whose failure fails the root. Before, it stayed
+  `Started` and was abandoned when the root ended. A `Cancelled` close
+  still leaves the request `Started`, so salvage can take the cut-off
+  response. For P2-3c2 ("salvage a Failed root turn"): a root that
+  fails on such an error now leaves its last request `Failed { error }`,
+  not `Started` or `Abandoned`, so that salvage must select it.
 
 - **A cut-off LLM response is salvaged (P2-3c).** A response cut off by a
   crash or a cancel used to be lost to the model: its text was streamed and

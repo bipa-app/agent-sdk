@@ -4728,6 +4728,13 @@ async fn call_llm_once(
                 OffsetDateTime::now_utc(),
             )
             .await;
+            finish_failed_request(
+                attempt,
+                &TurnAttemptOutcome::InvalidRequest,
+                deps,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
             return Err(StreamAttemptError::Fatal {
                 message: format!("Failed to hydrate provider request artifacts: {error:#}"),
                 kind: StreamErrorKind::InvalidRequest,
@@ -5046,6 +5053,7 @@ async fn close_truncated_stream(
         now,
     )
     .await;
+    finish_failed_request(attempt, &TurnAttemptOutcome::ServerError, deps, now).await;
     StreamAttemptError::Recoverable {
         kind: StreamErrorKind::ServerError,
         message: "LLM stream ended without a completion marker (stop_reason); \
@@ -5535,6 +5543,47 @@ async fn close_attempt_with(
     let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
 }
 
+/// Finish `attempt`'s LLM request `Failed` after its attempt closed with a
+/// failure `outcome` (a server or rate-limit error the turn may retry, an
+/// invalid request), so it does not stay `Started` to be abandoned when the
+/// root ends. A `Cancelled` close leaves it `Started`: a cut-off response is
+/// salvaged (see `super::salvage`). Best-effort, like the close.
+async fn finish_failed_request(
+    attempt: &TurnAttempt,
+    outcome: &TurnAttemptOutcome,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    if matches!(outcome, TurnAttemptOutcome::Cancelled) {
+        return;
+    }
+    let task = &attempt.task_id;
+    let state = EffectState::Failed {
+        error: outcome.as_str().to_owned(),
+    };
+    let label = state.outcome_label();
+    let transition = Transition {
+        guards: Vec::new(),
+        writes: vec![Write::Effect(EffectWrite::Finish {
+            key: EffectKey::llm(task, attempt.id.as_str()),
+            owner: task.clone(),
+            state,
+        })],
+    };
+    match deps.task_store.commit(transition, now).await {
+        Ok(_) => crate::journal::effect::record_effect_finished(
+            EffectKind::LlmRequest,
+            label,
+            (now - attempt.opened_at).as_seconds_f64().max(0.0),
+        ),
+        Err(error) => log::warn!(
+            task_id = task.as_str(),
+            turn_attempt_id = attempt.id.as_str();
+            "finish the LLM request of a failed attempt: {error:#}"
+        ),
+    }
+}
+
 /// Flush any buffered deltas, then close the turn attempt with `outcome`.
 ///
 /// Used on every early-return path so a failed / cancelled attempt still
@@ -5549,13 +5598,14 @@ async fn flush_and_close(params: CloseStreamAttemptParams<'_, '_>) {
     flush_streaming_deltas(ctx.deps, ctx.thread_id, ctx.pending_deltas).await;
     close_attempt_with(
         ctx.attempt,
-        outcome,
+        outcome.clone(),
         usage,
         Some(ctx.evidence),
         ctx.deps.attempt_store,
         now,
     )
     .await;
+    finish_failed_request(ctx.attempt, &outcome, ctx.deps, now).await;
 }
 
 /// Coalesce: flush buffered deltas once the count or time bound trips, so
