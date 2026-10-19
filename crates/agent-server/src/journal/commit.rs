@@ -194,6 +194,8 @@ impl CompletedTurnCommit {
                 Write::SettleTask { .. }
                 | Write::RejectConfirmation { .. }
                 | Write::PauseOnConfirmation { .. }
+                | Write::ParkInvocation { .. }
+                | Write::WakeInvocation { .. }
                 | Write::ReparkAfterSteering { .. }
                 | Write::Effect(_)
                 | Write::AppendCompaction { .. }

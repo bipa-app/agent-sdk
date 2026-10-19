@@ -45,6 +45,8 @@ const fn commit_may_add(write: &Write) -> bool {
         Write::SettleTask { .. }
         | Write::RejectConfirmation { .. }
         | Write::PauseOnConfirmation { .. }
+        | Write::ParkInvocation { .. }
+        | Write::WakeInvocation { .. }
         | Write::ReparkAfterSteering { .. }
         | Write::Effect(_)
         | Write::AppendCompaction { .. }
@@ -127,6 +129,8 @@ impl CompletedTurnCommit {
             Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ParkInvocation { .. }
+            | Write::WakeInvocation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::AppendCompaction { .. }

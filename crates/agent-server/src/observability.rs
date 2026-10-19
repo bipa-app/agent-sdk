@@ -148,6 +148,10 @@ pub mod attrs {
     pub const SPAN_TASK_MAX_ATTEMPTS: &str = "agent_server.task.max_attempts";
     /// A subagent invocation's acquisition count: `1`, `2`, `3` or `4+`.
     pub const ATTEMPT: &str = "attempt";
+    /// What a prompt step did to a subagent invocation: `parked` / `woken`.
+    pub const STEP: &str = "step";
+    pub const STEP_PARKED: &str = "parked";
+    pub const STEP_WOKEN: &str = "woken";
     /// The tool a stalled call ran (span-only: tool names are unbounded).
     pub const SPAN_TOOL_NAME: &str = "agent_server.tool.name";
     /// A tool call's store-side phase, on `agent_server.tool.phase` spans:
@@ -407,6 +411,9 @@ pub struct ServerMetrics {
     /// `agent_server.subagent.completion_hook.refused`: hook outputs the
     /// SDK refused, by `reason`.
     pub(crate) completion_hook_refused: Counter<u64>,
+    /// `agent_server.subagent.invocation.prompts`: subagent invocations
+    /// parked on a host prompt and woken from one, by backend and step.
+    pub(crate) invocation_prompts: Counter<u64>,
     /// `agent_server.subagent.stalls`: subagent child roots failed for
     /// silence, by leg.
     pub(crate) subagent_stalls: Counter<u64>,
@@ -642,6 +649,20 @@ impl ServerMetrics {
                 &[
                     KeyValue::new(attrs::BACKEND, backend),
                     KeyValue::new(attrs::OUTCOME, outcome),
+                ],
+            );
+        }
+        for invocation in &committed.invocations {
+            let step = if invocation.status == crate::journal::TaskStatus::WaitingOnChildren {
+                attrs::STEP_PARKED
+            } else {
+                attrs::STEP_WOKEN
+            };
+            self.invocation_prompts.add(
+                1,
+                &[
+                    KeyValue::new(attrs::BACKEND, backend),
+                    KeyValue::new(attrs::STEP, step),
                 ],
             );
         }
@@ -1079,8 +1100,7 @@ impl ServerMetrics {
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
-        let (invocation_attempts, invocation_failed_closed, completion_hook_refused) =
-            invocation_instruments(&meter);
+        let invocation = invocation_instruments(&meter);
         let (tool_stalls, tool_stall_unbounded, subagent_stalls) =
             Self::build_stall_instruments(&meter);
         let tool_phase_duration = meter
@@ -1118,8 +1138,8 @@ impl ServerMetrics {
             effects,
             effect_duration,
             completed_turn_commits,
-            invocation_attempts,
-            invocation_failed_closed,
+            invocation_attempts: invocation.attempts,
+            invocation_failed_closed: invocation.failed_closed,
             view_fold_duration,
             view_folded_events,
             view_stream,
@@ -1130,7 +1150,8 @@ impl ServerMetrics {
             fence_refused,
             progress_events,
             progress_refused,
-            completion_hook_refused,
+            completion_hook_refused: invocation.completion_hook_refused,
+            invocation_prompts: invocation.prompts,
             subagent_stalls,
             leader: leader_counter(&meter),
             is_leader: is_leader_gauge(&meter),
@@ -1265,9 +1286,7 @@ fn fence_refused_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u64> 
 /// The subagent invocation instruments: runs by attempt, invocations the
 /// lease sweep failed closed at their budget, and completion hook outputs
 /// the SDK refused.
-fn invocation_instruments(
-    meter: &opentelemetry::metrics::Meter,
-) -> (Counter<u64>, Counter<u64>, Counter<u64>) {
+fn invocation_instruments(meter: &opentelemetry::metrics::Meter) -> InvocationInstruments {
     let attempts = meter
         .u64_counter("agent_server.subagent.invocation.attempts")
         .with_description(
@@ -1288,7 +1307,27 @@ fn invocation_instruments(
              extra_write, park or state. The invocation then fails closed.",
         )
         .build();
-    (attempts, failed_closed, completion_hook_refused)
+    let prompts = meter
+        .u64_counter("agent_server.subagent.invocation.prompts")
+        .with_description(
+            "Subagent invocations parked on a host prompt (step=parked) and woken from one \
+             (step=woken), by backend.",
+        )
+        .build();
+    InvocationInstruments {
+        attempts,
+        failed_closed,
+        completion_hook_refused,
+        prompts,
+    }
+}
+
+/// The counters [`invocation_instruments`] builds.
+struct InvocationInstruments {
+    attempts: Counter<u64>,
+    failed_closed: Counter<u64>,
+    completion_hook_refused: Counter<u64>,
+    prompts: Counter<u64>,
 }
 
 /// The crash-safety instruments: effect transitions, effect run time and

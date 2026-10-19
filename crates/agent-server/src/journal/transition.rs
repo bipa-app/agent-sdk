@@ -70,6 +70,23 @@ pub enum Write {
         continuation: Box<ContinuationEnvelope>,
         prepared_operation: Option<ListenExecutionContext>,
     },
+    /// Park a running subagent invocation on the host prompt `prompt`
+    /// (primitive 10): it drops its lease and waits as `waiting_on_children`
+    /// with the prompt as its one pending child. Its effect records stay
+    /// `Started`. Needs a [`Guard::TaskIs`] that it is running under its
+    /// lease.
+    ParkInvocation {
+        invocation: AgentTaskId,
+        prompt: String,
+    },
+    /// Wake a subagent invocation parked on `prompt`: it becomes `Pending`
+    /// and its next acquisition is free. Refused with [`Rejected::Guard`]
+    /// unless the invocation still waits on `prompt`. Needs a
+    /// [`Guard::TaskIs`] that it is waiting on children.
+    WakeInvocation {
+        invocation: AgentTaskId,
+        prompt: String,
+    },
     /// Re-park a steering exchange's parent on `reattach`, its still-live
     /// children, under `(worker, lease)`. Unlike the other task writes it
     /// takes no guard, and a guard on its task is refused: the backend
@@ -491,6 +508,9 @@ pub struct Committed {
     pub paused: Vec<AgentTask>,
     /// For each [`Write::ReparkAfterSteering`]: the re-parked parent.
     pub reparked: Vec<AgentTask>,
+    /// For each [`Write::ParkInvocation`] and [`Write::WakeInvocation`]: the
+    /// invocation after the write.
+    pub invocations: Vec<AgentTask>,
     /// For each [`Write::AppendCompaction`]: the compacted projection.
     pub compacted: Vec<MessageProjection>,
     /// For each [`Write::SpawnChildren`]: the rows it wrote.
@@ -824,6 +844,8 @@ impl Transition {
             | Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ParkInvocation { .. }
+            | Write::WakeInvocation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::AppendCompaction { .. }
@@ -843,6 +865,8 @@ impl Transition {
             | Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ParkInvocation { .. }
+            | Write::WakeInvocation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::AppendCompaction { .. }
@@ -879,6 +903,8 @@ impl Transition {
             | Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ParkInvocation { .. }
+            | Write::WakeInvocation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::Effect(_)
             | Write::SpawnChildren { .. }
@@ -920,6 +946,8 @@ impl Transition {
                 }
                 Write::Effect(_)
                 | Write::PauseOnConfirmation { .. }
+                | Write::ParkInvocation { .. }
+                | Write::WakeInvocation { .. }
                 | Write::ReparkAfterSteering { .. }
                 | Write::AppendCompaction { .. }
                 | Write::AppendEvents { .. }
@@ -931,6 +959,60 @@ impl Transition {
             }
         }
         Ok(())
+    }
+
+    /// Check that every [`Write::WakeInvocation`] names the prompt its
+    /// invocation still waits on, against the rows `stored` returns. The
+    /// in-memory store runs this before its first write; the SQL backends
+    /// make the same check when they apply the wake, inside the
+    /// transaction.
+    ///
+    /// # Errors
+    /// [`Rejected::Guard`] indexed by the guard count plus the wake's index.
+    pub fn check_invocation_prompts<'a>(
+        &self,
+        stored: impl Fn(&AgentTaskId) -> Option<&'a AgentTask>,
+    ) -> Result<(), Rejected> {
+        for (index, write) in self.writes.iter().enumerate() {
+            let Write::WakeInvocation { invocation, prompt } = write else {
+                continue;
+            };
+            let awaited = stored(invocation).and_then(|task| task.state.awaited_prompt());
+            if awaited != Some(prompt.as_str()) {
+                return Err(Rejected::Guard {
+                    index: self.guards.len() + index,
+                    reason: format!(
+                        "invocation {invocation} does not wait on prompt {prompt} ({awaited:?})"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// A park needs a leased guard that the invocation is running; a wake a
+    /// guard that it is waiting on children.
+    fn validate_invocation_step(&self, write: &Write) -> Result<(), Rejected> {
+        match write {
+            Write::ParkInvocation { invocation, .. }
+                if self.lease_for(invocation).is_none()
+                    || !self.guards_status(invocation, TaskStatus::Running) =>
+            {
+                Err(Rejected::Store(anyhow::anyhow!(
+                    "parking invocation {invocation} needs a TaskIs guard that it is running \
+                     under its lease"
+                )))
+            }
+            Write::WakeInvocation { invocation, .. }
+                if !self.guards_status(invocation, TaskStatus::WaitingOnChildren) =>
+            {
+                Err(Rejected::Store(anyhow::anyhow!(
+                    "waking invocation {invocation} needs a TaskIs guard that it is waiting on \
+                     children"
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Check the shape every backend relies on before it opens a
@@ -962,6 +1044,9 @@ impl Transition {
                              under its lease"
                         )));
                     }
+                }
+                Write::ParkInvocation { .. } | Write::WakeInvocation { .. } => {
+                    self.validate_invocation_step(write)?;
                 }
                 Write::RejectConfirmation { task, .. } => {
                     if !self.guards_status(task, TaskStatus::AwaitingConfirmation) {
@@ -1118,6 +1203,8 @@ impl Write {
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }
             | Self::PauseOnConfirmation { .. }
+            | Self::ParkInvocation { .. }
+            | Self::WakeInvocation { .. }
             | Self::BeginEpoch(_) => Vec::new(),
         }
     }

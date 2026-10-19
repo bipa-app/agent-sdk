@@ -147,7 +147,7 @@ pub use activity::{ActivityBeacon, ActivityTrackingEventRepo};
 pub use bootstrap::{WorkerBootstrapContext, resolve_bootstrap_context};
 pub use completion_hook::{
     CompletionContext, CompletionHookError, CompletionOutput, CompletionPlan,
-    InstalledCompletionHook, PromptRequest, RunMode, SubagentCompletionHook,
+    InstalledCompletionHook, RunMode, SubagentCompletionHook,
 };
 pub use connectivity::{ConnectivityWait, ConnectivityWaitGuard, ConnectivityWaitRegistry};
 pub use definition::{

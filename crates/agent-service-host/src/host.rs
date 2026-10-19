@@ -9561,6 +9561,7 @@ mod tests {
                 spec,
                 child_thread_id: nested_thread.clone(),
                 child_root_task_id: nested_root.id.clone(),
+                awaiting_prompt: None,
             },
             0,
             spawned_at,
@@ -11573,6 +11574,8 @@ mod tests {
                     } => self.observe_failure(now)?,
                     Write::RejectConfirmation { .. }
                     | Write::PauseOnConfirmation { .. }
+                    | Write::ParkInvocation { .. }
+                    | Write::WakeInvocation { .. }
                     | Write::ReparkAfterSteering { .. }
                     | Write::Effect(_)
                     | Write::BeginEpoch(_)

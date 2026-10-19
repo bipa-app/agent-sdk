@@ -753,6 +753,8 @@ impl Transition {
             Write::SettleTask { .. }
             | Write::RejectConfirmation { .. }
             | Write::PauseOnConfirmation { .. }
+            | Write::ParkInvocation { .. }
+            | Write::WakeInvocation { .. }
             | Write::ReparkAfterSteering { .. }
             | Write::AppendCompaction { .. }
             | Write::AppendEvents { .. }

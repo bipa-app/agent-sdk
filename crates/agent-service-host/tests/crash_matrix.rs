@@ -116,10 +116,12 @@ enum Scenario {
     /// S10 (SQLite): concurrent writers while an outside connection holds
     /// the write lock past `busy_timeout`.
     Contention,
+    ParkCrash,
+    WakeCrash,
 }
 
 impl Scenario {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 19] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
@@ -132,6 +134,8 @@ impl Scenario {
         Self::HungTool,
         Self::HungSubagent,
         Self::Overlap,
+        Self::ParkCrash,
+        Self::WakeCrash,
         Self::OverlapLeader,
         Self::LockLossLeader,
         Self::MergeBack,
@@ -152,6 +156,8 @@ impl Scenario {
             Self::CancelTree => "s5_cancel_tree",
             Self::HungTool => "s7_hung_tool",
             Self::HungSubagent => "s7_hung_subagent",
+            Self::ParkCrash => "s9_park_crash",
+            Self::WakeCrash => "s9_wake_crash",
             Self::Overlap => "s8_overlap",
             Self::OverlapLeader => "s8_overlap_leader",
             Self::LockLossLeader => "s8_lock_loss_leader",
@@ -185,7 +191,9 @@ impl Scenario {
                     .collect(),
             ),
             Self::HungTool => tool_use(HANG_TOOL, json!({})),
-            Self::HungSubagent | Self::MergeBack => tool_use(SUBAGENT_TOOL, json!({})),
+            Self::HungSubagent | Self::MergeBack | Self::ParkCrash | Self::WakeCrash => {
+                tool_use(SUBAGENT_TOOL, json!({}))
+            }
             Self::Overlap | Self::OverlapLeader | Self::LockLossLeader => tool_uses(vec![
                 ("cm-call-1".to_owned(), UNSAFE_TOOL),
                 ("cm-call-2".to_owned(), SAFE_TOOL),
@@ -470,8 +478,71 @@ impl LlmProvider for MatrixProvider {
 /// record committed) and waits to be killed; the recovering process records
 /// the attempt, mode and prior record it ran with, and finishes the step.
 struct MatrixHook {
+    scenario: Scenario,
     phase: Phase,
     dir: Arc<CaseDir>,
+}
+
+/// The host prompt the S9 park cases park on.
+const PARK_PROMPT: &str = "cm-merge-1";
+
+/// A merge decision prompt on `thread`, owned by the host.
+fn park_prompt(thread: &ThreadId) -> agent_server::journal::prompt::NewPrompt {
+    use agent_server::journal::prompt::{NewPrompt, PromptCloseFrame, PromptFrame, PromptOwner};
+    NewPrompt {
+        id: PARK_PROMPT.to_owned(),
+        surface_thread: thread.clone(),
+        owner: PromptOwner::Host {
+            name: "cm.merge_gate".into(),
+        },
+        owner_task: None,
+        frame: PromptFrame {
+            name: "apply_worker_merge".into(),
+            display_name: "Merge worker".into(),
+            input: json!({"unit": "unit_1"}),
+            description: "Merge unit_1?".into(),
+        },
+        close: PromptCloseFrame {
+            name: "apply_worker_merge".into(),
+            display_name: "Merge worker".into(),
+            input: json!({"unit": "unit_1"}),
+        },
+        must_reach_human: true,
+        host_state: json!({}),
+    }
+}
+
+/// The S9 park cases' prompt handler: an answer closes the prompt and wakes
+/// its owner invocation in the close's transaction.
+struct MatrixPromptHandler;
+
+#[async_trait]
+impl agent_service_host::prompts::PromptHandler for MatrixPromptHandler {
+    async fn on_answered(
+        &self,
+        prompt: &agent_server::journal::StoredPrompt,
+    ) -> Result<agent_service_host::prompts::PromptResolution> {
+        let invocation = prompt
+            .record
+            .owner_task
+            .clone()
+            .context("the merge prompt names its invocation")?;
+        Ok(agent_service_host::prompts::PromptResolution::Close {
+            result: ToolResult::success("approved"),
+            retain: false,
+            extra: agent_server::journal::Transition {
+                guards: vec![agent_server::journal::Guard::TaskIs {
+                    task: invocation.clone(),
+                    status: TaskStatus::WaitingOnChildren,
+                    lease: None,
+                }],
+                writes: vec![agent_server::journal::Write::WakeInvocation {
+                    invocation,
+                    prompt: prompt.record.id.clone(),
+                }],
+            },
+        })
+    }
 }
 
 #[async_trait]
@@ -490,6 +561,9 @@ impl SubagentCompletionHook for MatrixHook {
         prior: Option<&EffectRecord>,
         mode: RunMode,
     ) -> Result<CompletionOutput> {
+        if matches!(self.scenario, Scenario::ParkCrash | Scenario::WakeCrash) {
+            return self.park_or_resume(ctx);
+        }
         if self.phase == Phase::Crash {
             self.dir.signal_ready(ctx.invocation.as_str())?;
             tokio::time::sleep(Duration::from_secs(600)).await;
@@ -505,6 +579,33 @@ impl SubagentCompletionHook for MatrixHook {
             state: EffectState::Completed,
             extra_writes: Vec::new(),
             park: None,
+        })
+    }
+}
+
+impl MatrixHook {
+    /// Park on [`PARK_PROMPT`] on a first run, settle once woken from it.
+    fn park_or_resume(&self, ctx: &CompletionContext) -> Result<CompletionOutput> {
+        let resumed = ctx.resumed_prompt.as_deref();
+        self.dir.record_run(&format!(
+            "{} attempt={} phase={:?}",
+            if resumed.is_some() { "resume" } else { "park" },
+            ctx.attempt,
+            self.phase,
+        ))?;
+        Ok(match resumed {
+            Some(_) => CompletionOutput {
+                result: ToolResult::success("merged unit_1"),
+                state: EffectState::Completed,
+                extra_writes: Vec::new(),
+                park: None,
+            },
+            None => CompletionOutput {
+                result: ToolResult::success("awaiting the merge decision"),
+                state: EffectState::Started,
+                extra_writes: Vec::new(),
+                park: Some(park_prompt(&ctx.parent_thread)),
+            },
         })
     }
 }
@@ -1145,18 +1246,28 @@ async fn start_daemon(
     );
     let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(definition()));
     let config_backend = storage.backend.clone();
-    let hook = (scenario == Scenario::MergeBack)
-        .then(|| Arc::new(MatrixHook { phase, dir }) as Arc<dyn SubagentCompletionHook>);
-    let daemon = LocalDaemon::start_with_store_decorator(
-        service_config(storage, scenario),
-        registry,
-        runtime,
-        move |stores| match hook {
+    let parks = matches!(scenario, Scenario::ParkCrash | Scenario::WakeCrash);
+    let hook = (scenario == Scenario::MergeBack || parks).then(|| {
+        Arc::new(MatrixHook {
+            scenario,
+            phase,
+            dir,
+        }) as Arc<dyn SubagentCompletionHook>
+    });
+    let daemon = LocalDaemon::builder(service_config(storage, scenario), registry, runtime)
+        .decorate_stores(move |stores| match hook {
             Some(hook) => stores.with_subagent_completion_hook(hook),
             None => stores,
-        },
-    )
-    .await?;
+        })
+        .configure_transport(move |transport| {
+            if parks {
+                transport.with_prompt_handler(Arc::new(MatrixPromptHandler))
+            } else {
+                transport
+            }
+        })
+        .start()
+        .await?;
     Ok(Daemon {
         host: daemon,
         provider,
@@ -1209,6 +1320,22 @@ async fn crash_matrix_child() -> Result<()> {
         let ready = Arc::clone(&dir);
         fail::cfg_callback("llm_request.consumed.before_finish", move || {
             let _ = ready.signal_ready("consumed");
+            std::thread::sleep(Duration::from_secs(600));
+        })
+        .map_err(anyhow::Error::msg)?;
+    }
+    // S9 park cases: block inside the transaction right after the park (or
+    // the wake) row is written, before its prompt document, and tell the
+    // parent the write was reached.
+    #[cfg(feature = "failpoints")]
+    if let Some(point) = match scenario {
+        Scenario::ParkCrash => Some("invocation.park_written"),
+        Scenario::WakeCrash => Some("invocation.wake_written"),
+        _ => None,
+    } {
+        let ready = dir.ready();
+        fail::cfg_callback(point, move || {
+            let _ = std::fs::write(&ready, point);
             std::thread::sleep(Duration::from_secs(600));
         })
         .map_err(anyhow::Error::msg)?;
@@ -1482,7 +1609,9 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
         | Scenario::Contention
-        | Scenario::MergeBack => {
+        | Scenario::MergeBack
+        | Scenario::ParkCrash
+        | Scenario::WakeCrash => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
             (scenario != Scenario::LlmStream && scenario != Scenario::ConsumedRequest)
                 .then(|| AgentTaskId::from_string(ready.trim()))
@@ -1595,7 +1724,9 @@ async fn answer_prompt(
         | Scenario::OverlapLeader
         | Scenario::LockLossLeader
         | Scenario::Contention
-        | Scenario::MergeBack => {}
+        | Scenario::MergeBack
+        | Scenario::ParkCrash
+        | Scenario::WakeCrash => {}
     }
     Ok(())
 }
@@ -2668,6 +2799,303 @@ async fn s10_sqlite_contention(backend: Backend) -> Result<()> {
     Ok(())
 }
 
+/// The S9 park cases' prompt row on `thread`, once `ready` holds for it.
+#[cfg(feature = "failpoints")]
+async fn wait_for_park_prompt(
+    stores: &StoreRegistry,
+    thread: &ThreadId,
+    what: &str,
+    ready: impl Fn(&agent_server::journal::StoredPrompt) -> bool,
+) -> Result<agent_server::journal::StoredPrompt> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(prompt) = agent_server::journal::prompt::get_prompt(
+            stores.document_store.as_ref(),
+            thread,
+            PARK_PROMPT,
+        )
+        .await?
+            && ready(&prompt)
+        {
+            return Ok(prompt);
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the merge prompt never became {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Answer [`PARK_PROMPT`] through the daemon at `endpoint`.
+#[cfg(feature = "failpoints")]
+async fn approve_park_prompt(endpoint: &str, thread: &ThreadId) -> Result<()> {
+    let mut control = connect(endpoint).await?;
+    control
+        .decide_confirmation(pb::DecideConfirmationRequest {
+            request_id: "cm-merge-decision".into(),
+            thread_id: thread.to_string(),
+            task_id: String::new(),
+            decision: Some(pb::ConfirmationDecision {
+                decision: Some(pb::confirmation_decision::Decision::Approved(
+                    pb::ApprovedConfirmation::default(),
+                )),
+            }),
+            automatic: false,
+            prompt_id: PARK_PROMPT.into(),
+        })
+        .await?;
+    Ok(())
+}
+
+/// How many prompt frames named `id` the thread holds: `(opened, closed)`.
+#[cfg(feature = "failpoints")]
+async fn prompt_frames(
+    stores: &StoreRegistry,
+    thread: &ThreadId,
+    id: &str,
+) -> Result<(usize, usize)> {
+    let events = thread_events(stores, thread).await?;
+    let opened = events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentEvent::ToolRequiresConfirmation { id: frame, .. } if frame == id)
+        })
+        .count();
+    let closed = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCallEnd { id: frame, .. } if frame == id))
+        .count();
+    Ok((opened, closed))
+}
+
+/// The invocation, its git-step record, its parent root and the parent
+/// thread's completed results, after the S9 park cases ran to the end.
+#[cfg(feature = "failpoints")]
+async fn assert_merged_once(
+    stores: &StoreRegistry,
+    thread: &ThreadId,
+    root: &AgentTaskId,
+    invocation: &AgentTaskId,
+) -> Result<()> {
+    let root_row =
+        wait_for_task(stores, root, "terminal", |task| task.status.is_terminal()).await?;
+    ensure!(
+        root_row.status == TaskStatus::Completed,
+        "the root turn is {:?}: {:?}",
+        root_row.status,
+        root_row.last_error
+    );
+    let record = stores
+        .task_store
+        .effect(&EffectKey::git(invocation, "merge_back"))
+        .await?
+        .context("no git-step record")?;
+    ensure!(
+        record.state == EffectState::Completed,
+        "the git-step record: {record:?}"
+    );
+    let completed = thread_events(stores, thread)
+        .await?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::SubagentProgress {
+                    completed: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    ensure!(
+        completed == 1,
+        "the parent got {completed} completed results"
+    );
+    ensure!(
+        prompt_frames(stores, thread, PARK_PROMPT).await? == (1, 1),
+        "the prompt opened and closed once: {:?}",
+        prompt_frames(stores, thread, PARK_PROMPT).await?
+    );
+    let live = live_rows(stores, thread).await?;
+    ensure!(live.is_empty(), "rows left live: {live:?}");
+    Ok(())
+}
+
+/// S9, park kill point (prim10 S-4): the daemon is killed inside the park's
+/// transaction, after the invocation's park row was written and before its
+/// prompt document. The transaction rolls back whole: no prompt row, no
+/// prompt frame, the invocation still running. The requeued invocation
+/// (attempt 2) parks again, the answer wakes it, and it settles once.
+#[cfg(feature = "failpoints")]
+async fn s9_park_crash(backend: Backend) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = Arc::new(CaseDir(temp.path().to_owned()));
+    let Some(db) = CaseDb::create(backend, temp.path()).await? else {
+        return Ok(());
+    };
+    let mut crashed = CrashedHost::spawn(Scenario::ParkCrash, &dir, &db.storage)?;
+    let endpoint = crashed.endpoint(&dir).await?;
+    let mut control = connect(&endpoint).await?;
+    let (thread, root) = start_turn(&mut control).await?;
+    let (thread, root) = (
+        ThreadId::from_string(&thread),
+        AgentTaskId::from_string(&root),
+    );
+    let reached = wait_file(&mut crashed.child, &dir.ready()).await?;
+    ensure!(
+        reached == "invocation.park_written",
+        "the crash point: {reached}"
+    );
+    drop(control);
+    crashed.kill_nine()?;
+
+    let stores = inspection(&db.storage).await?;
+    let children = stores.task_store.list_children(&root).await?;
+    let [invocation] = children.as_slice() else {
+        bail!("expected one invocation, got {children:?}");
+    };
+    ensure!(
+        invocation.status == TaskStatus::Running && invocation.state.awaited_prompt().is_none(),
+        "the crashed park left {:?} awaiting {:?}",
+        invocation.status,
+        invocation.state.awaited_prompt()
+    );
+    ensure!(
+        agent_server::journal::prompt::get_prompt(
+            stores.document_store.as_ref(),
+            &thread,
+            PARK_PROMPT
+        )
+        .await?
+        .is_none(),
+        "the crashed park left a prompt row"
+    );
+    ensure!(prompt_frames(&stores, &thread, PARK_PROMPT).await? == (0, 0));
+
+    let daemon = start_daemon(
+        db.storage.clone(),
+        Scenario::ParkCrash,
+        Phase::Recover,
+        Arc::clone(&dir),
+    )
+    .await?;
+    wait_for_park_prompt(&stores, &thread, "open", |prompt| {
+        matches!(
+            prompt.record.state,
+            agent_server::journal::PromptState::Open
+        )
+    })
+    .await?;
+    approve_park_prompt(&daemon.host.endpoint(), &thread).await?;
+    assert_merged_once(&stores, &thread, &root, &invocation.id).await?;
+    let runs = dir.run_lines()?;
+    ensure!(
+        runs == [
+            "park attempt=1 phase=Crash",
+            "park attempt=2 phase=Recover",
+            "resume attempt=2 phase=Recover"
+        ],
+        "the hook ran {runs:?}"
+    );
+    daemon.report(Scenario::ParkCrash.name());
+    Ok(())
+}
+
+/// S9, wake kill point (prim10 S-4): the invocation parked; the answer's
+/// close-and-wake transaction is killed after the wake row was written and
+/// before the prompt document's retire. It rolls back whole: the prompt
+/// stays answered, the invocation parked. The restarted transport re-drives
+/// the answer, the wake commits once, and the invocation resumes with no
+/// attempt charged and settles once.
+#[cfg(feature = "failpoints")]
+async fn s9_wake_crash(backend: Backend) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = Arc::new(CaseDir(temp.path().to_owned()));
+    let Some(db) = CaseDb::create(backend, temp.path()).await? else {
+        return Ok(());
+    };
+    let mut crashed = CrashedHost::spawn(Scenario::WakeCrash, &dir, &db.storage)?;
+    let endpoint = crashed.endpoint(&dir).await?;
+    let mut control = connect(&endpoint).await?;
+    let (thread, root) = start_turn(&mut control).await?;
+    let (thread, root) = (
+        ThreadId::from_string(&thread),
+        AgentTaskId::from_string(&root),
+    );
+    let stores = inspection(&db.storage).await?;
+    wait_for_park_prompt(&stores, &thread, "open", |prompt| {
+        matches!(
+            prompt.record.state,
+            agent_server::journal::PromptState::Open
+        )
+    })
+    .await?;
+    // The answer commits first; the handler's close then blocks at the
+    // failpoint holding its transaction, so on SQLite the RPC's own later
+    // idempotency write can time out on the lock. Either way the process is
+    // killed next; the answered row checked below is what counts.
+    if let Err(error) = approve_park_prompt(&endpoint, &thread).await {
+        eprintln!("the decision RPC returned an error while the close was blocked: {error:#}");
+    }
+    let reached = wait_file(&mut crashed.child, &dir.ready()).await?;
+    ensure!(
+        reached == "invocation.wake_written",
+        "the crash point: {reached}"
+    );
+    drop(control);
+    crashed.kill_nine()?;
+
+    let children = stores.task_store.list_children(&root).await?;
+    let [invocation] = children.as_slice() else {
+        bail!("expected one invocation, got {children:?}");
+    };
+    ensure!(
+        invocation.status == TaskStatus::WaitingOnChildren
+            && invocation.state.awaited_prompt() == Some(PARK_PROMPT),
+        "the crashed wake left {:?} awaiting {:?}",
+        invocation.status,
+        invocation.state.awaited_prompt()
+    );
+    wait_for_park_prompt(&stores, &thread, "answered", |prompt| {
+        matches!(
+            prompt.record.state,
+            agent_server::journal::PromptState::Answered { .. }
+        )
+    })
+    .await
+    .context("the crashed close must leave the prompt answered")?;
+
+    let daemon = start_daemon(
+        db.storage.clone(),
+        Scenario::WakeCrash,
+        Phase::Recover,
+        Arc::clone(&dir),
+    )
+    .await?;
+    assert_merged_once(&stores, &thread, &root, &invocation.id).await?;
+    let settled = stores
+        .task_store
+        .get(&invocation.id)
+        .await?
+        .context("invocation")?;
+    ensure!(
+        settled.attempt == 1,
+        "the wake charged an attempt: {}",
+        settled.attempt
+    );
+    let runs = dir.run_lines()?;
+    ensure!(
+        runs == [
+            "park attempt=1 phase=Crash",
+            "resume attempt=1 phase=Recover"
+        ],
+        "the hook ran {runs:?}"
+    );
+    daemon.report(Scenario::WakeCrash.name());
+    Ok(())
+}
+
 macro_rules! matrix {
     ($backend:ident, $feature:literal, [$($scenario:ident),* $(,)?], [$($gated:ident: $gate:literal),* $(,)?], [$($known:ident: $why:literal),* $(,)?]) => {
         #[cfg(feature = $feature)]
@@ -2713,7 +3141,12 @@ matrix!(
         s7_hung_subagent,
         s10_sqlite_contention,
     ],
-    [s4_fork: "failpoints", s11_consumed_request: "failpoints"],
+    [
+        s4_fork: "failpoints",
+        s11_consumed_request: "failpoints",
+        s9_park_crash: "failpoints",
+        s9_wake_crash: "failpoints",
+    ],
     [
     ]
 );
@@ -2740,6 +3173,8 @@ matrix!(
         s8_overlap: "postgres",
         s8_overlap_leader: "postgres",
         s8_lock_loss_leader: "postgres",
+        s9_park_crash: "failpoints",
+        s9_wake_crash: "failpoints",
     ],
     [
     ]

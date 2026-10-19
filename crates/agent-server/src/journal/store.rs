@@ -3195,6 +3195,40 @@ impl InMemoryAgentTaskStore {
         Ok(paused)
     }
 
+    /// Apply a [`Write::ParkInvocation`](super::transition::Write::ParkInvocation)
+    /// or [`Write::WakeInvocation`](super::transition::Write::WakeInvocation).
+    fn invocation_step_locked(
+        inner: &mut Inner,
+        transition: &super::transition::Transition,
+        write: &super::transition::Write,
+        now: OffsetDateTime,
+    ) -> Result<AgentTask> {
+        use super::transition::Write;
+
+        let (id, prompt) = match write {
+            Write::ParkInvocation { invocation, prompt }
+            | Write::WakeInvocation { invocation, prompt } => (invocation.clone(), prompt.clone()),
+            other => return Err(anyhow!("not an invocation prompt step: {other:?}")),
+        };
+        let old = inner
+            .by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("invocation {id} does not exist"))?;
+        let new = if matches!(write, Write::ParkInvocation { .. }) {
+            let (worker, lease) = transition
+                .lease_for(&id)
+                .ok_or_else(|| anyhow!("park rejected: no lease guard on {id}"))?;
+            old.clone().park_on_prompt(worker, lease, prompt, now)
+        } else {
+            old.clone().wake_from_prompt(&prompt, now)
+        }
+        .with_context(|| format!("invocation {id} prompt step"))?;
+        inner.rebalance_after_row_change(&old, &new);
+        inner.put_row(new.id.clone(), new.clone());
+        Ok(new)
+    }
+
     fn reject_confirmation_locked(
         inner: &mut Inner,
         id: &AgentTaskId,
@@ -5099,6 +5133,7 @@ impl Inner {
                     spec,
                     child_thread_id,
                     child_root_task_id: child_root.id.clone(),
+                    awaiting_prompt: None,
                 },
                 spawn_index,
                 now,
@@ -5497,6 +5532,10 @@ impl InMemoryAgentTaskStore {
                     )?;
                     committed.paused.push(paused);
                 }
+                write @ (Write::ParkInvocation { .. } | Write::WakeInvocation { .. }) => {
+                    let invocation = Self::invocation_step_locked(inner, &transition, &write, now)?;
+                    committed.invocations.push(invocation);
+                }
                 Write::ReparkAfterSteering {
                     task,
                     worker,
@@ -5795,6 +5834,7 @@ impl InMemoryAgentTaskStore {
             }
         }
         transition.check_effects(|key| inner.effects.get(key))?;
+        transition.check_invocation_prompts(|id| inner.by_id.get(id))?;
         for write in &transition.writes {
             if let super::transition::Write::EnqueueSteeringResume { parent, .. } = write
                 && !inner.by_id.contains_key(parent)
@@ -5991,6 +6031,8 @@ impl InMemoryAgentTaskStore {
                 | Write::SettleTask { .. }
                 | Write::RejectConfirmation { .. }
                 | Write::PauseOnConfirmation { .. }
+                | Write::ParkInvocation { .. }
+                | Write::WakeInvocation { .. }
                 | Write::ReparkAfterSteering { .. }
                 | Write::AppendCompaction { .. }
                 | Write::SpawnChildren { .. }
@@ -6127,6 +6169,8 @@ impl InMemoryAgentTaskStore {
                 // `validate_extra_writes` refuses every other write.
                 super::transition::Write::RejectConfirmation { .. }
                 | super::transition::Write::PauseOnConfirmation { .. }
+                | super::transition::Write::ParkInvocation { .. }
+                | super::transition::Write::WakeInvocation { .. }
                 | super::transition::Write::ReparkAfterSteering { .. }
                 | super::transition::Write::AppendCompaction { .. }
                 | super::transition::Write::AppendEvents { .. }

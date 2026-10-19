@@ -24,6 +24,16 @@
 //!    the hook's result, appends the parent's completed `SubagentProgress`
 //!    and applies the hook's extra writes. The parent resumes in it.
 //!
+//! **Park.** Instead, the hook can ask for a human decision
+//! ([`CompletionOutput::park`]). One transition then opens the host prompt
+//! (owned by the host, with the invocation as its `owner_task`), parks the
+//! invocation on it ([`Write::ParkInvocation`]) and applies the extra
+//! writes. The effect stays `Started` and the parent keeps waiting. The
+//! host's prompt handler closes the prompt with a
+//! [`Write::WakeInvocation`] in its close transaction; the woken invocation
+//! runs the hook again, with no attempt charged, `prior` set to the record
+//! and [`CompletionContext::resumed_prompt`] naming the prompt.
+//!
 //! A crash or an expired lease anywhere before step 4 commits leaves the
 //! record `Started`; the requeued invocation (up to
 //! [`AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS`](crate::journal::task::AgentTask::SUBAGENT_INVOCATION_MAX_ATTEMPTS))
@@ -83,6 +93,9 @@ pub struct CompletionContext {
     /// The tool result the SDK materialized from the terminal child. It
     /// can be a failure.
     pub child_result: ToolResult,
+    /// The prompt this run continues from: the invocation parked on it and
+    /// the host's handler woke it. `None` on a first or a retried run.
+    pub resumed_prompt: Option<String>,
     /// The task store, read only: its `commit` is refused. A hook reads
     /// effect records with it (`effect`, `effects_for_task`) and returns its
     /// writes in [`CompletionOutput::extra_writes`].
@@ -99,27 +112,23 @@ pub struct CompletionPlan {
     pub unit: String,
 }
 
-/// A request to park the invocation on a human decision. Placeholder: the
-/// SDK refuses it ([`CompletionHookError::Unsupported`]) until the durable
-/// prompt row (primitive 6) can own a parked invocation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PromptRequest {
-    pub payload: serde_json::Value,
-}
-
 /// What [`SubagentCompletionHook::run`] returns.
 #[derive(Clone, Debug)]
 pub struct CompletionOutput {
     /// The tool result the parent gets, in place of the child's.
     pub result: ToolResult,
     /// The state the effect finishes in. Not `Started`. Ignored when
-    /// [`SubagentCompletionHook::plan`] returned `None`.
+    /// [`SubagentCompletionHook::plan`] returned `None`, and on a park.
     pub state: EffectState,
-    /// More writes for the settle transition: [`Write::Document`] and
-    /// [`Write::AppendEvents`] only.
+    /// More writes for the settle (or park) transition: [`Write::Document`]
+    /// and [`Write::AppendEvents`] only.
     pub extra_writes: Vec<Write>,
-    /// Must be `None` in this release.
-    pub park: Option<PromptRequest>,
+    /// Park the invocation on this host prompt instead of settling it. The
+    /// owner must be [`PromptOwner::Host`](crate::journal::prompt::PromptOwner::Host);
+    /// the SDK sets `owner_task` to the invocation. The id must be new: a
+    /// live or kept row with the same id refuses the park. Refused on the
+    /// invocation's last attempt ([`RunMode::Inspect`]).
+    pub park: Option<crate::journal::prompt::NewPrompt>,
 }
 
 /// Host work for each completed subagent invocation.
@@ -163,9 +172,10 @@ pub struct InstalledCompletionHook {
 /// Why the SDK refused a hook's output.
 #[derive(Debug, thiserror::Error)]
 pub enum CompletionHookError {
-    /// The hook asked for something this release cannot do.
-    #[error("unsupported: {0}")]
-    Unsupported(&'static str),
+    /// The hook asked to park on the invocation's last attempt, which only
+    /// inspects.
+    #[error("a completion hook cannot park on the invocation's last attempt (inspect mode)")]
+    ParkOnLastAttempt,
     /// An extra write of a kind the settle cannot carry.
     #[error(
         "a completion hook may add only Document and AppendEvents writes; extra write {index} is {write}"
@@ -183,6 +193,17 @@ pub enum CompletionHookError {
         owner: AgentTaskId,
         invocation: AgentTaskId,
     },
+}
+
+impl CompletionHookError {
+    /// The `reason` of `agent_server.subagent.completion_hook.refused`.
+    const fn reason(&self) -> &'static str {
+        match self {
+            Self::RefusedExtraWrite { .. } => "extra_write",
+            Self::ParkOnLastAttempt => "park",
+            Self::StartedFinish | Self::EffectNotContinuable { .. } => "state",
+        }
+    }
 }
 
 /// The context's store: reads pass through, `commit` is refused.
@@ -214,6 +235,8 @@ const fn write_name(write: &Write) -> &'static str {
         Write::SettleTask { .. } => "SettleTask",
         Write::RejectConfirmation { .. } => "RejectConfirmation",
         Write::PauseOnConfirmation { .. } => "PauseOnConfirmation",
+        Write::ParkInvocation { .. } => "ParkInvocation",
+        Write::WakeInvocation { .. } => "WakeInvocation",
         Write::ReparkAfterSteering { .. } => "ReparkAfterSteering",
         Write::AppendCompaction { .. } => "AppendCompaction",
         Write::AppendEvents { .. } => "AppendEvents",
@@ -227,13 +250,11 @@ const fn write_name(write: &Write) -> &'static str {
 }
 
 /// Check the hook's output before the SDK builds the settle from it.
-fn check_output(output: &CompletionOutput) -> Result<(), CompletionHookError> {
-    if output.park.is_some() {
-        return Err(CompletionHookError::Unsupported(
-            "park: an invocation cannot wait on a prompt before primitive 6",
-        ));
+fn check_output(output: &CompletionOutput, mode: RunMode) -> Result<(), CompletionHookError> {
+    if output.park.is_some() && mode == RunMode::Inspect {
+        return Err(CompletionHookError::ParkOnLastAttempt);
     }
-    if output.state.is_started() {
+    if output.park.is_none() && output.state.is_started() {
         return Err(CompletionHookError::StartedFinish);
     }
     for (index, write) in output.extra_writes.iter().enumerate() {
@@ -338,6 +359,18 @@ impl HookSignals {
     }
 }
 
+/// The decided prompt a woken invocation continues from.
+fn resumed_prompt(invocation: &crate::journal::task::AgentTask) -> Option<String> {
+    match &invocation.state {
+        crate::journal::TaskState::SubagentInvocation { invocation } => invocation
+            .awaiting_prompt
+            .as_ref()
+            .filter(|prompt| prompt.decided)
+            .map(|prompt| prompt.prompt_id.clone()),
+        _ => None,
+    }
+}
+
 /// The settle of [`execute_subagent_task`](super::execute_subagent_task)
 /// when a hook is installed (see the module documentation).
 pub(super) async fn settle_with_hook(
@@ -355,6 +388,7 @@ pub(super) async fn settle_with_hook(
         parent_thread: bootstrap.thread_id.clone(),
         child_thread: bootstrap.child_thread_id.clone(),
         child_result,
+        resumed_prompt: resumed_prompt(&bootstrap.invocation_task),
         store: Arc::new(ReadOnlyStore(Arc::clone(&installed.store))),
     };
     // A first attempt always executes: an invocation stored with a budget
@@ -447,16 +481,22 @@ impl HookRun<'_> {
             .run(ctx, prior.as_ref(), mode)
             .await
             .context("run the subagent completion hook")?;
-        if let Err(refused) = check_output(&output) {
-            signals.refused(match refused {
-                CompletionHookError::RefusedExtraWrite { .. } => "extra_write",
-                CompletionHookError::Unsupported(_) => "park",
-                CompletionHookError::StartedFinish
-                | CompletionHookError::EffectNotContinuable { .. } => "state",
-            });
+        if let Err(refused) = check_output(&output, mode) {
+            signals.refused(refused.reason());
             return Err(refused.into());
         }
 
+        if let Some(prompt) = output.park {
+            return self
+                .park(
+                    prompt,
+                    output.extra_writes,
+                    subagent_result,
+                    output.result,
+                    &leased,
+                )
+                .await;
+        }
         let result = serde_json::to_value(&output.result)
             .context("serialize the completion hook's tool result")?;
         let mut end = Transition::settle(
@@ -510,8 +550,73 @@ impl HookRun<'_> {
                 subagent_result,
                 tool_result: output.result,
                 committed_events: committed.events,
+                parked_on: None,
             },
             label.unwrap_or("no_effect"),
+        ))
+    }
+
+    /// Open the host prompt and park the invocation on it in one transition;
+    /// the effect record stays `Started`.
+    async fn park(
+        &self,
+        mut prompt: crate::journal::prompt::NewPrompt,
+        extra_writes: Vec<Write>,
+        subagent_result: SubagentResult,
+        tool_result: ToolResult,
+        leased: &Guard,
+    ) -> Result<(SubagentTaskOutcome, &'static str)> {
+        let Self {
+            task_store,
+            ctx,
+            now,
+            ..
+        } = *self;
+        prompt.owner_task = Some(ctx.invocation.clone());
+        let prompt_id = prompt.id.clone();
+        let mut writes = crate::journal::prompt::PromptRecord::open(prompt, now)
+            .open_writes(true)
+            .context("open the completion hook's prompt")?;
+        writes.push(Write::ParkInvocation {
+            invocation: ctx.invocation.clone(),
+            prompt: prompt_id.clone(),
+        });
+        writes.extend(extra_writes);
+        crate::fail_point!("subagent.completion_hook.before_park");
+        let committed = task_store
+            .commit(
+                Transition {
+                    guards: vec![leased.clone()],
+                    writes,
+                },
+                now,
+            )
+            .await
+            .map_err(|rejected| {
+                crate::journal::transition::wrapper_error("park_invocation", rejected)
+            })
+            .context("park subagent invocation on its completion hook's prompt")?;
+        log::info!(
+            task_id = ctx.invocation.as_str(),
+            prompt_id = prompt_id.as_str(),
+            attempt = ctx.attempt;
+            "a subagent invocation parked on its completion hook's prompt"
+        );
+        let invocation_task = committed
+            .invocations
+            .into_iter()
+            .next()
+            .context("a park transition returns its invocation")?;
+        Ok((
+            SubagentTaskOutcome {
+                invocation_task,
+                parent_task: None,
+                subagent_result,
+                tool_result,
+                committed_events: committed.events,
+                parked_on: Some(prompt_id),
+            },
+            "parked",
         ))
     }
 
