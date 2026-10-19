@@ -15,7 +15,7 @@ use agent_server::journal::document::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgConnection, Postgres, Transaction};
 use time::OffsetDateTime;
 
 use super::PostgresDurableStore;
@@ -58,6 +58,32 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 }
 
 impl PostgresDurableStore {
+    /// The live document at `key`, read on `connection` (a transaction's,
+    /// to read under the locks it holds).
+    pub(super) async fn get_document_on(
+        connection: &mut PgConnection,
+        key: &DocumentKey,
+    ) -> Result<Option<Document>> {
+        let (scope_kind, scope_id, kind, doc_key) = key.stored();
+        sqlx::query_as!(
+            DocumentRecord,
+            r#"SELECT scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,
+                      updated_at
+               FROM agent_sdk_documents
+               WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4
+                 AND retired_at IS NULL"#,
+            scope_kind,
+            scope_id,
+            kind,
+            doc_key,
+        )
+        .fetch_optional(connection)
+        .await
+        .with_context(|| format!("get document {key}"))?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
     /// Lock the host documents among a transition's `locks`, in key
     /// order, after its task rows. A key with no row locks nothing.
     pub(super) async fn lock_host_documents_tx(
@@ -296,24 +322,8 @@ impl PostgresDurableStore {
 #[async_trait]
 impl DocumentStore for PostgresDurableStore {
     async fn get_document(&self, key: &DocumentKey) -> Result<Option<Document>> {
-        let (scope_kind, scope_id, kind, doc_key) = key.stored();
-        sqlx::query_as!(
-            DocumentRecord,
-            r#"SELECT scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,
-                      updated_at
-               FROM agent_sdk_documents
-               WHERE scope_kind = $1 AND scope_id = $2 AND kind = $3 AND doc_key = $4
-                 AND retired_at IS NULL"#,
-            scope_kind,
-            scope_id,
-            kind,
-            doc_key,
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("get document {key}"))?
-        .map(TryInto::try_into)
-        .transpose()
+        let mut connection = self.pool.acquire().await.context("acquire connection")?;
+        Self::get_document_on(&mut connection, key).await
     }
 
     async fn list_documents(&self, scope: &DocScope, kind: &DocKind) -> Result<Vec<Document>> {

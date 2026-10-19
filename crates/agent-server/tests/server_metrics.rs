@@ -737,26 +737,29 @@ async fn a_transition_extension_records_its_writes_and_refusals() -> Result<()> 
     assert_eq!(added[0].1, 1);
     let refused = collect_u64_counter(&snapshots, "agent_server.journal.extension.refused");
     assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(matches_all(
+        &refused[0].0,
+        &[
+            (attrs::EXTENSION_POINT, attrs::EXTENSION_POINT_COMMIT),
+            (attrs::WRITE_KIND, "AppendCompaction"),
+        ]
+    ));
     assert_eq!(refused[0].1, 1);
     Ok(())
 }
 
-#[tokio::test]
-async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
-    use agent_sdk_foundation::{
-        AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage, llm::ContentBlock,
-    };
-    use agent_server::journal::store::InMemoryAgentTaskStore;
+/// A root on `thread`, parked on one tool child.
+async fn parked_root(
+    store: &agent_server::journal::store::InMemoryAgentTaskStore,
+    thread: &ThreadId,
+    now: OffsetDateTime,
+) -> Result<agent_server::journal::task::AgentTask> {
+    use agent_sdk_foundation::{AgentContinuation, AgentState, ContinuationEnvelope, TokenUsage};
     use agent_server::journal::task::{
         AgentTask, ChildSpawnSpec, LeaseId, SuspensionPayload, WorkerId,
     };
-    use agent_server::journal::{AgentTaskStore, DurableStore, SpawnChildrenExt, Transition};
+    use agent_server::journal::{AgentTaskStore, SpawnChildrenExt};
 
-    let _guard = acquire_test_lock().await;
-    let (provider, exporter) = setup_meter();
-    let store = InMemoryAgentTaskStore::new();
-    let now = OffsetDateTime::UNIX_EPOCH;
-    let thread = ThreadId::from_string("steer");
     let root = AgentTask::new_root_turn(thread.clone(), now, 3);
     let _ = store.submit_root_turn(root.clone()).await?;
     let (worker, lease) = (WorkerId::new(), LeaseId::new());
@@ -798,6 +801,21 @@ async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
             now,
         )
         .await?;
+    Ok(root)
+}
+
+#[tokio::test]
+async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
+    use agent_sdk_foundation::llm::ContentBlock;
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::{DurableStore, Transition};
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new();
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let thread = ThreadId::from_string("steer");
+    let root = parked_root(&store, &thread, now).await?;
     let note = || {
         vec![ContentBlock::Text {
             text: "status?".into(),
@@ -833,6 +851,107 @@ async fn a_steering_wake_records_whether_it_woke_the_parent() -> Result<()> {
                     ]
                 )),
             "one {outcome} wake is counted: {resumes:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A queued steering wake counts each read of its queue by outcome:
+/// nothing queued, taken, then the parent no longer parked.
+#[tokio::test]
+async fn a_queued_steering_wake_records_each_read_of_its_queue() -> Result<()> {
+    use agent_sdk_foundation::llm::ContentBlock;
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::task::AgentTask;
+    use agent_server::journal::{
+        DocExpect, DocKind, DocScope, Document, DocumentKey, DocumentWrite, DurableStore,
+        QueuedSteering, SteeringInput, Transition, TransitionExtension, TransitionView, Write,
+    };
+
+    struct TakesTheQueue;
+
+    impl TransitionExtension for TakesTheQueue {
+        fn extend(&self, _view: TransitionView<'_>) -> Vec<Write> {
+            Vec::new()
+        }
+
+        fn take_queued_steering(
+            &self,
+            _parent: &AgentTask,
+            queued: &Document,
+        ) -> Option<QueuedSteering> {
+            Some(QueuedSteering {
+                steering: vec![ContentBlock::Text {
+                    text: queued.value.to_string(),
+                }],
+                schema_version: queued.schema_version,
+                value: serde_json::json!(null),
+            })
+        }
+    }
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new().with_transition_extension(Arc::new(TakesTheQueue));
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let thread = ThreadId::from_string("queued");
+    let root = parked_root(&store, &thread, now).await?;
+    let kind = DocKind::new("test.steering")?;
+    let wake = || Transition {
+        guards: Vec::new(),
+        writes: vec![Write::EnqueueSteeringResume {
+            parent: root.id.clone(),
+            steering: SteeringInput::Queued {
+                kind: kind.clone(),
+                key: String::new(),
+            },
+        }],
+    };
+    let _ = store
+        .commit(wake(), now)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let _ = store
+        .commit(
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::Document(DocumentWrite::put(
+                    DocumentKey::new(DocScope::Thread(thread.clone()), kind.clone(), ""),
+                    1,
+                    DocExpect::Absent,
+                    serde_json::json!(["status?"]),
+                ))],
+            },
+            now,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    for _ in 0..2 {
+        let _ = store
+            .commit(wake(), now)
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let takes = collect_u64_counter(&snapshots, "agent_server.journal.steering_queue.takes");
+    assert_eq!(takes.len(), 3, "{takes:?}");
+    for outcome in [
+        attrs::OUTCOME_EMPTY,
+        attrs::OUTCOME_TAKEN,
+        attrs::OUTCOME_NOT_PARKED,
+    ] {
+        assert!(
+            takes.iter().any(|(labels, count)| *count == 1
+                && matches_all(
+                    labels,
+                    &[
+                        (attrs::BACKEND, attrs::BACKEND_MEMORY),
+                        (attrs::OUTCOME, outcome)
+                    ]
+                )),
+            "one {outcome} read is counted: {takes:?}"
         );
     }
     Ok(())

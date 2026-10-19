@@ -263,8 +263,19 @@ pub mod attrs {
     /// longer parked).
     pub const OUTCOME_WOKEN: &str = "woken";
     pub const OUTCOME_DECLINED: &str = "declined";
+    /// A queued steering wake's read of its queue.
+    ///
+    /// `taken` (woke the parent), `empty` (nothing queued), `not_parked`
+    /// or `no_extension` (refused: the store has no extension to take it).
+    pub const OUTCOME_TAKEN: &str = "taken";
+    pub const OUTCOME_EMPTY: &str = "empty";
+    pub const OUTCOME_NOT_PARKED: &str = "not_parked";
+    pub const OUTCOME_NO_EXTENSION: &str = "no_extension";
     /// Where a transition extension ran: `commit` / `completed_turn`.
     pub const EXTENSION_POINT: &str = "extension.point";
+    /// The kind of a write a transition extension was refused
+    /// ([`crate::journal::Write::kind_name`]): one of the `Write` variants.
+    pub const WRITE_KIND: &str = "write.kind";
     pub const EXTENSION_POINT_COMMIT: &str = "commit";
     pub const EXTENSION_POINT_COMPLETED_TURN: &str = "completed_turn";
 
@@ -377,10 +388,9 @@ pub struct ServerMetrics {
     /// `agent_server.journal.steering_resumes`: steering wakes committed,
     /// by backend and outcome.
     pub(crate) steering_resumes: Counter<u64>,
-    /// `agent_server.journal.extension.{writes,refused}`: what a transition
-    /// extension added, and the commits refused for a write it may not add.
-    pub(crate) extension_writes: Counter<u64>,
-    pub(crate) extension_refused: Counter<u64>,
+    /// `agent_server.journal.extension.{writes,refused}` and
+    /// `agent_server.journal.steering_queue.takes`.
+    pub(crate) extension: ExtensionInstruments,
     /// `agent_server.effects`: effect transitions, by kind.
     pub(crate) effects: Counter<u64>,
     /// `agent_server.effect.duration`: started to finished, by kind and
@@ -685,14 +695,40 @@ impl ServerMetrics {
 
     /// Count what a transition extension did on one commit: the writes it
     /// added, or a refusal of a write it may not add.
-    pub fn record_extension(&self, point: &'static str, added: usize, refused: bool) {
+    pub fn record_extension(
+        &self,
+        point: &'static str,
+        added: usize,
+        refused: Option<&'static str>,
+    ) {
         let attributes = [KeyValue::new(attrs::EXTENSION_POINT, point)];
-        if refused {
-            self.extension_refused.add(1, &attributes);
+        if let Some(kind) = refused {
+            self.extension.refused.add(
+                1,
+                &[
+                    KeyValue::new(attrs::EXTENSION_POINT, point),
+                    KeyValue::new(attrs::WRITE_KIND, kind),
+                ],
+            );
         } else if added > 0 {
-            self.extension_writes
+            self.extension
+                .writes
                 .add(u64::try_from(added).unwrap_or(u64::MAX), &attributes);
         }
+    }
+
+    /// Count one read of a queued steering wake's queue on
+    /// `agent_server.journal.steering_queue.takes`. It is counted inside
+    /// the transaction, so a retried or rolled-back transaction counts
+    /// again; `agent_server.journal.steering_resumes` counts the commits.
+    pub fn record_steering_queue(&self, backend: &'static str, outcome: &'static str) {
+        self.extension.steering_queue_takes.add(
+            1,
+            &[
+                KeyValue::new(attrs::BACKEND, backend),
+                KeyValue::new(attrs::OUTCOME, outcome),
+            ],
+        );
     }
 
     /// Count each committed document write on
@@ -1120,7 +1156,7 @@ impl ServerMetrics {
             transition_instruments(&meter);
         let steering_resumes = steering_resumes_counter(&meter);
         let documents_written = documents_written_counter(&meter);
-        let (extension_writes, extension_refused) = extension_instruments(&meter);
+        let extension = extension_instruments(&meter);
         let prompts = prompts_counter(&meter);
 
         let (effects, effect_duration, completed_turn_commits) = durability_instruments(&meter);
@@ -1158,8 +1194,7 @@ impl ServerMetrics {
             transition_lock_conflict_retries,
             documents_written,
             steering_resumes,
-            extension_writes,
-            extension_refused,
+            extension,
             effects,
             effect_duration,
             completed_turn_commits,
@@ -1448,20 +1483,46 @@ fn steering_resumes_counter(meter: &opentelemetry::metrics::Meter) -> Counter<u6
         .build()
 }
 
-/// The transition extension's counters: the writes it added, and the
-/// commits refused for a write it may not add.
-fn extension_instruments(meter: &opentelemetry::metrics::Meter) -> (Counter<u64>, Counter<u64>) {
-    let extension_writes = meter
+/// The transition extension's counters: the writes it added, the commits
+/// refused for a write it may not add, and the reads of a queued steering
+/// wake's queue.
+fn extension_instruments(meter: &opentelemetry::metrics::Meter) -> ExtensionInstruments {
+    let writes = meter
         .u64_counter("agent_server.journal.extension.writes")
         .with_description("Writes a transition extension added, attributed by extension point.")
         .build();
-    let extension_refused = meter
+    let refused = meter
         .u64_counter("agent_server.journal.extension.refused")
         .with_description(
-            "Commits refused because the transition extension returned a write it may not add.",
+            "Commits refused because the transition extension returned a write it may not add, \
+             attributed by extension point and write kind.",
         )
         .build();
-    (extension_writes, extension_refused)
+    let steering_queue_takes = meter
+        .u64_counter("agent_server.journal.steering_queue.takes")
+        .with_description(
+            "Reads of a queued steering wake's queue inside its transaction, attributed by \
+             backend and outcome (taken, empty, not_parked, no_extension).",
+        )
+        .build();
+    ExtensionInstruments {
+        writes,
+        refused,
+        steering_queue_takes,
+    }
+}
+
+/// The transition extension's counters.
+#[derive(Clone, Debug)]
+pub(crate) struct ExtensionInstruments {
+    /// `agent_server.journal.extension.writes`: the writes it added.
+    pub(crate) writes: Counter<u64>,
+    /// `agent_server.journal.extension.refused`: commits refused for a
+    /// write it may not add.
+    pub(crate) refused: Counter<u64>,
+    /// `agent_server.journal.steering_queue.takes`: reads of a queued
+    /// steering wake's queue, by backend and outcome.
+    pub(crate) steering_queue_takes: Counter<u64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────

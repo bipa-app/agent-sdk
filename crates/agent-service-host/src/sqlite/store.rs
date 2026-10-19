@@ -3862,15 +3862,22 @@ impl SqliteDurableStore {
         Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
         for (index, write) in agent_server::journal::writes_in_apply_order(&transition) {
-            Self::apply_write_tx(&mut tx, &transition, write, now, &mut committed)
-                .await
-                .map_err(|error| {
-                    agent_server::journal::Rejected::from_write_error(
-                        error,
-                        transition.guards.len(),
-                        index,
-                    )
-                })?;
+            Self::apply_write_tx(
+                &mut tx,
+                &transition,
+                write,
+                self.extension.as_deref(),
+                now,
+                &mut committed,
+            )
+            .await
+            .map_err(|error| {
+                agent_server::journal::Rejected::from_write_error(
+                    error,
+                    transition.guards.len(),
+                    index,
+                )
+            })?;
         }
         agent_server::fail_point!("transition.before_commit");
         tx.commit().await.context("commit transition")?;
@@ -3902,7 +3909,7 @@ impl SqliteDurableStore {
     ) -> Result<CompletedTurnExtra> {
         let mut committed = agent_server::journal::Committed::default();
         for write in extra.writes.iter().cloned() {
-            Self::apply_write_tx(tx, extra, write, now, &mut committed).await?;
+            Self::apply_write_tx(tx, extra, write, None, now, &mut committed).await?;
         }
         if !committed.settled.is_empty() {
             agent_server::fail_point!("commit.completed_turn.settled");
@@ -4004,6 +4011,7 @@ impl SqliteDurableStore {
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
         write: agent_server::journal::Write,
+        extension: Option<&dyn agent_server::journal::TransitionExtension>,
         now: OffsetDateTime,
         committed: &mut agent_server::journal::Committed,
     ) -> Result<()> {
@@ -4090,7 +4098,8 @@ impl SqliteDurableStore {
                 committed.documents.push(outcome);
             }
             Write::EnqueueSteeringResume { parent, steering } => {
-                let woken = Self::enqueue_steering_resume_tx(tx, &parent, steering, now).await?;
+                let woken =
+                    Self::enqueue_steering_resume_tx(tx, extension, &parent, steering, now).await?;
                 committed.steering_resumed.push(woken);
             }
         }
@@ -4100,15 +4109,40 @@ impl SqliteDurableStore {
     /// Wake a parent parked on its children for a steering exchange. Only
     /// a parent still waiting on its children is woken; any other status
     /// declines with `None`, so a concurrent fan-in never races the wake.
+    /// A [`SteeringInput::Queued`](agent_server::journal::SteeringInput::Queued)
+    /// reads its queue in this transaction, after the park, and writes the
+    /// taken queue back in it.
     async fn enqueue_steering_resume_tx(
         tx: &mut Transaction<'_, Sqlite>,
+        extension: Option<&dyn agent_server::journal::TransitionExtension>,
         parent_id: &AgentTaskId,
-        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        steering: agent_server::journal::SteeringInput,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
         let old = Self::load_task_tx(tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("steering wake rejected: task {parent_id} does not exist"))?;
+        let steering = match steering {
+            agent_server::journal::SteeringInput::Blocks(steering) => steering,
+            queued @ agent_server::journal::SteeringInput::Queued { .. } => {
+                let queue = queued
+                    .queue_on(&old.thread_id)
+                    .context("a queued steering input names its queue")?;
+                let stored = Self::get_document_on(tx, &queue).await?;
+                let Some((steering, write)) = agent_server::journal::take_queued_steering(
+                    "sqlite",
+                    extension,
+                    &old,
+                    queue,
+                    stored.as_ref(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                Self::apply_document_tx(tx, write, now).await?;
+                steering
+            }
+        };
         if old.status != TaskStatus::WaitingOnChildren {
             return Ok(None);
         }
