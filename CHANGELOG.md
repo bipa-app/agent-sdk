@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Host: store options through `LocalDaemonBuilder`, and root-turn metrics
+
+- `LocalDaemonBuilder::store_options(StoreOptions)`: `start` builds the
+  registry with `StoreRegistry::from_config_with`, so a transition extension
+  or view settings reach the concrete stores before the registry shares
+  them. A store decorator cannot do this, because it gets the shared
+  handles. The default is `StoreOptions::default()`, today's behaviour.
+- `agent_server.root_turn.duration` (histogram, seconds, admission to
+  terminal) and `agent_server.root_turn.outcome` (counter), both labelled
+  `outcome` = `success` / `error` / `cancelled`. Every store records each
+  `RootTurn` row once, after the transaction that made it terminal commits:
+  a settle (`commit`, `commit_completed_turn`), `complete_task`,
+  `cancel_tree`, `cancel_descendants_of_owned`, and a fail-close at lease
+  expiry, epoch reclaim or acquisition. `reject_confirmation` ends only
+  tool children, so it records none. A subagent's child-thread root counts; tool
+  children, invocations and input injections do not. The measurement is
+  `agent_server::journal::TerminalRootTurn`. These replace bip's
+  decorator-recorded `bip.turn.duration` / `bip.turn.outcome` (same labels
+  and buckets), so dashboards that read those move to the new names. No migration, no
+  `Write` variant, no protocol change.
+
 ### Primitive 10 (S-4): a subagent invocation can wait on a host prompt
 
 - **Breaking:** two `Write` variants, `ParkInvocation { invocation, prompt }`

@@ -58,6 +58,7 @@ use agent_server::journal::relay::{
     TASK_WAKEUP_OUTBOX_MAX_ATTEMPTS, TaskWakeupEmitter, TaskWakeupTrigger,
 };
 use agent_server::journal::retention::{RetentionCursor, RetentionStore};
+use agent_server::journal::root_turn::TerminalRootTurn;
 use agent_server::journal::sibling_order::{
     HELD_PROBE_WINDOW, HeldProbe, HeldRow, decoded_wait_list, hold_tool_children_behind_siblings,
     mixed_spawn_waits, pure_spawn_waits,
@@ -848,21 +849,24 @@ FOR UPDATE SKIP LOCKED
                 "cancel_tree rejected: task {root_id} does not exist"
             ));
         };
-        let (outcome, _top) = Self::cancel_scoped_tx(&mut tx, root_id, scope, owner, now).await?;
+        let (outcome, _top, root_turns) =
+            Self::cancel_scoped_tx(&mut tx, root_id, scope, owner, now).await?;
         tx.commit().await.context("commit cancel_tree")?;
+        TerminalRootTurn::record_each(root_turns);
         Ok(outcome)
     }
 
     /// The body of `cancel_scoped`, inside the caller's transaction. Also
     /// returns `root_id`'s row as read under its lock, before any
-    /// transition.
+    /// transition, and the root turns it cancelled (recorded once the
+    /// caller commits).
     async fn cancel_scoped_tx(
         tx: &mut Transaction<'_, Postgres>,
         root_id: &AgentTaskId,
         scope: CancelScope,
         owner: Option<(&WorkerId, &LeaseId)>,
         now: OffsetDateTime,
-    ) -> Result<(CancelTreeOutcome, Option<AgentTask>)> {
+    ) -> Result<(CancelTreeOutcome, Option<AgentTask>, Vec<TerminalRootTurn>)> {
         // Collect the given task + descendants (mirror in-memory
         // `collect_subtree`: children-BFS, root-first, following
         // SubagentInvocation linkage across threads). A mid-tree id
@@ -911,6 +915,7 @@ FOR UPDATE SKIP LOCKED
         let mut cancel_order: Vec<&AgentTask> = all_tasks.iter().collect();
         cancel_order.sort_by(|a, b| task_lock_order(a).cmp(&task_lock_order(b)));
 
+        let mut root_turns = Vec::new();
         let mut cancelled_ids: std::collections::BTreeSet<AgentTaskId> =
             std::collections::BTreeSet::new();
         // Track cancelled root-turn roots (and their threads) so we can
@@ -961,6 +966,7 @@ FOR UPDATE SKIP LOCKED
                 .cancel_with_reason(reason, now)
                 .context("cancel_tree: cancel transition failed")?;
             Self::update_task_tx(tx, &cancelled).await?;
+            root_turns.extend(TerminalRootTurn::of(&cancelled));
             cancelled_ids.insert(cancelled.id.clone());
             if is_root_turn_root {
                 cancelled_root_ids.push(cancelled.id.clone());
@@ -1032,6 +1038,7 @@ FOR UPDATE SKIP LOCKED
                 markers,
             },
             top,
+            root_turns,
         ))
     }
 
@@ -2889,7 +2896,7 @@ WHERE parent_id = $1
     /// Journaling that event locks `old`'s thread row, so for a root the
     /// caller must already hold the thread lock taken before the task
     /// lock (thread → task) and pass it as `root_thread`; otherwise use
-    /// [`Self::fail_closed_root_thread_first`].
+    /// [`Self::fail_closed_root_thread_first`]. Returns the failed row.
     async fn fail_closed_with_thread_tx(
         tx: &mut Transaction<'_, Postgres>,
         old: &AgentTask,
@@ -2897,7 +2904,7 @@ WHERE parent_id = $1
         root_thread: Option<&HeldThreadLock>,
         now: OffsetDateTime,
         error_prefix: &str,
-    ) -> Result<()> {
+    ) -> Result<AgentTask> {
         let failed = old
             .clone()
             .fail_with_reason(reason, now)
@@ -2915,7 +2922,8 @@ WHERE parent_id = $1
             )
             .await?;
         }
-        Self::propagate_terminal_to_parent_tx(tx, &failed, root_thread, now, error_prefix).await
+        Self::propagate_terminal_to_parent_tx(tx, &failed, root_thread, now, error_prefix).await?;
+        Ok(failed)
     }
 
     /// [`Self::fail_closed_with_thread_tx`] for a row that is not a root
@@ -2928,7 +2936,9 @@ WHERE parent_id = $1
         now: OffsetDateTime,
         error_prefix: &str,
     ) -> Result<()> {
-        Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix).await
+        Self::fail_closed_with_thread_tx(tx, old, reason, None, now, error_prefix)
+            .await
+            .map(drop)
     }
 
     /// Fail closed, each in its own transaction, the roots whose last
@@ -2992,7 +3002,7 @@ WHERE parent_id = $1
             return Ok(None);
         };
         Self::bootstrap_thread_row_tx(&mut tx, &screened.thread_id, now).await?;
-        let (settled, locked) =
+        let (settled, locked, mut root_turns) =
             Self::cancel_scoped_tx(&mut tx, id, CancelScope::Descendants, None, now).await?;
         let Some(old) = locked else {
             tx.rollback()
@@ -3029,7 +3039,7 @@ WHERE parent_id = $1
         };
         match action {
             RecoveryAction::FailClosed(reason) => {
-                Self::fail_closed_with_thread_tx(
+                let failed = Self::fail_closed_with_thread_tx(
                     &mut tx,
                     &old,
                     reason,
@@ -3041,6 +3051,8 @@ WHERE parent_id = $1
                 tx.commit()
                     .await
                     .with_context(|| format!("commit {error_prefix} fail-close"))?;
+                root_turns.extend(TerminalRootTurn::of(&failed));
+                TerminalRootTurn::record_each(root_turns);
                 Ok(Some((reason, settled)))
             }
             RecoveryAction::NoAction | RecoveryAction::Requeue => {
@@ -4517,6 +4529,9 @@ impl agent_server::journal::DurableStore for PostgresDurableStore {
             &result,
             started.elapsed().as_secs_f64(),
         );
+        if let Ok(committed) = &result {
+            TerminalRootTurn::record_settled(&committed.settled);
+        }
         result
     }
 
@@ -5454,7 +5469,11 @@ impl PostgresDurableStore {
 impl AgentTaskStore for PostgresDurableStore {
     async fn commit_completed_turn(&self, params: CompletedTurnCommit) -> Result<CommitOutcome> {
         let params = params.extended(self.extension.as_deref())?;
-        self.commit_completed_turn_atomic_inner(params, None).await
+        let outcome = self
+            .commit_completed_turn_atomic_inner(params, None)
+            .await?;
+        TerminalRootTurn::record_tasks(outcome.settled.iter().map(|(task, _)| task));
+        Ok(outcome)
     }
 
     async fn insert(&self, task: AgentTask) -> Result<()> {
@@ -6737,6 +6756,7 @@ ORDER BY descendant.root_id
         )
         .await?;
         tx.commit().await.context("commit complete_task")?;
+        TerminalRootTurn::record_tasks([&result.0]);
         Ok(result)
     }
 

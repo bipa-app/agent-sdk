@@ -69,7 +69,7 @@ use crate::proto::agent::service::v1::agent_event_service_server::{
     AgentEventService, AgentEventServiceServer,
 };
 use crate::runtime::ExecutionRuntime;
-use crate::stores::StoreRegistry;
+use crate::stores::{StoreOptions, StoreRegistry};
 
 mod prompt_rpc;
 
@@ -2936,8 +2936,8 @@ type TransportConfigurer = Box<dyn FnOnce(GrpcTransport) -> GrpcTransport + Send
 
 /// Assembles a [`LocalDaemon`]: [`LocalDaemon::builder`].
 ///
-/// Startup order: build the [`StoreRegistry`] for `config.storage`, apply
-/// the store decorator, initialize the stores (migrations), await the
+/// Startup order: build the [`StoreRegistry`] for `config.storage` with the
+/// [`StoreOptions`] (see [`Self::store_options`]), apply the store decorator, initialize the stores (migrations), await the
 /// pre-worker gate, then create the [`ServiceHost`], configure the gRPC
 /// transport, bind the loopback listener and start both. No worker can
 /// acquire a task, and no sweep or transport can run, before the gate
@@ -2947,12 +2947,23 @@ pub struct LocalDaemonBuilder {
     config: ServiceConfig,
     definition_registry: Arc<dyn AgentDefinitionRegistry>,
     runtime: Arc<ExecutionRuntime>,
+    store_options: StoreOptions,
     decorate: Option<StoreDecorator>,
     before_workers: Option<PreWorkerGate>,
     configure_transport: Option<TransportConfigurer>,
 }
 
 impl LocalDaemonBuilder {
+    /// Set what the concrete stores carry (a transition extension, the
+    /// session view settings) before the registry shares them:
+    /// [`StoreRegistry::from_config_with`]. A decorator cannot do this,
+    /// because it only gets the shared handles. The default is
+    /// [`StoreOptions::default`], which is [`StoreRegistry::from_config`].
+    pub fn store_options(mut self, options: StoreOptions) -> Self {
+        self.store_options = options;
+        self
+    }
+
     /// Wrap the assembled [`StoreRegistry`] before the daemon uses it.
     /// The contract is [`LocalDaemon::start_with_store_decorator`]'s.
     pub fn decorate_stores(
@@ -2998,12 +3009,14 @@ impl LocalDaemonBuilder {
             config,
             definition_registry,
             runtime,
+            store_options,
             decorate,
             before_workers,
             configure_transport,
         } = self;
-        let stores = StoreRegistry::from_config(&config.storage, definition_registry)
-            .context("creating daemon stores")?;
+        let stores =
+            StoreRegistry::from_config_with(&config.storage, definition_registry, store_options)
+                .context("creating daemon stores")?;
         let event_notifier = Arc::clone(&stores.event_notifier);
         let confirm_drive_cancels = Arc::clone(&stores.confirm_drive_cancels);
         let stores = match decorate {
@@ -3190,6 +3203,7 @@ impl LocalDaemon {
             config,
             definition_registry,
             runtime,
+            store_options: StoreOptions::default(),
             decorate: None,
             before_workers: None,
             configure_transport: None,
@@ -6683,6 +6697,124 @@ mod tests {
             [agent_server::journal::task::TaskStatus::Pending]
         );
         Ok(())
+    }
+
+    /// Books each completed turn into a document on its thread, and each
+    /// other commit into one host document.
+    struct BookCommits;
+
+    impl agent_server::journal::TransitionExtension for BookCommits {
+        fn extend(
+            &self,
+            view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            let scope = match view {
+                agent_server::journal::TransitionView::CompletedTurn(commit) => {
+                    agent_server::journal::DocScope::Thread(commit.thread_id.clone())
+                }
+                agent_server::journal::TransitionView::Commit(_) => {
+                    agent_server::journal::DocScope::Host
+                }
+            };
+            let Ok(kind) = agent_server::journal::DocKind::new("daemon.booked") else {
+                return Vec::new();
+            };
+            vec![agent_server::journal::Write::Document(
+                agent_server::journal::DocumentWrite::put(
+                    agent_server::journal::DocumentKey::new(scope, kind, ""),
+                    1,
+                    agent_server::journal::DocExpect::Any,
+                    serde_json::json!(true),
+                ),
+            )]
+        }
+    }
+
+    /// `store_options` reach the stores the daemon mounts, under its
+    /// decorator: the extension runs in the worker's completed-turn commit
+    /// and in a commit through `LocalDaemon::stores()`.
+    #[tokio::test]
+    async fn local_daemon_builds_its_stores_with_the_store_options() -> Result<()> {
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let runtime = runtime_with(
+            Arc::new(ScriptedProvider::new(vec![text_response(
+                "resp_options_1",
+                "booked",
+            )])),
+            Arc::new(NoopToolExecutor),
+        )?;
+        let thread_id = ThreadId::from_string("options-thread");
+        let decorated = Arc::new(std::sync::Mutex::new(None));
+        let daemon = LocalDaemon::builder(ServiceConfig::default(), registry, runtime)
+            .store_options(StoreOptions {
+                transition_extension: Some(Arc::new(BookCommits)),
+                ..StoreOptions::default()
+            })
+            .decorate_stores(wrapping_decorator(Arc::clone(&decorated)))
+            .before_workers({
+                let thread_id = thread_id.clone();
+                move |stores| async move { seed_gated_root(&stores, &thread_id).await }
+            })
+            .start()
+            .await?;
+
+        let result = async {
+            let booked = |scope| {
+                Ok::<_, anyhow::Error>(agent_server::journal::DocumentKey::new(
+                    scope,
+                    agent_server::journal::DocKind::new("daemon.booked")?,
+                    "",
+                ))
+            };
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let statuses = thread_task_statuses(daemon.stores(), &thread_id).await?;
+                if statuses == [agent_server::journal::task::TaskStatus::Completed] {
+                    break;
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "the root never completed: {statuses:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let documents = &daemon.stores().document_store;
+            anyhow::ensure!(
+                documents
+                    .get_document(&booked(agent_server::journal::DocScope::Thread(
+                        thread_id.clone()
+                    ))?)
+                    .await?
+                    .is_some(),
+                "the worker's completed-turn commit did not run the extension"
+            );
+            let host = booked(agent_server::journal::DocScope::Host)?;
+            let (_, wrapper) = decorated
+                .lock()
+                .map_err(|_| anyhow::anyhow!("decorator lock"))?
+                .clone()
+                .context("the decorator ran")?;
+            assert!(Arc::ptr_eq(&daemon.stores().task_store, &wrapper));
+            daemon
+                .stores()
+                .task_store
+                .commit(
+                    agent_server::journal::Transition::default(),
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+            anyhow::ensure!(
+                documents.get_document(&host).await?.is_some(),
+                "a commit through LocalDaemon::stores() did not run the extension"
+            );
+            Ok(())
+        }
+        .await;
+        daemon.stop().await?;
+        result
     }
 
     /// `SubmitThreadWork` wakes a parked worker: with a 60 s acquisition
