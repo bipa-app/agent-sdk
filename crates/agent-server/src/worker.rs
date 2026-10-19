@@ -100,6 +100,7 @@ pub mod tool_effect;
 mod tool_phase;
 pub mod tool_stall;
 pub mod tool_task;
+pub mod usage_progress;
 pub mod user_input;
 
 #[cfg(test)]
@@ -184,6 +185,7 @@ pub use tool_task::{
     ToolEventCollector, ToolTaskBootstrap, ToolTaskOutcome, execute_tool_task,
     resolve_tool_bootstrap,
 };
+pub use usage_progress::{AttemptOwner, close_attempt_transition, usage_progress_event};
 pub use user_input::{UserInput, user_input_from_submitted};
 
 pub use crate::journal::effect::TOOL_INTERRUPTED_PREFIX;

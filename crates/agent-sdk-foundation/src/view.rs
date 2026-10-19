@@ -750,6 +750,9 @@ impl Step {
                 });
             }
             AgentEvent::AutoRetryEnd { .. } => self.status.retry = None,
+            // Live usage is priced by the host, which reads the events; the
+            // view keeps the turn and run totals it already folds.
+            AgentEvent::UsageProgress { .. } => {}
             AgentEvent::UserInput {
                 content,
                 emitter_task_id,
@@ -880,7 +883,8 @@ impl Step {
             | AgentEvent::Error { .. }
             | AgentEvent::AutoRetryStart { .. }
             | AgentEvent::AutoRetryEnd { .. }
-            | AgentEvent::Cancelled { .. } => {}
+            | AgentEvent::Cancelled { .. }
+            | AgentEvent::UsageProgress { .. } => {}
         }
     }
 

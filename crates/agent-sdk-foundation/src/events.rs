@@ -706,6 +706,41 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         liveness: Option<Box<SubagentLiveness>>,
     },
+
+    /// An LLM call of a durable root turn closed. Committed in the
+    /// transaction that closes the call's attempt row, under the turn's
+    /// lease, so the events of a task are exactly its closed attempts.
+    UsageProgress {
+        /// The root turn task that made the call.
+        task_id: String,
+        /// The closed attempt's row id.
+        attempt_id: String,
+        /// The attempt's 1-indexed number within its task.
+        attempt_number: u32,
+        /// The provider identity the attempt was opened against (the API
+        /// shape), not necessarily the one that served it.
+        provider: String,
+        /// The model the attempt requested.
+        model: String,
+        /// The model the provider said it served.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_model: Option<String>,
+        /// The route that served the attempt, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route_provider: Option<String>,
+        /// The attempt's billed usage, failed and cancelled calls included.
+        usage: TokenUsage,
+        /// The billed usage of every closed attempt of `task_id`, this one
+        /// included (retries and compaction calls count). The turn's
+        /// `TurnComplete` usage folds the same calls in, so on a completed
+        /// turn the last event's figure matches it.
+        turn_usage: TokenUsage,
+        /// Prompt tokens of the call's last physical request (its context
+        /// occupancy), when the provider reported them. `usage.input_tokens`
+        /// sums failover requests and is not an occupancy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u32>,
+    },
 }
 
 impl AgentEvent {
@@ -1843,6 +1878,73 @@ mod tests {
             }
             other => panic!("expected SubagentProgress, got {other:?}"),
         }
+        Ok(())
+    }
+
+    #[test]
+    fn usage_progress_round_trips_and_its_optional_fields_default() -> serde_json::Result<()> {
+        let row = serde_json::json!({
+            "type": "usage_progress",
+            "task_id": "task_1",
+            "attempt_id": "attempt_1",
+            "attempt_number": 2,
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "usage": {"input_tokens": 120, "output_tokens": 7},
+            "turn_usage": {
+                "input_tokens": 300,
+                "output_tokens": 20,
+                "cached_input_tokens": 100,
+                "cache_creation_input_tokens": 50
+            },
+        });
+        let bare: AgentEvent = serde_json::from_value(row)?;
+        let AgentEvent::UsageProgress {
+            attempt_number,
+            response_model: None,
+            route_provider: None,
+            context_tokens: None,
+            usage,
+            turn_usage,
+            ..
+        } = &bare
+        else {
+            panic!("expected a UsageProgress without its optional fields, got {bare:?}");
+        };
+        assert_eq!(*attempt_number, 2);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(turn_usage.cache_creation_input_tokens, 50);
+        let rewritten = serde_json::to_value(&bare)?;
+        for absent in ["response_model", "route_provider", "context_tokens"] {
+            assert!(
+                rewritten.get(absent).is_none(),
+                "{absent} written: {rewritten}"
+            );
+        }
+
+        let full = AgentEvent::UsageProgress {
+            task_id: "task_1".into(),
+            attempt_id: "attempt_1".into(),
+            attempt_number: 2,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            response_model: Some("claude-sonnet-5-5-20261001".into()),
+            route_provider: Some("openrouter".into()),
+            usage: TokenUsage {
+                input_tokens: 120,
+                output_tokens: 7,
+                cached_input_tokens: 30,
+                cache_creation_input_tokens: 11,
+            },
+            turn_usage: TokenUsage::default(),
+            context_tokens: Some(120),
+        };
+        let json = serde_json::to_value(&full)?;
+        assert_eq!(json["type"], "usage_progress");
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<AgentEvent>(json.clone())?)?,
+            json
+        );
         Ok(())
     }
 

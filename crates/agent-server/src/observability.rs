@@ -182,6 +182,9 @@ pub mod attrs {
     pub const PROGRESS_SUBAGENT: &str = "subagent_progress";
     /// `kind` of `agent_server.progress.events`: a root turn's stall notice.
     pub const PROGRESS_ROOT_STALL_NOTICE: &str = "root_stall_notice";
+    /// `kind` of `agent_server.progress.events`: a root turn's
+    /// `UsageProgress`, committed with its attempt's close.
+    pub const PROGRESS_USAGE: &str = "usage_progress";
     /// `reason` of `agent_server.progress.refused`: the emitter no longer
     /// holds the lease it writes under.
     pub const PROGRESS_LEASE_LOST: &str = "lease_lost";
@@ -1032,7 +1035,8 @@ impl ServerMetrics {
     }
 
     /// Count a progress event appended under a lease, by `kind`
-    /// ([`attrs::PROGRESS_SUBAGENT`] or [`attrs::PROGRESS_ROOT_STALL_NOTICE`]).
+    /// ([`attrs::PROGRESS_SUBAGENT`], [`attrs::PROGRESS_ROOT_STALL_NOTICE`] or
+    /// [`attrs::PROGRESS_USAGE`]).
     pub fn record_progress_event(&self, kind: &'static str) {
         self.progress_events
             .add(1, &[KeyValue::new(attrs::KIND, kind)]);

@@ -63,6 +63,7 @@ use super::definition::{
     AgentDefinition, ChildJoinPolicy, ThinkingPolicy, ToolInputPreflightContext,
     ToolInputPreflightOutcome, ToolInputSanitizer,
 };
+use super::usage_progress::AttemptOwner;
 use crate::journal::SpawnChildrenExt;
 use crate::journal::checkpoint::CheckpointKind;
 use crate::journal::checkpoint_store::CheckpointStore;
@@ -390,6 +391,9 @@ struct AttemptEvidence {
     /// The model the stream's `Done` named; `None` when the provider did not
     /// stamp one.
     served_model: Option<String>,
+    /// The root turn that dispatched the call, which closes its attempt with
+    /// a `UsageProgress`. `None` only in tests that build evidence alone.
+    owner: Option<AttemptOwner>,
 }
 
 impl AttemptEvidence {
@@ -432,11 +436,17 @@ impl AttemptEvidence {
             staged_history_generation: None,
             served_route: None,
             served_model: None,
+            owner: None,
         }
     }
 
     const fn with_staged_history_generation(mut self, generation: u64) -> Self {
         self.staged_history_generation = Some(generation);
+        self
+    }
+
+    fn with_owner(mut self, bootstrap: &super::bootstrap::WorkerBootstrapContext) -> Self {
+        self.owner = Some(AttemptOwner::of(bootstrap));
         self
     }
 }
@@ -2311,8 +2321,7 @@ async fn commit_text_only_turn(
         duration,
         content_ids: &close_ctx.content_ids,
     });
-
-    let commit = commit_completed_turn_shifting_slot(
+    let commit = super::usage_progress::commit_completed_turn_reporting_usage(
         CompletedTurnCommit {
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
@@ -2335,8 +2344,8 @@ async fn commit_text_only_turn(
             extra_writes: completed_root_writes(task_id, &attempt.id, &salvaged),
             now,
         },
-        &inputs.bootstrap.worker_id,
-        &inputs.bootstrap.lease_id,
+        (&attempt, close_ctx.success_usage.request_input_tokens),
+        (&inputs.bootstrap.worker_id, &inputs.bootstrap.lease_id),
         deps,
     )
     .await
@@ -2671,14 +2680,25 @@ pub(crate) async fn settle_attempt_after_lost_ownership(
     settle_own_attempt(params, deps).await;
 }
 
-/// Best-effort close of THIS execution's attempt — the id was opened
-/// by this worker, so it cannot belong to a replacement worker. The
-/// close carries the REAL token usage the commit would have recorded
-/// (attempt rows are the billing source of truth) under the
-/// `Cancelled` outcome, since the turn did not commit. A concurrent
-/// close (the cancel path, or the host's terminal envelope, racing
-/// this settle) makes the store reject `AlreadyClosed`, which is
-/// swallowed as usual for best-effort closes.
+/// Best-effort close of THIS execution's attempt when its completed turn
+/// did not commit, with no `UsageProgress`.
+///
+/// It runs on three exits of [`commit_completed_turn_shifting_slot`]:
+/// - an owner-guarded shifted retry rejected with `LostCommitOwnership`
+///   (through [`settle_attempt_after_lost_ownership`]);
+/// - the turn-slot shift walk exhausted at `MAX_TURN_SLOT_SHIFTS`;
+/// - the no-shift exit, when the eligibility re-read refuses the shift.
+///
+/// On the last two the task may still be owned. The close is the plain,
+/// unguarded one on all three — the id was opened by this worker, so it
+/// cannot belong to a replacement worker. It carries the REAL token usage
+/// the commit would have recorded (attempt rows are the billing source of
+/// truth) under the `Cancelled` outcome, so the attempt is billed
+/// correctly; but no per-attempt `UsageProgress` frame is written for it,
+/// even where ownership is intact. A concurrent close (the cancel path,
+/// or the host's terminal envelope, racing this settle) makes the store
+/// reject `AlreadyClosed`, which is swallowed as usual for best-effort
+/// closes.
 pub(crate) async fn settle_own_attempt(params: &CompletedTurnCommit, deps: &RootTurnDeps<'_>) {
     let close = CloseAttemptParams {
         outcome: TurnAttemptOutcome::Cancelled,
@@ -3106,7 +3126,11 @@ impl<'a> From<&'a super::compaction::CompactionFailure> for CompactionAudit<'a> 
     }
 }
 
+/// Close a compaction call's attempt with its `UsageProgress`. Its
+/// `context_tokens` stay `None`: the summary request's prompt is not the
+/// thread's context occupancy.
 async fn close_compaction_attempt(
+    inputs: &RootWorkerInputs,
     attempt: &TurnAttempt,
     outcome: TurnAttemptOutcome,
     audit: CompactionAudit<'_>,
@@ -3119,35 +3143,36 @@ async fn close_compaction_attempt(
         response_model,
         served_route,
     } = audit;
-    deps.attempt_store
-        .close_attempt(
-            &attempt.id,
-            CloseAttemptParams {
-                response_blob: serde_json::json!({
-                    "operation": "context_compaction",
-                    "applied": applied,
-                }),
-                response_id: None,
-                response_model,
-                stop_reason: None,
-                outcome,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                route_provider: served_route.or_else(|| {
-                    deps.compaction_provider
-                        .map(|provider| provider.route().to_owned())
-                }),
-                thinking_mode: None,
-                thinking_budget_tokens: None,
-                thinking_effort: None,
-            },
-            now,
-        )
-        .await
-        .map(|_| ())
-        .context("close context-compaction attempt")
+    super::usage_progress::close_attempt_reporting_usage(
+        deps,
+        &AttemptOwner::of(&inputs.bootstrap),
+        attempt,
+        CloseAttemptParams {
+            response_blob: serde_json::json!({
+                "operation": "context_compaction",
+                "applied": applied,
+            }),
+            response_id: None,
+            response_model,
+            stop_reason: None,
+            outcome,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            route_provider: served_route.or_else(|| {
+                deps.compaction_provider
+                    .map(|provider| provider.route().to_owned())
+            }),
+            thinking_mode: None,
+            thinking_budget_tokens: None,
+            thinking_effort: None,
+        },
+        None,
+        now,
+    )
+    .await
+    .context("close context-compaction attempt")
 }
 
 struct PreCallCompactionParams<'a> {
@@ -3229,6 +3254,7 @@ async fn prepare_pre_call_compaction(
         Ok(outcome) => outcome,
         Err(failure) => {
             close_compaction_attempt(
+                inputs,
                 &compaction_attempt,
                 TurnAttemptOutcome::ServerError,
                 (&failure).into(),
@@ -3243,6 +3269,7 @@ async fn prepare_pre_call_compaction(
     if !outcome.completed {
         let closed_at = OffsetDateTime::now_utc();
         close_compaction_attempt(
+            inputs,
             &compaction_attempt,
             TurnAttemptOutcome::Cancelled,
             (&outcome).into(),
@@ -3258,6 +3285,7 @@ async fn prepare_pre_call_compaction(
 
     let closed_at = OffsetDateTime::now_utc();
     close_compaction_attempt(
+        inputs,
         &compaction_attempt,
         TurnAttemptOutcome::Success,
         (&outcome).into(),
@@ -3819,12 +3847,12 @@ async fn ensure_retry_not_cancelled(
     // the evidence of the call it was about to make, so a turn cancelled
     // mid-retry-storm still names the route it was hammering.
     let cancelled_at = OffsetDateTime::now_utc();
-    close_attempt_with(
+    close_own_attempt(
         attempt,
         TurnAttemptOutcome::Cancelled,
         &ZERO_ATTEMPT_USAGE,
-        Some(evidence),
-        deps.attempt_store,
+        evidence,
+        deps,
         cancelled_at,
     )
     .await;
@@ -3964,7 +3992,8 @@ async fn call_llm_with_retry(params: LlmRetryParams<'_>) -> Result<StreamedTurn>
         // without one — the route a cancelled attempt was aimed at is exactly
         // what an operator needs from the audit trail.
         let evidence = AttemptEvidence::from_dispatch(provider, &chat_request)
-            .with_staged_history_generation(inputs.staged_stores.messages.history_generation());
+            .with_staged_history_generation(inputs.staged_stores.messages.history_generation())
+            .with_owner(&inputs.bootstrap);
         ensure_retry_not_cancelled(deps, &attempt, &evidence).await?;
         let was_retried = retry.any_stream_retry() || compaction_retries > 0;
         let attempt_now = if was_retried {
@@ -4086,12 +4115,12 @@ async fn race_wait_against_cancel<T>(
         biased;
         () = cancel.cancelled() => {
             let cancelled_at = OffsetDateTime::now_utc();
-            close_attempt_with(
+            close_own_attempt(
                 current_attempt,
                 TurnAttemptOutcome::Cancelled,
                 &ZERO_ATTEMPT_USAGE,
-                Some(evidence),
-                deps.attempt_store,
+                evidence,
+                deps,
                 cancelled_at,
             )
             .await;
@@ -4390,6 +4419,37 @@ struct CompactionRecovery {
     abandoned_usage: llm::Usage,
 }
 
+/// An overflow compaction that rewrote nothing, so the turn does not retry.
+///
+/// Under a cancel, an incomplete call's attempt goes back to the caller
+/// still open, with zero usage; any other incomplete call closes its
+/// attempt as a server error.
+async fn settle_unapplied_overflow_compaction(
+    inputs: &RootWorkerInputs,
+    compaction_attempt: TurnAttempt,
+    outcome: &super::compaction::CompactionOutcome,
+    deps: &RootTurnDeps<'_>,
+) -> Result<Option<CompactionRecovery>> {
+    if deps.is_cancelled() && !outcome.completed {
+        return Ok(Some(CompactionRecovery {
+            attempt: compaction_attempt,
+            abandoned_usage: ZERO_ATTEMPT_USAGE,
+        }));
+    }
+    if !outcome.completed {
+        close_compaction_attempt(
+            inputs,
+            &compaction_attempt,
+            TurnAttemptOutcome::ServerError,
+            outcome.into(),
+            deps,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+    }
+    Ok(None)
+}
+
 /// Detect a `prompt is too long`-class fatal error, run an emergency
 /// compaction against the durable projection + staged buffer, rebuild
 /// the chat request from the compacted history, and open a fresh
@@ -4451,6 +4511,7 @@ async fn try_recover_with_compaction(
     let completed_usage = token_usage_as_llm_usage(&outcome.llm_usage);
     if outcome.completed {
         close_compaction_attempt(
+            inputs,
             &compaction_attempt,
             TurnAttemptOutcome::Success,
             (&outcome).into(),
@@ -4465,23 +4526,8 @@ async fn try_recover_with_compaction(
     }
 
     if !outcome.applied {
-        if deps.is_cancelled() && !outcome.completed {
-            return Ok(Some(CompactionRecovery {
-                attempt: compaction_attempt,
-                abandoned_usage: ZERO_ATTEMPT_USAGE,
-            }));
-        }
-        if !outcome.completed {
-            close_compaction_attempt(
-                &compaction_attempt,
-                TurnAttemptOutcome::ServerError,
-                (&outcome).into(),
-                deps,
-                OffsetDateTime::now_utc(),
-            )
-            .await?;
-        }
-        return Ok(None);
+        return settle_unapplied_overflow_compaction(inputs, compaction_attempt, &outcome, deps)
+            .await;
     }
 
     // Rebuild the chat request from the compacted staged history.
@@ -4558,6 +4604,7 @@ async fn run_overflow_compaction(
         Ok(outcome) => Ok(outcome),
         Err(failure) => {
             close_compaction_attempt(
+                inputs,
                 compaction_attempt,
                 TurnAttemptOutcome::ServerError,
                 (&failure).into(),
@@ -4732,12 +4779,12 @@ async fn call_llm_once(
     {
         Ok(request) => request,
         Err(error) => {
-            close_attempt_with(
+            close_own_attempt(
                 attempt,
                 TurnAttemptOutcome::InvalidRequest,
                 &ZERO_ATTEMPT_USAGE,
-                Some(evidence),
-                deps.attempt_store,
+                evidence,
+                deps,
                 OffsetDateTime::now_utc(),
             )
             .await;
@@ -4756,12 +4803,12 @@ async fn call_llm_once(
     };
     if deps.is_cancelled() {
         let cancelled_at = OffsetDateTime::now_utc();
-        close_attempt_with(
+        close_own_attempt(
             attempt,
             TurnAttemptOutcome::Cancelled,
             &ZERO_ATTEMPT_USAGE,
-            Some(evidence),
-            deps.attempt_store,
+            evidence,
+            deps,
             cancelled_at,
         )
         .await;
@@ -5057,12 +5104,12 @@ async fn close_truncated_stream(
     usage: llm::Usage,
     now: OffsetDateTime,
 ) -> StreamAttemptError {
-    close_attempt_with(
+    close_own_attempt(
         attempt,
         TurnAttemptOutcome::ServerError,
         &usage,
-        Some(evidence),
-        deps.attempt_store,
+        evidence,
+        deps,
         now,
     )
     .await;
@@ -5526,7 +5573,9 @@ async fn flush_streaming_deltas(
     }
 }
 
-/// Best-effort close of a turn attempt with a failure outcome.
+/// Best-effort close of a turn attempt this execution did not dispatch (a
+/// row read back from the store, or a synthetic one), with a failure
+/// outcome and no `UsageProgress`.
 async fn close_attempt_with(
     attempt: &TurnAttempt,
     outcome: TurnAttemptOutcome,
@@ -5535,7 +5584,62 @@ async fn close_attempt_with(
     attempt_store: &dyn TurnAttemptStore,
     now: OffsetDateTime,
 ) {
-    let params = CloseAttemptParams {
+    let params = failure_close_params(outcome, usage, evidence);
+    // Best-effort: if closing fails, the primary error is more important.
+    let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
+}
+
+/// Best-effort close of the attempt this execution dispatched, with a
+/// failure outcome, committing its `UsageProgress` with it.
+async fn close_own_attempt(
+    attempt: &TurnAttempt,
+    outcome: TurnAttemptOutcome,
+    usage: &llm::Usage,
+    evidence: &AttemptEvidence,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    let params = failure_close_params(outcome, usage, Some(evidence));
+    // Best-effort: if closing fails, the primary error is more important.
+    let _ = close_reporting_usage(attempt, params, evidence, usage, deps, now).await;
+}
+
+/// Close `attempt` with `params`, with its `UsageProgress` when `evidence`
+/// names the root turn that dispatched it.
+async fn close_reporting_usage(
+    attempt: &TurnAttempt,
+    params: CloseAttemptParams,
+    evidence: &AttemptEvidence,
+    usage: &llm::Usage,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    match &evidence.owner {
+        Some(owner) => {
+            super::usage_progress::close_attempt_reporting_usage(
+                deps,
+                owner,
+                attempt,
+                params,
+                usage.request_input_tokens,
+                now,
+            )
+            .await
+        }
+        None => deps
+            .attempt_store
+            .close_attempt(&attempt.id, params, now)
+            .await
+            .map(drop),
+    }
+}
+
+fn failure_close_params(
+    outcome: TurnAttemptOutcome,
+    usage: &llm::Usage,
+    evidence: Option<&AttemptEvidence>,
+) -> CloseAttemptParams {
+    CloseAttemptParams {
         response_blob: serde_json::json!(null),
         response_id: None,
         response_model: None,
@@ -5551,9 +5655,7 @@ async fn close_attempt_with(
         thinking_mode: evidence.map(|value| value.thinking_mode),
         thinking_budget_tokens: evidence.and_then(|value| value.thinking_budget_tokens),
         thinking_effort: evidence.and_then(|value| value.thinking_effort),
-    };
-    // Best-effort: if closing fails, the primary error is more important.
-    let _ = attempt_store.close_attempt(&attempt.id, params, now).await;
+    }
 }
 
 /// Finish `attempt`'s LLM request `Failed` after its attempt closed with a
@@ -5609,12 +5711,12 @@ async fn flush_and_close(params: CloseStreamAttemptParams<'_, '_>) {
         now,
     } = params;
     flush_streaming_deltas(ctx.deps, ctx.thread_id, ctx.pending_deltas).await;
-    close_attempt_with(
+    close_own_attempt(
         ctx.attempt,
         outcome.clone(),
         usage,
-        Some(ctx.evidence),
-        ctx.deps.attempt_store,
+        ctx.evidence,
+        ctx.deps,
         now,
     )
     .await;
@@ -5977,12 +6079,12 @@ async fn guard_against_duplicate_suspension(
         // billed, so the row records that attempt's own usage — the winning
         // worker's separate call committed the turn, but this loser's tokens
         // were billed too and belong on its audit row.
-        close_attempt_with(
+        close_own_attempt(
             attempt,
             TurnAttemptOutcome::Cancelled,
             &close_ctx.success_usage,
-            Some(&close_ctx.evidence),
-            deps.attempt_store,
+            &close_ctx.evidence,
+            deps,
             now,
         )
         .await;
@@ -7104,12 +7206,8 @@ async fn close_attempt_or_propagate_already_closed(
     now: OffsetDateTime,
 ) -> Result<()> {
     let params = build_close_params(response, usage, evidence);
-    match deps
-        .attempt_store
-        .close_attempt(&attempt.id, params, now)
-        .await
-    {
-        Ok(_) => {
+    match close_reporting_usage(attempt, params, evidence, usage, deps, now).await {
+        Ok(()) => {
             finish_consumed_request(attempt, deps, now).await;
             Ok(())
         }
@@ -8283,8 +8381,7 @@ async fn commit_resumed_turn(
         duration,
         content_ids: close.content_ids,
     });
-
-    let commit = commit_completed_turn_shifting_slot(
+    let commit = super::usage_progress::commit_completed_turn_reporting_usage(
         CompletedTurnCommit {
             checkpoint_kind: CheckpointKind::FullTurn,
             thread_id: thread_id.clone(),
@@ -8307,8 +8404,8 @@ async fn commit_resumed_turn(
             extra_writes: completed_root_writes(task_id, &attempt.id, &[]),
             now,
         },
-        &inputs.bootstrap.worker_id,
-        &inputs.bootstrap.lease_id,
+        (attempt, close.success_usage.request_input_tokens),
+        (&inputs.bootstrap.worker_id, &inputs.bootstrap.lease_id),
         deps,
     )
     .await

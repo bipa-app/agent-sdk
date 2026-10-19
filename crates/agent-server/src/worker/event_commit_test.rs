@@ -257,8 +257,9 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     // The streamed `TextDelta` is committed to the journal during
     // streaming but is *not* threaded back into the outcome vec (it is
     // committed out-of-band by the streaming delta-batch flush), so the
-    // outcome carries only the consolidated content + lifecycle edges.
-    assert_eq!(committed_events.len(), 5, "expected 5 outcome events");
+    // outcome carries only the consolidated content + lifecycle edges,
+    // with the attempt's `UsageProgress` committed before `TurnComplete`.
+    assert_eq!(committed_events.len(), 6, "expected 6 outcome events");
     assert!(
         matches!(&committed_events[0].event, AgentEvent::UserInput { .. }),
         "event[0] should be UserInput, got {:?}",
@@ -275,22 +276,27 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
         committed_events[2].event,
     );
     assert!(
-        matches!(&committed_events[3].event, AgentEvent::TurnComplete { .. }),
-        "event[3] should be TurnComplete, got {:?}",
+        matches!(&committed_events[3].event, AgentEvent::UsageProgress { .. }),
+        "event[3] should be UsageProgress, got {:?}",
         committed_events[3].event,
     );
     assert!(
-        matches!(&committed_events[4].event, AgentEvent::Done { .. }),
-        "event[4] should be Done, got {:?}",
+        matches!(&committed_events[4].event, AgentEvent::TurnComplete { .. }),
+        "event[4] should be TurnComplete, got {:?}",
         committed_events[4].event,
+    );
+    assert!(
+        matches!(&committed_events[5].event, AgentEvent::Done { .. }),
+        "event[5] should be Done, got {:?}",
+        committed_events[5].event,
     );
 
     // The journal additionally carries the streamed `TextDelta` between
     // `Start` and the consolidated `Text`, so the full replay is
-    // `UserInput → Start → TextDelta → Text → TurnComplete → Done`
-    // (6 events) with contiguous sequences.
+    // `UserInput → Start → TextDelta → Text → UsageProgress → TurnComplete
+    // → Done` (7 events) with contiguous sequences.
     let repo_events = stores.events.get_events(&thread_a()).await?;
-    assert_eq!(repo_events.len(), 6, "expected 6 journal events");
+    assert_eq!(repo_events.len(), 7, "expected 7 journal events");
     assert!(matches!(
         &repo_events[0].event,
         AgentEvent::UserInput { .. }
@@ -304,9 +310,13 @@ async fn text_only_turn_emits_turn_complete_and_done() -> Result<()> {
     assert!(matches!(&repo_events[3].event, AgentEvent::Text { .. }));
     assert!(matches!(
         &repo_events[4].event,
+        AgentEvent::UsageProgress { .. }
+    ));
+    assert!(matches!(
+        &repo_events[5].event,
         AgentEvent::TurnComplete { .. }
     ));
-    assert!(matches!(&repo_events[5].event, AgentEvent::Done { .. }));
+    assert!(matches!(&repo_events[6].event, AgentEvent::Done { .. }));
     for (i, evt) in repo_events.iter().enumerate() {
         assert_eq!(evt.sequence, i as u64);
     }
@@ -361,8 +371,9 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
         RootTurnOutcome::Suspended { .. } => panic!("expected Completed, got Suspended"),
     };
 
-    // UserInput + Start + Text + Refusal + TurnComplete + Done (6 events).
-    assert_eq!(committed_events.len(), 6, "expected 6 events");
+    // UserInput + Start + Text + Refusal + UsageProgress + TurnComplete +
+    // Done (7 events).
+    assert_eq!(committed_events.len(), 7, "expected 7 events");
     assert!(
         matches!(&committed_events[0].event, AgentEvent::UserInput { .. }),
         "event[0] should be UserInput, got {:?}",
@@ -384,14 +395,19 @@ async fn refusal_turn_emits_refusal_event() -> Result<()> {
         committed_events[3].event,
     );
     assert!(
-        matches!(&committed_events[4].event, AgentEvent::TurnComplete { .. }),
-        "event[4] should be TurnComplete, got {:?}",
+        matches!(&committed_events[4].event, AgentEvent::UsageProgress { .. }),
+        "event[4] should be UsageProgress, got {:?}",
         committed_events[4].event,
     );
     assert!(
-        matches!(&committed_events[5].event, AgentEvent::Done { .. }),
-        "event[5] should be Done, got {:?}",
+        matches!(&committed_events[5].event, AgentEvent::TurnComplete { .. }),
+        "event[5] should be TurnComplete, got {:?}",
         committed_events[5].event,
+    );
+    assert!(
+        matches!(&committed_events[6].event, AgentEvent::Done { .. }),
+        "event[6] should be Done, got {:?}",
+        committed_events[6].event,
     );
 
     Ok(())
@@ -449,10 +465,10 @@ async fn suspension_emits_tool_call_start_per_tool() -> Result<()> {
         committed_events[3].event,
     );
 
-    // Sequences should be contiguous.
-    for (i, evt) in committed_events.iter().enumerate() {
-        assert_eq!(evt.sequence, i as u64);
-    }
+    // The attempt's `UsageProgress` (sequence 2) commits with its close,
+    // before the suspension, and is not part of the suspension's events.
+    let sequences: Vec<u64> = committed_events.iter().map(|evt| evt.sequence).collect();
+    assert_eq!(sequences, vec![0, 1, 3, 4]);
 
     Ok(())
 }
@@ -775,6 +791,7 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
             AgentEvent::TextDelta { .. } => "TextDelta",
             AgentEvent::Text { .. } => "Text",
             AgentEvent::TurnComplete { .. } => "TurnComplete",
+            AgentEvent::UsageProgress { .. } => "UsageProgress",
             AgentEvent::Done { .. } => "Done",
             other => panic!("unexpected event in lifecycle: {other:?}"),
         })
@@ -784,10 +801,12 @@ async fn event_sequences_monotonic_across_lifecycle() -> Result<()> {
         vec![
             "UserInput",
             "Start",
+            "UsageProgress",
             "ToolCallStart",
             "ToolCallEnd",
             "TextDelta",
             "Text",
+            "UsageProgress",
             "TurnComplete",
             "Done",
         ],

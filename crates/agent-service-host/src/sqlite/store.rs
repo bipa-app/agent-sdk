@@ -1798,6 +1798,39 @@ WHERE id = ?1
     /// Close the still-open attempt row an abandoned LLM request names, in
     /// the transaction that abandons the request: its task ended before the
     /// request finished, so nothing will close it later (crash matrix S3).
+    /// Apply a transition's attempt write inside its transaction. A close
+    /// refuses an unknown attempt, one of another task, and one already
+    /// closed.
+    async fn apply_attempt_write_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        write: agent_server::journal::TurnAttemptWrite,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        match write {
+            agent_server::journal::TurnAttemptWrite::Open(attempt) => {
+                Self::insert_attempt_tx(tx, &attempt).await
+            }
+            agent_server::journal::TurnAttemptWrite::Close {
+                attempt,
+                task,
+                params,
+            } => {
+                let open = Self::get_attempt_tx(tx, &attempt)
+                    .await?
+                    .ok_or_else(|| anyhow!("attempt not found: {attempt}"))?;
+                anyhow::ensure!(
+                    open.task_id == task,
+                    "attempt {attempt} belongs to task {}, not {task}",
+                    open.task_id
+                );
+                let closed = open.close(*params, now)?;
+                Self::update_attempt_tx(tx, &closed).await?;
+                agent_server::fail_point!("transition.attempt_closed");
+                Ok(())
+            }
+        }
+    }
+
     async fn close_abandoned_attempt_tx(
         tx: &mut Transaction<'_, Sqlite>,
         id: &TurnAttemptId,
@@ -4052,9 +4085,7 @@ impl SqliteDurableStore {
             }
             Write::Effect(effect) => Self::apply_effect_tx(tx, effect, now).await?,
             Write::BeginEpoch(record) => Self::insert_epoch_tx(tx, &record).await?,
-            Write::TurnAttempt(agent_server::journal::TurnAttemptWrite::Open(attempt)) => {
-                Self::insert_attempt_tx(tx, &attempt).await?;
-            }
+            Write::TurnAttempt(attempt) => Self::apply_attempt_write_tx(tx, attempt, now).await?,
             Write::AppendCompaction {
                 thread,
                 messages,
