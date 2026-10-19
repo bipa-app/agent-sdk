@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Journal: a transition extension wakes the root it parks with its queued steering
+
+- **Breaking:** `Write::EnqueueSteeringResume::steering` is a
+  `SteeringInput`. `SteeringInput::Blocks` is the old inline steering
+  (`Vec<ContentBlock>` converts with `.into()`; `Transition::enqueue_steering_resume`
+  is unchanged). `SteeringInput::Queued { kind, key }` takes the steering
+  from the document of that kind and key on the parent's own thread: the
+  backend reads it under the parent's thread lock, after the transition's
+  earlier writes, and calls the store's
+  `TransitionExtension::take_queued_steering(parent, document)` (new, a
+  pure function; default `None`), which returns the steering and the
+  queue's new value. The wake and the queue write commit in the
+  transition's transaction. Nothing queued (no live document, or the
+  extension takes nothing) and a parent that is no longer parked mean no
+  wake and no write, so applying the wake again (twice in one transition,
+  in a later one, a retried transaction) is a no-op. A queued wake on a
+  store with no extension refuses its transition.
+- A transition extension may now add a `SteeringInput::Queued` steering
+  wake of a task its transition parks (`SpawnChildren` parent,
+  `ReparkAfterSteering` task); a wake of any other task, or with inline
+  steering, refuses the commit. Extension refusals are typed
+  (`ExtensionWriteRefused { point, write, reason }`), on commits and on
+  completed turns. A queued wake can name only a queue on its parent's
+  thread, so a cross-thread queue cannot be expressed.
+- This lets bip deliver a steering note queued while its root runs at the
+  root's park, in the park's transaction (bip #904's park-time wake and its
+  start-up `wake_parked_roots`, which B-3 #985 deletes with the store
+  decorator), instead of a 30 s sweep.
+- `Write::kind_name`. Observability: `agent_server.journal.extension.refused`
+  gains `write.kind`; new `agent_server.journal.steering_queue.takes`
+  (`backend`, `outcome` = `taken` / `empty` / `not_parked` /
+  `no_extension`), counted per read inside the transaction.
+
 ### Added: commit times, run usage and turn duration in the session view
 
 - Each item records when it was first put and when it last changed:

@@ -5509,7 +5509,11 @@ impl InMemoryAgentTaskStore {
                 Write::EnqueueSteeringResume { parent, steering } => committed
                     .steering_resumed
                     .push(Self::enqueue_steering_resume_locked(
-                        inner, &parent, steering, now,
+                        inner,
+                        self.extension.as_deref(),
+                        &parent,
+                        steering,
+                        now,
                     )?),
                 Write::Document(document) => committed.documents.push(apply_document_locked(
                     &mut inner.documents,
@@ -5790,14 +5794,53 @@ impl InMemoryAgentTaskStore {
     /// terminal), and the wake declines rather than racing.
     fn enqueue_steering_resume_locked(
         inner: &mut Inner,
+        extension: Option<&dyn super::extension::TransitionExtension>,
         parent_id: &AgentTaskId,
-        steering: Vec<agent_sdk_foundation::llm::ContentBlock>,
+        steering: super::transition::SteeringInput,
         now: OffsetDateTime,
     ) -> Result<Option<AgentTask>> {
+        use super::transition::SteeringInput;
+
         let old =
             inner.by_id.get(parent_id).cloned().ok_or_else(|| {
                 anyhow!("steering wake rejected: task {parent_id} does not exist")
             })?;
+        let steering = match steering {
+            SteeringInput::Blocks(steering) => steering,
+            queued @ SteeringInput::Queued { .. } => {
+                let queue = queued
+                    .queue_on(&old.thread_id)
+                    .ok_or_else(|| anyhow!("a queued steering input names its queue"))?;
+                let key = stored_document_key(&queue);
+                let stored = inner.documents.get(&key).and_then(|row| {
+                    Some(super::document::Document {
+                        key: row.key.clone(),
+                        schema_version: row.schema_version,
+                        revision: row.revision,
+                        value: row.value.clone()?,
+                        updated_at: row.updated_at,
+                    })
+                });
+                let Some((steering, write)) = super::extension::take_queued_steering(
+                    "memory",
+                    extension,
+                    &old,
+                    queue,
+                    stored.as_ref(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let plan = write
+                    .plan(stored.map(|row| super::document::StoredRevision {
+                        revision: row.revision,
+                        live: true,
+                    }))
+                    .map_err(anyhow::Error::new)?;
+                apply_document_locked(&mut inner.documents, write, Some(plan), now)?;
+                steering
+            }
+        };
         if old.status != TaskStatus::WaitingOnChildren {
             return Ok(None);
         }
@@ -5844,12 +5887,22 @@ impl InMemoryAgentTaskStore {
         transition.check_effects(|key| inner.effects.get(key))?;
         transition.check_invocation_prompts(|id| inner.by_id.get(id))?;
         for write in &transition.writes {
-            if let super::transition::Write::EnqueueSteeringResume { parent, .. } = write
-                && !inner.by_id.contains_key(parent)
-            {
-                return Err(super::transition::Rejected::Store(anyhow!(
-                    "steering wake rejected: task {parent} does not exist"
-                )));
+            if let super::transition::Write::EnqueueSteeringResume { parent, steering } = write {
+                let Some(row) = inner.by_id.get(parent) else {
+                    return Err(super::transition::Rejected::Store(anyhow!(
+                        "steering wake rejected: task {parent} does not exist"
+                    )));
+                };
+                // The refusal a durable backend gives at apply time, here
+                // before the first mutation (reconciliation C15).
+                if let Some(queue) = steering.queue_on(&row.thread_id)
+                    && self.extension.is_none()
+                {
+                    return Err(super::transition::Rejected::Store(anyhow!(
+                        "steering wake rejected: no transition extension to take the \
+                         steering queued in {queue}"
+                    )));
+                }
             }
         }
         inner.require_new_epochs(transition)?;

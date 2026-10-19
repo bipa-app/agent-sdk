@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
-use super::document::{DocScope, DocumentKey, DocumentOutcome, DocumentWrite, ExpectationFailed};
+use super::document::{
+    DocKind, DocScope, DocumentKey, DocumentOutcome, DocumentWrite, ExpectationFailed,
+};
 use super::effect::{EffectKey, EffectRecord, EffectWrite};
 use super::epoch::EpochRecord;
 use super::message::MessageProjection;
@@ -136,20 +138,58 @@ pub enum Write {
     /// writes after the transition's other writes, in their given order.
     Document(DocumentWrite),
     /// Wake a parent parked on its children to run a steering exchange
-    /// with `steering`, which must not be empty. A parent that is no
-    /// longer parked (its last child fanned it in, an exchange is already
-    /// running, or it is terminal) is left alone: the rest of the
-    /// transition still commits, and [`Committed::steering_resumed`]
-    /// reports `None`, so the steering waits for the next boundary.
+    /// with `steering`. A parent that is no longer parked (its last child
+    /// fanned it in, an exchange is already running, or it is terminal) is
+    /// left alone, and so is one with nothing queued for a
+    /// [`SteeringInput::Queued`]: the rest of the transition still
+    /// commits, and [`Committed::steering_resumed`] reports `None`, so the
+    /// steering waits for the next boundary. Applying it again is a no-op.
     EnqueueSteeringResume {
         parent: AgentTaskId,
-        steering: Vec<llm::ContentBlock>,
+        steering: SteeringInput,
     },
 
     /// Record the start of a host process's epoch. Every lease the store
     /// grants after the commit carries this epoch (see
     /// [`super::epoch`]). An epoch id that already exists is refused.
     BeginEpoch(EpochRecord),
+}
+
+/// What a [`Write::EnqueueSteeringResume`] wakes its parent with.
+#[derive(Clone, Debug)]
+pub enum SteeringInput {
+    /// This steering, which must not be empty.
+    Blocks(Vec<llm::ContentBlock>),
+    /// The steering queued in the document of `kind` and `key` on the
+    /// parent's own thread (so never another thread's). The backend reads
+    /// it under the parent's thread lock, after the transition's earlier
+    /// writes (so after the park that parks the parent), and the store's
+    /// [`TransitionExtension::take_queued_steering`](super::TransitionExtension::take_queued_steering)
+    /// turns it into the steering and the document's new value, both
+    /// written in this transaction. Nothing queued (no live document, or
+    /// the extension takes nothing): no wake and no document write.
+    Queued { kind: DocKind, key: String },
+}
+
+impl SteeringInput {
+    /// The queue of a [`Self::Queued`] on `thread`, the parent's thread.
+    #[must_use]
+    pub fn queue_on(&self, thread: &ThreadId) -> Option<DocumentKey> {
+        match self {
+            Self::Blocks(_) => None,
+            Self::Queued { kind, key } => Some(DocumentKey::new(
+                DocScope::Thread(thread.clone()),
+                kind.clone(),
+                key.clone(),
+            )),
+        }
+    }
+}
+
+impl From<Vec<llm::ContentBlock>> for SteeringInput {
+    fn from(blocks: Vec<llm::ContentBlock>) -> Self {
+        Self::Blocks(blocks)
+    }
 }
 
 /// A [`Write::TurnAttempt`].
@@ -521,7 +561,7 @@ pub struct Committed {
     /// For each [`Write::Document`]: the document's live revision after it.
     pub documents: Vec<DocumentOutcome>,
     /// For each [`Write::EnqueueSteeringResume`]: the woken parent, or
-    /// `None` when it was no longer parked.
+    /// `None` when it was no longer parked or had nothing queued.
     pub steering_resumed: Vec<Option<AgentTask>>,
 }
 
@@ -591,7 +631,10 @@ impl Transition {
     pub fn enqueue_steering_resume(parent: AgentTaskId, steering: Vec<llm::ContentBlock>) -> Self {
         Self {
             guards: Vec::new(),
-            writes: vec![Write::EnqueueSteeringResume { parent, steering }],
+            writes: vec![Write::EnqueueSteeringResume {
+                parent,
+                steering: steering.into(),
+            }],
         }
     }
 
@@ -926,6 +969,34 @@ impl Transition {
         Ok(())
     }
 
+    /// Refuse empty inline steering, and a steering queue this transition
+    /// may also write as a thread document: the backend writes the queue
+    /// itself, under the read it takes the steering from.
+    fn validate_steering(&self, steering: &SteeringInput) -> Result<(), Rejected> {
+        let (kind, key) = match steering {
+            SteeringInput::Blocks(steering) if steering.is_empty() => {
+                return Err(Rejected::Store(anyhow::anyhow!(
+                    "steering wake rejected: steering content must be non-empty"
+                )));
+            }
+            SteeringInput::Blocks(_) => return Ok(()),
+            SteeringInput::Queued { kind, key } => (kind, key),
+        };
+        let also_written = self.writes.iter().any(|write| {
+            matches!(write, Write::Document(document)
+                if matches!(document.key.scope, DocScope::Thread(_))
+                    && document.key.kind == *kind
+                    && document.key.key == *key)
+        });
+        if also_written {
+            return Err(Rejected::Store(anyhow::anyhow!(
+                "steering wake rejected: the transition also writes a {kind} document {key:?}, \
+                 which may be its steering queue"
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuse an effect write that comes after the write ending its owner:
     /// ending an owner abandons its still-`Started` effects, so the effect
     /// would meet an abandoned record (or, in memory, overwrite one).
@@ -1099,11 +1170,7 @@ impl Transition {
                     }
                 }
                 Write::EnqueueSteeringResume { steering, .. } => {
-                    if steering.is_empty() {
-                        return Err(Rejected::Store(anyhow::anyhow!(
-                            "steering wake rejected: steering content must be non-empty"
-                        )));
-                    }
+                    self.validate_steering(steering)?;
                 }
                 Write::TurnAttempt(attempt) => self.validate_turn_attempt(attempt)?,
                 Write::AppendEvents { .. }
@@ -1126,6 +1193,27 @@ impl Transition {
 }
 
 impl Write {
+    /// The variant's name, a bounded metric label and error word.
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::SettleTask { .. } => "SettleTask",
+            Self::RejectConfirmation { .. } => "RejectConfirmation",
+            Self::PauseOnConfirmation { .. } => "PauseOnConfirmation",
+            Self::ParkInvocation { .. } => "ParkInvocation",
+            Self::WakeInvocation { .. } => "WakeInvocation",
+            Self::ReparkAfterSteering { .. } => "ReparkAfterSteering",
+            Self::AppendCompaction { .. } => "AppendCompaction",
+            Self::AppendEvents { .. } => "AppendEvents",
+            Self::SpawnChildren { .. } => "SpawnChildren",
+            Self::Document(_) => "Document",
+            Self::Effect(_) => "Effect",
+            Self::EnqueueSteeringResume { .. } => "EnqueueSteeringResume",
+            Self::BeginEpoch(_) => "BeginEpoch",
+            Self::TurnAttempt(_) => "TurnAttempt",
+        }
+    }
+
     /// The rows this write locks before the transition's first write, so a
     /// backend takes them in its one sorted order rather than in write
     /// order. A settle, pause or confirmation reject locks its task through
@@ -1198,7 +1286,19 @@ impl Write {
                     Lock::Task(task.clone()),
                 ],
             },
-            Self::EnqueueSteeringResume { parent, .. } => vec![Lock::Task(parent.clone())],
+            Self::EnqueueSteeringResume { parent, steering } => {
+                let mut locks = vec![Lock::Task(parent.clone())];
+                // The queue's thread row, which a document write on the
+                // queue locks, so the read under it sees every committed
+                // note.
+                if matches!(steering, SteeringInput::Queued { .. }) {
+                    locks.push(Lock::ThreadOf {
+                        task: parent.clone(),
+                        fence: None,
+                    });
+                }
+                locks
+            }
             Self::AppendEvents { .. }
             | Self::SettleTask { .. }
             | Self::RejectConfirmation { .. }

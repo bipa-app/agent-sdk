@@ -230,25 +230,6 @@ impl DurableStore for ReadOnlyStore {
     }
 }
 
-const fn write_name(write: &Write) -> &'static str {
-    match write {
-        Write::SettleTask { .. } => "SettleTask",
-        Write::RejectConfirmation { .. } => "RejectConfirmation",
-        Write::PauseOnConfirmation { .. } => "PauseOnConfirmation",
-        Write::ParkInvocation { .. } => "ParkInvocation",
-        Write::WakeInvocation { .. } => "WakeInvocation",
-        Write::ReparkAfterSteering { .. } => "ReparkAfterSteering",
-        Write::AppendCompaction { .. } => "AppendCompaction",
-        Write::AppendEvents { .. } => "AppendEvents",
-        Write::SpawnChildren { .. } => "SpawnChildren",
-        Write::Document(_) => "Document",
-        Write::Effect(_) => "Effect",
-        Write::EnqueueSteeringResume { .. } => "EnqueueSteeringResume",
-        Write::BeginEpoch(_) => "BeginEpoch",
-        Write::TurnAttempt(_) => "TurnAttempt",
-    }
-}
-
 /// Check the hook's output before the SDK builds the settle from it.
 fn check_output(output: &CompletionOutput, mode: RunMode) -> Result<(), CompletionHookError> {
     if output.park.is_some() && mode == RunMode::Inspect {
@@ -261,7 +242,7 @@ fn check_output(output: &CompletionOutput, mode: RunMode) -> Result<(), Completi
         if !matches!(write, Write::Document(_) | Write::AppendEvents { .. }) {
             return Err(CompletionHookError::RefusedExtraWrite {
                 index,
-                write: write_name(write),
+                write: Write::kind_name(write),
             });
         }
     }

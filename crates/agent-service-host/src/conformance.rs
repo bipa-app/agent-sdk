@@ -3929,7 +3929,7 @@ mod tests {
         let queue = thread_doc(&thread_id(tid), "steering_queue")?;
         let wake = |text: &str, parent: &AgentTaskId| Write::EnqueueSteeringResume {
             parent: parent.clone(),
-            steering: steering_note(text),
+            steering: steering_note(text).into(),
         };
 
         let committed = task_store
@@ -3982,7 +3982,10 @@ mod tests {
                 0,
                 put_doc(&queue, DocExpect::Revision(2), serde_json::json!(["lost"])),
             );
-            if let Some(Write::EnqueueSteeringResume { steering, .. }) = writes.last_mut()
+            if let Some(Write::EnqueueSteeringResume {
+                steering: agent_server::journal::SteeringInput::Blocks(steering),
+                ..
+            }) = writes.last_mut()
                 && what == "an empty note"
             {
                 steering.clear();
@@ -4022,7 +4025,7 @@ mod tests {
                     },
                     Write::EnqueueSteeringResume {
                         parent: AgentTaskId::from_string("task_missing"),
-                        steering: steering_note("lost"),
+                        steering: steering_note("lost").into(),
                     },
                 ]),
                 t_plus(68),
@@ -4050,7 +4053,7 @@ mod tests {
         let transition = doc_only(vec![
             agent_server::journal::Write::EnqueueSteeringResume {
                 parent: parent.id.clone(),
-                steering: steering_note("status?"),
+                steering: steering_note("status?").into(),
             },
             agent_server::journal::Write::AppendEvents {
                 thread: thread_id(tid),
@@ -4067,6 +4070,518 @@ mod tests {
             .await?
             .context("parent")?;
         assert_eq!(after.status, TaskStatus::WaitingOnChildren);
+        Ok(())
+    }
+
+    // ── queued steering at the park (bip #904 W1) ────────────────────
+
+    /// A pure extension that, on every park, adds a queued steering wake
+    /// of the parked task, reading the notes from a `conformance.steering`
+    /// document on the parent's thread (`{"notes": [..]}`). With
+    /// `wake_instead` it wakes another task, and with `blocks` it adds
+    /// inline steering, both writes an extension may not add.
+    struct SteeringExtension {
+        wake: std::sync::Mutex<Option<AgentTaskId>>,
+        blocks: bool,
+        takes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SteeringExtension {
+        fn new(
+            blocks: bool,
+        ) -> (
+            std::sync::Arc<Self>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let takes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                std::sync::Arc::new(Self {
+                    wake: std::sync::Mutex::new(None),
+                    blocks,
+                    takes: takes.clone(),
+                }),
+                takes,
+            )
+        }
+
+        /// Wake `task` on every park from now on.
+        fn wake_instead(&self, task: AgentTaskId) {
+            if let Ok(mut wake) = self.wake.lock() {
+                *wake = Some(task);
+            }
+        }
+    }
+
+    impl agent_server::journal::TransitionExtension for SteeringExtension {
+        fn extend(
+            &self,
+            view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            use agent_server::journal::{SteeringInput, TransitionView, Write};
+
+            let TransitionView::Commit(transition) = view else {
+                return Vec::new();
+            };
+            let wake = self.wake.lock().ok().and_then(|wake| wake.clone());
+            let Ok(kind) = doc_kind("steering") else {
+                return Vec::new();
+            };
+            transition
+                .writes
+                .iter()
+                .filter_map(|write| match write {
+                    Write::SpawnChildren { parent, .. } => Some(parent),
+                    Write::ReparkAfterSteering { task, .. } => Some(task),
+                    _ => None,
+                })
+                .map(|parked| Write::EnqueueSteeringResume {
+                    parent: wake.clone().unwrap_or_else(|| parked.clone()),
+                    steering: if self.blocks {
+                        steering_note("inline").into()
+                    } else {
+                        SteeringInput::Queued {
+                            kind: kind.clone(),
+                            key: String::new(),
+                        }
+                    },
+                })
+                .collect()
+        }
+
+        fn take_queued_steering(
+            &self,
+            _parent: &AgentTask,
+            queued: &agent_server::journal::Document,
+        ) -> Option<agent_server::journal::QueuedSteering> {
+            self.takes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let notes: Vec<String> = queued
+                .value
+                .get("notes")
+                .and_then(|notes| serde_json::from_value(notes.clone()).ok())
+                .unwrap_or_default();
+            (!notes.is_empty()).then(|| agent_server::journal::QueuedSteering {
+                steering: steering_note(&notes.join("\n")),
+                schema_version: queued.schema_version,
+                value: serde_json::json!({ "notes": [] }),
+            })
+        }
+    }
+
+    fn steering_queue(tid: &str) -> Result<agent_server::journal::DocumentKey> {
+        thread_doc(&thread_id(tid), "steering")
+    }
+
+    /// Queue `notes` on `tid`'s thread, from nothing.
+    async fn queue_notes(task_store: &dyn AgentTaskStore, tid: &str, notes: &[&str]) -> Result<()> {
+        task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    &steering_queue(tid)?,
+                    agent_server::journal::DocExpect::Absent,
+                    serde_json::json!({ "notes": notes }),
+                )]),
+                t_plus(59),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// A submitted root turn on `tid`, running under a fresh lease.
+    async fn running_root(
+        task_store: &dyn AgentTaskStore,
+        tid: &str,
+    ) -> Result<(AgentTask, WorkerId, LeaseId)> {
+        let root = fresh_root(tid, 60);
+        task_store.submit_root_turn(root.clone()).await?;
+        let (worker, lease) = (WorkerId::new(), LeaseId::new());
+        task_store
+            .try_acquire_task(
+                &root.id,
+                worker.clone(),
+                lease.clone(),
+                t_plus(90),
+                t_plus(61),
+            )
+            .await?;
+        Ok((root, worker, lease))
+    }
+
+    /// Park `root` on one tool child.
+    async fn park(
+        task_store: &dyn AgentTaskStore,
+        (root, worker, lease): &(AgentTask, WorkerId, LeaseId),
+    ) -> Result<()> {
+        task_store
+            .spawn_tool_children(
+                &root.id,
+                worker,
+                lease,
+                vec![ChildSpawnSpec::new(3)],
+                suspension_payload(root.thread_id.0.as_str()),
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn steering_text(task: &AgentTask) -> String {
+        match &task.state {
+            TaskState::ReadyToResume { steering, .. } => steering
+                .iter()
+                .filter_map(|block| match block {
+                    agent_sdk_foundation::llm::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// bip #904's W1 on the SDK: a note queued while the root runs is
+    /// delivered by the park itself, in the park's transaction: the root is
+    /// woken with the note and the queue is emptied. A park with nothing
+    /// queued (no queue, or an empty one) is only a park.
+    async fn test_extension_wakes_the_parked_root_with_its_queued_steering(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        takes: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tid = "conformance-queued-steering";
+        let running = running_root(task_store, tid).await?;
+        queue_notes(task_store, tid, &["skip the docs crate"]).await?;
+        park(task_store, &running).await?;
+        let woken = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(woken.status, TaskStatus::Pending, "woken at the park");
+        assert!(woken.state.is_steering_resume(), "{:?}", woken.state);
+        assert_eq!(steering_text(&woken), "skip the docs crate");
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] }))),
+            "the park's transaction emptied the queue"
+        );
+        assert_eq!(takes.load(Ordering::SeqCst), 1);
+
+        let tid = "conformance-queued-steering-none";
+        let running = running_root(task_store, tid).await?;
+        park(task_store, &running).await?;
+        let parked = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren, "no queue");
+        assert_eq!(takes.load(Ordering::SeqCst), 1, "no queue, nothing to take");
+
+        let tid = "conformance-queued-steering-empty";
+        let running = running_root(task_store, tid).await?;
+        queue_notes(task_store, tid, &[]).await?;
+        park(task_store, &running).await?;
+        let parked = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(parked.status, TaskStatus::WaitingOnChildren, "empty queue");
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((1, serde_json::json!({ "notes": [] }))),
+            "an empty queue is left alone"
+        );
+        assert_eq!(takes.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// A queued wake applied again (twice in one transition, in a later
+    /// one, or a retried park) wakes nothing more and leaves the queue as
+    /// the first take left it.
+    async fn test_a_queued_wake_applied_again_is_a_no_op(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        use agent_server::journal::{Rejected, SteeringInput, Write};
+
+        let tid = "conformance-queued-steering-again";
+        let running = running_root(task_store, tid).await?;
+        park(task_store, &running).await?;
+        queue_notes(task_store, tid, &["status?"]).await?;
+        let kind = doc_kind("steering")?;
+        let wake = || Write::EnqueueSteeringResume {
+            parent: running.0.id.clone(),
+            steering: SteeringInput::Queued {
+                kind: kind.clone(),
+                key: String::new(),
+            },
+        };
+        let committed = task_store
+            .commit(doc_only(vec![wake(), wake()]), t_plus(65))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let [Some(woken), None] = committed.steering_resumed.as_slice() else {
+            anyhow::bail!("one wake, then a no-op: {:?}", committed.steering_resumed);
+        };
+        assert_eq!(steering_text(woken), "status?");
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] })))
+        );
+
+        let committed = task_store
+            .commit(doc_only(vec![wake()]), t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert!(
+            matches!(committed.steering_resumed.as_slice(), [None]),
+            "{:?}",
+            committed.steering_resumed
+        );
+        a_woken_root_leaves_a_later_note_queued(task_store, documents, tid, &wake).await?;
+        let retried = task_store
+            .spawn_tool_children(
+                &running.0.id,
+                &running.1,
+                &running.2,
+                vec![ChildSpawnSpec::new(3)],
+                suspension_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(67),
+            )
+            .await;
+        assert!(retried.is_err(), "a retried park finds the root moved");
+        let rejected = task_store
+            .commit(
+                agent_server::journal::Transition {
+                    guards: vec![agent_server::journal::Guard::TaskIs {
+                        task: running.0.id.clone(),
+                        status: TaskStatus::Running,
+                        lease: Some((running.1.clone(), running.2.clone())),
+                    }],
+                    writes: vec![wake()],
+                },
+                t_plus(68),
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(Rejected::Guard { .. })),
+            "{rejected:?}"
+        );
+        let after = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(after.status, TaskStatus::Pending);
+        assert_eq!(steering_text(&after), "status?", "woken once");
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((3, serde_json::json!({ "notes": ["later"] }))),
+            "the later note is still queued"
+        );
+        Ok(())
+    }
+
+    /// A note queued after the wake stays queued: the woken root is no
+    /// longer parked, so a queued wake neither takes it nor fails. A wake
+    /// may not share its transition with a write of its queue.
+    async fn a_woken_root_leaves_a_later_note_queued(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        tid: &str,
+        wake: &(dyn Fn() -> agent_server::journal::Write + Sync),
+    ) -> Result<()> {
+        use agent_server::journal::Rejected;
+
+        let later = serde_json::json!({ "notes": ["later"] });
+        let committed = task_store
+            .commit(
+                doc_only(vec![
+                    put_doc(
+                        &steering_queue(tid)?,
+                        agent_server::journal::DocExpect::Revision(2),
+                        later.clone(),
+                    ),
+                    wake(),
+                ]),
+                t_plus(66),
+            )
+            .await;
+        assert!(
+            matches!(committed, Err(Rejected::Store(_))),
+            "a wake may not share its transition with a write of its queue: {committed:?}"
+        );
+        task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    &steering_queue(tid)?,
+                    agent_server::journal::DocExpect::Revision(2),
+                    later.clone(),
+                )]),
+                t_plus(66),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        let committed = task_store
+            .commit(doc_only(vec![wake()]), t_plus(66))
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert!(
+            matches!(committed.steering_resumed.as_slice(), [None]),
+            "a woken root takes no note queued since: {:?}",
+            committed.steering_resumed
+        );
+        let taken = Some((3, later));
+        assert_eq!(doc_value(documents, &steering_queue(tid)?).await?, taken);
+        Ok(())
+    }
+
+    /// An extension may wake only the task its transition parks, and only
+    /// from a queue on that task's thread (the only queue a
+    /// [`SteeringInput::Queued`](agent_server::journal::SteeringInput::Queued)
+    /// can name): a wake of another thread's parked root, or one with
+    /// inline steering, refuses the park with a typed error and writes
+    /// nothing, the other root's queue included.
+    async fn test_extension_may_not_wake_another_task(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        tid: &str,
+    ) -> Result<()> {
+        use agent_server::journal::{ExtensionWriteRefused, Rejected};
+
+        let running = running_root(task_store, tid).await?;
+        queue_notes(task_store, tid, &["mine"]).await?;
+        let rejected = task_store
+            .commit(
+                agent_server::journal::Transition::spawn_children(
+                    running.0.id.clone(),
+                    running.1.clone(),
+                    running.2.clone(),
+                    agent_server::journal::ChildSpawn::Tools(
+                        agent_server::journal::ToolChildrenSpawn {
+                            specs: vec![ChildSpawnSpec::new(3)],
+                            payload: suspension_payload(tid),
+                            child_otel_traceparent: None,
+                            delivered_injection_ids: Vec::new(),
+                        },
+                    ),
+                ),
+                t_plus(62),
+            )
+            .await;
+        let Err(Rejected::Store(error)) = rejected else {
+            anyhow::bail!("the park is refused: {rejected:?}");
+        };
+        let refused = error
+            .downcast_ref::<ExtensionWriteRefused>()
+            .with_context(|| format!("a typed refusal: {error:#}"))?;
+        assert_eq!(refused.write, "EnqueueSteeringResume");
+        assert_eq!(refused.point, "commit");
+        let after = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(after.status, TaskStatus::Running, "the park wrote nothing");
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?)
+                .await?
+                .map(|(r, _)| r),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    /// The other thread's parked root and its queue, after a refused
+    /// cross-thread wake: still parked, the note still queued.
+    async fn assert_elsewhere_untouched(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        let parked = task_store
+            .list_by_status(TaskStatus::WaitingOnChildren)
+            .await?;
+        assert!(
+            parked
+                .iter()
+                .any(|task| task.thread_id == thread_id("elsewhere") && task.is_root()),
+            "the other thread's root stays parked: {parked:?}"
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue("elsewhere")?).await?,
+            Some((1, serde_json::json!({ "notes": ["not yours"] }))),
+        );
+        Ok(())
+    }
+
+    /// A queued wake on a store without an extension to take the queue
+    /// refuses its transition, an earlier write included.
+    async fn test_a_queued_wake_without_an_extension_writes_nothing(
+        task_store: &dyn AgentTaskStore,
+        events: &dyn EventRepository,
+    ) -> Result<()> {
+        use agent_server::journal::{Rejected, SteeringInput, Write};
+
+        let tid = "conformance-queued-steering-no-extension";
+        let parent = parked_root(task_store, tid).await?;
+        let rejected = task_store
+            .commit(
+                doc_only(vec![
+                    Write::AppendEvents {
+                        thread: thread_id(tid),
+                        events: vec![AgentEvent::text("early", "before the wake")],
+                    },
+                    Write::EnqueueSteeringResume {
+                        parent: parent.id.clone(),
+                        steering: SteeringInput::Queued {
+                            kind: doc_kind("steering")?,
+                            key: String::new(),
+                        },
+                    },
+                ]),
+                t_plus(65),
+            )
+            .await;
+        assert!(matches!(rejected, Err(Rejected::Store(_))), "{rejected:?}");
+        assert!(events.get_events(&thread_id(tid)).await?.is_empty());
+        let after = AgentTaskStore::get(task_store, &parent.id)
+            .await?
+            .context("parent")?;
+        assert_eq!(after.status, TaskStatus::WaitingOnChildren);
+        Ok(())
+    }
+
+    /// A crash after the park and its queued wake are written, before the
+    /// commit, leaves the root running and its note queued. The take ran
+    /// in the crashed transaction (the extension counted it), so the
+    /// rollback is what undid the wake and the emptied queue.
+    #[cfg(feature = "failpoints")]
+    async fn test_a_crash_after_the_queued_wake_leaves_the_note_queued(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        takes: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tid = "conformance-queued-steering-crash";
+        let running = running_root(task_store, tid).await?;
+        queue_notes(task_store, tid, &["skip the docs crate"]).await?;
+        fail::cfg("transition.before_commit", "panic")
+            .map_err(|error| anyhow::anyhow!("configure transition failpoint: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(park(task_store, &running));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove("transition.before_commit");
+        assert!(result.is_err(), "the transition failpoint must fire");
+        assert_eq!(
+            takes.load(Ordering::SeqCst),
+            1,
+            "the take ran before the crash"
+        );
+        let after = AgentTaskStore::get(task_store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(after.status, TaskStatus::Running);
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((1, serde_json::json!({ "notes": ["skip the docs crate"] }))),
+        );
         Ok(())
     }
 
@@ -8125,6 +8640,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_queued_steering() -> Result<()> {
+        let (extension, takes) = SteeringExtension::new(false);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_extension_wakes_the_parked_root_with_its_queued_steering(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            &takes,
+        )
+        .await?;
+        test_a_queued_wake_applied_again_is_a_no_op(s.task.as_ref(), s.documents.as_ref()).await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_queued_steering_refused() -> Result<()> {
+        for (other_task, blocks, tid) in [
+            (true, false, "conformance-steering-other-task"),
+            (false, true, "conformance-steering-inline"),
+        ] {
+            let (extension, _takes) = SteeringExtension::new(blocks);
+            let s = fresh_in_memory_stores_with(Some(extension.clone()));
+            if other_task {
+                let other = parked_root(s.task.as_ref(), "elsewhere").await?;
+                queue_notes(s.task.as_ref(), "elsewhere", &["not yours"]).await?;
+                extension.wake_instead(other.id);
+            }
+            test_extension_may_not_wake_another_task(s.task.as_ref(), s.documents.as_ref(), tid)
+                .await?;
+            if other_task {
+                assert_elsewhere_untouched(s.task.as_ref(), s.documents.as_ref()).await?;
+            }
+        }
+        let s = fresh_in_memory_stores();
+        test_a_queued_wake_without_an_extension_writes_nothing(s.task.as_ref(), s.event.as_ref())
+            .await
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_extension() -> Result<()> {
         let (extension, calls) = ProbeExtension::new(false);
         let s = fresh_in_memory_stores_with(Some(extension));
@@ -8180,6 +8732,54 @@ mod tests {
     async fn conformance_sqlite_failing_wake_leaves_no_earlier_write() -> Result<()> {
         let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
         test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_queued_steering() -> Result<()> {
+        let (extension, takes) = SteeringExtension::new(false);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_extension_wakes_the_parked_root_with_its_queued_steering(&store, &store, &takes)
+            .await?;
+        test_a_queued_wake_applied_again_is_a_no_op(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_queued_steering_refused() -> Result<()> {
+        let plain = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:").await?;
+        for (other_task, blocks, tid) in [
+            (true, false, "conformance-steering-other-task"),
+            (false, true, "conformance-steering-inline"),
+        ] {
+            let (extension, _takes) = SteeringExtension::new(blocks);
+            let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+                .await?
+                .with_transition_extension(extension.clone());
+            if other_task {
+                let other = parked_root(&store, "elsewhere").await?;
+                queue_notes(&store, "elsewhere", &["not yours"]).await?;
+                extension.wake_instead(other.id);
+            }
+            test_extension_may_not_wake_another_task(&store, &store, tid).await?;
+            if other_task {
+                assert_elsewhere_untouched(&store, &store).await?;
+            }
+        }
+        test_a_queued_wake_without_an_extension_writes_nothing(&plain, &plain).await
+    }
+
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_crash_after_the_queued_wake_leaves_the_note_queued() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let (extension, takes) = SteeringExtension::new(false);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        test_a_crash_after_the_queued_wake_leaves_the_note_queued(&store, &store, &takes).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -8254,6 +8854,176 @@ mod tests {
             return Ok(());
         };
         test_a_failing_wake_leaves_no_earlier_write(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_queued_steering() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, takes) = SteeringExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        test_extension_wakes_the_parked_root_with_its_queued_steering(&store, &store, &takes)
+            .await?;
+        test_a_queued_wake_applied_again_is_a_no_op(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_queued_steering_refused() -> Result<()> {
+        let Some((plain, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        for (other_task, blocks, tid) in [
+            (true, false, "conformance-steering-other-task"),
+            (false, true, "conformance-steering-inline"),
+        ] {
+            let (extension, _takes) = SteeringExtension::new(blocks);
+            let store = plain.clone().with_transition_extension(extension.clone());
+            if other_task {
+                let other = parked_root(&store, "elsewhere").await?;
+                queue_notes(&store, "elsewhere", &["not yours"]).await?;
+                extension.wake_instead(other.id);
+            }
+            test_extension_may_not_wake_another_task(&store, &store, tid).await?;
+            if other_task {
+                assert_elsewhere_untouched(&store, &store).await?;
+            }
+        }
+        test_a_queued_wake_without_an_extension_writes_nothing(&plain, &plain).await
+    }
+
+    /// The park reads its queue under the queue's thread lock: a note a
+    /// writer commits while it holds that lock, after the park has started,
+    /// is taken by the park. Without the lock the park would read the queue
+    /// before the note committed and stay parked, and the writer, which
+    /// saw the root running, would not wake it either. (A tool park's child
+    /// rows also wait on the thread row, through their foreign key; the
+    /// re-park below does not.)
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_park_reads_its_queue_under_the_thread_lock() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, _takes) = SteeringExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        let tid = "pg-queued-steering-lock";
+        let running = running_root(&store, tid).await?;
+        ThreadStore::get_or_create(&store, &thread_id(tid), t_plus(61)).await?;
+        let queue = steering_queue(tid)?;
+        let raw = hold_thread_with_a_note(&store, tid, &queue).await?;
+        let writer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            raw.commit().await?;
+            anyhow::Ok(())
+        };
+        let (parked, written) = tokio::join!(park(&store, &running), writer);
+        written?;
+        parked?;
+
+        let woken = AgentTaskStore::get(&store, &running.0.id)
+            .await?
+            .context("root")?;
+        assert_eq!(woken.status, TaskStatus::Pending, "the park took the note");
+        assert_eq!(steering_text(&woken), "late");
+        assert_eq!(
+            doc_value(&store, &queue).await?,
+            Some((2, serde_json::json!({ "notes": [] })))
+        );
+        Ok(())
+    }
+
+    /// The same for a re-park after a steering exchange, which takes no
+    /// other lock on the thread row: only the queued wake's own thread
+    /// lock makes it wait for the note.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_repark_reads_its_queue_under_the_thread_lock() -> Result<()> {
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, _takes) = SteeringExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        let tid = "pg-queued-steering-repark-lock";
+        let (root, survivor, worker, lease) = steering_woken_root(&store, tid).await?;
+        ThreadStore::get_or_create(&store, &thread_id(tid), t_plus(61)).await?;
+        let queue = steering_queue(tid)?;
+        let raw = hold_thread_with_a_note(&store, tid, &queue).await?;
+        let writer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            raw.commit().await?;
+            anyhow::Ok(())
+        };
+        let repark = agent_server::journal::DurableStore::commit(
+            &store,
+            agent_server::journal::Transition::repark_after_steering(
+                root.id.clone(),
+                (worker, lease),
+                suspension_payload(tid),
+                vec![survivor],
+                root.thread_id.clone(),
+                Vec::new(),
+            ),
+            t_plus(69),
+        );
+        let (reparked, written) = tokio::join!(repark, writer);
+        written?;
+        reparked.map_err(anyhow::Error::from)?;
+
+        let woken = AgentTaskStore::get(&store, &root.id)
+            .await?
+            .context("root")?;
+        assert_eq!(
+            woken.status,
+            TaskStatus::Pending,
+            "the re-park took the note"
+        );
+        assert_eq!(steering_text(&woken), "late");
+        Ok(())
+    }
+
+    /// A raw transaction that holds `tid`'s thread row, as a document
+    /// writer does, and has inserted a `late` note in `queue`, uncommitted.
+    #[cfg(feature = "postgres")]
+    async fn hold_thread_with_a_note(
+        store: &crate::postgres::store::PostgresDurableStore,
+        tid: &str,
+        queue: &agent_server::journal::DocumentKey,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        let (scope_kind, scope_id, kind, key) = queue.stored();
+        let mut raw = store.pool().begin().await?;
+        sqlx::query("SELECT thread_id FROM agent_sdk_threads WHERE thread_id = $1 FOR UPDATE")
+            .bind(tid)
+            .execute(&mut *raw)
+            .await?;
+        sqlx::query(
+            "INSERT INTO agent_sdk_documents
+                 (scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json,
+                  retired_at, updated_at)
+             VALUES ($1, $2, $3, $4, 1, 1, $5, NULL, now())",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(kind)
+        .bind(key)
+        .bind(serde_json::json!({ "notes": ["late"] }))
+        .execute(&mut *raw)
+        .await?;
+        Ok(raw)
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_crash_after_the_queued_wake_leaves_the_note_queued() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, _guard)) = pg_test_store().await? else {
+            return Ok(());
+        };
+        let (extension, takes) = SteeringExtension::new(false);
+        let store = store.with_transition_extension(extension);
+        test_a_crash_after_the_queued_wake_leaves_the_note_queued(&store, &store, &takes).await
     }
 
     #[cfg(feature = "postgres")]

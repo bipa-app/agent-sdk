@@ -8,7 +8,7 @@ use agent_server::journal::document::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
-use sqlx::{FromRow, Sqlite, Transaction};
+use sqlx::{FromRow, Sqlite, SqliteConnection, Transaction};
 use time::OffsetDateTime;
 
 use super::SqliteDurableStore;
@@ -45,6 +45,32 @@ impl TryFrom<DocumentRecord> for Document {
 }
 
 impl SqliteDurableStore {
+    /// The live document at `key`, read on `connection` (a transaction's,
+    /// to read under its lock).
+    pub(super) async fn get_document_on(
+        connection: &mut SqliteConnection,
+        key: &DocumentKey,
+    ) -> Result<Option<Document>> {
+        let (scope_kind, scope_id, kind, doc_key) = key.stored();
+        sqlx::query_as::<_, DocumentRecord>(
+            r"
+SELECT scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json, updated_at
+FROM agent_sdk_documents
+WHERE scope_kind = ?1 AND scope_id = ?2 AND kind = ?3 AND doc_key = ?4
+  AND retired_at IS NULL
+",
+        )
+        .bind(scope_kind)
+        .bind(scope_id)
+        .bind(kind)
+        .bind(doc_key)
+        .fetch_optional(connection)
+        .await
+        .with_context(|| format!("get document {key}"))?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
     /// Apply one document write inside its transition's transaction.
     pub(super) async fn apply_document_tx(
         tx: &mut Transaction<'_, Sqlite>,
@@ -167,24 +193,8 @@ impl SqliteDurableStore {
 #[async_trait]
 impl DocumentStore for SqliteDurableStore {
     async fn get_document(&self, key: &DocumentKey) -> Result<Option<Document>> {
-        let (scope_kind, scope_id, kind, doc_key) = key.stored();
-        sqlx::query_as::<_, DocumentRecord>(
-            r"
-SELECT scope_kind, scope_id, kind, doc_key, schema_version, revision, value_json, updated_at
-FROM agent_sdk_documents
-WHERE scope_kind = ?1 AND scope_id = ?2 AND kind = ?3 AND doc_key = ?4
-  AND retired_at IS NULL
-",
-        )
-        .bind(scope_kind)
-        .bind(scope_id)
-        .bind(kind)
-        .bind(doc_key)
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("get document {key}"))?
-        .map(TryInto::try_into)
-        .transpose()
+        let mut connection = self.pool.acquire().await.context("acquire connection")?;
+        Self::get_document_on(&mut connection, key).await
     }
 
     async fn list_documents(&self, scope: &DocScope, kind: &DocKind) -> Result<Vec<Document>> {
