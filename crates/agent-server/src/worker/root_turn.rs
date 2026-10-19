@@ -7046,7 +7046,10 @@ async fn close_attempt_or_propagate_already_closed(
         .close_attempt(&attempt.id, params, now)
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            finish_consumed_request(attempt, deps, now).await;
+            Ok(())
+        }
         Err(e)
             if e.downcast_ref::<TurnAttemptSchemaError>()
                 == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
@@ -7055,6 +7058,40 @@ async fn close_attempt_or_propagate_already_closed(
             Ok(())
         }
         Err(e) => Err(e.context(error_context)),
+    }
+}
+
+/// Finish `attempt`'s LLM request `Completed` once its response was
+/// consumed and its attempt closed: a response the turn suspends on, injects
+/// at or re-parks with ended normally, and must not stay `Started` to be
+/// abandoned when the root ends.
+///
+/// Its own transaction, after the attempt's close: a crash between them
+/// leaves the request `Started` with its attempt closed `Success`, which
+/// salvage never takes for a cut-off response. A failure is logged with the
+/// same outcome; the turn goes on.
+async fn finish_consumed_request(
+    attempt: &TurnAttempt,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) {
+    crate::fail_point!("llm_request.consumed.before_finish");
+    let task = &attempt.task_id;
+    let transition = Transition {
+        guards: Vec::new(),
+        writes: vec![Write::Effect(EffectWrite::Finish {
+            key: EffectKey::llm(task, attempt.id.as_str()),
+            owner: task.clone(),
+            state: EffectState::Completed,
+        })],
+    };
+    match deps.task_store.commit(transition, now).await {
+        Ok(_) => record_llm_request_finished(attempt, now),
+        Err(error) => log::warn!(
+            task_id = task.as_str(),
+            turn_attempt_id = attempt.id.as_str();
+            "finish the LLM request of a consumed response: {error:#}"
+        ),
     }
 }
 

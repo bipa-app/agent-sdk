@@ -110,13 +110,16 @@ enum Scenario {
     /// connection dies while it lives (a failover, an idle-session kill).
     LockLossLeader,
     MergeBack,
+    /// S11: a tool round's response was consumed (its attempt closed
+    /// `Success`) and the process died before its LLM request finished.
+    ConsumedRequest,
     /// S10 (SQLite): concurrent writers while an outside connection holds
     /// the write lock past `busy_timeout`.
     Contention,
 }
 
 impl Scenario {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::UnsafeTool,
         Self::SafeTool,
         Self::LlmStream,
@@ -133,6 +136,7 @@ impl Scenario {
         Self::LockLossLeader,
         Self::MergeBack,
         Self::Contention,
+        Self::ConsumedRequest,
     ];
 
     const fn name(self) -> &'static str {
@@ -153,6 +157,7 @@ impl Scenario {
             Self::LockLossLeader => "s8_lock_loss_leader",
             Self::MergeBack => "s9_merge_back",
             Self::Contention => "s10_sqlite_contention",
+            Self::ConsumedRequest => "s11_consumed_request",
         }
     }
 
@@ -167,7 +172,7 @@ impl Scenario {
     fn first_response(self) -> ChatResponse {
         match self {
             Self::UnsafeTool | Self::Contention => tool_use(UNSAFE_TOOL, json!({})),
-            Self::SafeTool => tool_use(SAFE_TOOL, json!({})),
+            Self::SafeTool | Self::ConsumedRequest => tool_use(SAFE_TOOL, json!({})),
             Self::Confirmation | Self::ConfirmationSingleHost | Self::ConfirmationLeader => {
                 tool_use(CONFIRM_TOOL, json!({}))
             }
@@ -931,6 +936,29 @@ struct Daemon {
 }
 
 impl Daemon {
+    /// How many LLM requests the recovering process counted with
+    /// `transition` on `agent_server.effects`, when it has a meter.
+    #[cfg_attr(
+        not(feature = "failpoints"),
+        expect(dead_code, reason = "read by S11, which needs failpoints")
+    )]
+    fn llm_request_transitions(&self, transition: &str) -> Option<u64> {
+        #[cfg(feature = "otel")]
+        {
+            self.signals.as_ref().map(|signals| {
+                signals.u64_total(
+                    "agent_server.effects",
+                    &[("kind", "llm_request"), ("transition", transition)],
+                )
+            })
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            let _ = (&self.signals, transition);
+            None
+        }
+    }
+
     /// Print what the recovering process emitted, when asked to.
     fn report(&self, case: &str) {
         if let Some(signals) = &self.signals {
@@ -984,6 +1012,37 @@ mod signals {
     }
 
     impl Capture {
+        /// The total of a `u64` counter's points that carry every label in
+        /// `labels`, in the last export.
+        #[cfg(feature = "otel")]
+        pub fn u64_total(&self, metric: &str, labels: &[(&str, &str)]) -> u64 {
+            use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+            let _ = self.meters.force_flush();
+            let exports = self.metrics.get_finished_metrics().unwrap_or_default();
+            let Some(resource) = exports.last() else {
+                return 0;
+            };
+            resource
+                .scope_metrics()
+                .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+                .filter(|data| data.name() == metric)
+                .map(|data| match data.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                        .data_points()
+                        .filter(|point| {
+                            labels.iter().all(|(key, value)| {
+                                point.attributes().any(|kv| {
+                                    kv.key.as_str() == *key && kv.value.as_str() == *value
+                                })
+                            })
+                        })
+                        .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                        .sum(),
+                    _ => 0,
+                })
+                .sum()
+        }
+
         /// Print every metric point and span, one line each.
         #[cfg(feature = "otel")]
         pub fn report(&self, case: &str) {
@@ -1142,6 +1201,17 @@ async fn crash_matrix_child() -> Result<()> {
     #[cfg(feature = "failpoints")]
     if scenario == Scenario::Fork {
         fail::cfg("fork.after_commit", "pause").map_err(anyhow::Error::msg)?;
+    }
+    #[cfg(feature = "failpoints")]
+    if scenario == Scenario::ConsumedRequest {
+        // After the tool round's attempt closed, before its request
+        // finishes: signal the parent, then hold the process for the kill.
+        let ready = Arc::clone(&dir);
+        fail::cfg_callback("llm_request.consumed.before_finish", move || {
+            let _ = ready.signal_ready("consumed");
+            std::thread::sleep(Duration::from_secs(600));
+        })
+        .map_err(anyhow::Error::msg)?;
     }
     let daemon = start_daemon(storage, scenario, Phase::Crash, Arc::clone(&dir)).await?;
     let endpoint = dir.endpoint();
@@ -1360,7 +1430,11 @@ struct Recovered {
     tool_child: Option<AgentTaskId>,
     runs: Vec<String>,
     requests: Vec<Vec<(String, bool)>>,
-    _daemon: Daemon,
+    #[cfg_attr(
+        not(feature = "failpoints"),
+        expect(dead_code, reason = "read by S11, which needs failpoints")
+    )]
+    daemon: Daemon,
     _db: CaseDb,
     _temp: tempfile::TempDir,
 }
@@ -1399,6 +1473,7 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         Scenario::UnsafeTool
         | Scenario::SafeTool
         | Scenario::LlmStream
+        | Scenario::ConsumedRequest
         | Scenario::Fork
         | Scenario::CancelTree
         | Scenario::HungTool
@@ -1409,7 +1484,8 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         | Scenario::Contention
         | Scenario::MergeBack => {
             let ready = wait_file(&mut crashed.child, &dir.ready()).await?;
-            (scenario != Scenario::LlmStream).then(|| AgentTaskId::from_string(ready.trim()))
+            (scenario != Scenario::LlmStream && scenario != Scenario::ConsumedRequest)
+                .then(|| AgentTaskId::from_string(ready.trim()))
         }
     };
     drop(control);
@@ -1446,7 +1522,7 @@ async fn crash_and_recover(backend: Backend, scenario: Scenario) -> Result<Optio
         tool_child,
         runs,
         requests,
-        _daemon: daemon,
+        daemon,
         _db: db,
         _temp: temp,
     }))
@@ -1510,6 +1586,7 @@ async fn answer_prompt(
         Scenario::UnsafeTool
         | Scenario::SafeTool
         | Scenario::LlmStream
+        | Scenario::ConsumedRequest
         | Scenario::Fork
         | Scenario::CancelTree
         | Scenario::HungTool
@@ -1751,6 +1828,90 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
     s3_requests_ended(&case, &attempts).await?;
     let live = live_rows(&case.stores, &case.thread).await?;
     ensure!(live.is_empty(), "rows left live: {live:?}");
+    Ok(())
+}
+
+/// S11: the process dies after a tool round's response was consumed (its
+/// attempt closed `Success`) and before its LLM request finished. That
+/// request is abandoned once, when the recovered root completes; it is
+/// never salvaged (no note reaches the transcript); and the re-run's two
+/// requests finish `Completed`. The closed `Success` attempt is the marker
+/// that the crash point comes after the close.
+#[cfg(feature = "failpoints")]
+async fn s11_consumed_request(backend: Backend) -> Result<()> {
+    use agent_server::journal::effect::{EffectKey, EffectKind, EffectState};
+
+    let Some(case) = crash_and_recover(backend, Scenario::ConsumedRequest).await? else {
+        return Ok(());
+    };
+    ensure!(
+        case.root.status == TaskStatus::Completed,
+        "the root turn is {:?}: {:?}",
+        case.root.status,
+        case.root.last_error
+    );
+    let requests: Vec<_> = agent_server::journal::DurableStore::effects_for_task(
+        case.stores.task_store.as_ref(),
+        &case.root.id,
+    )
+    .await?
+    .into_iter()
+    .filter(|record| record.kind() == EffectKind::LlmRequest)
+    .collect();
+    let abandoned: Vec<_> = requests
+        .iter()
+        .filter(|record| record.state == EffectState::Abandoned)
+        .collect();
+    let [crashed] = abandoned.as_slice() else {
+        bail!("expected one abandoned request: {requests:?}");
+    };
+    let completed = requests
+        .iter()
+        .filter(|record| record.state == EffectState::Completed)
+        .count();
+    ensure!(
+        completed == 2 && requests.len() == 3,
+        "the re-run's two requests must be Completed: {requests:?}"
+    );
+    let attempts = case
+        .stores
+        .attempt_store
+        .list_by_task(&case.root.id)
+        .await?;
+    let crashed_attempt = attempts
+        .iter()
+        .find(|attempt| EffectKey::llm(&case.root.id, attempt.id.as_str()) == crashed.key)
+        .context("the crashed request's attempt")?;
+    ensure!(
+        crashed_attempt.outcome == Some(agent_server::journal::TurnAttemptOutcome::Success)
+            && !crashed_attempt.closed_as_abandoned(),
+        "the crash point comes after the close: {crashed_attempt:?}"
+    );
+    let messages = case
+        .stores
+        .message_store
+        .get(&case.thread)
+        .await?
+        .context("no transcript")?
+        .messages;
+    ensure!(
+        !messages
+            .iter()
+            .any(agent_server::journal::effect::is_aborted_response_note),
+        "a consumed response must not be salvaged: {messages:?}"
+    );
+    if let (Some(finished), Some(abandoned)) = (
+        case.daemon.llm_request_transitions("finished"),
+        case.daemon.llm_request_transitions("abandoned"),
+    ) {
+        // The crashed process counted its one start; the recovering one
+        // counts the re-run's two starts and finishes, and the crashed
+        // request's abandon: started (1 + 2) = finished + abandoned.
+        ensure!(
+            finished == 2 && abandoned == 1,
+            "recovery counted finished={finished} abandoned={abandoned}"
+        );
+    }
     Ok(())
 }
 
@@ -2552,7 +2713,7 @@ matrix!(
         s7_hung_subagent,
         s10_sqlite_contention,
     ],
-    [s4_fork: "failpoints"],
+    [s4_fork: "failpoints", s11_consumed_request: "failpoints"],
     [
     ]
 );
@@ -2575,6 +2736,7 @@ matrix!(
     ],
     [
         s4_fork: "failpoints",
+        s11_consumed_request: "failpoints",
         s8_overlap: "postgres",
         s8_overlap_leader: "postgres",
         s8_lock_loss_leader: "postgres",
