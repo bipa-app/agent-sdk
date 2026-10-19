@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Rolling back:** an earlier release has no handler that wakes a parked
     invocation, so it would wait forever. Drain or decide parked merges
     before rolling back.
+    bip: decide parked merge prompts before rolling back past B-4.
 - **Breaking:** `CompletionOutput::park` is an `Option<NewPrompt>` (the
   placeholder `PromptRequest` is gone).
   - A park opens the host-owned prompt (with the invocation as its
