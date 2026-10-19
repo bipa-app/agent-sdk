@@ -205,7 +205,9 @@ inventory covers the whole observability surface.
 | `agent_server.journal.completed_turn.commits` | Counter | `outcome` (`ok`, `lost_ownership`, `stale_turn`, `error`) | `[agent-server]` `commit_completed_turn` | Phase 2 |
 | `agent_server.effects` | Counter | `kind` (`tool_call`, `llm_request`, `git_step`), `transition` (`started`, `refused`, `finished`, `reclaimed`, `abandoned`, `salvaged`: a cut-off `llm_request` response committed with the turn that continues, `continued`: a requeued subagent invocation continues its `git_step` record) | `[agent-server]` (abandons also from the SQL stores) | Phase 2; `git_step`/`continued` primitive 10 |
 | `agent_server.effect.duration` | Histogram (s) | `kind`, `outcome` (the state it finished in) | `[agent-server]` | Phase 2 |
-| span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id` | `[agent-server]` | Phase 2 |
+| span `effect.run` | Span | `agent_server.effect.kind`, `agent_server.effect.state`; span-only `agent_server.effect.id`, `agent_server.task.id`. A tool call's `effect.run` nests under the same parent as its `agent_server.tool.phase` spans | `[agent-server]` | Phase 2 |
+| `agent_server.tool.phase.duration` | Histogram (s) | `phase` (`lookup`: the prior-effect read of an `Unsafe` call; `claim`: the commit that starts its effect record; `settlement`: the commit that settles the tool child, including the interrupted-replay and fail-closed settles), `outcome` (`success`, `error`, `interrupted`: the future was dropped first). Task and call ids are never labels. Buckets 1 ms to 900 s | `[agent-server]` `worker/tool_phase.rs` | D15; replaces bip #980's store-side phases of `bip.tool.phase.duration{bip.tool.phase, outcome}`, which bip #985 deletes. The metric name and the phase label key changed; the phase values are the same. bip keeps `execution` |
+| span `agent_server.tool.phase` | Span | `agent_server.tool.phase`, `outcome`; span-only `agent_server.task.id`, `gen_ai.tool.call.id`, `gen_ai.tool.name`. Nests under the caller's current span, else the tool child's stored `traceparent`; the phase's store work runs in its context. A replay-safe call has only `settlement` | `[agent-server]` `worker/tool_phase.rs` | D15; replaces bip #980's store-side `bip.tool.phase` spans, which bip #985 deletes. The span name and the phase attribute key changed (`bip.tool.phase` → `agent_server.tool.phase`); the phase values are the same. See "Tool-call phases" below |
 | `agent_server.tool.stalls` | Counter | `outcome` (`tripped`, `fallback_settled`) | `[agent-service-host]` (tool child heartbeat) | prim-wait W1 |
 | `agent_server.tool.stall_budget.unbounded` | Counter | — | `[agent-service-host]` | prim-wait W1 |
 | span `agent_server.tool.stall` | Span | span-only `agent_server.tool.name`, `agent_server.task.id`; parented on the tool child's stored `traceparent` when it has one (the heartbeat runs under no span) | `[agent-server]`, recorded from the `[agent-service-host]` tool child heartbeat and dispatch | prim-wait W1 |
@@ -235,6 +237,19 @@ Ids are on spans only, never on the counter. A host opens a row inside its own t
 | `agent_server.leader` | Counter | `state` (`waiting`, `acquired`, `lost`, `released`) | `[agent-service-host]` (OTel span `leader.acquire` with `agent_server.leader.waited_ms`) | crash-matrix (#523) |
 | `agent_server.leader.is_leader` | UpDownCounter | — | `[agent-service-host]` (+1 on `acquired`, −1 on `released`; summed per store, more than 1 means two leaders) | crash-matrix (#523) |
 | `agent_server.epoch.reclaims{scope=superseded_epoch}` | (label of the row above) | `scope` | `[agent-server]` (the `PostgresLeader` boot reclaim) | crash-matrix (#523) |
+
+Tool-call phases (`agent_server.tool.phase`, D15). These spans replace the store-side phases bip #980 recorded in bip's store decorator, which bip #985 deletes:
+- the span name changed: `bip.tool.phase` → `agent_server.tool.phase`;
+- the phase attribute key changed: `bip.tool.phase` → `agent_server.tool.phase` on the span, `phase` on `agent_server.tool.phase.duration`;
+- the phase values (`lookup`, `claim`, `settlement`) and the outcomes are the same.
+
+The one task key is `agent_server.task.id`, the tool child's id. bip keeps its `execution` phase on span `bip.tool.phase`, and bip #985 (same pin bump, PT-6) renames that span's `task.id` attribute to `agent_server.task.id`. `gen_ai.tool.call.id` joins one call's four phases across the two emitters. One TraceQL query finds all four phases of a task:
+
+```traceql
+{ span.agent_server.task.id = "<task>" && (name = "agent_server.tool.phase" || name = "bip.tool.phase") }
+```
+
+The three SDK phases and the call's `effect.run` span share one parent: the caller's current span, or else the tool child's stored `traceparent`. bip's `execute_tool` span, the parent of its `execution` phase, nests under the same `traceparent`, so all four phases are in one trace. The stored-`traceparent` fallback decodes through the global text-map propagator. `agent_sdk_otel::install_global_provider` installs it; a host that sets its tracer provider by hand must also call `opentelemetry::global::set_text_map_propagator`, or the phases start unparented.
 
 ### 4.4 Agent-service-host metrics
 

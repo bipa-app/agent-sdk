@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Observability: a tool call's store-side phases
+
+- Each tool call's store work is an `agent_server.tool.phase` span with
+  `agent_server.tool.phase` set to `lookup` (the read of an `Unsafe`
+  call's prior effect record), `claim` (the commit that starts its effect
+  record) or `settlement` (the commit that settles the tool child,
+  including the interrupted-replay settle and the fail-closed settle after
+  a refused claim). A replay-safe call has only `settlement`. The span
+  carries `agent_server.task.id`, `gen_ai.tool.call.id`, `gen_ai.tool.name`
+  and `outcome` (`success`, `error`, or `interrupted` when the future was
+  dropped first). It nests under the caller's current span, or else under
+  the tool child's stored `traceparent`.
+- `agent_server.tool.phase.duration` (histogram, seconds) records each
+  phase, labelled only by `phase` and `outcome`.
+- These spans replace the store-side phases bip #980 recorded in bip's
+  store decorator, which bip #985 deletes. What changed for dashboards and
+  queries:
+  - the span name: `bip.tool.phase` is now `agent_server.tool.phase`;
+  - the phase attribute key: `bip.tool.phase` is now
+    `agent_server.tool.phase` on the span, and `phase` on the histogram
+    (`bip.tool.phase.duration` is now `agent_server.tool.phase.duration`);
+  - the phase values (`lookup`, `claim`, `settlement`) and outcomes are the
+    same.
+- The one task key is `agent_server.task.id` (the tool child's id). bip
+  keeps its `execution` phase (span `bip.tool.phase`), and bip #985, which
+  ships in the same pin bump (PT-6), renames that span's `task.id` to
+  `agent_server.task.id`. `gen_ai.tool.call.id` joins one call's four
+  phases across the two emitters. One TraceQL query finds all four phases
+  of a task:
+  `{ span.agent_server.task.id = "<task>" && (name = "agent_server.tool.phase" || name = "bip.tool.phase") }`.
+- A tool call's `effect.run` span now nests under the same parent as its
+  phase spans: the caller's current span, else the tool child's stored
+  `traceparent`. Before, it was a root span in a trace of its own.
+- The stored-`traceparent` fallback decodes through the global text-map
+  propagator. `agent_sdk_otel::install_global_provider` installs it. A host
+  that sets its tracer provider by hand must also set the propagator, or
+  these spans start unparented.
+- Nothing else changes: no new table, `Write` variant, protocol number or
+  behaviour.
+
 ### Tests: crash matrix S10, SQLite contention
 
 - `s10_sqlite_contention` runs a real `LocalDaemon` on SQLite while an

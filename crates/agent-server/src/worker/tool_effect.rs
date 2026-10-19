@@ -14,6 +14,7 @@ use crate::journal::effect::{
 };
 use crate::journal::task::TaskStatus;
 use crate::journal::transition::{DurableStore, Guard, Rejected, Settle, Transition, Write};
+use crate::worker::tool_phase::{PhaseStore, ToolPhase, in_call_context, observe};
 use crate::worker::tool_task::{
     ToolEventCollector, ToolRun, ToolTaskBootstrap, ToolTaskOutcome, execute_on, instrumented,
     run_tool_executor, settle_transition, settled_outcome,
@@ -57,8 +58,7 @@ where
     }
 
     let key = EffectKey::tool(&bootstrap.task_id, &bootstrap.tool_call.id);
-    let prior = task_store
-        .effect(&key)
+    let prior = observe(ToolPhase::Lookup, &bootstrap, task_store.effect(&key))
         .await
         .context("failed to check prior intent")?;
     if let Some(prior) = prior {
@@ -100,13 +100,22 @@ where
         }],
         writes: Vec::new(),
     };
-    let run = run_effect(
-        task_store,
-        intent,
-        start,
-        || run_tool_executor(&bootstrap, executor),
-        |run: &ToolRun| Ok((settle_transition(&bootstrap, run)?, end_state(run))),
-        now,
+    // The effect's two commits are its claim and its settlement phases.
+    let phases = PhaseStore {
+        inner: task_store,
+        bootstrap: &bootstrap,
+    };
+    // `effect.run` nests where the phases do.
+    let run = in_call_context(
+        &bootstrap,
+        run_effect(
+            &phases,
+            intent,
+            start,
+            || run_tool_executor(&bootstrap, executor),
+            |run: &ToolRun| Ok((settle_transition(&bootstrap, run)?, end_state(run))),
+            now,
+        ),
     )
     .await
     .with_context(|| format!("settle tool child {}", bootstrap.task_id))?;
@@ -194,7 +203,7 @@ async fn interrupt_unsafe_replay(
             }),
         );
     }
-    let outcome = commit_failed_settle(task_store, transition, error_msg, now)
+    let outcome = commit_failed_settle(bootstrap, task_store, transition, error_msg, now)
         .await
         .with_context(|| format!("fail interrupted tool task {}", bootstrap.task_id))?;
     if prior.state.is_started() {
@@ -244,7 +253,7 @@ async fn fail_closed_on_claim_error(
         bootstrap.thread_id.clone(),
         vec![failure_tool_call_end(bootstrap, &error_msg)],
     );
-    commit_failed_settle(task_store, transition, error_msg, now)
+    commit_failed_settle(bootstrap, task_store, transition, error_msg, now)
         .await
         .with_context(|| {
             format!(
@@ -272,15 +281,19 @@ fn failure_tool_call_end(bootstrap: &ToolTaskBootstrap, error: &str) -> AgentEve
 }
 
 async fn commit_failed_settle(
+    bootstrap: &ToolTaskBootstrap,
     task_store: &dyn DurableStore,
     transition: Transition,
     error: String,
     now: OffsetDateTime,
 ) -> anyhow::Result<ToolTaskOutcome> {
-    let committed = task_store
-        .commit(transition, now)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let committed = observe(
+        ToolPhase::Settlement,
+        bootstrap,
+        task_store.commit(transition, now),
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
     let (child, parent) = committed
         .settled
         .into_iter()
