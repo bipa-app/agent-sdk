@@ -61,6 +61,7 @@ http = { version = "1.5.0", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+xxhash-rust = { version = "0.8.18", default-features = false, features = ["xxh64"] }
 cap-std = { version = "4.0.3", default-features = false }
 cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
 windows-sys = { version = "0.61.2", default-features = false }

@@ -35,6 +35,11 @@ bytes = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+# Claude Code fingerprint forging on OAuth: the billing-header version
+# suffix (sha2) and the `cch` body attestation (xxhash-rust, seed-matched to
+# omp's Bun.hash.xxHash64).
+sha2 = { workspace = true }
+xxhash-rust = { workspace = true }
 # WebSocket transport — only the OpenAI Codex / ChatGPT provider needs it,
 # so it is gated behind the `openai-codex` feature.
 tokio-tungstenite = { workspace = true, optional = true }

@@ -5,6 +5,7 @@
 //! non-streaming responses.
 
 pub(crate) mod data;
+mod fingerprint;
 
 use crate::attachments::validate_request_attachments;
 use crate::provider::{LlmProvider, thinking_for_forced_tool};
@@ -96,6 +97,9 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EFFORT_BETA: &str = "effort-2025-11-24";
 const CLAUDE_CODE_SESSION_ID_HEADER: &str = "X-Claude-Code-Session-Id";
+/// Claude Code (and pi and omp, which reach a subscription the same way)
+/// sends this on every OAuth request.
+const DIRECT_BROWSER_ACCESS_HEADER: &str = "anthropic-dangerous-direct-browser-access";
 /// Beta header required alongside `speed: "fast"`. Fast mode is a research
 /// preview, so the API rejects the field without it.
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
@@ -183,11 +187,86 @@ pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oat")
 }
 
-/// The `user-agent` Claude Code [`CLAUDE_CODE_VERSION`] sends from an
-/// interactive terminal session.
+/// The `user-agent` Claude Code sends from an interactive terminal session,
+/// under the CLI version currently reported on the wire.
 #[must_use]
 pub fn claude_code_user_agent() -> String {
-    format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)")
+    format!(
+        "claude-cli/{} (external, cli)",
+        reported_claude_code_version()
+    )
+}
+
+/// Claude Code CLI version adopted from an Anthropic
+/// `claude_code_version_too_old` rejection, process-wide.
+static ADOPTED_CLAUDE_CODE_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The Claude Code CLI version reported on the wire: a version adopted from
+/// a `claude_code_version_too_old` rejection, else [`CLAUDE_CODE_VERSION`].
+fn reported_claude_code_version() -> String {
+    ADOPTED_CLAUDE_CODE_VERSION
+        .lock()
+        .ok()
+        .and_then(|adopted| adopted.clone())
+        .unwrap_or_else(|| CLAUDE_CODE_VERSION.to_owned())
+}
+
+/// Adopts the minimum version an Anthropic `claude_code_version_too_old`
+/// rejection names, for the rest of the process, so a stale
+/// [`CLAUDE_CODE_VERSION`] pin costs one rejected request instead of a hard
+/// failure. Returns whether the reported version increased — callers retry
+/// once on `true`, so a repeated rejection at the same version cannot loop.
+fn adopt_required_claude_code_version(error_body: &str) -> bool {
+    let Some(required) = fingerprint::required_claude_code_version(error_body) else {
+        return false;
+    };
+    let Ok(mut adopted) = ADOPTED_CLAUDE_CODE_VERSION.lock() else {
+        return false;
+    };
+    let current = adopted.as_deref().unwrap_or(CLAUDE_CODE_VERSION);
+    if fingerprint::compare_semver(&required, current) != Some(std::cmp::Ordering::Greater) {
+        return false;
+    }
+    *adopted = Some(required);
+    true
+}
+
+/// Text of the first conversational wire user turn, the seed of the Claude
+/// Code billing-header fingerprint. Empty when the first user turn opens on
+/// an image or carries no text.
+fn first_wire_user_message_text(messages: &[agent_sdk_foundation::llm::Message]) -> String {
+    for message in messages {
+        if message.role != agent_sdk_foundation::llm::Role::User {
+            continue;
+        }
+        match &message.content {
+            agent_sdk_foundation::llm::Content::Text(text) => {
+                if !text.trim().is_empty() {
+                    return text.clone();
+                }
+            }
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => {
+                let opens_on_image = blocks.iter().any(|block| {
+                    matches!(block, agent_sdk_foundation::llm::ContentBlock::Image { .. })
+                });
+                let Some(text) = blocks.iter().find_map(|block| match block {
+                    agent_sdk_foundation::llm::ContentBlock::Text { text }
+                        if !text.trim().is_empty() =>
+                    {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                }) else {
+                    if opens_on_image {
+                        return String::new();
+                    }
+                    continue;
+                };
+                return text;
+            }
+        }
+    }
+    String::new()
 }
 
 /// One page of the Anthropic `GET /v1/models` response: the model rows plus the
@@ -363,6 +442,52 @@ impl AnthropicProvider {
         matches!(self.auth_mode, AuthMode::OAuth { .. })
     }
 
+    /// The Messages endpoint URL. OAuth requests carry `?beta=true`, as the
+    /// beta-gated SDK client Claude Code bundles always does.
+    fn messages_url(&self) -> String {
+        if self.is_oauth() {
+            format!("{}/v1/messages?beta=true", self.base_url)
+        } else {
+            format!("{}/v1/messages", self.base_url)
+        }
+    }
+
+    /// OAuth request attribution: `metadata.user_id` naming the synthetic
+    /// device this install presents as and this provider's Claude Code
+    /// session. `None` on API-key auth, which carries no attribution.
+    fn oauth_metadata(&self) -> Option<data::ApiMetadata> {
+        match &self.auth_mode {
+            AuthMode::OAuth { session_id } => Some(data::ApiMetadata {
+                user_id: fingerprint::metadata_user_id(session_id),
+            }),
+            AuthMode::ApiKey => None,
+        }
+    }
+
+    /// Serialize a request body, patching the Claude Code `cch` attestation
+    /// into the OAuth billing block. A `cch` placeholder left unanchored —
+    /// a serialization drift, not a caller error — is sent unattested and
+    /// logged, not failed.
+    fn encode_request_body<T>(&self, request: &T) -> Result<String>
+    where
+        T: serde::Serialize,
+    {
+        let mut body = serde_json::to_string(request)
+            .map_err(|e| anyhow::anyhow!("failed to serialize Anthropic request: {e}"))?;
+        if self.is_oauth()
+            && matches!(
+                fingerprint::patch_cch(&mut body),
+                fingerprint::CchOutcome::Unanchored
+            )
+        {
+            log::warn!(
+                "Anthropic OAuth request sent without its cch attestation: \
+                 the billing placeholder was not anchored to system[0]"
+            );
+        }
+        Ok(body)
+    }
+
     /// Applies authentication headers to a request builder.
     ///
     /// When `api_key` is empty the provider-specific credential header is
@@ -407,7 +532,22 @@ impl AnthropicProvider {
                     .header("anthropic-beta", self.oauth_betas(effort_on_wire).join(","))
                     .header("user-agent", claude_code_user_agent())
                     .header("x-app", "cli")
-                    .header(CLAUDE_CODE_SESSION_ID_HEADER, session_id),
+                    .header(DIRECT_BROWSER_ACCESS_HEADER, "true")
+                    .header(CLAUDE_CODE_SESSION_ID_HEADER, session_id)
+                    .header("X-Stainless-Arch", fingerprint::stainless_arch())
+                    .header("X-Stainless-Lang", "js")
+                    .header("X-Stainless-OS", fingerprint::stainless_os())
+                    .header(
+                        "X-Stainless-Package-Version",
+                        fingerprint::STAINLESS_PACKAGE_VERSION,
+                    )
+                    .header("X-Stainless-Retry-Count", "0")
+                    .header("X-Stainless-Runtime", "node")
+                    .header(
+                        "X-Stainless-Runtime-Version",
+                        fingerprint::STAINLESS_RUNTIME_VERSION,
+                    )
+                    .header("X-Stainless-Timeout", fingerprint::STAINLESS_TIMEOUT),
             }
         };
         self.extra_headers
@@ -434,12 +574,15 @@ impl AnthropicProvider {
 
     /// Build the system prompt payload, accounting for OAuth mode.
     ///
-    /// In OAuth mode the identity string must be a **separate** system block
-    /// (matching the layout Claude Code itself sends).  For API-key auth the
-    /// user-supplied system prompt is sent as a single block.
+    /// In OAuth mode Claude Code's block layout is reproduced: the
+    /// billing-header block, then the identity string, then the user's
+    /// prompt. `first_user_message_text` seeds the billing-header
+    /// fingerprint ([`fingerprint::claude_billing_header`]). For API-key
+    /// auth the user-supplied system prompt is sent as a single block.
     fn build_system_prompt_for_request<'a>(
-        &self,
+        &'a self,
         system: &'a str,
+        first_user_message_text: &str,
         cache_control: Option<data::ApiCacheControl>,
     ) -> Option<data::ApiSystemPrompt<'a>> {
         match self.auth_mode {
@@ -447,13 +590,22 @@ impl AnthropicProvider {
             AuthMode::OAuth { .. } => {
                 let mut blocks = vec![data::ApiSystemBlock {
                     block_type: "text",
-                    text: Self::OAUTH_IDENTITY,
-                    cache_control: cache_control.clone(),
+                    text: fingerprint::claude_billing_header(
+                        first_user_message_text,
+                        &reported_claude_code_version(),
+                    )
+                    .into(),
+                    cache_control: None,
                 }];
+                blocks.push(data::ApiSystemBlock {
+                    block_type: "text",
+                    text: Self::OAUTH_IDENTITY.into(),
+                    cache_control: cache_control.clone(),
+                });
                 if !system.is_empty() {
                     blocks.push(data::ApiSystemBlock {
                         block_type: "text",
-                        text: system,
+                        text: system.into(),
                         cache_control,
                     });
                 }
@@ -828,15 +980,22 @@ impl LlmProvider for AnthropicProvider {
             .and_then(|t| t.effort)
             .map(|effort| ApiOutputConfig { effort });
 
-        let system = self.build_system_prompt_for_request(&request.system, system_cache);
+        let first_user_message_text = first_wire_user_message_text(&request.messages);
+
+        let system = self.build_system_prompt_for_request(
+            &request.system,
+            &first_user_message_text,
+            system_cache.clone(),
+        );
         let max_tokens = self.effective_max_tokens(&request);
         let tool_choice = request
             .tool_choice
             .as_ref()
             .map(ApiToolChoice::from_tool_choice);
 
-        let api_request = ApiMessagesRequest {
+        let mut api_request = ApiMessagesRequest {
             model: Some(&self.model),
+            metadata: self.oauth_metadata(),
             max_tokens,
             system,
             messages: &messages,
@@ -868,52 +1027,79 @@ impl LlmProvider for AnthropicProvider {
         // so a fast headers deadline is unsafe here — bound the whole request
         // instead (same shape as the Gemini/Vertex providers). Without any
         // bound, a half-open pooled connection hangs this call forever.
-        let builder = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .timeout(CHAT_REQUEST_TIMEOUT)
-            .header("Content-Type", "application/json");
-        let response = self
-            .apply_auth(builder, api_request.output_config.is_some())
-            .json(&api_request)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+        let mut adopted_version = false;
+        let bytes = loop {
+            let body = self.encode_request_body(&api_request)?;
+            let builder = self
+                .client
+                .post(self.messages_url())
+                .timeout(CHAT_REQUEST_TIMEOUT)
+                .header("Content-Type", "application/json");
+            let response = self
+                .apply_auth(builder, api_request.output_config.is_some())
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
 
-        let status = response.status();
-        // Read `Retry-After` off the 429 response before the body is consumed
-        // (`bytes()` takes the response by value).
-        let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-            crate::http::retry_after_from_headers(response.headers())
-        } else {
-            None
+            let status = response.status();
+            // Read `Retry-After` off the 429 response before the body is
+            // consumed (`bytes()` takes the response by value).
+            let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                crate::http::retry_after_from_headers(response.headers())
+            } else {
+                None
+            };
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
+
+            log::debug!(
+                "Anthropic LLM response status={} body_len={}",
+                status,
+                bytes.len()
+            );
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Ok(ChatOutcome::RateLimited(retry_after));
+            }
+
+            if status.is_server_error() {
+                let body = String::from_utf8_lossy(&bytes);
+                log::error!("Anthropic server error status={status} body={body}");
+                return Ok(ChatOutcome::ServerError(body.into_owned()));
+            }
+
+            if status.is_client_error() {
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                // A stale CLAUDE_CODE_VERSION pin costs one rejected
+                // request, not a hard failure: adopt the named minimum and
+                // retry once.
+                if !adopted_version
+                    && status == StatusCode::BAD_REQUEST
+                    && self.is_oauth()
+                    && adopt_required_claude_code_version(&body)
+                {
+                    log::warn!(
+                        "Anthropic rejected the Claude Code version as too old; \
+                         retrying once as {}",
+                        reported_claude_code_version()
+                    );
+                    adopted_version = true;
+                    api_request.system = self.build_system_prompt_for_request(
+                        &request.system,
+                        &first_user_message_text,
+                        system_cache.clone(),
+                    );
+                    continue;
+                }
+                log::warn!("Anthropic client error status={status} body={body}");
+                return Ok(ChatOutcome::InvalidRequest(body));
+            }
+
+            break bytes;
         };
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to read response body: {e}"))?;
-
-        log::debug!(
-            "Anthropic LLM response status={} body_len={}",
-            status,
-            bytes.len()
-        );
-
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(ChatOutcome::RateLimited(retry_after));
-        }
-
-        if status.is_server_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::error!("Anthropic server error status={status} body={body}");
-            return Ok(ChatOutcome::ServerError(body.into_owned()));
-        }
-
-        if status.is_client_error() {
-            let body = String::from_utf8_lossy(&bytes);
-            log::warn!("Anthropic client error status={status} body={body}");
-            return Ok(ChatOutcome::InvalidRequest(body.into_owned()));
-        }
 
         let api_response: data::ApiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("failed to parse response: {e}"))?;
@@ -1041,15 +1227,23 @@ impl LlmProvider for AnthropicProvider {
                         .and_then(|t| t.effort)
                         .map(|effort| ApiOutputConfig { effort });
 
-                    let system = self.build_system_prompt_for_request(&request.system, system_cache);
+                    let first_user_message_text = first_wire_user_message_text(&request.messages);
+
+
+                    let system = self.build_system_prompt_for_request(
+                        &request.system,
+                        &first_user_message_text,
+                        system_cache.clone(),
+                    );
                     let max_tokens = self.effective_max_tokens(&request);
                     let tool_choice = request
                         .tool_choice
                         .as_ref()
                         .map(ApiToolChoice::from_tool_choice);
 
-                    let api_request = ApiMessagesRequest {
+                    let mut api_request = ApiMessagesRequest {
                         model: Some(&self.model),
+                        metadata: self.oauth_metadata(),
                         max_tokens,
                         system,
                         messages: &messages,
@@ -1072,10 +1266,8 @@ impl LlmProvider for AnthropicProvider {
                         }
                     }
 
-                    let builder = self
-                        .client
-                        .post(format!("{}/v1/messages", self.base_url))
-                        .header("Content-Type", "application/json");
+                    let headers_timeout = self.stream_headers_timeout;
+                    let mut adopted_version = false;
                     // With `stream: true` the server answers promptly (200 +
                     // `message_start`, then pings through generation gaps), so slow
                     // headers only ever mean a dead connection — typically a pooled
@@ -1084,63 +1276,102 @@ impl LlmProvider for AnthropicProvider {
                     // this deadline does. The message says "timed out" so every
                     // retry layer classifies it as a retryable transport error and
                     // re-sends on a fresh connection.
-                    let headers_timeout = self.stream_headers_timeout;
-                    let send = self
-                        .apply_auth(builder, api_request.output_config.is_some())
-                        .json(&api_request)
-                        .send();
-                    let response = match tokio::time::timeout(headers_timeout, send).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(error)) => {
-                            yield Ok(reqwest_error_delta("request failed", &error));
-                            return;
-                        }
-                        Err(_elapsed) => {
-                            log::error!(
-                                "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
-                                headers_timeout.as_secs()
-                            );
-                            yield Ok(StreamDelta::Error {
-                                message: format!(
-                                    "request timed out awaiting response headers after {}s",
+                    let response = loop {
+                        let body = match self.encode_request_body(&api_request) {
+                            Ok(body) => body,
+                            Err(error) => {
+                                yield Ok(StreamDelta::Error {
+                                    message: error.to_string(),
+                                    kind: StreamErrorKind::InvalidRequest,
+                                });
+                                return;
+                            }
+                        };
+                        let builder = self
+                            .client
+                            .post(self.messages_url())
+                            .header("Content-Type", "application/json");
+                        let send = self
+                            .apply_auth(builder, api_request.output_config.is_some())
+                            .body(body)
+                            .send();
+                        let response = match tokio::time::timeout(headers_timeout, send).await {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(error)) => {
+                                yield Ok(reqwest_error_delta("request failed", &error));
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                log::error!(
+                                    "Anthropic streaming request timed out awaiting response headers after {}s — stalled connection",
                                     headers_timeout.as_secs()
-                                ),
-                                kind: StreamErrorKind::ConnectionLost,
+                                );
+                                yield Ok(StreamDelta::Error {
+                                    message: format!(
+                                        "request timed out awaiting response headers after {}s",
+                                        headers_timeout.as_secs()
+                                    ),
+                                    kind: StreamErrorKind::ConnectionLost,
+                                });
+                                return;
+                            }
+                        };
+
+                        let status = response.status();
+
+                        if status == StatusCode::TOO_MANY_REQUESTS {
+                            let retry_after =
+                                crate::http::retry_after_from_headers(response.headers());
+                            yield Ok(StreamDelta::Error {
+                                message: "Rate limited".to_string(),
+                                kind: StreamErrorKind::RateLimited(retry_after),
                             });
                             return;
                         }
+
+                        if status.is_server_error() {
+                            let body = response.text().await.unwrap_or_default();
+                            log::error!("Anthropic server error status={status} body={body}");
+                            yield Ok(StreamDelta::Error {
+                                message: body,
+                                kind: StreamErrorKind::ServerError,
+                            });
+                            return;
+                        }
+
+                        if status.is_client_error() {
+                            let body = response.text().await.unwrap_or_default();
+                            // A stale CLAUDE_CODE_VERSION pin costs one rejected
+                            // request, not a hard failure: adopt the named minimum
+                            // and retry once.
+                            if !adopted_version
+                                && status == StatusCode::BAD_REQUEST
+                                && is_oauth
+                                && adopt_required_claude_code_version(&body)
+                            {
+                                log::warn!(
+                                    "Anthropic rejected the Claude Code version as too old; \
+                                     retrying once as {}",
+                                    reported_claude_code_version()
+                                );
+                                adopted_version = true;
+                                api_request.system = self.build_system_prompt_for_request(
+                                    &request.system,
+                                    &first_user_message_text,
+                                    system_cache.clone(),
+                                );
+                                continue;
+                            }
+                            log::warn!("Anthropic client error status={status} body={body}");
+                            yield Ok(StreamDelta::Error {
+                                message: body,
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+
+                        break response;
                     };
-
-                    let status = response.status();
-
-                    if status == StatusCode::TOO_MANY_REQUESTS {
-                        let retry_after = crate::http::retry_after_from_headers(response.headers());
-                        yield Ok(StreamDelta::Error {
-                            message: "Rate limited".to_string(),
-                            kind: StreamErrorKind::RateLimited(retry_after),
-                        });
-                        return;
-                    }
-
-                    if status.is_server_error() {
-                        let body = response.text().await.unwrap_or_default();
-                        log::error!("Anthropic server error status={status} body={body}");
-                        yield Ok(StreamDelta::Error {
-                            message: body,
-                            kind: StreamErrorKind::ServerError,
-                        });
-                        return;
-                    }
-
-                    if status.is_client_error() {
-                        let body = response.text().await.unwrap_or_default();
-                        log::warn!("Anthropic client error status={status} body={body}");
-                        yield Ok(StreamDelta::Error {
-                            message: body,
-                            kind: StreamErrorKind::InvalidRequest,
-                        });
-                        return;
-                    }
 
                     // Process SSE stream
                     let mut stream = response.bytes_stream();
@@ -2180,6 +2411,15 @@ mod tests {
         headers.get(name).and_then(|value| value.to_str().ok())
     }
 
+    /// Clears a version adopted from a `claude_code_version_too_old`
+    /// rejection, so a test observes the pinned [`CLAUDE_CODE_VERSION`]
+    /// regardless of test-order contamination of the process-wide state.
+    fn reset_adopted_claude_code_version() {
+        let _ = ADOPTED_CLAUDE_CODE_VERSION
+            .lock()
+            .map(|mut adopted| *adopted = None);
+    }
+
     #[test]
     fn claude_code_version_clears_the_newest_model_gates() -> anyhow::Result<()> {
         // Over OAuth the API rejects Opus 5.5 below Claude Code 2.1.280 and
@@ -2199,6 +2439,7 @@ mod tests {
     fn oauth_sends_the_current_claude_code_identity_headers() -> anyhow::Result<()> {
         use anyhow::Context as _;
 
+        reset_adopted_claude_code_version();
         let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55);
         let headers = auth_headers(&provider, false)?;
 
@@ -2207,6 +2448,10 @@ mod tests {
             Some(format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").as_str())
         );
         assert_eq!(header_str(&headers, "x-app"), Some("cli"));
+        assert_eq!(
+            header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
+            Some("true")
+        );
         assert_eq!(
             header_str(&headers, "authorization"),
             Some(format!("Bearer {OAUTH_TEST_TOKEN}").as_str())
@@ -2222,6 +2467,7 @@ mod tests {
     #[test]
     fn a_claude_code_gateway_bearer_is_shaped_as_claude_code() -> anyhow::Result<()> {
         let bearer = "gateway-bearer-not-an-oauth-token";
+        reset_adopted_claude_code_version();
         let provider = AnthropicProvider::claude_code_gateway(bearer, MODEL_OPUS_55);
         assert!(provider.is_oauth());
 
@@ -2236,6 +2482,10 @@ mod tests {
             Some(format!("claude-cli/{CLAUDE_CODE_VERSION} (external, cli)").as_str())
         );
         assert_eq!(header_str(&headers, "x-app"), Some("cli"));
+        assert_eq!(
+            header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
+            Some("true")
+        );
         assert!(
             header_str(&headers, "anthropic-beta").is_some_and(|betas| betas.contains(OAUTH_BETA)),
             "the OAuth betas: {headers:?}"
@@ -2249,15 +2499,23 @@ mod tests {
             header_str(&oauth, "anthropic-beta"),
             "the same betas as a Claude Code login"
         );
-        let system = serde_json::to_value(
-            provider.build_system_prompt_for_request("You are a coding agent.", None),
-        )?;
-        assert_eq!(
-            system[0]["text"],
-            AnthropicProvider::OAUTH_IDENTITY,
-            "the Claude Code identity leads the system prompt: {system}"
+        let system = serde_json::to_value(provider.build_system_prompt_for_request(
+            "You are a coding agent.",
+            "",
+            None,
+        ))?;
+        assert!(
+            system[0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("x-anthropic-billing-header: cc_version=")),
+            "the Claude Code billing header leads the system prompt: {system}"
         );
-        assert_eq!(system[1]["text"], "You are a coding agent.");
+        assert_eq!(
+            system[1]["text"],
+            AnthropicProvider::OAUTH_IDENTITY,
+            "the Claude Code identity follows the billing block: {system}"
+        );
+        assert_eq!(system[2]["text"], "You are a coding agent.");
         Ok(())
     }
 
@@ -2325,6 +2583,7 @@ mod tests {
             "x-app",
             "anthropic-beta",
             CLAUDE_CODE_SESSION_ID_HEADER,
+            DIRECT_BROWSER_ACCESS_HEADER,
         ] {
             assert!(
                 headers.get(name).is_none(),
@@ -2404,8 +2663,14 @@ mod tests {
                     expected_effort,
                     "streaming={streaming} body={body}"
                 );
+                assert!(
+                    body["system"][0]["text"].as_str().is_some_and(
+                        |text| text.starts_with("x-anthropic-billing-header: cc_version=")
+                    ),
+                    "streaming={streaming} body={body}"
+                );
                 assert_eq!(
-                    body["system"][0]["text"],
+                    body["system"][1]["text"],
                     "You are Claude Code, Anthropic's official CLI for Claude."
                 );
             }
@@ -2902,5 +3167,217 @@ mod tests {
             "message must name the byte stall: {message}"
         );
         server.abort();
+    }
+
+    #[test]
+    fn oauth_sends_the_stainless_sdk_headers() -> anyhow::Result<()> {
+        let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55);
+        let headers = auth_headers(&provider, false)?;
+        assert_eq!(header_str(&headers, "X-Stainless-Lang"), Some("js"));
+        assert_eq!(header_str(&headers, "X-Stainless-Retry-Count"), Some("0"));
+        assert_eq!(header_str(&headers, "X-Stainless-Runtime"), Some("node"));
+        assert_eq!(
+            header_str(&headers, "X-Stainless-Runtime-Version"),
+            Some(fingerprint::STAINLESS_RUNTIME_VERSION)
+        );
+        assert_eq!(
+            header_str(&headers, "X-Stainless-Package-Version"),
+            Some(fingerprint::STAINLESS_PACKAGE_VERSION)
+        );
+        assert_eq!(
+            header_str(&headers, "X-Stainless-Timeout"),
+            Some(fingerprint::STAINLESS_TIMEOUT)
+        );
+        assert_eq!(
+            header_str(&headers, "X-Stainless-OS"),
+            Some(fingerprint::stainless_os())
+        );
+        assert_eq!(
+            header_str(&headers, "X-Stainless-Arch"),
+            Some(fingerprint::stainless_arch())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_wire_carries_beta_true_url_metadata_and_cch() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider =
+            AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55).with_base_url(server.uri());
+
+        let _ = provider.chat(request_with_tools(vec![tool("read")])).await;
+        let recorded = single_recorded_request(&server).await?;
+
+        assert_eq!(recorded.url.path(), "/v1/messages");
+        assert_eq!(
+            recorded.url.query(),
+            Some("beta=true"),
+            "OAuth requests carry ?beta=true"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        let metadata = body["metadata"]["user_id"]
+            .as_str()
+            .context("OAuth requests carry metadata.user_id")?;
+        let user: serde_json::Value = serde_json::from_str(metadata)
+            .with_context(|| format!("not a JSON user_id: {metadata}"))?;
+        let device_id = user["device_id"].as_str().context("device_id")?;
+        assert_eq!(device_id.len(), 64, "{metadata}");
+        let session_header = recorded
+            .headers
+            .get("x-claude-code-session-id")
+            .and_then(|value| value.to_str().ok());
+        assert_eq!(user["session_id"].as_str(), session_header, "{metadata}");
+
+        let raw = String::from_utf8_lossy(&recorded.body).into_owned();
+        let cch_at = raw.find("cch=").context("cch in the billing block")?;
+        let cch = &raw[cch_at + 4..cch_at + 9];
+        assert_ne!(cch, "00000", "the placeholder must be patched: {raw}");
+        let mut restored = raw.clone();
+        restored.replace_range(cch_at + 4..cch_at + 9, "00000");
+        let expected =
+            xxhash_rust::xxh64::xxh64(restored.as_bytes(), fingerprint::CCH_SEED) & 0xfffff;
+        assert_eq!(cch, format!("{expected:05x}"), "self-consistent cch: {raw}");
+        assert_eq!(restored.len(), raw.len(), "the placeholder is 5 chars");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_wire_carries_no_fingerprint() -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider =
+            AnthropicProvider::opus_55("sk-ant-api-test-not-a-secret").with_base_url(server.uri());
+
+        let _ = provider.chat(request_with_tools(vec![tool("read")])).await;
+        let recorded = single_recorded_request(&server).await?;
+        assert_eq!(recorded.url.query(), None);
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        assert!(body.get("metadata").is_none(), "API-key body: {body}");
+        assert!(
+            body.get("system").is_none(),
+            "an empty system prompt serializes no system field: {body}"
+        );
+        assert!(
+            !serde_json::to_string(&body)?.contains("x-anthropic-billing-header"),
+            "API-key body carries no billing block: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oauth_adopts_a_required_version_and_retries_once() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        reset_adopted_claude_code_version();
+        let too_old = ResponseTemplate::new(400)
+            .set_body_string("claude_code_version_too_old: version 99.0.0 or newer is required.");
+        let captured = ResponseTemplate::new(400).set_body_string("captured");
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(too_old)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(captured)
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_OPUS_55).with_base_url(server.uri());
+        let outcome = provider
+            .chat(request_with_tools(vec![tool("read")]))
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        assert_eq!(received.len(), 2, "adopt-and-retry-once: {received:?}");
+        assert_eq!(
+            received[1]
+                .headers
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("claude-cli/99.0.0 (external, cli)"),
+            "the retry reports the adopted version"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&received[1].body)?;
+        assert!(
+            body["system"][0]["text"].as_str().is_some_and(
+                |text| text.starts_with("x-anthropic-billing-header: cc_version=99.0.0")
+            ),
+            "the retried billing block names the adopted version: {body}"
+        );
+        assert!(
+            matches!(outcome, ChatOutcome::InvalidRequest(_)),
+            "a second rejection is terminal: {outcome:?}"
+        );
+
+        let repeat = provider
+            .chat(request_with_tools(vec![tool("read")]))
+            .await?;
+        let received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        assert_eq!(
+            received.len(),
+            3,
+            "a repeated rejection at the adopted version is terminal: {received:?} {repeat:?}"
+        );
+        reset_adopted_claude_code_version();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn api_key_never_adopts_a_version() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "claude_code_version_too_old: version 99.0.0 or newer is required.",
+            ))
+            .mount(&server)
+            .await;
+        let provider =
+            AnthropicProvider::opus_55("sk-ant-api-test-not-a-secret").with_base_url(server.uri());
+        let outcome = provider
+            .chat(request_with_tools(vec![tool("read")]))
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        assert_eq!(
+            received.len(),
+            1,
+            "API-key auth never retries: {received:?}"
+        );
+        let user_agent = received[0]
+            .headers
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok());
+        assert!(
+            !user_agent.is_some_and(|ua| ua.starts_with("claude-cli/")),
+            "API-key auth presents no Claude Code identity: {user_agent:?}"
+        );
+        assert!(
+            matches!(outcome, ChatOutcome::InvalidRequest(_)),
+            "the rejection surfaces unchanged: {outcome:?}"
+        );
+        Ok(())
     }
 }

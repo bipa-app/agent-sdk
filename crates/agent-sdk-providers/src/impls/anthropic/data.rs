@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 pub struct ApiMessagesRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ApiMetadata>,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<ApiSystemPrompt<'a>>,
@@ -39,6 +41,13 @@ pub struct ApiMessagesRequest<'a> {
     pub speed: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_version: Option<&'a str>,
+}
+
+/// OAuth request attribution (`metadata.user_id`): a JSON document naming a
+/// synthetic device and the Claude Code session, as Claude Code sends.
+#[derive(Serialize)]
+pub struct ApiMetadata {
+    pub user_id: String,
 }
 
 /// Anthropic API `tool_choice` wire format.
@@ -93,7 +102,7 @@ impl ApiCacheControl {
 pub struct ApiSystemBlock<'a> {
     #[serde(rename = "type")]
     pub block_type: &'static str,
-    pub text: &'a str,
+    pub text: std::borrow::Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<ApiCacheControl>,
 }
@@ -616,7 +625,7 @@ pub fn build_api_system_prompt(
     cache_control.map_or(Some(ApiSystemPrompt::Text(system)), |cache_control| {
         Some(ApiSystemPrompt::Blocks(vec![ApiSystemBlock {
             block_type: "text",
-            text: system,
+            text: system.into(),
             cache_control: Some(cache_control),
         }]))
     })
@@ -1330,6 +1339,7 @@ mod tests {
         let messages = vec![];
         let request = ApiMessagesRequest {
             model: Some("claude-3-5-sonnet"),
+            metadata: None,
             max_tokens: 1024,
             system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
@@ -1451,6 +1461,7 @@ mod tests {
         let messages = vec![];
         let mut request = ApiMessagesRequest {
             model: Some("claude-opus-5"),
+            metadata: None,
             max_tokens: 1024,
             system: None,
             messages: &messages,
@@ -1478,6 +1489,7 @@ mod tests {
         let messages = vec![];
         let request = ApiMessagesRequest {
             model: None,
+            metadata: None,
             max_tokens: 1024,
             system: Some(ApiSystemPrompt::Text("You are helpful.")),
             messages: &messages,
