@@ -528,6 +528,7 @@ impl AnthropicProvider {
                 }
                 AuthMode::OAuth { session_id } => builder
                     .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("accept", "application/json")
                     .header("anthropic-version", API_VERSION)
                     .header("anthropic-beta", self.oauth_betas(effort_on_wire).join(","))
                     .header("user-agent", claude_code_user_agent())
@@ -2452,6 +2453,7 @@ mod tests {
             header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
             Some("true")
         );
+        assert_eq!(header_str(&headers, "accept"), Some("application/json"));
         assert_eq!(
             header_str(&headers, "authorization"),
             Some(format!("Bearer {OAUTH_TEST_TOKEN}").as_str())
@@ -2486,6 +2488,7 @@ mod tests {
             header_str(&headers, DIRECT_BROWSER_ACCESS_HEADER),
             Some("true")
         );
+        assert_eq!(header_str(&headers, "accept"), Some("application/json"));
         assert!(
             header_str(&headers, "anthropic-beta").is_some_and(|betas| betas.contains(OAUTH_BETA)),
             "the OAuth betas: {headers:?}"
@@ -2584,6 +2587,7 @@ mod tests {
             "anthropic-beta",
             CLAUDE_CODE_SESSION_ID_HEADER,
             DIRECT_BROWSER_ACCESS_HEADER,
+            "accept",
         ] {
             assert!(
                 headers.get(name).is_none(),
