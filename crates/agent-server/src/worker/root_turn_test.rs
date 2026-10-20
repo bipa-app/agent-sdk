@@ -2451,6 +2451,15 @@ async fn resume_with_tool_calls_re_suspends() -> Result<()> {
         new_state.len()
     );
 
+    // Both LLM requests finished `Completed`: the resumed one with the
+    // re-park's spawn (`suspend_resumed_turn`).
+    let requests = llm_request_states(&stores, &parent_id).await?;
+    assert_eq!(
+        requests,
+        vec![crate::journal::effect::EffectState::Completed; 2],
+        "{requests:?}"
+    );
+
     Ok(())
 }
 
@@ -5887,6 +5896,225 @@ async fn fresh_turn_fails_fast_on_legacy_orphaned_tool_use() -> Result<()> {
     Ok(())
 }
 
+/// The `tool_result` blocks of `messages` that close a call as cancelled.
+fn cancelled_closures(messages: &[agent_sdk_foundation::llm::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            agent_sdk_foundation::llm::Content::Blocks(blocks) => Some(blocks),
+            agent_sdk_foundation::llm::Content::Text(_) => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } if content == agent_sdk_foundation::llm::USER_CANCELLED_TOOL_RESULT => {
+                Some(tool_use_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A root parked on a tool batch and cancelled without its cancel commit (a
+/// crash during the cancel) leaves its draft ending in the unanswered call.
+/// The next root's turn closes that call as cancelled, once, so its request
+/// is provider-valid, and the closure commits with the turn (review of
+/// #534, B2). Unlike a legacy draft no root explains
+/// ([`fresh_turn_fails_fast_on_legacy_orphaned_tool_use`]), this one was
+/// left by a root that ended.
+#[tokio::test]
+async fn a_fresh_turn_closes_the_calls_a_cancelled_root_left() -> Result<()> {
+    let stores = TestStores::new();
+    let thread = thread_a();
+    let first = create_and_acquire_task(&stores.tasks, &thread).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(first),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let tool_round =
+        MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "ls"}));
+    let RootTurnOutcome::Suspended { parent_task, .. } = execute_root_turn(
+        inputs,
+        "first prompt",
+        &tool_round,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?
+    else {
+        bail!("the first turn must suspend on its tool call");
+    };
+    // The process dies during the cancel: the tree is cancelled, the
+    // cancel commit never runs, and the draft keeps the unanswered call.
+    stores.tasks.cancel_tree(&parent_task.id, t_plus(2)).await?;
+
+    let second = create_and_acquire_task(&stores.tasks, &thread).await?;
+    // A prompt sent right after waits behind the second: a `Queued` root
+    // never ran, so it does not hold the draft.
+    let third = stores
+        .tasks
+        .submit_root_turn(AgentTask::new_root_turn(thread.clone(), t_plus(3), 3))
+        .await?;
+    assert_eq!(third.status, TaskStatus::Queued);
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(second),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(3),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    execute_root_turn(
+        inputs,
+        "second prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(4),
+    )
+    .await?;
+
+    let sent = provider.captured()?;
+    assert!(
+        agent_sdk_foundation::llm::is_provider_valid_tool_sequence(&sent),
+        "{sent:?}"
+    );
+    assert_eq!(cancelled_closures(&sent), vec!["call_1".to_owned()]);
+    let projection = stores.messages.get(&thread).await?.context("projection")?;
+    assert_eq!(
+        projection.draft_messages,
+        Vec::<agent_sdk_foundation::llm::Message>::new()
+    );
+    assert_eq!(
+        cancelled_closures(&projection.messages),
+        vec!["call_1".to_owned()],
+        "the closure commits with the turn, once: {:?}",
+        projection.messages
+    );
+    assert!(agent_sdk_foundation::llm::is_provider_valid_tool_sequence(
+        &projection.messages
+    ));
+    Ok(())
+}
+
+/// The closure is the cancel seam's, so only a `Cancelled` root's calls get
+/// it. A root that ended `Failed` with the same unanswered trailing call and
+/// a child for it is not explained as cancelled (the user cancelled
+/// nothing): the next turn fails fast, as for a legacy draft
+/// ([`fresh_turn_fails_fast_on_legacy_orphaned_tool_use`]), and nothing
+/// closes the call `USER_CANCELLED`.
+#[tokio::test]
+async fn a_fresh_turn_does_not_close_the_calls_a_failed_root_left() -> Result<()> {
+    let stores = TestStores::new();
+    let thread = thread_a();
+    let first = create_and_acquire_task(&stores.tasks, &thread).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap_with_tools(first),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t0(),
+    )
+    .await?;
+    let tool_round =
+        MockToolCallProvider::single("call_1", "bash", serde_json::json!({"command": "ls"}));
+    let RootTurnOutcome::Suspended {
+        parent_task,
+        child_tasks,
+        ..
+    } = execute_root_turn(
+        inputs,
+        "first prompt",
+        &tool_round,
+        &stores.deps(),
+        t_plus(1),
+    )
+    .await?
+    else {
+        bail!("the first turn must suspend on its tool call");
+    };
+    // The child finishes and wakes the root, which fails before its resume
+    // answers the call: the draft keeps the unanswered call, and the root
+    // has its child at spawn index 0, as a cancelled one would.
+    complete_child_at(
+        &stores,
+        &child_tasks[0],
+        &ok_result("done"),
+        t_plus(1),
+        t_plus(2),
+    )
+    .await?;
+    let woken = stores
+        .tasks
+        .try_acquire_task(
+            &parent_task.id,
+            WorkerId::from_string("worker_test"),
+            LeaseId::from_string("lease_test"),
+            t_plus(300),
+            t_plus(2),
+        )
+        .await?
+        .context("acquire the woken root")?;
+    fail_with(&stores, &woken, TerminalReason::InternalError).await?;
+    let failed = stores.tasks.get(&woken.id).await?.context("failed root")?;
+    assert!(failed.last_error.is_some());
+    let draft = stores
+        .messages
+        .get(&thread)
+        .await?
+        .context("projection")?
+        .draft_messages;
+    assert!(
+        !agent_sdk_foundation::llm::is_provider_valid_tool_sequence(&draft),
+        "the failed root leaves the call unanswered: {draft:?}"
+    );
+
+    let second = create_and_acquire_task(&stores.tasks, &thread).await?;
+    let inputs = build_root_worker_inputs(
+        sample_bootstrap(second),
+        &stores.threads,
+        &stores.checkpoints,
+        &stores.messages,
+        t_plus(4),
+    )
+    .await?;
+    let provider = CapturingProvider::new();
+    let error = execute_root_turn(
+        inputs,
+        "second prompt",
+        &provider,
+        &stores.deps(),
+        t_plus(5),
+    )
+    .await
+    .expect_err("a failed root's unanswered call is not closed as cancelled");
+    assert!(
+        format!("{error:#}").contains("invalid tool_use/tool_result sequence"),
+        "the failure names the invariant: {error:#}",
+    );
+    let projection = stores.messages.get(&thread).await?.context("projection")?;
+    assert_eq!(
+        cancelled_closures(&projection.draft_messages),
+        Vec::<String>::new(),
+        "{:?}",
+        projection.draft_messages
+    );
+    assert_eq!(
+        cancelled_closures(&projection.messages),
+        Vec::<String>::new(),
+        "{:?}",
+        projection.messages
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn fresh_turn_fails_fast_on_legacy_duplicated_resume() -> Result<()> {
     use agent_sdk_foundation::llm::{self, Message};
@@ -6253,10 +6481,36 @@ async fn steering_wake_answers_and_reparks_with_wire_contract() -> Result<()> {
     // Survivor re-indexed to dense position 0.
     let child1 = stores.tasks.get(&children[1].id).await?.context("child1")?;
     assert_eq!(child1.spawn_index, Some(0));
+    // Both LLM requests (the tool round, the steering answer) finished
+    // `Completed`: the steering answer's with the re-park transition.
+    let requests = llm_request_states(&stores, &parent.id).await?;
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|state| *state == crate::journal::effect::EffectState::Completed),
+        "{requests:?}"
+    );
 
     // Survivor finishes → the real result reaches the coordinator once,
     // as a late result for the original call (nothing lost or duplicated).
     assert_survivor_fanin_delivers(&stores, &parent, &children[1], "call_1").await
+}
+
+/// The states of `task`'s LLM requests, oldest first.
+async fn llm_request_states(
+    stores: &TestStores,
+    task: &AgentTaskId,
+) -> Result<Vec<crate::journal::effect::EffectState>> {
+    use crate::journal::DurableStore;
+    Ok(stores
+        .tasks
+        .effects_for_task(task)
+        .await?
+        .into_iter()
+        .filter(|record| record.kind() == crate::journal::effect::EffectKind::LlmRequest)
+        .map(|record| record.state)
+        .collect())
 }
 
 /// The late result delivered for `id`, one entry per delivery.

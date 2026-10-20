@@ -989,6 +989,7 @@ async fn spawn_batch_creates_n_invocations_under_one_parent() -> Result<()> {
             delivered_injection_ids: Vec::new(),
             entries,
             payload,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1062,6 +1063,7 @@ async fn spawn_batch_rejects_empty_input() -> Result<()> {
             delivered_injection_ids: Vec::new(),
             entries: Vec::new(),
             payload,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1114,6 +1116,7 @@ async fn spawn_batch_rejects_out_of_bounds_spawn_index() -> Result<()> {
             delivered_injection_ids: Vec::new(),
             entries,
             payload,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1633,6 +1636,7 @@ async fn spawn_mixed_creates_subagents_and_tool_children_under_one_parent() -> R
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1723,6 +1727,7 @@ async fn spawn_mixed_reports_short_committed_event_batch_without_panicking() -> 
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1801,6 +1806,7 @@ async fn spawn_mixed_rejects_losing_cas_without_partial_spawn() -> Result<()> {
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1854,6 +1860,7 @@ async fn spawn_mixed_rejects_uncovered_pending_tool_call() -> Result<()> {
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1916,6 +1923,7 @@ async fn spawn_mixed_rejects_bad_tool_slot_without_orphaning_child_threads() -> 
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -1990,6 +1998,7 @@ async fn spawn_mixed_records_child_ids_in_slot_order_when_interleaved() -> Resul
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -2069,6 +2078,7 @@ async fn spawn_batch_rejects_duplicate_child_thread_without_orphaning_projection
             delivered_injection_ids: Vec::new(),
             entries,
             payload,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,
@@ -2136,6 +2146,7 @@ async fn spawn_mixed_rejects_duplicate_child_thread_without_orphaning_projection
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: None,
+            prelude: Vec::new(),
         },
         &SubagentInvocationDeps {
             task_store: &task_store,

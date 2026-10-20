@@ -900,6 +900,40 @@ long as it needs. No migration, table, `Write` variant or protocol change.
 
 ### Crash safety, Phase 2: effects
 
+- **Fix: a consumed LLM request finishes in its spawn's transaction
+  (P2-3b2).** A tool suspension (`suspend_at_tool_boundary`,
+  `suspend_resumed_turn`) and a steering re-park now finish the consumed
+  response's request `Completed` in the transaction that parks the root,
+  ahead of its spawn write (after the re-park write). A crash there leaves
+  the request `Started` with no child, never `Completed` with the root
+  still running. The attempt's close stays its own commit before it, as
+  does the finish where no transition consumes the response (boundary
+  injection, a question park). So a crash between the close and the spawn
+  leaves the request `Abandoned` once the root settles, not `Completed`:
+  the park it was consumed by never committed.
+  - **Breaking:** `MixedChildrenRequest::prelude` and
+    `SubagentBatchRequest::prelude` (`Vec<Write>`) are new public fields, so
+    a struct literal of either must set them (`Vec::new()` for none).
+  - **`Preceded`** (new, `agent_server::journal`): a `DurableStore`
+    decorator whose commits apply the caller's writes first.
+    `SpawnChildrenExt` now holds for every `DurableStore`.
+  - The finish rides the spawn only for a `Started` request of the root
+    (one read before the spawn), so it can never refuse the spawn.
+  - **Crash matrix S11** now kills the process at `effect.finish_written`
+    inside the spawn transaction; the outcome is unchanged (one abandoned,
+    two `Completed`).
+- **Fix: a fresh turn closes the calls a cancelled root left unanswered.**
+  A root parked on a tool batch that ends `Cancelled` without its cancel
+  commit (a crash during the cancel) left its draft ending in the
+  unanswered `tool_use`, and the next turn's request was refused at the
+  pre-send check on Postgres, and on SQLite until a restart ran the repair
+  sweep. The next fresh turn now appends the cancel seam's own closure
+  (`repair_tool_sequence_in_place` with `USER_CANCELLED_TOOL_RESULT`) to
+  the draft and its staged history before its first request, so it
+  commits with the turn. Only when the closure is the history's one fault,
+  no other root holds or parks a turn, and the most recent ended root was
+  cancelled with a child for each call; a draft no root explains still
+  fails fast (ENG-9651).
 - **Fix: a tool round's LLM request finishes `Completed`.** A response the
   turn suspends on (its tool calls), injects at, or re-parks with is
   consumed. Its request is now finished `Completed` right after its attempt

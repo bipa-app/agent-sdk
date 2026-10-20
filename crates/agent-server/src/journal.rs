@@ -655,7 +655,7 @@ pub use retention_janitor::{
     JanitorCycleReport, RetentionJanitorDeps, RetentionPolicy, run_janitor_cycle,
 };
 pub use root_turn::{RootTurnOutcome, TerminalRootTurn};
-pub use spawn_children::SpawnChildrenExt;
+pub use spawn_children::{Preceded, SpawnChildrenExt};
 pub use staged::{StagedMessageStore, StagedStateStore, StagedStores};
 pub use store::{
     AgentTaskStore, CancelTreeOutcome, CancellationMarkerSink, ChildProbe, CompletedTurnSink,

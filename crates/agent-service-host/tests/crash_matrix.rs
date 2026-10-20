@@ -111,7 +111,8 @@ enum Scenario {
     LockLossLeader,
     MergeBack,
     /// S11: a tool round's response was consumed (its attempt closed
-    /// `Success`) and the process died before its LLM request finished.
+    /// `Success`) and the process died inside the spawn transaction that
+    /// finishes its LLM request, after the finish was written.
     ConsumedRequest,
     /// S10 (SQLite): concurrent writers while an outside connection holds
     /// the write lock past `busy_timeout`.
@@ -1339,10 +1340,11 @@ async fn crash_matrix_child() -> Result<()> {
     }
     #[cfg(feature = "failpoints")]
     if scenario == Scenario::ConsumedRequest {
-        // After the tool round's attempt closed, before its request
-        // finishes: signal the parent, then hold the process for the kill.
+        // Inside the tool round's spawn transaction, right after its
+        // request's finish is written (the turn's first effect finish):
+        // signal the parent, then hold the open transaction for the kill.
         let ready = Arc::clone(&dir);
-        fail::cfg_callback("llm_request.consumed.before_finish", move || {
+        fail::cfg_callback("effect.finish_written", move || {
             let _ = ready.signal_ready("consumed");
             std::thread::sleep(Duration::from_secs(600));
         })
@@ -2007,11 +2009,14 @@ async fn s3_llm_stream(backend: Backend) -> Result<()> {
 }
 
 /// S11: the process dies after a tool round's response was consumed (its
-/// attempt closed `Success`) and before its LLM request finished. That
-/// request is abandoned once, when the recovered root completes; it is
-/// never salvaged (no note reaches the transcript); and the re-run's two
-/// requests finish `Completed`. The closed `Success` attempt is the marker
-/// that the crash point comes after the close.
+/// attempt closed `Success`), inside the spawn transaction that finishes
+/// its LLM request, after the finish is written. The kill rolls the finish
+/// back with the spawn, so that request is abandoned once, when the
+/// recovered root completes; it is never salvaged (no note reaches the
+/// transcript); and the re-run's two requests finish `Completed`. The
+/// closed `Success` attempt is the marker that the crash point comes after
+/// the close, and the `Abandoned` (not `Completed`) request that the
+/// finish written before the kill never committed.
 #[cfg(feature = "failpoints")]
 async fn s11_consumed_request(backend: Backend) -> Result<()> {
     use agent_server::journal::effect::{EffectKey, EffectKind, EffectState};

@@ -1764,7 +1764,9 @@ async fn run_boundary_injection_call(
     acc.staged_prefix.extend(staged);
     acc.delivered_injections.extend(drained.delivered);
 
-    close_attempt_or_propagate_already_closed(
+    // No transition consumes this response (the injected input is staged,
+    // not committed), so its request finishes in its own transaction.
+    if close_attempt_or_propagate_already_closed(
         &acc.streamed.attempt,
         &acc.streamed.response,
         &acc.streamed.success_usage,
@@ -1773,7 +1775,10 @@ async fn run_boundary_injection_call(
         "close attempt before boundary injection",
         now,
     )
-    .await?;
+    .await?
+    {
+        finish_consumed_request(&acc.streamed.attempt, deps, now).await;
+    }
 
     // This call's consolidated content events are committed here rather than
     // deferred into the turn-close context: `build_content_events` matches ids
@@ -2040,6 +2045,11 @@ async fn execute_root_turn_inner(
     // 2.4b Close calls earlier turns left answered only by an interim
     //      result, before compaction and the first provider request.
     let closing = close_undelivered_calls(&inputs, deps, now).await?;
+
+    // 2.4b' Close the trailing calls a terminal root left unanswered (a
+    //      crash during its cancel): not the removed repair pass above, an
+    //      append of the cancel seam's own closure, committed with the turn.
+    close_unanswered_trailing_calls(&inputs, &user_input, deps, now).await?;
 
     // 2.4c Salvage the cut-off LLM requests this turn continues: its own,
     //      when the task was re-acquired after a crash, and those of a
@@ -2960,7 +2970,12 @@ async fn begin_llm_request(
 /// Count the LLM request of `attempt` finished `Completed` by its turn's
 /// commit at `now`, with its run time since the attempt opened.
 fn record_llm_request_finished(attempt: &TurnAttempt, now: OffsetDateTime) {
-    let duration = (now - attempt.opened_at).as_seconds_f64().max(0.0);
+    record_llm_request_finished_since(attempt.opened_at, now);
+}
+
+/// [`record_llm_request_finished`] for a request opened at `opened_at`.
+fn record_llm_request_finished_since(opened_at: OffsetDateTime, now: OffsetDateTime) {
+    let duration = (now - opened_at).as_seconds_f64().max(0.0);
     crate::journal::effect::record_effect_finished(
         EffectKind::LlmRequest,
         EffectState::Completed.outcome_label(),
@@ -6219,6 +6234,8 @@ struct ToolSuspensionSpawn {
     preflight_completions: Vec<PreflightCompletion>,
     suspension_events: Vec<AgentEvent>,
     delivered_injection_ids: Vec<AgentTaskId>,
+    /// Writes the spawn transaction applies first (see [`SuspendedBatch::prelude`]).
+    prelude: Vec<Write>,
     tool_children_context: &'static str,
     draft_context: &'static str,
 }
@@ -6247,6 +6264,7 @@ async fn spawn_suspended_tool_children(
         preflight_completions,
         suspension_events,
         delivered_injection_ids,
+        prelude,
         tool_children_context,
         draft_context,
     } = spawn;
@@ -6304,6 +6322,7 @@ async fn spawn_suspended_tool_children(
                 delivered_injection_ids,
                 boundary_events,
                 trailing_events,
+                prelude,
             },
             specs,
             reattach: Vec::new(),
@@ -6384,7 +6403,7 @@ async fn suspend_at_tool_boundary(
     validate_pending_tool_call_identities_for_turn(&continuation, &inputs, deps).await?;
 
     // 1. Close the turn attempt — the LLM call itself succeeded.
-    close_attempt_or_propagate_already_closed(
+    let closed = close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
         &close_ctx.success_usage,
@@ -6413,6 +6432,10 @@ async fn suspend_at_tool_boundary(
     if preflight_completions.is_empty()
         && let Some(questions) = durable_questions(&continuation)
     {
+        // A question park is no transition: the request finishes alone.
+        if closed {
+            finish_consumed_request(&attempt, deps, now).await;
+        }
         let draft = suspended_messages.clone();
         let mut events = content_events;
         events.extend(tool_call_events);
@@ -6438,7 +6461,9 @@ async fn suspend_at_tool_boundary(
 
     // 5. Atomically spawn children and park the parent (shared tail:
     //    selector routing, boundary transaction, draft snapshot, and
-    //    precompleted-child publication).
+    //    precompleted-child publication). The consumed request finishes
+    //    in the spawn's transaction.
+    let consumed = ConsumedRequest::of(&attempt, closed, deps).await;
     let mut suspension_events = content_events;
     suspension_events.extend(tool_call_events);
     let (parent_task, child_tasks, suspension_committed) = spawn_suspended_tool_children(
@@ -6454,12 +6479,14 @@ async fn suspend_at_tool_boundary(
             preflight_completions,
             suspension_events,
             delivered_injection_ids: close_ctx.delivered_injections.clone(),
+            prelude: ConsumedRequest::writes(consumed.as_ref()),
             tool_children_context: "spawn tool children",
             draft_context: "snapshot suspended_messages to message projection draft",
         },
         now,
     )
     .await?;
+    ConsumedRequest::record(consumed.as_ref(), now);
 
     // 6. Prepend the durable per-turn admission events (`UserInput`
     //    when present + `Start`) committed before streaming so the
@@ -6551,7 +6578,7 @@ async fn spawn_single_subagent_invocation(
     deps: &RootTurnDeps<'_>,
     plan: &super::subagent_spawn_selector::SubagentSpawnPlan,
     payload: SuspensionPayload,
-    delivered_injection_ids: Vec<AgentTaskId>,
+    (delivered_injection_ids, prelude): (Vec<AgentTaskId>, Vec<Write>),
     spawn_index: usize,
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedSubagentInvocation> {
@@ -6569,12 +6596,11 @@ async fn spawn_single_subagent_invocation(
         thread_store: deps.thread_store,
         event_repo: deps.event_repo,
     };
-    super::subagent::spawn_subagent_invocation(
+    super::subagent::spawn_subagent_invocation_preceded(
         &inputs.bootstrap.task_id,
-        &inputs.bootstrap.worker_id,
-        &inputs.bootstrap.lease_id,
+        (&inputs.bootstrap.worker_id, &inputs.bootstrap.lease_id),
         spawn,
-        delivered_injection_ids,
+        (delivered_injection_ids, prelude),
         &invocation_deps,
         now,
     )
@@ -6599,7 +6625,7 @@ async fn spawn_multi_subagent_invocations(
         Box<super::subagent_spawn_selector::SubagentSpawnPlan>,
     )>,
     payload: SuspensionPayload,
-    delivered_injection_ids: Vec<AgentTaskId>,
+    (delivered_injection_ids, prelude): (Vec<AgentTaskId>, Vec<Write>),
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedSubagentBatch> {
     let mut entries = Vec::with_capacity(plans.len());
@@ -6627,6 +6653,7 @@ async fn spawn_multi_subagent_invocations(
             delivered_injection_ids,
             entries,
             payload,
+            prelude,
         },
         &invocation_deps,
         now,
@@ -6649,7 +6676,7 @@ async fn spawn_mixed_batch_children(
     deps: &RootTurnDeps<'_>,
     routing: MixedRoutingInputs,
     payload: SuspensionPayload,
-    delivered_injection_ids: Vec<AgentTaskId>,
+    (delivered_injection_ids, prelude): (Vec<AgentTaskId>, Vec<Write>),
     (boundary_events, trailing_events): (Vec<AgentEvent>, Vec<AgentEvent>),
     now: OffsetDateTime,
 ) -> Result<super::subagent::SpawnedMixedBatch> {
@@ -6705,6 +6732,7 @@ async fn spawn_mixed_batch_children(
             reattach: Vec::new(),
             payload,
             child_otel_traceparent: child_tool_traceparent(deps, &inputs.bootstrap.task_id).await,
+            prelude,
         },
         &invocation_deps,
         now,
@@ -6758,6 +6786,9 @@ struct SuspendedBatch {
     /// Events committed in the spawn transaction after the subagent starts:
     /// an ordinary suspension's content and tool call starts.
     trailing_events: Vec<AgentEvent>,
+    /// Writes the spawn transaction applies before the spawn (see
+    /// [`crate::journal::Preceded`]): the consumed LLM request's finish.
+    prelude: Vec<Write>,
 }
 
 struct BatchRoutingApplication {
@@ -6787,6 +6818,7 @@ async fn apply_reattached_batch_routing(
         delivered_injection_ids,
         boundary_events,
         trailing_events,
+        prelude,
     } = batch;
     let (subagents, tool_children) = partition_attached_batch(routing, &specs)?;
     let invocation_deps = super::subagent::SubagentInvocationDeps {
@@ -6807,6 +6839,7 @@ async fn apply_reattached_batch_routing(
             reattach,
             payload,
             child_otel_traceparent: child_tool_traceparent(deps, &inputs.bootstrap.task_id).await,
+            prelude,
         },
         &invocation_deps,
         now,
@@ -6932,6 +6965,7 @@ async fn spawn_mixed_routed_children(
         delivered_injection_ids,
         boundary_events,
         trailing_events,
+        prelude,
     } = batch;
     let spawned = spawn_mixed_batch_children(
         inputs,
@@ -6942,7 +6976,7 @@ async fn spawn_mixed_routed_children(
             specs,
         },
         payload,
-        delivered_injection_ids,
+        (delivered_injection_ids, prelude),
         (boundary_events, trailing_events),
         now,
     )
@@ -7021,7 +7055,6 @@ async fn spawn_routed_batch(
         wake_workers,
         ..
     } = application;
-    let task_id = &inputs.bootstrap.task_id;
     // Every arm returns the events its spawn transaction committed: the
     // subagent `SubagentProgress` start snapshots must ride the outcome
     // so `publish_events` feeds them to the live tail ahead of the
@@ -7031,6 +7064,7 @@ async fn spawn_routed_batch(
             let SuspendedBatch {
                 payload,
                 delivered_injection_ids,
+                prelude,
                 ..
             } = batch;
             let spawned = spawn_single_subagent_invocation(
@@ -7038,7 +7072,7 @@ async fn spawn_routed_batch(
                 deps,
                 &plan,
                 payload,
-                delivered_injection_ids,
+                (delivered_injection_ids, prelude),
                 spawn_index,
                 now,
             )
@@ -7053,6 +7087,7 @@ async fn spawn_routed_batch(
             let SuspendedBatch {
                 payload,
                 delivered_injection_ids,
+                prelude,
                 ..
             } = batch;
             let batch = spawn_multi_subagent_invocations(
@@ -7060,7 +7095,7 @@ async fn spawn_routed_batch(
                 deps,
                 plans,
                 payload,
-                delivered_injection_ids,
+                (delivered_injection_ids, prelude),
                 now,
             )
             .await?;
@@ -7081,27 +7116,8 @@ async fn spawn_routed_batch(
                 .await?
         }
         super::subagent_spawn_selector::BatchRouting::AllTools => {
-            let SuspendedBatch {
-                payload,
-                delivered_injection_ids,
-                ..
-            } = batch;
-            let child_otel_traceparent = child_tool_traceparent(deps, task_id).await;
-            let (parent, children) = deps
-                .task_store
-                .spawn_tool_children(
-                    task_id,
-                    &inputs.bootstrap.worker_id,
-                    &inputs.bootstrap.lease_id,
-                    specs,
-                    payload,
-                    child_otel_traceparent,
-                    delivered_injection_ids,
-                    now,
-                )
-                .await
-                .context(tool_children_context)?;
-            (parent, children, Vec::new())
+            spawn_all_tool_children(inputs, deps, (specs, batch), tool_children_context, now)
+                .await?
         }
     };
 
@@ -7114,6 +7130,39 @@ async fn spawn_routed_batch(
         deps.wake_workers_for_batch();
     }
     Ok(spawned)
+}
+
+/// Spawn an `AllTools` batch with no events through
+/// [`SpawnChildrenExt::spawn_tool_children`], its prelude first.
+async fn spawn_all_tool_children(
+    inputs: &RootWorkerInputs,
+    deps: &RootTurnDeps<'_>,
+    (specs, batch): (Vec<ChildSpawnSpec>, SuspendedBatch),
+    tool_children_context: &'static str,
+    now: OffsetDateTime,
+) -> Result<(AgentTask, Vec<AgentTask>, Vec<CommittedEvent>)> {
+    let SuspendedBatch {
+        payload,
+        delivered_injection_ids,
+        prelude,
+        ..
+    } = batch;
+    let task_id = &inputs.bootstrap.task_id;
+    let child_otel_traceparent = child_tool_traceparent(deps, task_id).await;
+    let (parent, children) = crate::journal::Preceded::new(deps.task_store, prelude)
+        .spawn_tool_children(
+            task_id,
+            &inputs.bootstrap.worker_id,
+            &inputs.bootstrap.lease_id,
+            specs,
+            payload,
+            child_otel_traceparent,
+            delivered_injection_ids,
+            now,
+        )
+        .await
+        .context(tool_children_context)?;
+    Ok((parent, children, Vec::new()))
 }
 
 /// Record on each tool child the earlier siblings it must wait for, in the
@@ -7193,6 +7242,10 @@ fn order_tool_children(
 /// recovery sweep may have closed it after the lease expired and
 /// before this worker reached the suspension point).
 ///
+/// Returns whether this call closed it: only then does the caller finish
+/// the attempt's LLM request (see [`ConsumedRequest`] and
+/// [`finish_consumed_request`]).
+///
 /// `error_context` is appended to any non-`AlreadyClosed` error so
 /// callers preserve their original "close attempt on …" context
 /// without duplicating the match arm.
@@ -7204,28 +7257,88 @@ async fn close_attempt_or_propagate_already_closed(
     deps: &RootTurnDeps<'_>,
     error_context: &'static str,
     now: OffsetDateTime,
-) -> Result<()> {
+) -> Result<bool> {
     let params = build_close_params(response, usage, evidence);
     match close_reporting_usage(attempt, params, evidence, usage, deps, now).await {
-        Ok(()) => {
-            finish_consumed_request(attempt, deps, now).await;
-            Ok(())
-        }
+        Ok(()) => Ok(true),
         Err(e)
             if e.downcast_ref::<TurnAttemptSchemaError>()
                 == Some(&TurnAttemptSchemaError::AlreadyClosed) =>
         {
             // Recovery sweep already closed this attempt — safe to proceed.
-            Ok(())
+            Ok(false)
         }
         Err(e) => Err(e.context(error_context)),
     }
 }
 
+/// The LLM request of a response the turn consumes with a transition: a
+/// tool suspension's spawn or a steering re-park. Its `Completed` finish
+/// rides that transition, so a crash leaves the request `Completed` with
+/// the parent parked, or `Started` with nothing parked.
+///
+/// The attempt's close stays its own commit, before the transition: a crash
+/// between them leaves the request `Started` with its attempt closed
+/// `Success`, which salvage never takes, and the root's settle abandons it.
+struct ConsumedRequest {
+    finish: Write,
+    opened_at: OffsetDateTime,
+}
+
+impl ConsumedRequest {
+    /// The finish of `attempt`'s request once this worker closed the attempt
+    /// (`closed`): only for a `Started` request of the attempt's task, since
+    /// a finish of any other record rejects the whole transition it rides.
+    /// `None` otherwise, and on a read failure (logged), which leaves the
+    /// request for the root's settle to abandon.
+    async fn of(attempt: &TurnAttempt, closed: bool, deps: &RootTurnDeps<'_>) -> Option<Self> {
+        if !closed {
+            return None;
+        }
+        let task = &attempt.task_id;
+        let key = EffectKey::llm(task, attempt.id.as_str());
+        match deps.task_store.effect(&key).await {
+            Ok(Some(record)) if &record.owner == task && record.state.is_started() => Some(Self {
+                finish: Write::Effect(EffectWrite::Finish {
+                    key,
+                    owner: task.clone(),
+                    state: EffectState::Completed,
+                }),
+                opened_at: attempt.opened_at,
+            }),
+            Ok(_) => None,
+            Err(error) => {
+                log::warn!(
+                    task_id = task.as_str(),
+                    turn_attempt_id = attempt.id.as_str();
+                    "read the LLM request of a consumed response: {error:#}"
+                );
+                None
+            }
+        }
+    }
+
+    /// The writes `consumed` adds to the transition that consumes it.
+    fn writes(consumed: Option<&Self>) -> Vec<Write> {
+        consumed
+            .map(|consumed| consumed.finish.clone())
+            .into_iter()
+            .collect()
+    }
+
+    /// Count the finish once its transition committed.
+    fn record(consumed: Option<&Self>, now: OffsetDateTime) {
+        if let Some(consumed) = consumed {
+            record_llm_request_finished_since(consumed.opened_at, now);
+        }
+    }
+}
+
 /// Finish `attempt`'s LLM request `Completed` once its response was
-/// consumed and its attempt closed: a response the turn suspends on, injects
-/// at or re-parks with ended normally, and must not stay `Started` to be
-/// abandoned when the root ends.
+/// consumed and its attempt closed, where no transition consumes it: a
+/// response the turn injects at or parks a question on ended normally, and
+/// must not stay `Started` to be abandoned when the root ends. (A spawn or
+/// a steering re-park carries the finish instead, see [`ConsumedRequest`].)
 ///
 /// Its own transaction, after the attempt's close: a crash between them
 /// leaves the request `Started` with its attempt closed `Success`, which
@@ -8546,7 +8659,7 @@ async fn suspend_resumed_turn(
     validate_pending_tool_call_identities_for_turn(&new_continuation, &inputs, deps).await?;
 
     // Close the turn attempt — the LLM call succeeded.
-    close_attempt_or_propagate_already_closed(
+    let closed = close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
         close.success_usage,
@@ -8574,6 +8687,10 @@ async fn suspend_resumed_turn(
     if preflight_completions.is_empty()
         && let Some(questions) = durable_questions(&new_continuation)
     {
+        // A question park is no transition: the request finishes alone.
+        if closed {
+            finish_consumed_request(&attempt, deps, now).await;
+        }
         let draft = new_suspended.clone();
         let mut events = content_events;
         events.extend(tool_call_events);
@@ -8603,7 +8720,8 @@ async fn suspend_resumed_turn(
 
     // Atomically spawn children and re-park the parent (shared tail:
     // selector routing, boundary transaction, draft snapshot, and
-    // precompleted-child publication).
+    // precompleted-child publication), finishing the consumed request.
+    let consumed = ConsumedRequest::of(&attempt, closed, deps).await;
     let mut suspension_events = content_events;
     suspension_events.extend(tool_call_events);
     let (parent_task, child_tasks, committed_events) = spawn_suspended_tool_children(
@@ -8619,12 +8737,14 @@ async fn suspend_resumed_turn(
             preflight_completions,
             suspension_events,
             delivered_injection_ids: close.delivered_injections.to_vec(),
+            prelude: ConsumedRequest::writes(consumed.as_ref()),
             tool_children_context: "re-spawn tool children on resume",
             draft_context: "refresh resumed suspended_messages draft",
         },
         now,
     )
     .await?;
+    ConsumedRequest::record(consumed.as_ref(), now);
 
     Ok(RootTurnOutcome::Suspended {
         parent_task,
@@ -9593,6 +9713,151 @@ async fn close_undelivered_calls(
     Ok((!carried.is_empty()).then(|| llm::Message::user_with_content(carried)))
 }
 
+/// Close the `tool_use` calls a terminal root left unanswered at the end of
+/// the history a fresh turn inherits.
+///
+/// A root parked on a tool batch that ends `Cancelled` without its cancel
+/// commit (a crash during the cancel, or a cancel commit that failed) leaves
+/// its draft ending `[prompt, assistant(tool_use)]`, and the next request
+/// would be refused. The closure is written to the draft in its own commit
+/// before the turn; that is safe to repeat, since a history it already
+/// closed has no fault left to close. The turn appends the closure the cancel seam would have
+/// committed ([`llm::repair_tool_sequence_in_place`] with
+/// [`llm::USER_CANCELLED_TOOL_RESULT`], a synthetic user message, never an
+/// edit), as the recovery view's contract asks of its caller (see
+/// [`crate::journal::thread_recover`]). Like [`close_undelivered_calls`] it
+/// persists the closure to the draft before the first request (compaction's
+/// source must match the staged history) and stages it, so it commits with
+/// the turn and clears with the draft.
+///
+/// Only that one shape: a fresh input, a history whose only fault is its
+/// trailing calls, and a root that provably left them and ended (see
+/// [`trailing_calls_left_by_ended_root`]). Anything else, such as a draft
+/// a pre-fix build corrupted, is left for the pre-send check to refuse, as
+/// before (ENG-9651).
+async fn close_unanswered_trailing_calls(
+    inputs: &RootWorkerInputs,
+    user_input: &super::user_input::UserInput,
+    deps: &RootTurnDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<()> {
+    if user_input.is_resume() {
+        return Ok(());
+    }
+    let thread_id = &inputs.bootstrap.thread_id;
+    let task_id = &inputs.bootstrap.task_id;
+    let history = inputs.staged_stores.messages.snapshot_messages()?;
+    let Some(closure) = trailing_calls_closure(&history) else {
+        return Ok(());
+    };
+    let closed_calls = message_tool_result_count(&closure);
+    let tasks = deps
+        .task_store
+        .list_by_thread(thread_id)
+        .await
+        .context("list the thread's tasks before closing trailing calls")?;
+    let Some(owner) = trailing_calls_left_by_ended_root(&tasks, task_id, closed_calls) else {
+        log::warn!(
+            thread_id = thread_id.0.as_str(),
+            task_id = task_id.as_str(),
+            unanswered_tool_calls = closed_calls;
+            "unanswered trailing tool calls left open: no ended root on the thread left them"
+        );
+        return Ok(());
+    };
+    let Some(projection) = deps
+        .message_store
+        .get(thread_id)
+        .await
+        .context("read the draft before closing trailing calls")?
+    else {
+        return Ok(());
+    };
+    let mut draft = projection.draft_messages;
+    draft.push(closure.clone());
+    deps.message_store
+        .set_draft(thread_id, draft, now)
+        .await
+        .context("persist the closure of trailing calls")?;
+    inputs
+        .staged_stores
+        .messages
+        .append(thread_id, closure)
+        .await
+        .context("stage the closure of trailing calls")?;
+    log::warn!(
+        thread_id = thread_id.0.as_str(),
+        task_id = task_id.as_str(),
+        ended_root = owner.as_str(),
+        closed_tool_calls = closed_calls;
+        "closed the unanswered tool calls an ended root left at the end of the history"
+    );
+    Ok(())
+}
+
+/// The root that left `calls` unanswered trailing tool calls and was
+/// cancelled, among `tasks` (every task on the thread), if one provably
+/// did: no other root on the thread holds or parks a turn (a parked root's
+/// calls are still being answered; a `Queued` one never ran), and the most
+/// recent ended root was `Cancelled` with a child for each call (spawn
+/// index `0..calls`), the batch it parked on.
+fn trailing_calls_left_by_ended_root<'a>(
+    tasks: &'a [AgentTask],
+    task_id: &AgentTaskId,
+    calls: usize,
+) -> Option<&'a AgentTaskId> {
+    let roots = tasks
+        .iter()
+        .filter(|row| row.kind == TaskKind::RootTurn && &row.id != task_id);
+    if roots
+        .clone()
+        .any(|row| !row.status.is_terminal() && row.status != TaskStatus::Queued)
+    {
+        return None;
+    }
+    let owner = roots
+        .filter(|row| row.status.is_terminal())
+        .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))?;
+    if owner.status != TaskStatus::Cancelled {
+        return None;
+    }
+    let spawned: std::collections::BTreeSet<u32> = tasks
+        .iter()
+        .filter(|row| row.parent_id.as_ref() == Some(&owner.id))
+        .filter_map(|row| row.spawn_index)
+        .collect();
+    let calls = u32::try_from(calls).ok()?;
+    (0..calls)
+        .all(|index| spawned.contains(&index))
+        .then_some(&owner.id)
+}
+
+/// The message that closes `history`'s unanswered trailing `tool_use`
+/// calls, when they are its only fault: the repair then appends exactly
+/// that one message and leaves every other message as it is.
+fn trailing_calls_closure(history: &[llm::Message]) -> Option<llm::Message> {
+    if llm::is_provider_valid_tool_sequence(history) {
+        return None;
+    }
+    let mut repaired = llm::repair_tool_sequence_in_place(history, llm::USER_CANCELLED_TOOL_RESULT);
+    if !llm::is_provider_valid_tool_sequence(&repaired) {
+        return None;
+    }
+    let closure = repaired.pop()?;
+    (repaired == history).then_some(closure)
+}
+
+/// How many `tool_result` blocks `message` carries.
+fn message_tool_result_count(message: &llm::Message) -> usize {
+    match &message.content {
+        llm::Content::Text(_) => 0,
+        llm::Content::Blocks(blocks) => blocks
+            .iter()
+            .filter(|block| matches!(block, llm::ContentBlock::ToolResult { .. }))
+            .count(),
+    }
+}
+
 /// The turn's closures that a suspension must carry: a suspension keeps
 /// only its `suspended_messages`, not the staged draft. Decided now, against
 /// the raw history as it stands at suspension: a closure that compaction
@@ -10099,6 +10364,8 @@ struct PreparedSteeringRepark {
     suspended_messages: Vec<llm::Message>,
     events: Vec<AgentEvent>,
     preflight_calls: Vec<(usize, PendingToolCallInfo, ToolResult)>,
+    /// The re-parking response's request, finishing with the re-park.
+    consumed: Option<ConsumedRequest>,
 }
 
 /// The stop reason refused dispatch (`MaxTokens` truncation, `StopSequence`,
@@ -10229,7 +10496,7 @@ async fn prepare_steering_repark(
         .payload
         .pending_tool_calls
         .extend(survivor_calls);
-    close_attempt_or_propagate_already_closed(
+    let closed = close_attempt_or_propagate_already_closed(
         &attempt,
         &response,
         &success_usage,
@@ -10239,6 +10506,7 @@ async fn prepare_steering_repark(
         now,
     )
     .await?;
+    let consumed = ConsumedRequest::of(&attempt, closed, deps).await;
     let preflight_calls = resolve_preflight_calls(&continuation, &preflight_completions)?;
     let routing = classify_steering_routing(
         inputs,
@@ -10268,6 +10536,7 @@ async fn prepare_steering_repark(
         suspended_messages: suspended,
         events,
         preflight_calls,
+        consumed,
     })
 }
 
@@ -10290,6 +10559,7 @@ async fn repark_after_steering_exchange(
         suspended_messages,
         events,
         preflight_calls,
+        consumed,
     } = prepare_steering_repark(inputs, deps, repark, now).await?;
     // The answer's content events commit with the re-park: as boundary
     // events ahead of the preflight ToolCallEnds, and otherwise after any
@@ -10312,6 +10582,7 @@ async fn repark_after_steering_exchange(
                     boundary_events,
                     trailing_events,
                     delivered_injection_ids: Vec::new(),
+                    prelude: ConsumedRequest::writes(consumed.as_ref()),
                 },
                 specs,
                 reattach,
@@ -10323,22 +10594,26 @@ async fn repark_after_steering_exchange(
         .await?
     } else {
         let child_ids = reattach.into_iter().map(|child| child.child_id).collect();
+        let mut transition = crate::journal::Transition::repark_after_steering(
+            inputs.bootstrap.task_id.clone(),
+            (
+                inputs.bootstrap.worker_id.clone(),
+                inputs.bootstrap.lease_id.clone(),
+            ),
+            payload,
+            child_ids,
+            thread_id.clone(),
+            trailing_events,
+        );
+        // After the re-park write, which checks the parent's ownership
+        // as it applies: a refused re-park then never reaches the finish,
+        // even on the in-memory store, which cannot roll back.
+        transition
+            .writes
+            .extend(ConsumedRequest::writes(consumed.as_ref()));
         let committed = deps
             .task_store
-            .commit(
-                crate::journal::Transition::repark_after_steering(
-                    inputs.bootstrap.task_id.clone(),
-                    (
-                        inputs.bootstrap.worker_id.clone(),
-                        inputs.bootstrap.lease_id.clone(),
-                    ),
-                    payload,
-                    child_ids,
-                    thread_id.clone(),
-                    trailing_events,
-                ),
-                now,
-            )
+            .commit(transition, now)
             .await
             .map_err(|rejected| crate::journal::transition::wrapper_error("repark", rejected))
             .context("re-park parent after partial child resume")?;
@@ -10349,6 +10624,7 @@ async fn repark_after_steering_exchange(
             .context("a repark transition returns its parent")?;
         (parent, Vec::new(), committed.events)
     };
+    ConsumedRequest::record(consumed.as_ref(), now);
 
     snapshot_suspension_draft(
         deps,

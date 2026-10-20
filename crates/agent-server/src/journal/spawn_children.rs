@@ -5,17 +5,22 @@
 //! behaviour to a spawn decorates the write its `commit` receives. No store
 //! can implement a spawn any other way: these methods are not on
 //! [`AgentTaskStore`].
+//!
+//! [`Preceded`] is such a decorator: a spawn through it carries writes of
+//! its own caller's, ahead of the spawn write, in the same transaction.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use super::committed_event::CommittedEvent;
+use super::effect::{EffectKey, EffectRecord};
+#[cfg(doc)]
+use super::store::AgentTaskStore;
 #[cfg(doc)]
 use super::store::validate_mixed_children_spawn;
 use super::store::{
-    AgentTaskStore, MixedChildrenSpawn, SpawnedMixedChildren, SubagentBatchSpawn,
-    SubagentInvocationSpawn,
+    MixedChildrenSpawn, SpawnedMixedChildren, SubagentBatchSpawn, SubagentInvocationSpawn,
 };
 use super::subagent_spawn_transaction::{
     SubagentSpawnCommit, SubagentSpawnEvent, SubagentSpawnOutcome,
@@ -23,15 +28,53 @@ use super::subagent_spawn_transaction::{
 use super::task::{AgentTask, AgentTaskId, ChildSpawnSpec, LeaseId, SuspensionPayload, WorkerId};
 #[cfg(doc)]
 use super::task::{TaskKind, TaskStatus};
-#[cfg(doc)]
-use super::transition::Write;
 use super::transition::{
-    ChildSpawn, DurableStore, SpawnedChildren, SubagentSpawn, ToolChildrenSpawn, Transition,
-    wrapper_error,
+    ChildSpawn, Committed, DurableStore, Rejected, SpawnedChildren, SubagentSpawn,
+    ToolChildrenSpawn, Transition, Write, wrapper_error,
 };
 
+/// A store whose commits apply `writes` first, in the same transaction.
+///
+/// Wrap a store in it for one spawn, so the spawn commits the caller's
+/// writes with it (a root's consumed LLM request finishes with the
+/// suspension that consumes it): `Preceded::new(store, writes)` then any
+/// [`SpawnChildrenExt`] method. Every commit through it carries `writes`,
+/// so use it for that one call only.
+pub struct Preceded<'a> {
+    store: &'a dyn DurableStore,
+    writes: Vec<Write>,
+}
+
+impl<'a> Preceded<'a> {
+    /// `store`, with `writes` ahead of every transition it commits.
+    #[must_use]
+    pub fn new(store: &'a dyn DurableStore, writes: Vec<Write>) -> Self {
+        Self { store, writes }
+    }
+}
+
+#[async_trait]
+impl DurableStore for Preceded<'_> {
+    async fn commit(
+        &self,
+        mut transition: Transition,
+        now: OffsetDateTime,
+    ) -> Result<Committed, Rejected> {
+        transition.writes.splice(0..0, self.writes.iter().cloned());
+        self.store.commit(transition, now).await
+    }
+
+    async fn effect(&self, key: &EffectKey) -> Result<Option<EffectRecord>> {
+        self.store.effect(key).await
+    }
+
+    async fn effects_for_task(&self, owner: &AgentTaskId) -> Result<Vec<EffectRecord>> {
+        self.store.effects_for_task(owner).await
+    }
+}
+
 /// Commit `spawn` under `parent` and return the rows it wrote.
-async fn spawn<S: AgentTaskStore + ?Sized>(
+async fn spawn<S: DurableStore + ?Sized>(
     store: &S,
     parent: &AgentTaskId,
     (worker, lease): (&WorkerId, &LeaseId),
@@ -50,9 +93,9 @@ async fn spawn<S: AgentTaskStore + ?Sized>(
         .context("a spawn transition returns its spawned children")
 }
 
-/// The spawn methods of every [`AgentTaskStore`].
+/// The spawn methods of every [`DurableStore`] (every [`AgentTaskStore`]).
 #[async_trait]
-pub trait SpawnChildrenExt: AgentTaskStore {
+pub trait SpawnChildrenExt: DurableStore {
     /// Spawn one subagent as one unit: the child thread row, the parent's
     /// `Running` → `WaitingOnChildren` transition, the invocation and child
     /// root rows, the delivered injections' completion, the parent's
@@ -395,4 +438,4 @@ pub trait SpawnChildrenExt: AgentTaskStore {
     }
 }
 
-impl<S: AgentTaskStore + ?Sized> SpawnChildrenExt for S {}
+impl<S: DurableStore + ?Sized> SpawnChildrenExt for S {}

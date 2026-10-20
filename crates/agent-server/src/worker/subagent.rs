@@ -38,7 +38,6 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::journal::SpawnChildrenExt;
 use crate::journal::commit::DEFAULT_TURN_OUTBOX_MAX_ATTEMPTS;
 use crate::journal::message_store::MessageProjectionStore;
 use crate::journal::store::{SubagentBatchSpawn, validate_reattached_slot_coverage};
@@ -50,6 +49,7 @@ use crate::journal::{
     SuspensionPayload, TaskKind, TaskStatus, Thread, ThreadStore, ToolChildSpawn, WorkerId,
     validate_mixed_slot_coverage,
 };
+use crate::journal::{Preceded, SpawnChildrenExt, Write};
 
 /// Typed durable request to spawn a subagent.
 ///
@@ -1449,8 +1449,29 @@ pub async fn spawn_subagent_invocation(
     parent_id: &AgentTaskId,
     worker: &WorkerId,
     lease: &LeaseId,
-    mut spawn: SubagentInvocationSpawn,
+    spawn: SubagentInvocationSpawn,
     delivered_injection_ids: Vec<AgentTaskId>,
+    deps: &SubagentInvocationDeps<'_>,
+    now: OffsetDateTime,
+) -> Result<SpawnedSubagentInvocation> {
+    spawn_subagent_invocation_preceded(
+        parent_id,
+        (worker, lease),
+        spawn,
+        (delivered_injection_ids, Vec::new()),
+        deps,
+        now,
+    )
+    .await
+}
+
+/// [`spawn_subagent_invocation`], whose spawn transaction applies
+/// `prelude` first (see [`Preceded`]).
+pub(crate) async fn spawn_subagent_invocation_preceded(
+    parent_id: &AgentTaskId,
+    (worker, lease): (&WorkerId, &LeaseId),
+    mut spawn: SubagentInvocationSpawn,
+    (delivered_injection_ids, prelude): (Vec<AgentTaskId>, Vec<Write>),
     deps: &SubagentInvocationDeps<'_>,
     now: OffsetDateTime,
 ) -> Result<SpawnedSubagentInvocation> {
@@ -1459,8 +1480,7 @@ pub async fn spawn_subagent_invocation(
     if spawn.child_root_input.is_empty() {
         spawn.child_root_input = build_child_root_input(&spawn.spec);
     }
-    let outcome = deps
-        .task_store
+    let outcome = Preceded::new(deps.task_store, prelude)
         .commit_subagent_spawn(SubagentSpawnCommit {
             delivered_injection_ids,
             parent_id: parent_id.clone(),
@@ -1554,6 +1574,8 @@ pub struct SubagentBatchRequest {
     pub entries: Vec<SubagentBatchEntry>,
     /// The one parent suspension shared by every entry in the batch.
     pub payload: SuspensionPayload,
+    /// Writes the spawn transaction applies first (see [`Preceded`]).
+    pub prelude: Vec<Write>,
 }
 
 /// Persist N durable subagent invocations atomically under one parent
@@ -1767,6 +1789,7 @@ pub async fn spawn_subagent_batch_invocations(
         delivered_injection_ids,
         mut entries,
         payload,
+        prelude,
     } = request;
     ensure!(!entries.is_empty(), "subagent batch must be non-empty");
 
@@ -1798,8 +1821,7 @@ pub async fn spawn_subagent_batch_invocations(
         .collect();
 
     let events = started_events_for_entries(&pending_tools_by_entry);
-    let (parent_task, prepared, committed_events) = deps
-        .task_store
+    let (parent_task, prepared, committed_events) = Preceded::new(deps.task_store, prelude)
         .spawn_subagent_batch(
             parent_id,
             worker,
@@ -1930,6 +1952,8 @@ pub struct MixedChildrenRequest {
     /// Trace parent stamped on the tool children so their
     /// `execute_tool` spans nest under the turn's root span.
     pub child_otel_traceparent: Option<String>,
+    /// Writes the spawn transaction applies first (see [`Preceded`]).
+    pub prelude: Vec<Write>,
 }
 
 fn validate_mixed_request_slots(
@@ -2015,6 +2039,7 @@ pub async fn spawn_mixed_children_invocations(
         reattach,
         payload,
         child_otel_traceparent,
+        prelude,
     } = request;
 
     // Validate the WHOLE batch — both halves' slots, plus every subagent
@@ -2046,8 +2071,7 @@ pub async fn spawn_mixed_children_invocations(
         .collect();
 
     let events = started_events_for_entries(&pending_tools_by_entry);
-    let spawned = deps
-        .task_store
+    let spawned = Preceded::new(deps.task_store, prelude)
         .spawn_mixed_children(
             parent_id,
             worker,
