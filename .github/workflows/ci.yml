@@ -28,18 +28,19 @@ jobs:
 
   # Cross-platform portability gate for the *published* surface. The internal
   # agent-service-host (Postgres/AMQP/sqlx) is Linux-first and excluded here;
-  # what ships via `cargo add agent-sdk` must at least build on macOS and
-  # Windows. macOS additionally runs the full test suite. The Windows job is
-  # build/check only for now: the filesystem primitive tools (glob/edit/grep)
-  # have known runtime path bugs on Windows (separator/escape/CRLF handling)
-  # tracked for a dedicated portability pass — see ENG-8731 (Phase 13·F).
+  # what ships via `cargo add agent-sdk` must at least build on Windows. The
+  # Windows job is build/check only for now: the filesystem primitive tools
+  # (glob/edit/grep) have known runtime path bugs on Windows (separator/escape/
+  # CRLF handling) tracked for a dedicated portability pass — see ENG-8731
+  # (Phase 13·F). macOS is not in the matrix: its minutes bill ~10x Linux, and
+  # the full test suite runs on Linux in `test`.
   cross-platform:
     name: Cross-platform (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [windows-latest]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@stable
@@ -50,14 +51,6 @@ jobs:
           cargo check --all-targets --all-features
           -p agent-sdk-foundation -p agent-sdk-tools -p agent-sdk-providers
           -p agent-sdk -p agent-sdk-otel -p agent-sdk-cli
-      # Windows is build/check only until the primitive-tools Windows
-      # portability pass lands (tracked follow-up); macOS runs the full suite.
-      - name: Test publishable crates (no live network / keys)
-        if: runner.os != 'Windows'
-        run: >-
-          cargo nextest run --profile ci --all-features
-          -p agent-sdk-foundation -p agent-sdk-tools -p agent-sdk-providers
-          -p agent-sdk -p agent-sdk-otel
 
   test:
     name: Test (nextest)
