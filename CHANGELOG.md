@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Journal: a fan-in settle folds its parent's queued steering into the wave's last result
+
+- `Write::EnqueueSteeringResume` with `SteeringInput::Queued` after a
+  `SettleTask` that fanned its parent in (the parent's last child, so the
+  parent is now `Pending` to resume) folds the queue into that child's
+  stored result instead of waking: the backend reads the queue under the
+  parent's thread lock and calls the store's new
+  `TransitionExtension::fold_queued_steering(parent, settled, result, queued)`
+  (pure; default `None`), which returns the child's new result (it must
+  decode as a `ToolResult`) and the queue's new value as a `FoldedSteering`.
+  The result and the queue, at the revision it was read at, commit in the
+  settle's transaction, and `Committed::settled` reports the folded row. A
+  retried transaction folds again from the same inputs and commits one
+  queue write. Nothing queued, a declined fold, a child with no result or
+  a fold that is not a tool result writes nothing and never refuses the
+  settle.
+- A subagent completion hook's settle may carry one such write of the
+  invocation's own parent in `CompletionOutput::extra_writes`. The hook
+  never writes the queue, so a note queued after the hook ran is folded
+  too, and a queue race can never fail the landed worker. The resumed
+  parent reads the note in its fan-in, from the durable result, so a
+  failed LLM call after the resume does not drop it.
+- **Breaking:** `CompletionHookError::RefusedSteeringWrite { index, reason }`
+  (signal reason `steering`): a steering write on a park, for another task
+  than the invocation's parent, with inline steering, or more than one.
+- **Behaviour change:** a settle that does not fan its parent in but finds
+  notes queued for it while it is still parked wakes it for a steering
+  exchange, as a park-time wake does. That only happens when the
+  queue-time wake missed, and only makes delivery earlier, never later.
+- This lets bip deliver a note queued for a coordinator at its wave's end
+  (bip #904's wave-settle delivery, which the B-3 port moves off the store
+  decorator) without the decorator's retry loop.
+- New failpoint `transition.steering_folded` (SQLite, Postgres), after the
+  fold's writes and before the commit. Observability:
+  `agent_server.journal.steering_queue.takes` gains the outcomes `folded`,
+  `fold_empty` and `fold_refused`.
+
 ### Journal: a transition extension wakes the root it parks with its queued steering
 
 - **Breaking:** `Write::EnqueueSteeringResume::steering` is a

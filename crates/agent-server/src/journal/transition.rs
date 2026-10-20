@@ -144,6 +144,15 @@ pub enum Write {
     /// [`SteeringInput::Queued`]: the rest of the transition still
     /// commits, and [`Committed::steering_resumed`] reports `None`, so the
     /// steering waits for the next boundary. Applying it again is a no-op.
+    ///
+    /// With [`SteeringInput::Queued`] after a [`Self::SettleTask`] that
+    /// fanned the parent in (the parent's last child settled earlier in
+    /// this transaction, so the parent is `Pending` to resume), the backend
+    /// folds the queue into that child's stored result instead, through
+    /// [`TransitionExtension::fold_queued_steering`](super::TransitionExtension::fold_queued_steering):
+    /// the new result and the queue's new value commit with the settle,
+    /// and `steering_resumed` reports `None`. Nothing to fold writes
+    /// nothing and never refuses the settle.
     EnqueueSteeringResume {
         parent: AgentTaskId,
         steering: SteeringInput,
@@ -167,7 +176,12 @@ pub enum SteeringInput {
     /// [`TransitionExtension::take_queued_steering`](super::TransitionExtension::take_queued_steering)
     /// turns it into the steering and the document's new value, both
     /// written in this transaction. Nothing queued (no live document, or
-    /// the extension takes nothing): no wake and no document write.
+    /// the extension takes nothing): no wake and no document write. After
+    /// a settle that fans the parent in, the queue is folded into that
+    /// settle's result instead (see [`Write::EnqueueSteeringResume`]).
+    ///
+    /// A transition that carries one may not also write a thread document
+    /// of the same kind and key, on any thread.
     Queued { kind: DocKind, key: String },
 }
 

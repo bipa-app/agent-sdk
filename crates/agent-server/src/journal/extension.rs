@@ -22,11 +22,23 @@
 //! means no wake, and a second application finds the task no longer
 //! parked, so a retried transaction wakes it at most once.
 //!
+//! The same write on a settle (a subagent completion hook adds it for its
+//! own parent) delivers the steering at the wave's end. When the settle
+//! fans the parent in (its last child), the backend reads the queue under
+//! the same lock and hands it to [`TransitionExtension::fold_queued_steering`],
+//! which appends it to that child's stored result, the one the resumed
+//! parent reads; the result and the queue's new value commit with the
+//! settle. A settle that does not fan the parent in wakes it, as a park
+//! does, if it is still parked. Neither ever refuses the settle for a
+//! steering reason: nothing queued, a declined fold or a fold that is not a
+//! tool result leaves the settle as it is.
+//!
 //! The hook runs only on these two paths. The older single-purpose store
 //! methods (`complete_task`, `cancel_tree`, `pause_on_question`, …) do not
 //! call it; a host whose rule keys on a write must make sure that write
 //! goes through `commit`.
 
+use agent_sdk_foundation::ToolResult;
 use agent_sdk_foundation::llm::ContentBlock;
 
 use super::commit::CompletedTurnCommit;
@@ -69,6 +81,43 @@ pub trait TransitionExtension: Send + Sync {
         let _ = (parent, queued);
         None
     }
+
+    /// Fold the steering queued for `parent` into `result`, the stored
+    /// result of `settled`, the child whose settle has just fanned `parent`
+    /// in (its last child, so `parent` is `Pending` with an empty
+    /// [`ReadyToResume`](super::TaskState::ReadyToResume)). `queued` is the
+    /// live document a [`SteeringInput::Queued`] names, read under the
+    /// settle's lock. `settled.spawn_index` names the parent's pending call
+    /// the result answers.
+    ///
+    /// Returns the result the parent reads instead, which must decode as a
+    /// [`ToolResult`], and the queue's new value; both commit with the
+    /// settle. `None` folds nothing and leaves the queue alone. Like
+    /// [`Self::take_queued_steering`] it must be a pure function of its
+    /// arguments: a backend may call it again for a retried transaction.
+    fn fold_queued_steering(
+        &self,
+        parent: &AgentTask,
+        settled: &AgentTask,
+        result: &serde_json::Value,
+        queued: &Document,
+    ) -> Option<FoldedSteering> {
+        let _ = (parent, settled, result, queued);
+        None
+    }
+}
+
+/// The result a fan-in settle's child carries with the steering folded in,
+/// and what the queue holds after it.
+#[derive(Clone, Debug)]
+pub struct FoldedSteering {
+    /// The settled child's new stored result. It must decode as a
+    /// [`ToolResult`]; otherwise nothing is folded.
+    pub result: serde_json::Value,
+    /// The queue's new value, written at its next revision in the same
+    /// transaction.
+    pub schema_version: u32,
+    pub value: serde_json::Value,
 }
 
 /// The steering an extension took from a queue, and what the queue holds
@@ -101,6 +150,9 @@ const OUTCOME_TAKEN: &str = "taken";
 const OUTCOME_EMPTY: &str = "empty";
 const OUTCOME_NOT_PARKED: &str = "not_parked";
 const OUTCOME_NO_EXTENSION: &str = "no_extension";
+const OUTCOME_FOLDED: &str = "folded";
+const OUTCOME_FOLD_EMPTY: &str = "fold_empty";
+const OUTCOME_FOLD_REFUSED: &str = "fold_refused";
 
 const POINT_COMMIT: &str = "commit";
 const POINT_COMPLETED_TURN: &str = "completed_turn";
@@ -200,6 +252,120 @@ fn take(
             (OUTCOME_TAKEN, Ok(Some((taken.steering, write))))
         }
         Some(_) | None => (OUTCOME_EMPTY, Ok(None)),
+    }
+}
+
+/// Apply-time half of a [`SteeringInput::Queued`] write on a settle that
+/// fanned `parent` in, shared by the backends: `settled` is the child row
+/// as that settle left it, and `stored` the live document at `queue` as
+/// read under the transition's lock. Returns the child's new stored result
+/// and the queue's write, or `None` (no write at all) when nothing is
+/// queued, the extension declines, the child has no stored result or the
+/// fold is not a [`ToolResult`]. `backend` labels the count.
+///
+/// # Errors
+/// When the store has no extension to fold the queue, the refusal a
+/// queued wake gives too.
+#[doc(hidden)]
+pub fn fold_queued_steering(
+    backend: &'static str,
+    extension: Option<&dyn TransitionExtension>,
+    parent: &AgentTask,
+    settled: &AgentTask,
+    queue: DocumentKey,
+    stored: Option<&Document>,
+) -> anyhow::Result<Option<(serde_json::Value, DocumentWrite)>> {
+    let (outcome, folded) = match extension {
+        None => (
+            OUTCOME_NO_EXTENSION,
+            Err(anyhow::anyhow!(
+                "steering fold rejected: no transition extension to fold the steering queued \
+                 in {queue}"
+            )),
+        ),
+        Some(extension) => fold(extension, parent, settled, queue, stored),
+    };
+    #[cfg(feature = "otel")]
+    crate::observability::ServerMetrics::global().record_steering_queue(backend, outcome);
+    let _ = (backend, outcome);
+    folded
+}
+
+type Folded = anyhow::Result<Option<(serde_json::Value, DocumentWrite)>>;
+
+fn fold(
+    extension: &dyn TransitionExtension,
+    parent: &AgentTask,
+    settled: &AgentTask,
+    queue: DocumentKey,
+    stored: Option<&Document>,
+) -> (&'static str, Folded) {
+    let Some(result) = settled.result_payload.as_ref() else {
+        return (OUTCOME_FOLD_REFUSED, Ok(None));
+    };
+    let Some(stored) = stored else {
+        return (OUTCOME_FOLD_EMPTY, Ok(None));
+    };
+    let Some(folded) = extension.fold_queued_steering(parent, settled, result, stored) else {
+        return (OUTCOME_FOLD_EMPTY, Ok(None));
+    };
+    if serde_json::from_value::<ToolResult>(folded.result.clone()).is_err() {
+        return (OUTCOME_FOLD_REFUSED, Ok(None));
+    }
+    let write = DocumentWrite::put(
+        queue,
+        folded.schema_version,
+        DocExpect::Revision(stored.revision),
+        folded.value,
+    );
+    (OUTCOME_FOLDED, Ok(Some((folded.result, write))))
+}
+
+/// Which parents a transition's settles fan in, for its
+/// [`SteeringInput::Queued`] writes. A backend reads the status of each
+/// [`Self::watched`] parent just before it applies a settle, then
+/// [`Self::record`]s the settle; a queued write whose parent a settle
+/// fanned in folds (see [`fold_queued_steering`]) instead of waking.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct FanIns(Vec<(AgentTaskId, AgentTaskId)>);
+
+impl FanIns {
+    /// The parents of `transition`'s queued steering writes.
+    pub fn watched(transition: &Transition) -> impl Iterator<Item = &AgentTaskId> {
+        transition.writes.iter().filter_map(|write| match write {
+            Write::EnqueueSteeringResume {
+                parent,
+                steering: SteeringInput::Queued { .. },
+            } => Some(parent),
+            _ => None,
+        })
+    }
+
+    /// Record a settle: `settled` is its child and the child's parent after
+    /// it, and `parked` the watched parents that were waiting on their
+    /// children just before it. The settle fanned the parent in when the
+    /// parent was parked, is the child's own parent, and is now `Pending`
+    /// with a [`ReadyToResume`](super::TaskState::ReadyToResume).
+    pub fn record(&mut self, parked: &[AgentTaskId], settled: &(AgentTask, Option<AgentTask>)) {
+        let (child, Some(parent)) = settled else {
+            return;
+        };
+        if child.parent_id.as_ref() == Some(&parent.id)
+            && parked.contains(&parent.id)
+            && parent.status == TaskStatus::Pending
+            && matches!(parent.state, super::TaskState::ReadyToResume { .. })
+        {
+            self.0.push((parent.id.clone(), child.id.clone()));
+        }
+    }
+
+    /// The child whose settle in this transaction fanned `parent` in.
+    #[must_use]
+    pub fn child_of(&self, parent: &AgentTaskId) -> Option<&AgentTaskId> {
+        self.0
+            .iter()
+            .find_map(|(fanned, child)| (fanned == parent).then_some(child))
     }
 }
 
@@ -361,6 +527,45 @@ mod tests {
         };
         assert!(commit_refusal(&transition, &inline).is_some());
         Ok(())
+    }
+
+    /// A settle fans in only the settled child's own parent, one that was
+    /// parked just before it and is now `Pending` to resume. A linked
+    /// child-thread root (no `parent_id`) reports the invocation it resumes
+    /// as its parent; that is not a fan-in even in a resume shape.
+    #[test]
+    fn a_settle_fans_in_only_its_own_parked_parent() -> anyhow::Result<()> {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let mut parent = AgentTask::new_root_turn(ThreadId::from_string("t"), now, 3);
+        parent.status = TaskStatus::Pending;
+        parent.state = crate::journal::TaskState::ReadyToResume {
+            continuation: Box::new(continuation()?),
+            suspended_messages: Vec::new(),
+            child_ids: Vec::new(),
+            child_join_policy: crate::ChildJoinPolicy::default(),
+            steering: Vec::new(),
+        };
+        let mut child = AgentTask::new_root_turn(ThreadId::from_string("t"), now, 3);
+        child.parent_id = Some(parent.id.clone());
+        let linked = AgentTask::new_root_turn(ThreadId::from_string("c"), now, 3);
+        let parked = [parent.id.clone()];
+
+        let mut fan_ins = FanIns::default();
+        fan_ins.record(&parked, &(linked, Some(parent.clone())));
+        assert_eq!(fan_ins.child_of(&parent.id), None, "not its own parent");
+        fan_ins.record(&[], &(child.clone(), Some(parent.clone())));
+        assert_eq!(fan_ins.child_of(&parent.id), None, "not parked before");
+        fan_ins.record(&parked, &(child.clone(), Some(parent.clone())));
+        assert_eq!(fan_ins.child_of(&parent.id), Some(&child.id));
+        Ok(())
+    }
+
+    /// The continuation of [`repark`]'s suspension payload.
+    fn continuation() -> anyhow::Result<agent_sdk_foundation::ContinuationEnvelope> {
+        match repark(&AgentTaskId::new()).writes.remove(0) {
+            Write::ReparkAfterSteering { payload, .. } => Ok(payload.continuation),
+            other => anyhow::bail!("repark builds a re-park, not {}", other.kind_name()),
+        }
     }
 
     #[test]

@@ -957,6 +957,158 @@ async fn a_queued_steering_wake_records_each_read_of_its_queue() -> Result<()> {
     Ok(())
 }
 
+/// A queued steering write on a settle that fans its parent in counts the
+/// fold by outcome: nothing queued, folded, and a fold that is not a tool
+/// result (the settle commits either way).
+#[tokio::test]
+async fn a_fan_in_settle_records_each_fold_of_its_queue() -> Result<()> {
+    use agent_sdk_foundation::ToolResult;
+    use agent_server::journal::store::InMemoryAgentTaskStore;
+    use agent_server::journal::task::AgentTask;
+    use agent_server::journal::{
+        Document, FoldedSteering, TransitionExtension, TransitionView, Write,
+    };
+
+    /// Folds `["bad"]` into a value that is not a tool result, anything
+    /// else into the result's output.
+    struct FoldsTheQueue;
+
+    impl TransitionExtension for FoldsTheQueue {
+        fn extend(&self, _view: TransitionView<'_>) -> Vec<Write> {
+            Vec::new()
+        }
+
+        fn fold_queued_steering(
+            &self,
+            _parent: &AgentTask,
+            _settled: &AgentTask,
+            result: &serde_json::Value,
+            queued: &Document,
+        ) -> Option<FoldedSteering> {
+            let result = if queued.value == serde_json::json!(["bad"]) {
+                serde_json::json!("bad")
+            } else {
+                let mut folded: ToolResult = serde_json::from_value(result.clone()).ok()?;
+                folded.output.push_str(&queued.value.to_string());
+                serde_json::to_value(folded).ok()?
+            };
+            Some(FoldedSteering {
+                result,
+                schema_version: queued.schema_version,
+                value: serde_json::json!(null),
+            })
+        }
+    }
+
+    let _guard = acquire_test_lock().await;
+    let (provider, exporter) = setup_meter();
+    let store = InMemoryAgentTaskStore::new().with_transition_extension(Arc::new(FoldsTheQueue));
+    for (name, notes) in [
+        ("fold-none", None),
+        ("fold-note", Some(serde_json::json!(["status?"]))),
+        ("fold-bad", Some(serde_json::json!(["bad"]))),
+    ] {
+        fan_in_settle_with_queued_steering(&store, &ThreadId::from_string(name), notes).await?;
+    }
+
+    flush(&provider)?;
+    let snapshots = collected(&exporter)?;
+    let takes = collect_u64_counter(&snapshots, "agent_server.journal.steering_queue.takes");
+    assert_eq!(takes.len(), 3, "{takes:?}");
+    for outcome in [
+        attrs::OUTCOME_FOLD_EMPTY,
+        attrs::OUTCOME_FOLDED,
+        attrs::OUTCOME_FOLD_REFUSED,
+    ] {
+        assert!(
+            takes.iter().any(|(labels, count)| *count == 1
+                && matches_all(
+                    labels,
+                    &[
+                        (attrs::BACKEND, attrs::BACKEND_MEMORY),
+                        (attrs::OUTCOME, outcome)
+                    ]
+                )),
+            "one {outcome} fold is counted: {takes:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Park a root on `thread` on one tool child, queue `notes` for it, and
+/// settle the child with a queued steering write of the root: a fan-in.
+async fn fan_in_settle_with_queued_steering(
+    store: &agent_server::journal::store::InMemoryAgentTaskStore,
+    thread: &ThreadId,
+    notes: Option<serde_json::Value>,
+) -> Result<()> {
+    use agent_sdk_foundation::ToolResult;
+    use agent_server::journal::task::{LeaseId, TaskStatus, WorkerId};
+    use agent_server::journal::{
+        AgentTaskStore, DocExpect, DocKind, DocScope, DocumentKey, DocumentWrite, DurableStore,
+        Settle, SteeringInput, Transition, Write,
+    };
+
+    let now = OffsetDateTime::UNIX_EPOCH;
+    let kind = DocKind::new("test.steering")?;
+    let root = parked_root(store, thread, now).await?;
+    if let Some(notes) = notes {
+        let _ = store
+            .commit(
+                Transition {
+                    guards: Vec::new(),
+                    writes: vec![Write::Document(DocumentWrite::put(
+                        DocumentKey::new(DocScope::Thread(thread.clone()), kind.clone(), ""),
+                        1,
+                        DocExpect::Absent,
+                        notes,
+                    ))],
+                },
+                now,
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+    }
+    let child = store
+        .list_by_status(TaskStatus::Pending)
+        .await?
+        .into_iter()
+        .find(|task| task.parent_id.as_ref() == Some(&root.id))
+        .context("the root's tool child")?;
+    let (worker, lease) = (WorkerId::new(), LeaseId::new());
+    let _ = store
+        .try_acquire_task(
+            &child.id,
+            worker.clone(),
+            lease.clone(),
+            now + Duration::from_secs(60),
+            now,
+        )
+        .await?;
+    let mut settle = Transition::settle(
+        child.id.clone(),
+        worker,
+        lease,
+        Settle::Complete {
+            result: serde_json::to_value(ToolResult::success("done"))?,
+        },
+        thread.clone(),
+        Vec::new(),
+    );
+    settle.writes.push(Write::EnqueueSteeringResume {
+        parent: root.id,
+        steering: SteeringInput::Queued {
+            kind,
+            key: String::new(),
+        },
+    });
+    let _ = store
+        .commit(settle, now)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
 /// A store error marked [`LockConflict`](agent_server::journal::LockConflict)
 /// is recorded as `outcome=lock_conflict`; any other store error stays
 /// `outcome=store`.

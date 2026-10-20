@@ -12,18 +12,22 @@ use super::completion_hook::{
     CompletionContext, CompletionHookError, CompletionOutput, CompletionPlan,
     InstalledCompletionHook, RunMode, SubagentCompletionHook,
 };
+use super::root_turn::RootTurnOutcome;
 use super::subagent::{
     SpawnedSubagentInvocation, SubagentInvocationDeps, SubagentResultDeps, SubagentTaskOutcome,
     execute_subagent_task, resolve_subagent_bootstrap, spawn_subagent_invocation,
 };
 use super::subagent_execution_test::{TestStores, child_spawn, create_running_parent_root, t_plus};
-use crate::journal::document::{DocExpect, DocKind, DocScope, DocumentKey, DocumentWrite};
+use crate::journal::document::{
+    DocExpect, DocKind, DocScope, Document, DocumentKey, DocumentWrite,
+};
 use crate::journal::effect::{EffectKey, EffectKind, EffectRecord, EffectState, EffectSubject};
 use crate::journal::event_repository::EventRepository;
+use crate::journal::extension::{FoldedSteering, TransitionExtension, TransitionView};
 use crate::journal::recovery::RecoveryAction;
 use crate::journal::store::AgentTaskStore;
-use crate::journal::task::{AgentTask, LeaseId, TaskStatus, WorkerId};
-use crate::journal::transition::{DurableStore, Settle, Transition, Write};
+use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskStatus, WorkerId};
+use crate::journal::transition::{DurableStore, Settle, SteeringInput, Transition, Write};
 use agent_sdk_foundation::ThreadId;
 
 /// What one call of [`FakeHook::run`] saw.
@@ -890,4 +894,384 @@ impl SubagentCompletionHook for ResumeHook {
             .push(ctx.resumed_prompt.clone());
         self.inner.run(ctx, prior, mode).await
     }
+}
+
+// ── steering at the wave's end (S-WS) ───────────────────────────────
+
+/// The `test.steering` queue on `thread`.
+fn steering_queue(thread: &ThreadId) -> Result<DocumentKey> {
+    Ok(DocumentKey::new(
+        DocScope::Thread(thread.clone()),
+        DocKind::new("test.steering")?,
+        "",
+    ))
+}
+
+/// The settle's steering write for `parent`'s queue.
+fn queued_steering(parent: &AgentTaskId) -> Result<Write> {
+    Ok(Write::EnqueueSteeringResume {
+        parent: parent.clone(),
+        steering: SteeringInput::Queued {
+            kind: DocKind::new("test.steering")?,
+            key: String::new(),
+        },
+    })
+}
+
+/// Folds the `test.steering` queue (`{"notes": [..]}`) into the fan-in
+/// result's output as `[steering] <notes>`, and counts its folds.
+#[derive(Default)]
+struct NoteFold {
+    folds: std::sync::atomic::AtomicUsize,
+}
+
+impl NoteFold {
+    fn folds(&self) -> usize {
+        self.folds.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl TransitionExtension for NoteFold {
+    fn extend(&self, _view: TransitionView<'_>) -> Vec<Write> {
+        Vec::new()
+    }
+
+    fn fold_queued_steering(
+        &self,
+        _parent: &AgentTask,
+        _settled: &AgentTask,
+        result: &serde_json::Value,
+        queued: &Document,
+    ) -> Option<FoldedSteering> {
+        self.folds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let notes: Vec<String> = serde_json::from_value(queued.value.get("notes")?.clone()).ok()?;
+        if notes.is_empty() {
+            return None;
+        }
+        let mut folded: ToolResult = serde_json::from_value(result.clone()).ok()?;
+        folded.output = format!("{}\n[steering] {}", folded.output, notes.join("; "));
+        Some(FoldedSteering {
+            result: serde_json::to_value(folded).ok()?,
+            schema_version: queued.schema_version,
+            value: json!({ "notes": [] }),
+        })
+    }
+}
+
+/// [`TestStores`] whose task store folds with a [`NoteFold`].
+fn stores_with_fold() -> (TestStores, Arc<NoteFold>) {
+    let fold = Arc::new(NoteFold::default());
+    let mut stores = TestStores::new();
+    stores.tasks = stores
+        .tasks
+        .clone()
+        .with_transition_extension(Arc::clone(&fold) as Arc<dyn TransitionExtension>);
+    (stores, fold)
+}
+
+/// Queue `notes` for the parent on `thread`, from nothing.
+async fn queue_notes(stores: &TestStores, thread: &ThreadId, notes: &[&str]) -> Result<()> {
+    stores
+        .tasks
+        .commit(
+            Transition {
+                guards: Vec::new(),
+                writes: vec![Write::Document(DocumentWrite::put(
+                    steering_queue(thread)?,
+                    1,
+                    DocExpect::Absent,
+                    json!({ "notes": notes }),
+                ))],
+            },
+            t_plus(4),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+async fn queue(stores: &TestStores, thread: &ThreadId) -> Result<Option<(u64, serde_json::Value)>> {
+    Ok(
+        crate::journal::DocumentStore::get_document(&stores.tasks, &steering_queue(thread)?)
+            .await?
+            .map(|document| (document.revision, document.value)),
+    )
+}
+
+fn parent_of(invocation: &AgentTask) -> Result<AgentTaskId> {
+    invocation
+        .parent_id
+        .clone()
+        .context("an invocation has a parent")
+}
+
+/// H1: the hook's settle may carry a queued steering write of the
+/// invocation's own parent. The settle fans the parent in, so the store
+/// folds the parent's notes into the settle's own result and empties the
+/// queue in the same transaction; the outcome reports the folded result.
+#[tokio::test]
+async fn a_hook_settle_folds_the_notes_queued_for_its_own_parent() -> Result<()> {
+    let (stores, fold) = stores_with_fold();
+    let spawned = runnable_invocation(&stores, "t-hook-fold").await?;
+    let invocation = &spawned.invocation_task;
+    let parent = parent_of(invocation)?;
+    queue_notes(&stores, &invocation.thread_id, &["skip the docs crate"]).await?;
+    let hook = FakeHook::new(
+        Some(merge_back()),
+        vec![Act::Return(Box::new(output(
+            EffectState::Completed,
+            vec![queued_steering(&parent)?],
+        )))],
+    );
+
+    let outcome = run_attempt(&stores, invocation, &hook, 10).await?;
+
+    assert_eq!(fold.folds(), 1);
+    let folded = "merged unit_1 at abc123\n[steering] skip the docs crate";
+    assert_eq!(outcome.tool_result.output, folded);
+    let persisted: ToolResult = serde_json::from_value(
+        stores
+            .tasks
+            .get(&invocation.id)
+            .await?
+            .and_then(|row| row.result_payload)
+            .context("the stored result")?,
+    )?;
+    assert_eq!(persisted.output, folded);
+    let resumed = stores.tasks.get(&parent).await?.context("parent")?;
+    assert_eq!(resumed.status, TaskStatus::Pending, "fanned in");
+    assert!(
+        matches!(&resumed.state, crate::journal::TaskState::ReadyToResume { steering, .. } if steering.is_empty()),
+        "{:?}",
+        resumed.state
+    );
+    assert_eq!(
+        queue(&stores, &invocation.thread_id).await?,
+        Some((2, json!({ "notes": [] })))
+    );
+    Ok(())
+}
+
+/// H2–H4: a steering write the settle cannot carry is refused with a typed
+/// error before anything is written: on a park, for another task, with
+/// inline steering, or a second one. The note stays queued.
+#[tokio::test]
+async fn a_steering_write_a_hook_may_not_add_is_refused() -> Result<()> {
+    for (index, case) in ["park", "foreign", "inline", "twice"]
+        .into_iter()
+        .enumerate()
+    {
+        let (stores, fold) = stores_with_fold();
+        let spawned = runnable_invocation(&stores, &format!("t-hook-steering-{case}")).await?;
+        let invocation = &spawned.invocation_task;
+        let parent = parent_of(invocation)?;
+        queue_notes(&stores, &invocation.thread_id, &["status?"]).await?;
+        let output = match case {
+            "park" => CompletionOutput {
+                extra_writes: vec![queued_steering(&parent)?],
+                ..parking(merge_prompt(invocation, "merge_1"))
+            },
+            "foreign" => output(
+                EffectState::Completed,
+                vec![queued_steering(&AgentTaskId::new())?],
+            ),
+            "inline" => output(
+                EffectState::Completed,
+                vec![Write::EnqueueSteeringResume {
+                    parent: parent.clone(),
+                    steering: SteeringInput::Blocks(vec![
+                        agent_sdk_foundation::llm::ContentBlock::Text {
+                            text: "inline".into(),
+                        },
+                    ]),
+                }],
+            ),
+            _ => output(
+                EffectState::Completed,
+                vec![queued_steering(&parent)?, queued_steering(&parent)?],
+            ),
+        };
+        let hook = FakeHook::new(Some(merge_back()), vec![Act::Return(Box::new(output))]);
+
+        let error = run_attempt(&stores, invocation, &hook, 10)
+            .await
+            .err()
+            .with_context(|| format!("{case} must be refused"))?;
+        let refused = error
+            .downcast_ref::<CompletionHookError>()
+            .with_context(|| format!("{case}: {error:#}"))?;
+        let expected_index = usize::from(case == "twice");
+        assert!(
+            matches!(refused, CompletionHookError::RefusedSteeringWrite { index, .. } if *index == expected_index),
+            "case {index} ({case}): {refused}"
+        );
+        let row = stores.tasks.get(&invocation.id).await?.context("row")?;
+        assert_eq!(row.status, TaskStatus::Running, "{case} wrote nothing");
+        assert_eq!(
+            stores.tasks.get(&parent).await?.map(|row| row.status),
+            Some(TaskStatus::WaitingOnChildren),
+            "{case}"
+        );
+        assert_eq!(fold.folds(), 0, "{case}");
+        assert_eq!(
+            queue(&stores, &invocation.thread_id).await?,
+            Some((1, json!({ "notes": ["status?"] }))),
+            "{case}"
+        );
+    }
+    Ok(())
+}
+
+/// A crash while the hook runs, before its settle commits, leaves the note
+/// queued; the requeued invocation's settle folds it exactly once.
+#[tokio::test]
+async fn a_crash_before_the_hook_settle_leaves_the_note_for_the_requeued_settle() -> Result<()> {
+    let (stores, fold) = stores_with_fold();
+    let spawned = runnable_invocation(&stores, "t-hook-fold-crash").await?;
+    let invocation = &spawned.invocation_task;
+    let parent = parent_of(invocation)?;
+    queue_notes(&stores, &invocation.thread_id, &["skip the docs crate"]).await?;
+    let hook = FakeHook::new(
+        Some(merge_back()),
+        vec![
+            Act::Crash,
+            Act::Return(Box::new(output(
+                EffectState::Completed,
+                vec![queued_steering(&parent)?],
+            ))),
+        ],
+    );
+    let crashed = std::panic::AssertUnwindSafe(run_attempt(&stores, invocation, &hook, 10))
+        .catch_unwind()
+        .await;
+    assert!(crashed.is_err(), "the first attempt crashes in the hook");
+    assert_eq!(fold.folds(), 0);
+    assert_eq!(
+        queue(&stores, &invocation.thread_id).await?,
+        Some((1, json!({ "notes": ["skip the docs crate"] })))
+    );
+    stores
+        .tasks
+        .release_expired_leases(t_plus(16), crate::journal::LeaseRecoveryScope::Expired)
+        .await?;
+
+    let outcome = run_attempt(&stores, invocation, &hook, 20).await?;
+    assert_eq!(
+        outcome.tool_result.output,
+        "merged unit_1 at abc123\n[steering] skip the docs crate"
+    );
+    assert_eq!(fold.folds(), 1);
+    assert_eq!(
+        queue(&stores, &invocation.thread_id).await?,
+        Some((2, json!({ "notes": [] })))
+    );
+    Ok(())
+}
+
+/// Records each request's messages as text, and fails the first `fail`
+/// calls with a server error.
+struct RecordingProvider {
+    fail: usize,
+    requests: Mutex<Vec<String>>,
+}
+
+impl RecordingProvider {
+    fn new(fail: usize) -> Self {
+        Self {
+            fail,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Result<Vec<String>> {
+        Ok(self.requests.lock().ok().context("requests lock")?.clone())
+    }
+}
+
+#[async_trait]
+impl agent_sdk_providers::LlmProvider for RecordingProvider {
+    async fn chat(
+        &self,
+        request: agent_sdk_foundation::llm::ChatRequest,
+    ) -> Result<agent_sdk_foundation::llm::ChatOutcome> {
+        use agent_sdk_foundation::llm::{
+            ChatOutcome, ChatResponse, ContentBlock, StopReason, Usage,
+        };
+
+        let call = {
+            let mut requests = self.requests.lock().ok().context("requests lock")?;
+            requests.push(format!("{:?}", request.messages));
+            requests.len()
+        };
+        if call <= self.fail {
+            return Ok(ChatOutcome::ServerError("simulated outage".into()));
+        }
+        Ok(ChatOutcome::Success(ChatResponse {
+            id: format!("msg_{call}"),
+            content: vec![ContentBlock::Text {
+                text: "noted".into(),
+            }],
+            model: "mock-model".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                served_speed: None,
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                request_input_tokens: None,
+            },
+        }))
+    }
+
+    fn model(&self) -> &'static str {
+        "mock-model"
+    }
+
+    fn provider(&self) -> &'static str {
+        "mock"
+    }
+}
+
+/// H5, H6: the resumed parent's first LLM request carries the folded note
+/// in the wave's last tool result, and so does the request after that call
+/// failed: the note sits in the durable result, not in a transient
+/// steering slot a failed call drops.
+#[tokio::test]
+async fn the_resumed_parent_reads_the_folded_note_also_after_a_failed_call() -> Result<()> {
+    for fail in [0, 1] {
+        let (stores, _fold) = stores_with_fold();
+        let spawned = runnable_invocation(&stores, &format!("t-hook-fold-resume-{fail}")).await?;
+        let invocation = &spawned.invocation_task;
+        let parent = parent_of(invocation)?;
+        queue_notes(&stores, &invocation.thread_id, &["skip the docs crate"]).await?;
+        let hook = FakeHook::new(
+            None,
+            vec![Act::Return(Box::new(output(
+                EffectState::Completed,
+                vec![queued_steering(&parent)?],
+            )))],
+        );
+        run_attempt(&stores, invocation, &hook, 10).await?;
+
+        let provider = RecordingProvider::new(fail);
+        let resumed = Box::pin(stores.resume_parent(&parent, &provider, 20)).await;
+        let requests = provider.requests()?;
+        assert!(
+            matches!(resumed, Ok(RootTurnOutcome::Completed { .. })),
+            "fail {fail}: {resumed:?}"
+        );
+        assert_eq!(
+            requests.len(),
+            fail + 1,
+            "fail {fail}: one retry per failure"
+        );
+        for (call, request) in requests.iter().enumerate() {
+            assert!(
+                request.contains("[steering] skip the docs crate"),
+                "fail {fail}: request {call} carries the note: {request}"
+            );
+        }
+    }
+    Ok(())
 }

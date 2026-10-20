@@ -5503,18 +5503,13 @@ impl InMemoryAgentTaskStore {
         let mut document_plans = self.check_locked(&lock.inner, &transition).await?;
         let anchors = self.effect_anchors(&transition).await?;
         let mut committed = Committed::default();
+        let mut fan_ins = super::extension::FanIns::default();
         for (_, write) in super::transition::writes_in_apply_order(&transition) {
             let inner = &mut *lock.inner;
             match write {
-                Write::EnqueueSteeringResume { parent, steering } => committed
-                    .steering_resumed
-                    .push(Self::enqueue_steering_resume_locked(
-                        inner,
-                        self.extension.as_deref(),
-                        &parent,
-                        steering,
-                        now,
-                    )?),
+                Write::EnqueueSteeringResume { parent, steering } => self
+                    .steering_locked(inner, &parent, steering, &fan_ins, now)?
+                    .record(&mut committed),
                 Write::Document(document) => committed.documents.push(apply_document_locked(
                     &mut inner.documents,
                     document,
@@ -5522,9 +5517,11 @@ impl InMemoryAgentTaskStore {
                     now,
                 )?),
                 Write::SettleTask { task, outcome } => {
+                    let parked = inner.parked_watched_parents(&transition);
                     let settled = self
                         .apply_settle_locked(inner, &transition, &task, outcome, now)
                         .await?;
+                    fan_ins.record(&parked, &settled);
                     committed.settled.push(settled);
                 }
                 Write::RejectConfirmation { task, error } => committed
@@ -5786,19 +5783,64 @@ fn apply_document_locked(
     })
 }
 
+impl Inner {
+    /// The parents of `transition`'s queued steering writes that wait on
+    /// their children now, read before a settle so it can tell a fan-in.
+    fn parked_watched_parents(
+        &self,
+        transition: &super::transition::Transition,
+    ) -> Vec<AgentTaskId> {
+        super::extension::FanIns::watched(transition)
+            .filter(|parent| {
+                self.by_id
+                    .get(*parent)
+                    .is_some_and(|row| row.status == TaskStatus::WaitingOnChildren)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// What a [`super::transition::Write::EnqueueSteeringResume`] did: the
+/// woken parent, or the settled child its fan-in fold rewrote.
+#[derive(Default)]
+struct SteeringApplied {
+    woken: Option<AgentTask>,
+    folded: Option<AgentTask>,
+}
+
+impl SteeringApplied {
+    /// Report it in `committed`: the woken parent, and the folded child in
+    /// place of the row its settle reported.
+    fn record(self, committed: &mut super::transition::Committed) {
+        committed.steering_resumed.push(self.woken);
+        if let Some(folded) = self.folded
+            && let Some((row, _)) = committed
+                .settled
+                .iter_mut()
+                .find(|(row, _)| row.id == folded.id)
+        {
+            *row = folded;
+        }
+    }
+}
+
 impl InMemoryAgentTaskStore {
     /// Wake a parked parent for a steering exchange. Only a parent still
     /// waiting on its children can be woken: any other status means it
     /// already left that state (a concurrent last-child fan-in reached
     /// `ReadyToResume`, a prior wake is mid-exchange, or the row is
-    /// terminal), and the wake declines rather than racing.
+    /// terminal), and the wake declines rather than racing. A queued wake
+    /// whose parent `fanned_in` (the child whose settle in this transaction
+    /// fanned it in) folds the queue into that child's result instead.
     fn enqueue_steering_resume_locked(
         inner: &mut Inner,
         extension: Option<&dyn super::extension::TransitionExtension>,
         parent_id: &AgentTaskId,
+        fanned_in: Option<&AgentTaskId>,
         steering: super::transition::SteeringInput,
         now: OffsetDateTime,
-    ) -> Result<Option<AgentTask>> {
+    ) -> Result<SteeringApplied> {
         use super::transition::SteeringInput;
 
         let old =
@@ -5821,6 +5863,17 @@ impl InMemoryAgentTaskStore {
                         updated_at: row.updated_at,
                     })
                 });
+                if old.status != TaskStatus::WaitingOnChildren
+                    && let Some(child) = fanned_in
+                {
+                    let folded = Self::fold_queued_steering_locked(
+                        inner, extension, &old, child, queue, stored, now,
+                    )?;
+                    return Ok(SteeringApplied {
+                        woken: None,
+                        folded,
+                    });
+                }
                 let Some((steering, write)) = super::extension::take_queued_steering(
                     "memory",
                     extension,
@@ -5829,7 +5882,7 @@ impl InMemoryAgentTaskStore {
                     stored.as_ref(),
                 )?
                 else {
-                    return Ok(None);
+                    return Ok(SteeringApplied::default());
                 };
                 let plan = write
                     .plan(stored.map(|row| super::document::StoredRevision {
@@ -5842,7 +5895,7 @@ impl InMemoryAgentTaskStore {
             }
         };
         if old.status != TaskStatus::WaitingOnChildren {
-            return Ok(None);
+            return Ok(SteeringApplied::default());
         }
         let woken = old
             .clone()
@@ -5850,7 +5903,72 @@ impl InMemoryAgentTaskStore {
             .context("steering wake rejected: begin_steering_resume transition failed")?;
         inner.rebalance_after_row_change(&old, &woken);
         inner.put_row(woken.id.clone(), woken.clone());
-        Ok(Some(woken))
+        Ok(SteeringApplied {
+            woken: Some(woken),
+            folded: None,
+        })
+    }
+
+    /// [`Self::enqueue_steering_resume_locked`] with the store's extension,
+    /// folding for a parent a settle in `fan_ins` fanned in.
+    fn steering_locked(
+        &self,
+        inner: &mut Inner,
+        parent: &AgentTaskId,
+        steering: super::transition::SteeringInput,
+        fan_ins: &super::extension::FanIns,
+        now: OffsetDateTime,
+    ) -> Result<SteeringApplied> {
+        Self::enqueue_steering_resume_locked(
+            inner,
+            self.extension.as_deref(),
+            parent,
+            fan_ins.child_of(parent),
+            steering,
+            now,
+        )
+    }
+
+    /// Fold the steering queued for `parent` into the stored result of
+    /// `child`, whose settle fanned it in: both rows are planned before
+    /// either is written. Returns the rewritten child, or `None` with
+    /// nothing written.
+    fn fold_queued_steering_locked(
+        inner: &mut Inner,
+        extension: Option<&dyn super::extension::TransitionExtension>,
+        parent: &AgentTask,
+        child: &AgentTaskId,
+        queue: super::document::DocumentKey,
+        stored: Option<super::document::Document>,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let settled = inner
+            .by_id
+            .get(child)
+            .cloned()
+            .ok_or_else(|| anyhow!("steering fold rejected: task {child} does not exist"))?;
+        let Some((result, write)) = super::extension::fold_queued_steering(
+            "memory",
+            extension,
+            parent,
+            &settled,
+            queue,
+            stored.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let plan = write
+            .plan(stored.map(|row| super::document::StoredRevision {
+                revision: row.revision,
+                live: true,
+            }))
+            .map_err(anyhow::Error::new)?;
+        let mut folded = settled;
+        folded.result_payload = Some(result);
+        apply_document_locked(&mut inner.documents, write, Some(plan), now)?;
+        inner.put_row(folded.id.clone(), folded.clone());
+        Ok(Some(folded))
     }
 
     /// `transition` with the host extension's writes, checked: a mixed

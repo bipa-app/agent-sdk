@@ -270,10 +270,17 @@ pub mod attrs {
     ///
     /// `taken` (woke the parent), `empty` (nothing queued), `not_parked`
     /// or `no_extension` (refused: the store has no extension to take it).
+    /// On a settle that fans the parent in: `folded` (the steering rides
+    /// the last child's result), `fold_empty` (nothing queued, or the
+    /// extension declined) or `fold_refused` (the fold is not a tool
+    /// result, or the child has none; the settle commits unchanged).
     pub const OUTCOME_TAKEN: &str = "taken";
     pub const OUTCOME_EMPTY: &str = "empty";
     pub const OUTCOME_NOT_PARKED: &str = "not_parked";
     pub const OUTCOME_NO_EXTENSION: &str = "no_extension";
+    pub const OUTCOME_FOLDED: &str = "folded";
+    pub const OUTCOME_FOLD_EMPTY: &str = "fold_empty";
+    pub const OUTCOME_FOLD_REFUSED: &str = "fold_refused";
     /// Where a transition extension ran: `commit` / `completed_turn`.
     pub const EXTENSION_POINT: &str = "extension.point";
     /// The kind of a write a transition extension was refused
@@ -1390,7 +1397,7 @@ fn invocation_instruments(meter: &opentelemetry::metrics::Meter) -> InvocationIn
         .u64_counter("agent_server.subagent.completion_hook.refused")
         .with_description(
             "Subagent completion hook outputs refused before the settle, by reason: \
-             extra_write, park or state. The invocation then fails closed.",
+             extra_write, steering, park or state. The invocation then fails closed.",
         )
         .build();
     let prompts = meter
@@ -1506,7 +1513,8 @@ fn extension_instruments(meter: &opentelemetry::metrics::Meter) -> ExtensionInst
         .u64_counter("agent_server.journal.steering_queue.takes")
         .with_description(
             "Reads of a queued steering wake's queue inside its transaction, attributed by \
-             backend and outcome (taken, empty, not_parked, no_extension).",
+             backend and outcome (taken, empty, not_parked, no_extension; on a fan-in settle \
+             folded, fold_empty, fold_refused).",
         )
         .build();
     ExtensionInstruments {
