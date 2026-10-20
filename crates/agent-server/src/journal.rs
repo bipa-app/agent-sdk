@@ -622,8 +622,8 @@ pub use event_repository::{EventRepository, InMemoryEventRepository};
 pub use event_stream::{EventStream, StreamEvent, stream_events};
 pub use execution_context::{RootWorkerInputs, build_root_worker_inputs};
 pub use extension::{
-    ExtensionWriteRefused, QueuedSteering, TransitionExtension, TransitionView,
-    take_queued_steering,
+    ExtensionWriteRefused, FanIns, FoldedSteering, QueuedSteering, TransitionExtension,
+    TransitionView, fold_queued_steering, take_queued_steering,
 };
 pub use live_tail::{LiveTailConfig, LiveTailEvent, LiveTailHub, LiveTailReceiver, SubscriberId};
 pub use lock_conflict::LockConflict;

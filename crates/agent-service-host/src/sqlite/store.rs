@@ -3894,6 +3894,7 @@ impl SqliteDurableStore {
         Self::check_effects_tx(&mut tx, &transition).await?;
         Self::check_declared_threads_tx(&mut tx, &transition, false, now).await?;
         let mut committed = agent_server::journal::Committed::default();
+        let mut fan_ins = agent_server::journal::FanIns::default();
         for (index, write) in agent_server::journal::writes_in_apply_order(&transition) {
             Self::apply_write_tx(
                 &mut tx,
@@ -3901,7 +3902,7 @@ impl SqliteDurableStore {
                 write,
                 self.extension.as_deref(),
                 now,
-                &mut committed,
+                (&mut committed, &mut fan_ins),
             )
             .await
             .map_err(|error| {
@@ -3942,7 +3943,18 @@ impl SqliteDurableStore {
     ) -> Result<CompletedTurnExtra> {
         let mut committed = agent_server::journal::Committed::default();
         for write in extra.writes.iter().cloned() {
-            Self::apply_write_tx(tx, extra, write, None, now, &mut committed).await?;
+            Self::apply_write_tx(
+                tx,
+                extra,
+                write,
+                None,
+                now,
+                (
+                    &mut committed,
+                    &mut agent_server::journal::FanIns::default(),
+                ),
+            )
+            .await?;
         }
         if !committed.settled.is_empty() {
             agent_server::fail_point!("commit.completed_turn.settled");
@@ -4039,20 +4051,26 @@ impl SqliteDurableStore {
         Self::pause_on_confirmation_tx(tx, &task, *continuation, prepared_operation, now).await
     }
 
-    /// Apply one write of a transition inside its transaction.
+    /// Apply one write of a transition inside its transaction. `fan_ins`
+    /// records the parents its settles fan in, for its queued steering.
     async fn apply_write_tx(
         tx: &mut Transaction<'_, Sqlite>,
         transition: &agent_server::journal::Transition,
         write: agent_server::journal::Write,
         extension: Option<&dyn agent_server::journal::TransitionExtension>,
         now: OffsetDateTime,
-        committed: &mut agent_server::journal::Committed,
+        (committed, fan_ins): (
+            &mut agent_server::journal::Committed,
+            &mut agent_server::journal::FanIns,
+        ),
     ) -> Result<()> {
         use agent_server::journal::Write;
 
         match write {
             Write::SettleTask { task, outcome } => {
+                let parked = Self::parked_watched_parents_tx(tx, transition).await?;
                 let settled = Self::apply_settle_tx(tx, transition, &task, outcome, now).await?;
+                fan_ins.record(&parked, &settled);
                 committed.settled.push(settled);
                 agent_server::fail_point!("transition.settle_written");
             }
@@ -4129,12 +4147,106 @@ impl SqliteDurableStore {
                 committed.documents.push(outcome);
             }
             Write::EnqueueSteeringResume { parent, steering } => {
-                let woken =
-                    Self::enqueue_steering_resume_tx(tx, extension, &parent, steering, now).await?;
-                committed.steering_resumed.push(woken);
+                Self::apply_steering_tx(
+                    tx,
+                    extension,
+                    &parent,
+                    steering,
+                    now,
+                    (committed, fan_ins),
+                )
+                .await?;
             }
         }
         Ok(())
+    }
+
+    /// Apply a [`Write::EnqueueSteeringResume`](agent_server::journal::Write::EnqueueSteeringResume)
+    /// and report it: the woken parent, and a folded child in place of the
+    /// row its settle reported.
+    async fn apply_steering_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        extension: Option<&dyn agent_server::journal::TransitionExtension>,
+        parent: &AgentTaskId,
+        steering: agent_server::journal::SteeringInput,
+        now: OffsetDateTime,
+        (committed, fan_ins): (
+            &mut agent_server::journal::Committed,
+            &agent_server::journal::FanIns,
+        ),
+    ) -> Result<()> {
+        let (woken, folded) = Self::enqueue_steering_resume_tx(
+            tx,
+            extension,
+            parent,
+            fan_ins.child_of(parent),
+            steering,
+            now,
+        )
+        .await?;
+        committed.steering_resumed.push(woken);
+        if let Some(folded) = folded
+            && let Some((row, _)) = committed
+                .settled
+                .iter_mut()
+                .find(|(row, _)| row.id == folded.id)
+        {
+            *row = folded;
+        }
+        Ok(())
+    }
+
+    /// The parents of `transition`'s queued steering writes that wait on
+    /// their children now, read before a settle so it can tell a fan-in.
+    async fn parked_watched_parents_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        transition: &agent_server::journal::Transition,
+    ) -> Result<Vec<AgentTaskId>> {
+        let mut parked = Vec::new();
+        for parent in agent_server::journal::FanIns::watched(transition) {
+            if Self::load_task_tx(tx, parent)
+                .await?
+                .is_some_and(|row| row.status == TaskStatus::WaitingOnChildren)
+            {
+                parked.push(parent.clone());
+            }
+        }
+        Ok(parked)
+    }
+
+    /// Fold the steering queued for `parent` into the stored result of
+    /// `child`, whose settle in this transaction fanned it in: the queue at
+    /// the revision it was read at, then the child's result. Returns the
+    /// rewritten child, or `None` with nothing written.
+    async fn fold_queued_steering_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        extension: Option<&dyn agent_server::journal::TransitionExtension>,
+        parent: &AgentTask,
+        child: &AgentTaskId,
+        queue: agent_server::journal::DocumentKey,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentTask>> {
+        let settled = Self::load_task_tx(tx, child)
+            .await?
+            .ok_or_else(|| anyhow!("steering fold rejected: task {child} does not exist"))?;
+        let stored = Self::get_document_on(tx, &queue).await?;
+        let Some((result, write)) = agent_server::journal::fold_queued_steering(
+            "sqlite",
+            extension,
+            parent,
+            &settled,
+            queue,
+            stored.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Self::apply_document_tx(tx, write, now).await?;
+        let mut folded = settled;
+        folded.result_payload = Some(result);
+        Self::update_task_tx(tx, &folded).await?;
+        agent_server::fail_point!("transition.steering_folded");
+        Ok(Some(folded))
     }
 
     /// Wake a parent parked on its children for a steering exchange. Only
@@ -4142,14 +4254,17 @@ impl SqliteDurableStore {
     /// declines with `None`, so a concurrent fan-in never races the wake.
     /// A [`SteeringInput::Queued`](agent_server::journal::SteeringInput::Queued)
     /// reads its queue in this transaction, after the park, and writes the
-    /// taken queue back in it.
+    /// taken queue back in it; after a settle that fanned the parent in
+    /// (`fanned_in` names that child) it folds the queue into the child's
+    /// result instead. Returns the woken parent and the folded child.
     async fn enqueue_steering_resume_tx(
         tx: &mut Transaction<'_, Sqlite>,
         extension: Option<&dyn agent_server::journal::TransitionExtension>,
         parent_id: &AgentTaskId,
+        fanned_in: Option<&AgentTaskId>,
         steering: agent_server::journal::SteeringInput,
         now: OffsetDateTime,
-    ) -> Result<Option<AgentTask>> {
+    ) -> Result<(Option<AgentTask>, Option<AgentTask>)> {
         let old = Self::load_task_tx(tx, parent_id)
             .await?
             .ok_or_else(|| anyhow!("steering wake rejected: task {parent_id} does not exist"))?;
@@ -4159,6 +4274,14 @@ impl SqliteDurableStore {
                 let queue = queued
                     .queue_on(&old.thread_id)
                     .context("a queued steering input names its queue")?;
+                if old.status != TaskStatus::WaitingOnChildren
+                    && let Some(child) = fanned_in
+                {
+                    let folded =
+                        Self::fold_queued_steering_tx(tx, extension, &old, child, queue, now)
+                            .await?;
+                    return Ok((None, folded));
+                }
                 let stored = Self::get_document_on(tx, &queue).await?;
                 let Some((steering, write)) = agent_server::journal::take_queued_steering(
                     "sqlite",
@@ -4168,20 +4291,20 @@ impl SqliteDurableStore {
                     stored.as_ref(),
                 )?
                 else {
-                    return Ok(None);
+                    return Ok((None, None));
                 };
                 Self::apply_document_tx(tx, write, now).await?;
                 steering
             }
         };
         if old.status != TaskStatus::WaitingOnChildren {
-            return Ok(None);
+            return Ok((None, None));
         }
         let woken = old
             .begin_steering_resume(steering, now)
             .context("steering wake rejected: begin_steering_resume transition failed")?;
         Self::update_task_tx(tx, &woken).await?;
-        Ok(Some(woken))
+        Ok((Some(woken), None))
     }
 
     /// Settle a leased task with the existing terminal-transition helper.

@@ -24,6 +24,17 @@
 //!    the hook's result, appends the parent's completed `SubagentProgress`
 //!    and applies the hook's extra writes. The parent resumes in it.
 //!
+//! **Steering at the wave's end.** The settle's extra writes may carry one
+//! [`Write::EnqueueSteeringResume`] of the invocation's own parent with
+//! [`SteeringInput::Queued`]. If the settle fans the parent in (its last
+//! child), the store folds the steering queued for the parent into this
+//! settle's result, under the parent's thread lock and in the settle's
+//! transaction ([`TransitionExtension::fold_queued_steering`](crate::journal::TransitionExtension::fold_queued_steering)),
+//! so the resumed parent reads it in its fan-in; otherwise it wakes the
+//! parent if it is still parked. The hook never writes the queue itself,
+//! so a note queued after the hook ran is folded too and never refuses the
+//! settle. A park carries no such write.
+//!
 //! **Park.** Instead, the hook can ask for a human decision
 //! ([`CompletionOutput::park`]). One transition then opens the host prompt
 //! (owned by the host, with the invocation as its `owner_task`), parks the
@@ -55,7 +66,7 @@ use crate::journal::effect::{
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTaskId, TaskStatus};
 use crate::journal::transition::{
-    Committed, DurableStore, Guard, Rejected, Settle, Transition, Write,
+    Committed, DurableStore, Guard, Rejected, Settle, SteeringInput, Transition, Write,
 };
 
 /// How [`SubagentCompletionHook::run`] may act.
@@ -121,7 +132,9 @@ pub struct CompletionOutput {
     /// [`SubagentCompletionHook::plan`] returned `None`, and on a park.
     pub state: EffectState,
     /// More writes for the settle (or park) transition: [`Write::Document`]
-    /// and [`Write::AppendEvents`] only.
+    /// and [`Write::AppendEvents`], and on a settle at most one
+    /// [`Write::EnqueueSteeringResume`] of the invocation's own parent with
+    /// [`SteeringInput::Queued`] (see the module documentation).
     pub extra_writes: Vec<Write>,
     /// Park the invocation on this host prompt instead of settling it. The
     /// owner must be [`PromptOwner::Host`](crate::journal::prompt::PromptOwner::Host);
@@ -181,6 +194,11 @@ pub enum CompletionHookError {
         "a completion hook may add only Document and AppendEvents writes; extra write {index} is {write}"
     )]
     RefusedExtraWrite { index: usize, write: &'static str },
+    /// A steering write the settle cannot carry: on a park, for another
+    /// task than the invocation's parent, with inline steering, or more
+    /// than one.
+    #[error("a completion hook's steering write {index} is refused: {reason}")]
+    RefusedSteeringWrite { index: usize, reason: &'static str },
     /// The hook finished its effect as `Started`.
     #[error("a completion hook must finish its effect in an end state, not Started")]
     StartedFinish,
@@ -200,6 +218,7 @@ impl CompletionHookError {
     const fn reason(&self) -> &'static str {
         match self {
             Self::RefusedExtraWrite { .. } => "extra_write",
+            Self::RefusedSteeringWrite { .. } => "steering",
             Self::ParkOnLastAttempt => "park",
             Self::StartedFinish | Self::EffectNotContinuable { .. } => "state",
         }
@@ -231,19 +250,48 @@ impl DurableStore for ReadOnlyStore {
 }
 
 /// Check the hook's output before the SDK builds the settle from it.
-fn check_output(output: &CompletionOutput, mode: RunMode) -> Result<(), CompletionHookError> {
+/// `parent` is the invocation's parent.
+fn check_output(
+    output: &CompletionOutput,
+    mode: RunMode,
+    parent: Option<&AgentTaskId>,
+) -> Result<(), CompletionHookError> {
     if output.park.is_some() && mode == RunMode::Inspect {
         return Err(CompletionHookError::ParkOnLastAttempt);
     }
     if output.park.is_none() && output.state.is_started() {
         return Err(CompletionHookError::StartedFinish);
     }
+    let mut steering = 0_usize;
     for (index, write) in output.extra_writes.iter().enumerate() {
-        if !matches!(write, Write::Document(_) | Write::AppendEvents { .. }) {
-            return Err(CompletionHookError::RefusedExtraWrite {
-                index,
-                write: Write::kind_name(write),
-            });
+        match write {
+            Write::Document(_) | Write::AppendEvents { .. } => {}
+            Write::EnqueueSteeringResume {
+                parent: woken,
+                steering: input,
+            } => {
+                steering += 1;
+                let reason = if output.park.is_some() {
+                    Some("a park resumes nothing")
+                } else if Some(woken) != parent {
+                    Some("it may name only the invocation's own parent")
+                } else if !matches!(input, SteeringInput::Queued { .. }) {
+                    Some("its steering must come from a queue")
+                } else if steering > 1 {
+                    Some("a settle carries at most one")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return Err(CompletionHookError::RefusedSteeringWrite { index, reason });
+                }
+            }
+            _ => {
+                return Err(CompletionHookError::RefusedExtraWrite {
+                    index,
+                    write: Write::kind_name(write),
+                });
+            }
         }
     }
     Ok(())
@@ -421,6 +469,16 @@ pub(super) async fn settle_with_hook(
     }
 }
 
+/// The tool result `settled` stores, with any steering the store folded
+/// in; `built` when it stores none.
+fn stored_tool_result(settled: &crate::journal::task::AgentTask, built: ToolResult) -> ToolResult {
+    settled
+        .result_payload
+        .clone()
+        .and_then(|stored| serde_json::from_value(stored).ok())
+        .unwrap_or(built)
+}
+
 /// One hook settle, split out of [`settle_with_hook`] so its span ends on
 /// every return.
 struct HookRun<'a> {
@@ -462,7 +520,9 @@ impl HookRun<'_> {
             .run(ctx, prior.as_ref(), mode)
             .await
             .context("run the subagent completion hook")?;
-        if let Err(refused) = check_output(&output, mode) {
+        if let Err(refused) =
+            check_output(&output, mode, bootstrap.invocation_task.parent_id.as_ref())
+        {
             signals.refused(refused.reason());
             return Err(refused.into());
         }
@@ -524,12 +584,13 @@ impl HookRun<'_> {
             .into_iter()
             .next()
             .context("a settle transition returns its settled task")?;
+        let tool_result = stored_tool_result(&invocation_task, output.result);
         Ok((
             SubagentTaskOutcome {
                 invocation_task,
                 parent_task,
                 subagent_result,
-                tool_result: output.result,
+                tool_result,
                 committed_events: committed.events,
                 parked_on: None,
             },

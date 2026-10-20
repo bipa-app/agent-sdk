@@ -177,7 +177,7 @@ impl TestStores {
         }
     }
 
-    fn root_turn_deps(&self) -> RootTurnDeps<'_> {
+    pub(super) fn root_turn_deps(&self) -> RootTurnDeps<'_> {
         RootTurnDeps {
             task_store: &self.tasks,
             thread_store: &self.threads,
@@ -195,6 +195,43 @@ impl TestStores {
             activity: None,
             connectivity_waits: None,
         }
+    }
+
+    /// Acquire the fanned-in `parent` at `secs` and resume it from its
+    /// children with `provider`.
+    pub(super) async fn resume_parent(
+        &self,
+        parent: &crate::journal::task::AgentTaskId,
+        provider: &dyn LlmProvider,
+        secs: i64,
+    ) -> Result<RootTurnOutcome> {
+        let running = self
+            .tasks
+            .try_acquire_task(
+                parent,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(secs + 60),
+                t_plus(secs),
+            )
+            .await?
+            .context("claim the parent root for its resume")?;
+        let inputs = build_root_worker_inputs(
+            bootstrap(running.clone(), sample_definition())?,
+            &self.threads,
+            &self.checkpoints,
+            &self.messages,
+            t_plus(secs),
+        )
+        .await?;
+        resume_from_children(
+            inputs,
+            &running,
+            provider,
+            &self.root_turn_deps(),
+            t_plus(secs + 1),
+        )
+        .await
     }
 
     pub(super) fn subagent_deps(&self) -> SubagentResultDeps<'_> {
@@ -221,7 +258,7 @@ fn set(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
-fn sample_definition() -> AgentDefinition {
+pub(super) fn sample_definition() -> AgentDefinition {
     AgentDefinition {
         provider: "mock".into(),
         model: "mock-model".into(),
@@ -252,7 +289,10 @@ fn child_definition_with_tools() -> AgentDefinition {
     }
 }
 
-fn bootstrap(task: AgentTask, definition: AgentDefinition) -> Result<WorkerBootstrapContext> {
+pub(super) fn bootstrap(
+    task: AgentTask,
+    definition: AgentDefinition,
+) -> Result<WorkerBootstrapContext> {
     let worker_id = task
         .worker_id
         .clone()

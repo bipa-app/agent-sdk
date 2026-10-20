@@ -4771,6 +4771,509 @@ mod tests {
         Ok(())
     }
 
+    // ── queued steering at the wave's end (bip #904's last-result delivery) ──
+
+    /// What [`FoldExtension::fold_queued_steering`] does with a queue that
+    /// holds notes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FoldMode {
+        /// Append the notes to the result's output and empty the queue.
+        Fold,
+        /// Fold nothing.
+        Decline,
+        /// Return a result that is not a tool result.
+        NotAToolResult,
+    }
+
+    /// A pure extension that folds the `conformance.steering` queue
+    /// (`{"notes": [..]}`) into a fan-in settle's tool result, appending
+    /// `[steering] <notes>` to its output, and takes it on a wake as
+    /// [`SteeringExtension`] does. It adds no writes: the settles in these
+    /// tests carry their own queued write, as a completion hook's does.
+    struct FoldExtension {
+        mode: FoldMode,
+        folds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FoldExtension {
+        fn new(
+            mode: FoldMode,
+        ) -> (
+            std::sync::Arc<Self>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) {
+            let folds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                std::sync::Arc::new(Self {
+                    mode,
+                    folds: folds.clone(),
+                }),
+                folds,
+            )
+        }
+
+        fn notes(queued: &agent_server::journal::Document) -> Vec<String> {
+            queued
+                .value
+                .get("notes")
+                .and_then(|notes| serde_json::from_value(notes.clone()).ok())
+                .unwrap_or_default()
+        }
+    }
+
+    impl agent_server::journal::TransitionExtension for FoldExtension {
+        fn extend(
+            &self,
+            _view: agent_server::journal::TransitionView<'_>,
+        ) -> Vec<agent_server::journal::Write> {
+            Vec::new()
+        }
+
+        fn take_queued_steering(
+            &self,
+            _parent: &AgentTask,
+            queued: &agent_server::journal::Document,
+        ) -> Option<agent_server::journal::QueuedSteering> {
+            let notes = Self::notes(queued);
+            (!notes.is_empty()).then(|| agent_server::journal::QueuedSteering {
+                steering: steering_note(&notes.join("\n")),
+                schema_version: queued.schema_version,
+                value: serde_json::json!({ "notes": [] }),
+            })
+        }
+
+        fn fold_queued_steering(
+            &self,
+            _parent: &AgentTask,
+            _settled: &AgentTask,
+            result: &serde_json::Value,
+            queued: &agent_server::journal::Document,
+        ) -> Option<agent_server::journal::FoldedSteering> {
+            self.folds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let notes = Self::notes(queued);
+            if notes.is_empty() {
+                return None;
+            }
+            let result = match self.mode {
+                FoldMode::Decline => return None,
+                FoldMode::NotAToolResult => serde_json::json!("not a tool result"),
+                FoldMode::Fold => {
+                    let mut folded: agent_sdk_foundation::ToolResult =
+                        serde_json::from_value(result.clone()).ok()?;
+                    folded.output = format!("{}\n[steering] {}", folded.output, notes.join("; "));
+                    serde_json::to_value(folded).ok()?
+                }
+            };
+            Some(agent_server::journal::FoldedSteering {
+                result,
+                schema_version: queued.schema_version,
+                value: serde_json::json!({ "notes": [] }),
+            })
+        }
+    }
+
+    /// One leased tool child of a wave.
+    type LeasedChild = (AgentTask, WorkerId, LeaseId);
+
+    /// A root on `tid` parked on `size` tool children, each leased.
+    async fn leased_wave(
+        task_store: &dyn AgentTaskStore,
+        tid: &str,
+        size: usize,
+    ) -> Result<(AgentTask, Vec<LeasedChild>)> {
+        let running = running_root(task_store, tid).await?;
+        let (_, children) = task_store
+            .spawn_tool_children(
+                &running.0.id,
+                &running.1,
+                &running.2,
+                vec![ChildSpawnSpec::new(3); size],
+                suspension_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        let mut leased = Vec::new();
+        for child in children {
+            let (worker, lease) = (WorkerId::new(), LeaseId::new());
+            let row = task_store
+                .try_acquire_task(
+                    &child.id,
+                    worker.clone(),
+                    lease.clone(),
+                    t_plus(90),
+                    t_plus(63),
+                )
+                .await?
+                .context("the tool child is acquirable")?;
+            leased.push((row, worker, lease));
+        }
+        Ok((running.0, leased))
+    }
+
+    /// `child`'s settle with the result `done <name>` and a queued steering
+    /// write of `parent`, the settle a completion hook builds.
+    fn settle_with_steering(
+        (child, worker, lease): &LeasedChild,
+        parent: &AgentTaskId,
+        name: &str,
+    ) -> Result<Transition> {
+        let mut settle = Transition::settle(
+            child.id.clone(),
+            worker.clone(),
+            lease.clone(),
+            Settle::Complete {
+                result: serde_json::to_value(agent_sdk_foundation::ToolResult::success(format!(
+                    "done {name}"
+                )))?,
+            },
+            child.thread_id.clone(),
+            Vec::new(),
+        );
+        settle.writes.push(Write::EnqueueSteeringResume {
+            parent: parent.clone(),
+            steering: agent_server::journal::SteeringInput::Queued {
+                kind: doc_kind("steering")?,
+                key: String::new(),
+            },
+        });
+        Ok(settle)
+    }
+
+    /// The output of `task`'s stored tool result.
+    fn stored_output(task: &AgentTask) -> Result<String> {
+        let result: agent_sdk_foundation::ToolResult = serde_json::from_value(
+            task.result_payload
+                .clone()
+                .context("the settled child stores its result")?,
+        )?;
+        Ok(result.output)
+    }
+
+    async fn row(task_store: &dyn AgentTaskStore, id: &AgentTaskId) -> Result<AgentTask> {
+        AgentTaskStore::get(task_store, id)
+            .await?
+            .with_context(|| format!("task {id}"))
+    }
+
+    /// C1, C2, C3: the settle that fans its parent in folds the parent's
+    /// queued steering into its own stored result and empties the queue at
+    /// the next revision, all in the settle's transaction; the parent
+    /// resumes with an empty steering slot. A note queued after the settle
+    /// was built (after the hook ran) rides it too. Nothing queued (no
+    /// queue, or an empty one) writes nothing.
+    async fn test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        folds: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tid = "conformance-fold";
+        let (root, children) = leased_wave(task_store, tid, 1).await?;
+        let settle = settle_with_steering(&children[0], &root.id, "c1")?;
+        // Queued after the settle was built: the store reads the queue.
+        queue_notes(task_store, tid, &["skip the docs crate"]).await?;
+        let committed = task_store
+            .commit(settle, t_plus(64))
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(folds.load(Ordering::SeqCst), 1);
+        let (settled, parent) = committed.settled.first().context("one settle")?;
+        assert_eq!(
+            stored_output(settled)?,
+            "done c1\n[steering] skip the docs crate",
+            "the commit reports the folded result"
+        );
+        assert!(committed.steering_resumed.iter().all(Option::is_none));
+        let parent = parent.as_ref().context("the settle returns the parent")?;
+        assert_eq!(parent.status, TaskStatus::Pending, "fanned in");
+        let stored = row(task_store, &children[0].0.id).await?;
+        assert_eq!(
+            stored_output(&stored)?,
+            "done c1\n[steering] skip the docs crate"
+        );
+        let resumed = row(task_store, &root.id).await?;
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert!(
+            matches!(&resumed.state, TaskState::ReadyToResume { steering, .. } if steering.is_empty()),
+            "a fan-in, not a steering exchange: {:?}",
+            resumed.state
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] }))),
+            "the settle's transaction emptied the queue"
+        );
+
+        for (tid, notes) in [
+            ("conformance-fold-no-queue", None),
+            ("conformance-fold-empty-queue", Some(Vec::<&str>::new())),
+        ] {
+            let (root, children) = leased_wave(task_store, tid, 1).await?;
+            if let Some(notes) = &notes {
+                queue_notes(task_store, tid, notes).await?;
+            }
+            task_store
+                .commit(
+                    settle_with_steering(&children[0], &root.id, "c1")?,
+                    t_plus(64),
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+            assert_eq!(
+                stored_output(&row(task_store, &children[0].0.id).await?)?,
+                "done c1",
+                "{tid}: nothing folded"
+            );
+            assert_eq!(row(task_store, &root.id).await?.status, TaskStatus::Pending);
+            assert_eq!(
+                doc_value(documents, &steering_queue(tid)?).await?,
+                notes.map(|_| (1, serde_json::json!({ "notes": [] }))),
+                "{tid}: the queue is left alone"
+            );
+        }
+        Ok(())
+    }
+
+    /// C4: a settle that does not fan its parent in (a sibling still runs)
+    /// folds nothing into its result. With notes queued it wakes the parked
+    /// parent with them, as a park does; with none it is only a settle.
+    /// The woken parent's last child then finds it no longer parked and
+    /// folds nothing either.
+    async fn test_a_settle_that_does_not_fan_in_folds_nothing(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        folds: &std::sync::atomic::AtomicUsize,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let before = folds.load(Ordering::SeqCst);
+        let tid = "conformance-fold-sibling";
+        let (root, children) = leased_wave(task_store, tid, 2).await?;
+        queue_notes(task_store, tid, &["status?"]).await?;
+        let committed = task_store
+            .commit(
+                settle_with_steering(&children[0], &root.id, "c1")?,
+                t_plus(64),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            stored_output(&row(task_store, &children[0].0.id).await?)?,
+            "done c1",
+            "a non-last result carries no notes"
+        );
+        let woken = row(task_store, &root.id).await?;
+        assert_eq!(
+            woken.status,
+            TaskStatus::Pending,
+            "the parked parent is woken"
+        );
+        assert!(woken.state.is_steering_resume(), "{:?}", woken.state);
+        assert_eq!(steering_text(&woken), "status?");
+        assert!(matches!(committed.steering_resumed.as_slice(), [Some(_)]));
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] })))
+        );
+        queue_notes_again(task_store, tid, 2, &["later"]).await?;
+        task_store
+            .commit(
+                settle_with_steering(&children[1], &root.id, "c2")?,
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            stored_output(&row(task_store, &children[1].0.id).await?)?,
+            "done c2",
+            "the woken parent is not fanned in by its last child"
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?)
+                .await?
+                .map(|(revision, _)| revision),
+            Some(3),
+            "the later note stays queued"
+        );
+
+        let tid = "conformance-fold-sibling-none";
+        let (root, children) = leased_wave(task_store, tid, 2).await?;
+        task_store
+            .commit(
+                settle_with_steering(&children[0], &root.id, "c1")?,
+                t_plus(64),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            row(task_store, &root.id).await?.status,
+            TaskStatus::WaitingOnChildren,
+            "nothing queued, still parked"
+        );
+        assert_eq!(doc_value(documents, &steering_queue(tid)?).await?, None);
+        assert_eq!(folds.load(Ordering::SeqCst), before, "no fan-in, no fold");
+        Ok(())
+    }
+
+    /// Put `notes` in `tid`'s queue, which is at `revision`.
+    async fn queue_notes_again(
+        task_store: &dyn AgentTaskStore,
+        tid: &str,
+        revision: u64,
+        notes: &[&str],
+    ) -> Result<()> {
+        task_store
+            .commit(
+                doc_only(vec![put_doc(
+                    &steering_queue(tid)?,
+                    agent_server::journal::DocExpect::Revision(revision),
+                    serde_json::json!({ "notes": notes }),
+                )]),
+                t_plus(59),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
+    /// C5: an extension that declines the fold, or folds into a value that
+    /// is not a tool result, leaves the settle as it is: it commits, the
+    /// parent resumes, the result is the child's own and the note stays
+    /// queued for the next boundary.
+    async fn test_a_fold_that_does_not_land_leaves_the_settle_as_it_is(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        tid: &str,
+    ) -> Result<()> {
+        let (root, children) = leased_wave(task_store, tid, 1).await?;
+        queue_notes(task_store, tid, &["skip the docs crate"]).await?;
+        task_store
+            .commit(
+                settle_with_steering(&children[0], &root.id, "c1")?,
+                t_plus(64),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            stored_output(&row(task_store, &children[0].0.id).await?)?,
+            "done c1"
+        );
+        assert_eq!(row(task_store, &root.id).await?.status, TaskStatus::Pending);
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((1, serde_json::json!({ "notes": ["skip the docs crate"] }))),
+        );
+        Ok(())
+    }
+
+    /// C6: a settle's queued write names another task than the settled
+    /// child's parent. It folds nothing into the child's result, and the
+    /// other task (a running root, not parked) is left alone with its
+    /// queue: the store folds only for the parent a settle fanned in.
+    async fn test_a_queued_write_for_another_parent_folds_nothing(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        let tid = "conformance-fold-other";
+        let (root, children) = leased_wave(task_store, tid, 1).await?;
+        queue_notes(task_store, tid, &["mine"]).await?;
+        let other = running_root(task_store, "conformance-fold-elsewhere").await?;
+        queue_notes(task_store, "conformance-fold-elsewhere", &["not yours"]).await?;
+        task_store
+            .commit(
+                settle_with_steering(&children[0], &other.0.id, "c1")?,
+                t_plus(64),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            stored_output(&row(task_store, &children[0].0.id).await?)?,
+            "done c1"
+        );
+        assert_eq!(row(task_store, &root.id).await?.status, TaskStatus::Pending);
+        assert_eq!(
+            row(task_store, &other.0.id).await?.status,
+            TaskStatus::Running
+        );
+        for (tid, note) in [(tid, "mine"), ("conformance-fold-elsewhere", "not yours")] {
+            assert_eq!(
+                doc_value(documents, &steering_queue(tid)?).await?,
+                Some((1, serde_json::json!({ "notes": [note] }))),
+                "{tid}'s queue is untouched"
+            );
+        }
+        Ok(())
+    }
+
+    /// A crash at `point` in the fan-in settle's transaction leaves the
+    /// child running with no result and the note queued; the retried
+    /// settle then folds it exactly once. `folded` is whether the crashed
+    /// transaction had already run the fold (the extension counted it), so
+    /// the rollback is what undid the result and the emptied queue.
+    #[cfg(feature = "failpoints")]
+    async fn test_a_crash_in_the_fan_in_settle_leaves_the_note_queued(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        folds: &std::sync::atomic::AtomicUsize,
+        point: &str,
+        folded: bool,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let tid = format!("conformance-fold-crash-{point}");
+        let (root, children) = leased_wave(task_store, &tid, 1).await?;
+        queue_notes(task_store, &tid, &["skip the docs crate"]).await?;
+        let before = folds.load(Ordering::SeqCst);
+        fail::cfg(point, "panic")
+            .map_err(|error| anyhow::anyhow!("configure failpoint {point}: {error}"))?;
+        let crashed = std::panic::AssertUnwindSafe(task_store.commit(
+            settle_with_steering(&children[0], &root.id, "c1")?,
+            t_plus(64),
+        ));
+        let result = futures::FutureExt::catch_unwind(crashed).await;
+        fail::remove(point);
+        assert!(result.is_err(), "the failpoint {point} must fire");
+        assert_eq!(
+            folds.load(Ordering::SeqCst) - before,
+            usize::from(folded),
+            "{point}: the fold ran in the crashed transaction: {folded}"
+        );
+        let child = row(task_store, &children[0].0.id).await?;
+        assert_eq!(child.status, TaskStatus::Running, "{point}");
+        assert_eq!(child.result_payload, None, "{point}");
+        assert_eq!(
+            row(task_store, &root.id).await?.status,
+            TaskStatus::WaitingOnChildren
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue(&tid)?).await?,
+            Some((1, serde_json::json!({ "notes": ["skip the docs crate"] }))),
+            "{point}"
+        );
+
+        task_store
+            .commit(
+                settle_with_steering(&children[0], &root.id, "c1")?,
+                t_plus(65),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        assert_eq!(
+            stored_output(&row(task_store, &children[0].0.id).await?)?,
+            "done c1\n[steering] skip the docs crate",
+            "{point}: the retried settle folds the note once"
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue(&tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] }))),
+            "{point}"
+        );
+        Ok(())
+    }
+
     /// A root parked on two tool children, one finished, woken by a
     /// steering note and re-acquired: ready to re-park on the survivor.
     async fn steering_woken_root(
@@ -8875,6 +9378,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_in_memory_fan_in_steering_fold() -> Result<()> {
+        let (extension, folds) = FoldExtension::new(FoldMode::Fold);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            &folds,
+        )
+        .await?;
+        test_a_settle_that_does_not_fan_in_folds_nothing(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+            &folds,
+        )
+        .await?;
+        test_a_queued_write_for_another_parent_folds_nothing(s.task.as_ref(), s.documents.as_ref())
+            .await
+    }
+
+    #[tokio::test]
+    async fn conformance_in_memory_fan_in_steering_fold_not_landed() -> Result<()> {
+        for (mode, tid) in [
+            (FoldMode::Decline, "conformance-fold-declined"),
+            (
+                FoldMode::NotAToolResult,
+                "conformance-fold-not-a-tool-result",
+            ),
+        ] {
+            let (extension, _folds) = FoldExtension::new(mode);
+            let s = fresh_in_memory_stores_with(Some(extension));
+            test_a_fold_that_does_not_land_leaves_the_settle_as_it_is(
+                s.task.as_ref(),
+                s.documents.as_ref(),
+                tid,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn conformance_in_memory_extension() -> Result<()> {
         let (extension, calls) = ProbeExtension::new(false);
         let s = fresh_in_memory_stores_with(Some(extension));
@@ -8978,6 +9522,66 @@ mod tests {
             .await?
             .with_transition_extension(extension);
         test_a_crash_after_the_queued_wake_leaves_the_note_queued(&store, &store, &takes).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn sqlite_fold_store(
+        mode: FoldMode,
+    ) -> Result<(
+        crate::sqlite::SqliteDurableStore,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        let (extension, folds) = FoldExtension::new(mode);
+        let store = crate::sqlite::SqliteDurableStore::connect("sqlite::memory:")
+            .await?
+            .with_transition_extension(extension);
+        Ok((store, folds))
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_fan_in_steering_fold() -> Result<()> {
+        let (store, folds) = sqlite_fold_store(FoldMode::Fold).await?;
+        test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(&store, &store, &folds)
+            .await?;
+        test_a_settle_that_does_not_fan_in_folds_nothing(&store, &store, &folds).await?;
+        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn conformance_sqlite_fan_in_steering_fold_not_landed() -> Result<()> {
+        for (mode, tid) in [
+            (FoldMode::Decline, "conformance-fold-declined"),
+            (
+                FoldMode::NotAToolResult,
+                "conformance-fold-not-a-tool-result",
+            ),
+        ] {
+            let (store, _folds) = sqlite_fold_store(mode).await?;
+            test_a_fold_that_does_not_land_leaves_the_settle_as_it_is(&store, &store, tid).await?;
+        }
+        Ok(())
+    }
+
+    /// Before the fold (the settle is written), after the fold's writes,
+    /// and before the commit.
+    #[cfg(all(feature = "sqlite", feature = "failpoints"))]
+    #[tokio::test]
+    async fn sqlite_a_crash_in_the_fan_in_settle_leaves_the_note_queued() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let (store, folds) = sqlite_fold_store(FoldMode::Fold).await?;
+        for (point, folded) in [
+            ("transition.settle_written", false),
+            ("transition.steering_folded", true),
+            ("transition.before_commit", true),
+        ] {
+            test_a_crash_in_the_fan_in_settle_leaves_the_note_queued(
+                &store, &store, &folds, point, folded,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "sqlite")]
@@ -9222,6 +9826,214 @@ mod tests {
         let (extension, takes) = SteeringExtension::new(false);
         let store = store.with_transition_extension(extension);
         test_a_crash_after_the_queued_wake_leaves_the_note_queued(&store, &store, &takes).await
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn pg_fold_store(
+        mode: FoldMode,
+    ) -> Result<
+        Option<(
+            crate::postgres::store::PostgresDurableStore,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            PgConformanceSchema,
+        )>,
+    > {
+        let Some((store, guard)) = pg_test_store().await? else {
+            return Ok(None);
+        };
+        let (extension, folds) = FoldExtension::new(mode);
+        Ok(Some((
+            store.with_transition_extension(extension),
+            folds,
+            guard,
+        )))
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_fan_in_steering_fold() -> Result<()> {
+        let Some((store, folds, _guard)) = pg_fold_store(FoldMode::Fold).await? else {
+            return Ok(());
+        };
+        test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(&store, &store, &folds)
+            .await?;
+        test_a_settle_that_does_not_fan_in_folds_nothing(&store, &store, &folds).await?;
+        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conformance_postgres_fan_in_steering_fold_not_landed() -> Result<()> {
+        for (mode, tid) in [
+            (FoldMode::Decline, "conformance-fold-declined"),
+            (
+                FoldMode::NotAToolResult,
+                "conformance-fold-not-a-tool-result",
+            ),
+        ] {
+            let Some((store, _folds, _guard)) = pg_fold_store(mode).await? else {
+                return Ok(());
+            };
+            test_a_fold_that_does_not_land_leaves_the_settle_as_it_is(&store, &store, tid).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "postgres", feature = "failpoints"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_crash_in_the_fan_in_settle_leaves_the_note_queued() -> Result<()> {
+        let _scenario = fail::FailScenario::setup();
+        let Some((store, folds, _guard)) = pg_fold_store(FoldMode::Fold).await? else {
+            return Ok(());
+        };
+        for (point, folded) in [
+            ("transition.settle_written", false),
+            ("transition.steering_folded", true),
+            ("transition.before_commit", true),
+        ] {
+            test_a_crash_in_the_fan_in_settle_leaves_the_note_queued(
+                &store, &store, &folds, point, folded,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A note whose writer holds the queue's thread row while the fan-in
+    /// settle starts: the settle waits for the thread lock, then reads the
+    /// committed note and folds it. It commits; the race never refuses it.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_fan_in_settle_reads_its_queue_under_the_thread_lock() -> Result<()> {
+        let Some((store, folds, _guard)) = pg_fold_store(FoldMode::Fold).await? else {
+            return Ok(());
+        };
+        let tid = "pg-fold-lock";
+        let (root, children) = leased_wave(&store, tid, 1).await?;
+        ThreadStore::get_or_create(&store, &thread_id(tid), t_plus(61)).await?;
+        let queue = steering_queue(tid)?;
+        let raw = hold_thread_with_a_note(&store, tid, &queue).await?;
+        let writer = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            raw.commit().await?;
+            anyhow::Ok(())
+        };
+        let settle = agent_server::journal::DurableStore::commit(
+            &store,
+            settle_with_steering(&children[0], &root.id, "c1")?,
+            t_plus(64),
+        );
+        let (settled, written) = tokio::join!(settle, writer);
+        written?;
+        settled.map_err(anyhow::Error::from)?;
+
+        assert_eq!(folds.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            stored_output(&row(&store, &children[0].0.id).await?)?,
+            "done c1\n[steering] late"
+        );
+        assert_eq!(
+            doc_value(&store, &queue).await?,
+            Some((2, serde_json::json!({ "notes": [] })))
+        );
+        Ok(())
+    }
+
+    /// Fan-in settles and note writers racing through the store: every
+    /// settle and every note commits (no deadlock, no refusal), and each
+    /// note is either folded into the last result with the queue emptied,
+    /// or still queued after the settle, never both and never lost.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_fan_in_settles_and_note_writers_in_parallel_never_refuse() -> Result<()> {
+        let Some((store, _folds, _guard)) = pg_fold_store(FoldMode::Fold).await? else {
+            return Ok(());
+        };
+        let (mut folded, mut queued) = (0, 0);
+        for round in 0..16 {
+            let tid = format!("pg-fold-race-{round}");
+            let (root, children) = leased_wave(&store, &tid, 1).await?;
+            ThreadStore::get_or_create(&store, &thread_id(&tid), t_plus(61)).await?;
+            let settle = agent_server::journal::DurableStore::commit(
+                &store,
+                settle_with_steering(&children[0], &root.id, "c1")?,
+                t_plus(64),
+            );
+            let (settled, written) = tokio::join!(settle, queue_notes(&store, &tid, &["race"]));
+            settled.map_err(anyhow::Error::from)?;
+            written?;
+            let output = stored_output(&row(&store, &children[0].0.id).await?)?;
+            match (
+                output.as_str(),
+                doc_value(&store, &steering_queue(&tid)?).await?,
+            ) {
+                ("done c1\n[steering] race", Some((2, value)))
+                    if value == serde_json::json!({ "notes": [] }) =>
+                {
+                    folded += 1;
+                }
+                ("done c1", Some((1, value)))
+                    if value == serde_json::json!({ "notes": ["race"] }) =>
+                {
+                    queued += 1;
+                }
+                other => anyhow::bail!("round {round}: the note was lost or doubled: {other:?}"),
+            }
+        }
+        assert_eq!(folded + queued, 16, "folded {folded}, queued {queued}");
+        Ok(())
+    }
+
+    /// C7: the fan-in settle's queue write conflicts (Postgres aborts the
+    /// attempt with a deadlock), so the store retries the transaction. The
+    /// retry calls the pure fold again and commits one queue write; the
+    /// settle is not refused.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_a_retried_fan_in_settle_folds_once() -> Result<()> {
+        let Some((store, folds, _guard)) = pg_fold_store(FoldMode::Fold).await? else {
+            return Ok(());
+        };
+        let tid = "pg-fold-retry";
+        let (root, children) = leased_wave(&store, tid, 1).await?;
+        queue_notes(&store, tid, &["skip the docs crate"]).await?;
+        // A sequence is not rolled back with the aborted attempt, so only
+        // the first queue update fails.
+        for statement in [
+            "CREATE SEQUENCE fold_conflict_once",
+            "CREATE FUNCTION fold_conflict() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF nextval('fold_conflict_once') = 1 THEN \
+             RAISE EXCEPTION 'forced deadlock' USING ERRCODE = '40P01'; END IF; \
+             RETURN NEW; END $$",
+            "CREATE TRIGGER fold_conflict BEFORE UPDATE ON agent_sdk_documents \
+             FOR EACH ROW EXECUTE FUNCTION fold_conflict()",
+        ] {
+            sqlx::query(statement).execute(store.pool()).await?;
+        }
+        agent_server::journal::DurableStore::commit(
+            &store,
+            settle_with_steering(&children[0], &root.id, "c1")?,
+            t_plus(64),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+
+        assert_eq!(store.lock_conflict_retries(), 1, "the attempt was retried");
+        assert_eq!(
+            folds.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the retry folded again"
+        );
+        assert_eq!(
+            stored_output(&row(&store, &children[0].0.id).await?)?,
+            "done c1\n[steering] skip the docs crate"
+        );
+        assert_eq!(
+            doc_value(&store, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] }))),
+            "one queue write committed"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "postgres")]
