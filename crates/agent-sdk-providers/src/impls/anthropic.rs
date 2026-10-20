@@ -96,6 +96,14 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Beta header that opts a request into interleaved (mid-loop) thinking.
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const EFFORT_BETA: &str = "effort-2025-11-24";
+/// The betas below switch no body field this provider sends — they are
+/// Claude Code's agent beta profile (omp's `claudeCodeAgentBetaDefaults`),
+/// part of the OAuth fingerprint, not features this provider exercises.
+const THINKING_TOKEN_COUNT_BETA: &str = "thinking-token-count-2026-05-13";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const PROMPT_CACHING_SCOPE_BETA: &str = "prompt-caching-scope-2026-01-05";
+const MID_CONVERSATION_SYSTEM_BETA: &str = "mid-conversation-system-2026-04-07";
+const FALLBACK_CREDIT_BETA: &str = "fallback-credit-2026-06-01";
 const CLAUDE_CODE_SESSION_ID_HEADER: &str = "X-Claude-Code-Session-Id";
 /// Claude Code (and pi and omp, which reach a subscription the same way)
 /// sends this on every OAuth request.
@@ -556,16 +564,31 @@ impl AnthropicProvider {
             .fold(builder, |b, (k, v)| b.header(k.as_str(), v.as_str()))
     }
 
-    /// The betas Claude Code sends on an agentic first-party request, minus
-    /// those that switch on features this provider does not implement.
+    /// The betas Claude Code sends on an agentic first-party request, in
+    /// omp's `buildClaudeCodeBetas({ agentRequest: true, thinkingRequest:
+    /// true })` order: the agent defaults, `effort` when the body carries
+    /// one, then `fallback-credit`, then the fast-mode beta. The agent
+    /// defaults for features this provider does not exercise
+    /// (`thinking-token-count`, `context-management`,
+    /// `prompt-caching-scope`, `mid-conversation-system`) are part of the
+    /// client fingerprint: they switch no body field this provider sends,
+    /// so their server-side effects stay response-side, where the
+    /// response parser ignores unknown fields.
     fn oauth_betas(&self, effort_on_wire: bool) -> Vec<&'static str> {
         let mut betas = vec![CLAUDE_CODE_BETA, OAUTH_BETA];
         if !self.model.contains("claude-3-") {
             betas.push(INTERLEAVED_THINKING_BETA);
         }
+        betas.extend([
+            THINKING_TOKEN_COUNT_BETA,
+            CONTEXT_MANAGEMENT_BETA,
+            PROMPT_CACHING_SCOPE_BETA,
+            MID_CONVERSATION_SYSTEM_BETA,
+        ]);
         if effort_on_wire {
             betas.push(EFFORT_BETA);
         }
+        betas.push(FALLBACK_CREDIT_BETA);
         betas.extend(self.fast_mode_beta());
         betas
     }
@@ -2542,9 +2565,21 @@ mod tests {
 
     #[test]
     fn oauth_betas_match_claude_code_per_model_family() -> anyhow::Result<()> {
-        const CURRENT: &str =
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
-        let with_effort = format!("{CURRENT},effort-2025-11-24");
+        const AGENT: &str = "claude-code-20250219,oauth-2025-04-20,\
+                             interleaved-thinking-2025-05-14,\
+                             thinking-token-count-2026-05-13,\
+                             context-management-2025-06-27,\
+                             prompt-caching-scope-2026-01-05,\
+                             mid-conversation-system-2026-04-07";
+        const CURRENT: &str = "claude-code-20250219,oauth-2025-04-20,\
+                               interleaved-thinking-2025-05-14,\
+                               thinking-token-count-2026-05-13,\
+                               context-management-2025-06-27,\
+                               prompt-caching-scope-2026-01-05,\
+                               mid-conversation-system-2026-04-07,\
+                               fallback-credit-2026-06-01";
+        // omp pushes `effort` ahead of `fallback-credit`.
+        let with_effort = format!("{AGENT},effort-2025-11-24,fallback-credit-2026-06-01");
         for (model, effort_on_wire, expected) in [
             (MODEL_OPUS_55, false, CURRENT),
             (MODEL_FABLE_51, false, CURRENT),
@@ -2557,7 +2592,12 @@ mod tests {
             (
                 MODEL_HAIKU_35,
                 false,
-                "claude-code-20250219,oauth-2025-04-20",
+                "claude-code-20250219,oauth-2025-04-20,\
+                 thinking-token-count-2026-05-13,\
+                 context-management-2025-06-27,\
+                 prompt-caching-scope-2026-01-05,\
+                 mid-conversation-system-2026-04-07,\
+                 fallback-credit-2026-06-01",
             ),
         ] {
             let provider = AnthropicProvider::new(OAUTH_TEST_TOKEN, model);
