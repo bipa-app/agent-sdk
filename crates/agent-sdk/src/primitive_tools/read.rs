@@ -38,9 +38,9 @@ const BYTES_PER_REQUESTED_LINE: usize = 512;
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum size (in bytes) of a media file (image/PDF) that will be
-/// base64-encoded and attached. Kept smaller than `MAX_FILE_BYTES` because
-/// base64 inflates the payload (~1.33x) before it reaches the model context.
-const MAX_MEDIA_BYTES: usize = 5 * 1024 * 1024;
+/// base64-encoded and attached: the largest whose base64 (~1.33x) fits the
+/// inline attachment budget, so an attached file always reaches the model.
+const MAX_MEDIA_BYTES: usize = agent_sdk_tools::artifacts::INLINE_ATTACHMENT_BUDGET_BYTES / 4 * 3;
 /// Maximum size of a magic-sniffed artifact media attachment. Artifact
 /// recovery is intentionally separate from the smaller filesystem-media cap:
 /// providers accept larger recovered images/PDFs, but metadata is checked
@@ -213,7 +213,9 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
             // binary cannot be inflated into the model context.
             if bytes.len() > MAX_MEDIA_BYTES {
                 return Ok(ToolResult::error(format!(
-                    "Media file '{path}' is {} bytes, which exceeds the {MAX_MEDIA_BYTES}-byte attachment limit",
+                    "Media file '{path}' is {} bytes, which exceeds the {MAX_MEDIA_BYTES}-byte attachment \
+                     limit. To view an image, downscale or re-encode it below that (for example \
+                     to a JPEG of at most 1600 px on its longest side) and read the smaller file.",
                     bytes.len()
                 )));
             }
@@ -1544,6 +1546,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_image_too_large_to_attach_is_refused_with_a_downscale_hint() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file_bytes("frame.png", &vec![0u8; 4 * 1024 * 1024])
+            .await?;
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        let result = tool
+            .execute(&tool_ctx(), json!({"path": "/workspace/frame.png"}))
+            .await?;
+
+        assert!(!result.success, "{}", result.output);
+        assert!(result.output.contains("downscale"), "{}", result.output);
+        assert!(result.documents.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rejects_oversized_media_file() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         let big = vec![0u8; MAX_MEDIA_BYTES + 1];
@@ -1651,7 +1670,7 @@ mod tests {
             artifact_media_capacity(thirty_two_mib + 1)
                 .is_err_and(|error| error.contains("attachment limit"))
         );
-        assert_eq!(MAX_MEDIA_BYTES, 5 * 1024 * 1024);
+        assert_eq!(MAX_MEDIA_BYTES, 3_932_160);
     }
 
     #[tokio::test]
