@@ -829,7 +829,9 @@ where
 ///
 /// Models sometimes send `"case_insensitive": "true"`. A field whose type also
 /// allows `"string"` keeps the string, and nothing else is converted.
-/// Properties are followed through nested objects and array `items`.
+/// Inline `properties` are followed through nested objects and array
+/// `items`; `$ref`, `anyOf` and `oneOf` are not resolved, so a boolean
+/// reached only through one of those is left as sent.
 pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
     match input {
         Value::String(text) if schema_is_boolean_only(schema) => {
@@ -2562,6 +2564,138 @@ mod tests {
         let tool = registry.get("echo").context("echo tool registered")?;
         let result = tool.execute(&ToolContext::new(()), input).await?;
         Ok(serde_json::from_str(&result.output)?)
+    }
+
+    fn flag_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "flag": { "type": "boolean" } }
+        })
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct EchoStage;
+
+    impl ProgressStage for EchoStage {}
+
+    struct AsyncEchoTool;
+
+    impl AsyncTool<()> for AsyncEchoTool {
+        type Name = DynamicToolName;
+        type Stage = EchoStage;
+
+        fn name(&self) -> DynamicToolName {
+            DynamicToolName::new("async_echo")
+        }
+
+        fn description(&self) -> &'static str {
+            "Echoes its input as an async tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            flag_schema()
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolOutcome> {
+            Ok(ToolOutcome::Success(ToolResult::success(input.to_string())))
+        }
+
+        fn check_status(
+            &self,
+            _ctx: &ToolContext<()>,
+            _operation_id: &str,
+        ) -> impl futures::Stream<Item = ToolStatus<EchoStage>> + Send {
+            futures::stream::empty()
+        }
+    }
+
+    struct ListenEchoTool;
+
+    impl ListenExecuteTool<()> for ListenEchoTool {
+        type Name = DynamicToolName;
+
+        fn name(&self) -> DynamicToolName {
+            DynamicToolName::new("listen_echo")
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Listen Echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Echoes its input as a listen snapshot"
+        }
+
+        fn input_schema(&self) -> Value {
+            flag_schema()
+        }
+
+        fn listen(
+            &self,
+            _ctx: &ToolContext<()>,
+            input: Value,
+        ) -> impl futures::Stream<Item = ListenToolUpdate> + Send {
+            futures::stream::iter(vec![ListenToolUpdate::Ready {
+                operation_id: "op_1".to_string(),
+                revision: 1,
+                message: "ready".to_string(),
+                snapshot: input,
+                expires_at: None,
+            }])
+        }
+
+        async fn execute(
+            &self,
+            _ctx: &ToolContext<()>,
+            _operation_id: &str,
+            _expected_revision: u64,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::success("Executed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn async_tools_receive_boolean_strings_as_booleans() -> Result<()> {
+        let mut registry = ToolRegistry::new();
+        registry.register_async(AsyncEchoTool);
+        let tool = registry
+            .get_async("async_echo")
+            .context("async tool registered")?;
+
+        let outcome = tool
+            .execute(&ToolContext::new(()), serde_json::json!({ "flag": "True" }))
+            .await?;
+
+        let ToolOutcome::Success(result) = outcome else {
+            anyhow::bail!("the echo tool always succeeds");
+        };
+        let seen: Value = serde_json::from_str(&result.output)?;
+        assert_eq!(seen, serde_json::json!({ "flag": true }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listen_tools_receive_boolean_strings_as_booleans() -> Result<()> {
+        use futures::StreamExt;
+
+        let mut registry = ToolRegistry::new();
+        registry.register_listen(ListenEchoTool);
+        let tool = registry
+            .get_listen("listen_echo")
+            .context("listen tool registered")?;
+        let ctx = ToolContext::new(());
+
+        let update = tool
+            .listen_stream(&ctx, serde_json::json!({ "flag": "false" }))
+            .next()
+            .await
+            .context("one update")?;
+
+        let ListenToolUpdate::Ready { snapshot, .. } = update else {
+            anyhow::bail!("the echo tool is ready at once");
+        };
+        assert_eq!(snapshot, serde_json::json!({ "flag": false }));
+        Ok(())
     }
 
     #[tokio::test]
