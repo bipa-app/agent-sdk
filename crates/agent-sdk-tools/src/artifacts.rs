@@ -2106,7 +2106,10 @@ mod tests {
         let saved = store
             .apply_inline_budget(&mut result, "read")?
             .expect("an image past the attachment budget spills");
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
         Ok(())
     }
@@ -2123,7 +2126,10 @@ mod tests {
         ]);
 
         assert!(store.apply_inline_budget(&mut result, "mcp")?.is_some());
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 

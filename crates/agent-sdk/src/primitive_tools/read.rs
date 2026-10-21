@@ -1558,7 +1558,10 @@ mod tests {
 
         assert!(!result.success, "{}", result.output);
         assert!(result.output.contains("downscale"), "{}", result.output);
-        assert!(result.documents.is_empty());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 
