@@ -39,6 +39,52 @@ struct GrepInput {
     /// Case insensitive search (default: false)
     #[serde(default, deserialize_with = "super::null_as_default")]
     case_insensitive: bool,
+    /// Lines of context around each match (default: 2)
+    #[serde(default = "default_context", deserialize_with = "deserialize_context")]
+    context: usize,
+    /// Search minified and bundled files too (default: false)
+    #[serde(default, deserialize_with = "super::null_as_default")]
+    include_minified: bool,
+}
+
+const fn default_context() -> usize {
+    2
+}
+
+fn deserialize_context<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<usize>::deserialize(deserializer)
+        .map(|context| context.unwrap_or_else(default_context))
+}
+
+const MAX_RESULTS: usize = 50;
+const MAX_CONTEXT: usize = 10;
+const MAX_OUTPUT_LINES: usize = 200;
+const MAX_LINE_CHARS: usize = 200;
+/// Total bytes read back for context lines; files past it show bare hits.
+const CONTEXT_READ_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Generated files whose hits drown out the source: minified bundles and
+/// their source maps.
+const MINIFIED_SUFFIXES: &[&str] = &[
+    ".min.js",
+    ".min.mjs",
+    ".min.cjs",
+    ".min.css",
+    ".bundle.js",
+    ".js.map",
+    ".mjs.map",
+    ".cjs.map",
+    ".css.map",
+];
+
+fn is_minified_or_bundled(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    MINIFIED_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 const fn default_recursive() -> bool {
@@ -65,7 +111,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
     }
 
     fn description(&self) -> &'static str {
-        "Search for a regex pattern in files. Returns matching lines with file paths and line numbers."
+        "Search for a regex pattern in files. Returns matching lines as path:line:text with 2 lines of context as path-line-text (set context, 0 to turn it off). Minified and bundled files (*.min.js, *.js.map, …) are skipped unless include_minified is true."
     }
 
     fn tier(&self) -> ToolTier {
@@ -99,6 +145,16 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
                 "case_insensitive": {
                     "type": "boolean",
                     "description": "Case insensitive search. Default: false"
+                },
+                "context": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_CONTEXT,
+                    "description": "Lines of context before and after each match. Default: 2; 0 shows bare matches"
+                },
+                "include_minified": {
+                    "type": "boolean",
+                    "description": "Also search minified and bundled files (*.min.js, *.min.css, *.bundle.js, source maps). Default: false"
                 }
             },
             "required": ["pattern"]
@@ -153,44 +209,143 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
             .context("Failed to execute grep")?;
 
         // Filter out matches in files the agent can't read
-        let accessible_matches: Vec<_> = matches
+        let (minified, matches): (Vec<_>, Vec<_>) = matches
             .into_iter()
             .filter(|m| self.ctx.capabilities.check_read(&m.path).is_ok())
-            .collect();
+            .partition(|m| !input.include_minified && is_minified_or_bundled(&m.path));
+        let skipped_note = (!minified.is_empty()).then(|| {
+            format!(
+                "{} matches in minified or bundled files were skipped; set include_minified: true to see them.",
+                minified.len()
+            )
+        });
 
-        if accessible_matches.is_empty() {
-            return Ok(ToolResult::success(format!(
-                "No matches found for pattern '{}'",
-                input.pattern
-            )));
+        if matches.is_empty() {
+            let output = skipped_note.map_or_else(
+                || format!("No matches found for pattern '{}'", input.pattern),
+                |note| format!("No matches found for pattern '{}' ({note})", input.pattern),
+            );
+            return Ok(ToolResult::success(output));
         }
 
-        let count = accessible_matches.len();
-        let max_results = 50;
-
-        let output_lines: Vec<String> = accessible_matches
-            .iter()
-            .take(max_results)
-            .map(|m| {
-                format!(
-                    "{}:{}:{}",
-                    m.path,
-                    m.line_number,
-                    truncate_line(&m.line_content, 200)
-                )
-            })
-            .collect();
-
-        let output = if count > max_results {
+        let count = matches.len();
+        let rendered = self
+            .render_matches(
+                &matches[..count.min(MAX_RESULTS)],
+                input.context.min(MAX_CONTEXT),
+            )
+            .await;
+        let mut output = if rendered.shown < count {
             format!(
-                "Found {count} matches (showing first {max_results}):\n{}",
-                output_lines.join("\n")
+                "Found {count} matches (showing first {}):\n",
+                rendered.shown
             )
         } else {
-            format!("Found {count} matches:\n{}", output_lines.join("\n"))
+            format!("Found {count} matches:\n")
         };
+        output.push_str(&rendered.lines.join("\n"));
+        for note in rendered.note.into_iter().chain(skipped_note) {
+            output.push('\n');
+            output.push_str(&note);
+        }
 
         Ok(ToolResult::success(output))
+    }
+}
+
+struct RenderedMatches {
+    lines: Vec<String>,
+    shown: usize,
+    note: Option<String>,
+}
+
+impl<E: Environment> GrepTool<E> {
+    /// Render matches as `path:line:text`, with `context` lines on each side
+    /// as `path-line-text` and `--` between ranges that do not touch, within
+    /// [`MAX_OUTPUT_LINES`]. A file whose text cannot be read back, or past
+    /// [`CONTEXT_READ_BUDGET_BYTES`], keeps its bare hits.
+    async fn render_matches(
+        &self,
+        matches: &[crate::environment::GrepMatch],
+        context: usize,
+    ) -> RenderedMatches {
+        let mut files: Vec<(&str, Vec<&crate::environment::GrepMatch>)> = Vec::new();
+        for m in matches {
+            match files.iter_mut().find(|(path, _)| *path == m.path) {
+                Some((_, hits)) => hits.push(m),
+                None => files.push((m.path.as_str(), vec![m])),
+            }
+        }
+
+        let mut rendered = RenderedMatches {
+            lines: Vec::new(),
+            shown: 0,
+            note: None,
+        };
+        let mut read_bytes = 0_usize;
+        for (path, mut hits) in files {
+            hits.sort_by_key(|m| m.line_number);
+            let text = if context == 0 {
+                None
+            } else if read_bytes > CONTEXT_READ_BUDGET_BYTES {
+                rendered.note.get_or_insert_with(|| {
+                    "Context was left out for later files: the context read budget ran out."
+                        .to_owned()
+                });
+                None
+            } else {
+                let text = self.ctx.environment.read_file(path).await.ok();
+                read_bytes = read_bytes.saturating_add(text.as_ref().map_or(0, String::len));
+                text
+            };
+            let file_lines: Vec<&str> = text
+                .as_deref()
+                .map_or_else(Vec::new, |t| t.lines().collect());
+            let width = if file_lines.is_empty() { 0 } else { context };
+
+            let mut ranges: Vec<(usize, usize, Vec<&crate::environment::GrepMatch>)> = Vec::new();
+            for m in hits {
+                let start = m.line_number.saturating_sub(width).max(1);
+                let end = m
+                    .line_number
+                    .saturating_add(width)
+                    .min(file_lines.len().max(m.line_number));
+                match ranges.last_mut() {
+                    Some((_, last_end, group))
+                        if width > 0 && start <= last_end.saturating_add(1) =>
+                    {
+                        *last_end = (*last_end).max(end);
+                        group.push(m);
+                    }
+                    _ => ranges.push((start, end, vec![m])),
+                }
+            }
+
+            for (start, end, group) in ranges {
+                let needed = end - start + 1 + usize::from(width > 0 && !rendered.lines.is_empty());
+                if rendered.lines.len() + needed > MAX_OUTPUT_LINES {
+                    return rendered;
+                }
+                if width > 0 && !rendered.lines.is_empty() {
+                    rendered.lines.push("--".to_owned());
+                }
+                for line_number in start..=end {
+                    if let Some(hit) = group.iter().find(|m| m.line_number == line_number) {
+                        rendered.lines.push(format!(
+                            "{path}:{line_number}:{}",
+                            truncate_line(&hit.line_content, MAX_LINE_CHARS)
+                        ));
+                        rendered.shown += 1;
+                    } else if let Some(text) = file_lines.get(line_number - 1) {
+                        rendered.lines.push(format!(
+                            "{path}-{line_number}-{}",
+                            truncate_line(text, MAX_LINE_CHARS)
+                        ));
+                    }
+                }
+            }
+        }
+        rendered
     }
 }
 
@@ -556,6 +711,127 @@ mod tests {
 
         assert!(result.success);
         assert!(result.output.contains("..."));
+        Ok(())
+    }
+
+    async fn grep_output(fs: Arc<InMemoryFileSystem>, input: Value) -> anyhow::Result<String> {
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        let result = tool.execute(&tool_ctx(), input).await?;
+        assert!(result.success, "{}", result.output);
+        Ok(result.output)
+    }
+
+    #[tokio::test]
+    async fn grep_shows_two_lines_of_context_by_default_and_merges_overlaps() -> anyhow::Result<()>
+    {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let mut body: Vec<String> = (1..=14).map(|n| format!("line {n}")).collect();
+        body[3] = "hit four".to_owned();
+        body[5] = "hit six".to_owned();
+        body[11] = "hit twelve".to_owned();
+        fs.write_file("src.txt", &body.join("\n")).await?;
+
+        let output = grep_output(fs, json!({"pattern": "hit"})).await?;
+
+        assert_eq!(
+            output,
+            "Found 3 matches:\n\
+             /workspace/src.txt-2-line 2\n\
+             /workspace/src.txt-3-line 3\n\
+             /workspace/src.txt:4:hit four\n\
+             /workspace/src.txt-5-line 5\n\
+             /workspace/src.txt:6:hit six\n\
+             /workspace/src.txt-7-line 7\n\
+             /workspace/src.txt-8-line 8\n\
+             --\n\
+             /workspace/src.txt-10-line 10\n\
+             /workspace/src.txt-11-line 11\n\
+             /workspace/src.txt:12:hit twelve\n\
+             /workspace/src.txt-13-line 13\n\
+             /workspace/src.txt-14-line 14"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grep_context_zero_prints_bare_hits() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("a.txt", "one\nhit\nthree").await?;
+        fs.write_file("b.txt", "hit").await?;
+
+        let output = grep_output(fs, json!({"pattern": "hit", "context": 0})).await?;
+
+        assert!(
+            !output.contains("one") && !output.contains("--"),
+            "{output}"
+        );
+        assert!(output.contains("/workspace/a.txt:2:hit"), "{output}");
+        assert!(output.contains("/workspace/b.txt:1:hit"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grep_skips_minified_and_bundled_files_unless_asked() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("src/list.ts", "export const WHITE_LISTED = [];")
+            .await?;
+        fs.write_file("dist/index.js.map", "{\"WHITE_LISTED\":1}")
+            .await?;
+        fs.write_file("dist/app.min.js", "var WHITE_LISTED=1")
+            .await?;
+
+        let output = grep_output(Arc::clone(&fs), json!({"pattern": "WHITE_LISTED"})).await?;
+        assert!(output.starts_with("Found 1 matches:"), "{output}");
+        assert!(output.contains("/workspace/src/list.ts:1:"), "{output}");
+        assert!(!output.contains("dist/"), "{output}");
+        assert!(
+            output.contains("2 matches in minified or bundled files were skipped")
+                && output.contains("include_minified"),
+            "{output}"
+        );
+
+        let output = grep_output(
+            Arc::clone(&fs),
+            json!({"pattern": "WHITE_LISTED", "include_minified": true}),
+        )
+        .await?;
+        assert!(output.starts_with("Found 3 matches:"), "{output}");
+        assert!(!output.contains("skipped"), "{output}");
+
+        let output = grep_output(fs, json!({"pattern": "nothing-matches-this"})).await?;
+        assert!(output.starts_with("No matches found"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grep_caps_output_lines_when_context_widens_it() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let body: Vec<String> = (0..60)
+            .map(|n| format!("hit {n}\nfill\nfill\nfill\nfill"))
+            .collect();
+        fs.write_file("many.txt", &body.join("\n")).await?;
+
+        let output = grep_output(fs, json!({"pattern": "hit"})).await?;
+
+        assert!(output.lines().count() <= MAX_OUTPUT_LINES + 1, "{output}");
+        assert!(
+            output.starts_with("Found 60 matches (showing first "),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grep_input_defaults_and_bounds_context() -> anyhow::Result<()> {
+        assert_eq!(parse_grep_input(json!({"pattern": "x"}))?.context, 2);
+        assert_eq!(
+            parse_grep_input(json!({"pattern": "x", "context": null}))?.context,
+            2
+        );
+        assert_eq!(
+            parse_grep_input(json!({"pattern": "x", "context": 0}))?.context,
+            0
+        );
         Ok(())
     }
 }
