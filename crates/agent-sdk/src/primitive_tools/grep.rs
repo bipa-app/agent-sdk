@@ -62,6 +62,9 @@ where
 const MAX_RESULTS: usize = 50;
 const MAX_CONTEXT: usize = 10;
 const MAX_OUTPUT_LINES: usize = 200;
+/// Keeps a default search under the inline output budget (50 KiB), so it is
+/// never spilled to an artifact.
+const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 const MAX_LINE_CHARS: usize = 200;
 /// Total bytes read back for context lines; files past it show bare hits.
 const CONTEXT_READ_BUDGET_BYTES: usize = 32 * 1024 * 1024;
@@ -208,22 +211,33 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
             .await
             .context("Failed to execute grep")?;
 
+        // A file named on its own is searched whatever its name: asking for
+        // it is the request to see it.
+        let skip_minified = !input.include_minified
+            && !self
+                .ctx
+                .environment
+                .is_file(&search_path)
+                .await
+                .unwrap_or(false);
+
         // Filter out matches in files the agent can't read
         let (minified, matches): (Vec<_>, Vec<_>) = matches
             .into_iter()
             .filter(|m| self.ctx.capabilities.check_read(&m.path).is_ok())
-            .partition(|m| !input.include_minified && is_minified_or_bundled(&m.path));
-        let skipped_note = (!minified.is_empty()).then(|| {
-            format!(
-                "{} matches in minified or bundled files were skipped; set include_minified: true to see them.",
-                minified.len()
-            )
-        });
+            .partition(|m| skip_minified && is_minified_or_bundled(&m.path));
+        let skipped_note = (!minified.is_empty())
+            .then(|| minified_note(minified.len(), minified.len() + matches.len()));
 
         if matches.is_empty() {
             let output = skipped_note.map_or_else(
                 || format!("No matches found for pattern '{}'", input.pattern),
-                |note| format!("No matches found for pattern '{}' ({note})", input.pattern),
+                |note| {
+                    format!(
+                        "No matches outside minified or bundled files for pattern '{}'. {note}",
+                        input.pattern
+                    )
+                },
             );
             return Ok(ToolResult::success(output));
         }
@@ -233,15 +247,18 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
             .render_matches(
                 &matches[..count.min(MAX_RESULTS)],
                 input.context.min(MAX_CONTEXT),
+                CONTEXT_READ_BUDGET_BYTES,
             )
             .await;
-        let mut output = if rendered.shown < count {
-            format!(
-                "Found {count} matches (showing first {}):\n",
-                rendered.shown
-            )
+        let found = if skipped_note.is_some() {
+            format!("Found {count} matches outside minified or bundled files")
         } else {
-            format!("Found {count} matches:\n")
+            format!("Found {count} matches")
+        };
+        let mut output = if rendered.shown < count {
+            format!("{found} (showing first {}):\n", rendered.shown)
+        } else {
+            format!("{found}:\n")
         };
         output.push_str(&rendered.lines.join("\n"));
         for note in rendered.note.into_iter().chain(skipped_note) {
@@ -253,16 +270,48 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for GrepToo
     }
 }
 
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
+/// The note for results dropped as minified or bundled. The search behind
+/// `grep` may stop at a result cap before it reaches other files, so the
+/// note never claims that nothing else matched.
+fn minified_note(skipped: usize, returned: usize) -> String {
+    format!(
+        "{skipped} of the {} the search returned {} in minified or bundled files \
+         (*.min.js, source maps, ...) and {} skipped. The search stops at a result cap, so \
+         it may not have reached other files: narrow `path` to the source directory, or set \
+         include_minified: true to see the skipped results.",
+        plural(returned, "result", "results"),
+        if skipped == 1 { "was" } else { "were" },
+        if skipped == 1 { "was" } else { "were" },
+    )
+}
+
 struct RenderedMatches {
     lines: Vec<String>,
+    bytes: usize,
     shown: usize,
     note: Option<String>,
     /// Lines up to the last shown match and its trailing context; a render
-    /// cut at the cap ends there, never on context for a match it dropped.
+    /// cut at a cap ends there, never on context for a match it dropped.
     complete_len: usize,
 }
 
 impl RenderedMatches {
+    /// Append `line` unless it would pass [`MAX_OUTPUT_LINES`] or
+    /// [`MAX_OUTPUT_BYTES`].
+    fn push(&mut self, line: String) -> bool {
+        let bytes = self.bytes + line.len() + 1;
+        if self.lines.len() >= MAX_OUTPUT_LINES || bytes > MAX_OUTPUT_BYTES {
+            return false;
+        }
+        self.bytes = bytes;
+        self.lines.push(line);
+        true
+    }
+
     fn cut(mut self) -> Self {
         self.lines.truncate(self.complete_len);
         self
@@ -272,12 +321,14 @@ impl RenderedMatches {
 impl<E: Environment> GrepTool<E> {
     /// Render matches as `path:line:text`, with `context` lines on each side
     /// as `path-line-text` and `--` between ranges that do not touch, within
-    /// [`MAX_OUTPUT_LINES`]. A file whose text cannot be read back, or past
-    /// [`CONTEXT_READ_BUDGET_BYTES`], keeps its bare hits.
+    /// [`MAX_OUTPUT_LINES`] and [`MAX_OUTPUT_BYTES`]. A file whose text cannot
+    /// be read back, or that comes after `read_budget` bytes were read back,
+    /// keeps its bare hits.
     async fn render_matches(
         &self,
         matches: &[crate::environment::GrepMatch],
         context: usize,
+        read_budget: usize,
     ) -> RenderedMatches {
         let mut files: Vec<(&str, Vec<&crate::environment::GrepMatch>)> = Vec::new();
         for m in matches {
@@ -289,6 +340,7 @@ impl<E: Environment> GrepTool<E> {
 
         let mut rendered = RenderedMatches {
             lines: Vec::new(),
+            bytes: 0,
             shown: 0,
             note: None,
             complete_len: 0,
@@ -298,7 +350,7 @@ impl<E: Environment> GrepTool<E> {
             hits.sort_by_key(|m| m.line_number);
             let text = if context == 0 {
                 None
-            } else if read_bytes > CONTEXT_READ_BUDGET_BYTES {
+            } else if read_bytes > read_budget {
                 rendered.note.get_or_insert_with(|| {
                     "Context was left out for later files: the context read budget ran out."
                         .to_owned()
@@ -332,32 +384,41 @@ impl<E: Environment> GrepTool<E> {
                 }
             }
 
-            let mut last_hit = 0_usize;
+            let mut last_hit: Option<usize> = None;
             for (start, end, group) in ranges {
-                if width > 0 && !rendered.lines.is_empty() {
-                    if rendered.lines.len() + 1 >= MAX_OUTPUT_LINES {
-                        return rendered.cut();
-                    }
-                    rendered.lines.push("--".to_owned());
+                if width > 0 && !rendered.lines.is_empty() && !rendered.push("--".to_owned()) {
+                    return rendered.cut();
                 }
                 for line_number in start..=end {
-                    if rendered.lines.len() >= MAX_OUTPUT_LINES {
+                    let hit = group.iter().find(|m| m.line_number == line_number);
+                    let line = hit.map_or_else(
+                        || {
+                            file_lines.get(line_number - 1).map(|text| {
+                                format!(
+                                    "{path}-{line_number}-{}",
+                                    truncate_line(text, MAX_LINE_CHARS)
+                                )
+                            })
+                        },
+                        |hit| {
+                            Some(format!(
+                                "{path}:{line_number}:{}",
+                                truncate_line(&hit.line_content, MAX_LINE_CHARS)
+                            ))
+                        },
+                    );
+                    let is_hit = hit.is_some();
+                    let Some(line) = line else {
+                        continue;
+                    };
+                    if !rendered.push(line) {
                         return rendered.cut();
                     }
-                    if let Some(hit) = group.iter().find(|m| m.line_number == line_number) {
-                        rendered.lines.push(format!(
-                            "{path}:{line_number}:{}",
-                            truncate_line(&hit.line_content, MAX_LINE_CHARS)
-                        ));
+                    if is_hit {
                         rendered.shown += 1;
-                        last_hit = line_number;
-                    } else if let Some(text) = file_lines.get(line_number - 1) {
-                        rendered.lines.push(format!(
-                            "{path}-{line_number}-{}",
-                            truncate_line(text, MAX_LINE_CHARS)
-                        ));
+                        last_hit = Some(line_number);
                     }
-                    if line_number <= last_hit.saturating_add(width) {
+                    if last_hit.is_some_and(|hit| line_number <= hit.saturating_add(width)) {
                         rendered.complete_len = rendered.lines.len();
                     }
                 }
@@ -367,8 +428,10 @@ impl<E: Environment> GrepTool<E> {
     }
 }
 
+/// Cut a line to `max_len` bytes. Leading whitespace is kept, so a line
+/// copied from the output into an `edit` still matches the file.
 fn truncate_line(s: &str, max_len: usize) -> String {
-    let trimmed = s.trim();
+    let trimmed = s.trim_end();
     if trimmed.len() <= max_len {
         trimmed.to_string()
     } else {
@@ -712,7 +775,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_line_function() {
         assert_eq!(truncate_line("short", 10), "short");
-        assert_eq!(truncate_line("  trimmed  ", 10), "trimmed");
+        assert_eq!(truncate_line("  indented  ", 10), "  indented");
         assert_eq!(truncate_line("this is a longer line", 10), "this is a ...");
     }
 
@@ -799,12 +862,16 @@ mod tests {
             .await?;
 
         let output = grep_output(Arc::clone(&fs), json!({"pattern": "WHITE_LISTED"})).await?;
-        assert!(output.starts_with("Found 1 matches:"), "{output}");
+        assert!(
+            output.starts_with("Found 1 matches outside minified or bundled files:"),
+            "{output}"
+        );
         assert!(output.contains("/workspace/src/list.ts:1:"), "{output}");
         assert!(!output.contains("dist/"), "{output}");
         assert!(
-            output.contains("2 matches in minified or bundled files were skipped")
-                && output.contains("include_minified"),
+            output.contains("2 of the 3 results the search returned were in minified or bundled")
+                && output.contains("narrow `path`")
+                && output.contains("include_minified: true"),
             "{output}"
         );
 
@@ -818,6 +885,167 @@ mod tests {
 
         let output = grep_output(fs, json!({"pattern": "nothing-matches-this"})).await?;
         assert!(output.starts_with("No matches found"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_minified_results_never_read_as_no_matches() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("dist/chunk.min.js", "renderWidget()").await?;
+
+        let output = grep_output(fs, json!({"pattern": "renderWidget"})).await?;
+
+        assert!(!output.contains("No matches found"), "{output}");
+        assert!(
+            output.starts_with("No matches outside minified or bundled files")
+                && output.contains("1 of the 1 result the search returned was in minified")
+                && output.contains("result cap"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_minified_file_named_as_the_path_is_searched() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("vendor/lib.min.js", "var needle=1").await?;
+
+        let output = grep_output(
+            fs,
+            json!({"pattern": "needle", "path": "vendor/lib.min.js"}),
+        )
+        .await?;
+
+        assert!(output.starts_with("Found 1 matches:"), "{output}");
+        assert!(
+            output.contains("/workspace/vendor/lib.min.js:1:"),
+            "{output}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_keeps_indentation() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file(
+            "a.py",
+            "def f(x):\n    if x:\n        return needle\n    else:\n        pass",
+        )
+        .await?;
+
+        let output = grep_output(fs, json!({"pattern": "needle"})).await?;
+
+        assert!(output.contains("/workspace/a.py-2-    if x:"), "{output}");
+        assert!(
+            output.contains("/workspace/a.py:3:        return needle"),
+            "{output}"
+        );
+        assert!(output.contains("/workspace/a.py-4-    else:"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_is_clamped_to_ten_lines() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let body: Vec<String> = (1..=40)
+            .map(|n| {
+                if n == 20 {
+                    "hit".to_owned()
+                } else {
+                    format!("line {n}")
+                }
+            })
+            .collect();
+        fs.write_file("c.txt", &body.join("\n")).await?;
+
+        let output = grep_output(fs, json!({"pattern": "hit", "context": 1000})).await?;
+
+        assert_eq!(output.lines().count(), 1 + 21, "{output}");
+        assert!(output.contains("/workspace/c.txt-10-line 10"), "{output}");
+        assert!(!output.contains("/workspace/c.txt-9-"), "{output}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn context_reads_stop_at_the_read_budget() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("a.txt", "before\nhit\nafter").await?;
+        fs.write_file("b.txt", "before\nhit\nafter").await?;
+        let matches = fs.grep("hit", "/workspace", true).await?;
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        let rendered = tool.render_matches(&matches, 2, 1).await;
+
+        assert_eq!(rendered.shown, 2);
+        let context_lines = rendered
+            .lines
+            .iter()
+            .filter(|line| line.ends_with("-before"))
+            .count();
+        assert_eq!(context_lines, 1, "{:?}", rendered.lines);
+        assert!(
+            rendered
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("read budget")),
+            "{:?}",
+            rendered.note
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cut_render_never_ends_on_the_next_files_leading_context() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        // 33 separate five-line ranges and their separators fill 197 lines;
+        // the cap then falls inside b's leading context (`--`, b 1, b 2).
+        let a: Vec<String> = (1..=400)
+            .map(|n| {
+                if n % 10 == 5 && n < 330 {
+                    format!("hit {n}")
+                } else {
+                    format!("fill {n}")
+                }
+            })
+            .collect();
+        fs.write_file("a.txt", &a.join("\n")).await?;
+        fs.write_file(
+            "b.txt",
+            "b one\nb two\nhit in b\nb four\nb five\nb six\nb seven",
+        )
+        .await?;
+        let mut matches = fs.grep("hit", "/workspace/a.txt", true).await?;
+        matches.extend(fs.grep("hit", "/workspace/b.txt", true).await?);
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        let rendered = tool.render_matches(&matches, 2, usize::MAX).await;
+
+        let last = rendered.lines.last().cloned().unwrap_or_default();
+        assert!(last.starts_with("/workspace/a.txt-"), "{last}");
+        assert!(
+            rendered.lines.iter().all(|line| !line.contains("b.txt")),
+            "{last}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_stays_within_the_byte_bound() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        let long = "x".repeat(190);
+        let body: Vec<String> = (0..50)
+            .map(|n| format!("hit {n} {long}\n{long}\n{long}"))
+            .collect();
+        fs.write_file(
+            "a/deeply/nested/directory/with/a/long/name/for/the/output/budget/file.txt",
+            &body.join("\n"),
+        )
+        .await?;
+
+        let output = grep_output(fs, json!({"pattern": "hit"})).await?;
+
+        assert!(output.len() <= MAX_OUTPUT_BYTES + 200, "{}", output.len());
+        assert!(output.contains("(showing first "), "{}", &output[..200]);
         Ok(())
     }
 
