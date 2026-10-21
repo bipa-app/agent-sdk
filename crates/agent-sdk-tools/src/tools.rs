@@ -824,11 +824,9 @@ where
     serde_json::from_value(raw).map_err(|error| invalid_tool_input_result(tool_name, &error))
 }
 
-/// Replace scalar strings the schema types otherwise: `"true"`/`"false"`
-/// where it allows only a boolean ([`coerce_boolean_strings`]) and exact
-/// integer strings where it allows only an integer
-/// ([`coerce_integer_strings`]).
+/// Replace scalar strings with the booleans and integers `schema` asks for.
 ///
+/// Applies [`coerce_boolean_strings`] and [`coerce_integer_strings`].
 /// Models often send `"limit": "25"` or `"case_insensitive": "true"`.
 pub fn coerce_tool_input(schema: &Value, input: &mut Value) {
     coerce_leaves(schema, input, &|schema, text| {
@@ -847,10 +845,11 @@ pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
     coerce_leaves(schema, input, &boolean_from);
 }
 
-/// Replace exact integer strings (`"25"`, `"-3"`) with integers wherever
-/// `schema` types the value as integer only, with the same reach as
-/// [`coerce_boolean_strings`]. Signs, spaces, decimals, exponents and values
-/// outside `i64`/`u64` stay strings.
+/// Replace exact integer strings (`"25"`, `"-3"`) with integers.
+///
+/// Only where `schema` types the value as integer only, with the same reach
+/// as [`coerce_boolean_strings`]. Signs, spaces, decimals, exponents and
+/// values outside `i64`/`u64` stay strings.
 pub fn coerce_integer_strings(schema: &Value, input: &mut Value) {
     coerce_leaves(schema, input, &integer_from);
 }
