@@ -561,8 +561,8 @@ pub use stores::sqlite::SqliteStore;
 pub use tools::{
     AsyncTool, DynamicToolName, PrimitiveToolName, ProgressStage, SimpleTool, SimpleToolAdapter,
     Tool, ToolContext, ToolLogic, ToolName, ToolRegistry, ToolStatus, TypedTool, TypedToolAdapter,
-    coerce_boolean_strings, invalid_tool_input_result, stage_to_string, tool_name_from_str,
-    tool_name_to_string, validate_tool_input,
+    coerce_boolean_strings, coerce_integer_strings, coerce_tool_input, invalid_tool_input_result,
+    stage_to_string, tool_name_from_str, tool_name_to_string, validate_tool_input,
 };
 
 // ── Ergonomics macros (Phase 13·E) ───────────────────────────────────
