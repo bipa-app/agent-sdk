@@ -241,6 +241,10 @@ jobs:
           - "--no-default-features --features anthropic,structured-output"
           - "--no-default-features --features anthropic,tls-rustls"
           - "--no-default-features --features anthropic,tls-native-tls,tls-rustls"
+          # The Codex WebSocket's bundled-root connector has one arm per
+          # backend (agent-sdk-providers `tls_roots`).
+          - "--no-default-features --features openai-codex,tls-native-tls"
+          - "--no-default-features --features openai-codex,tls-rustls"
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@stable
