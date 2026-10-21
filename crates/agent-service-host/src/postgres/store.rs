@@ -3147,9 +3147,11 @@ WHERE parent_id = $1
             let mut child = locked.remove(child_id).with_context(|| {
                 format!("repark rejected: duplicate re-attach child {child_id}")
             })?;
-            child.spawn_index =
-                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
-            child.updated_at = now;
+            child.reattach_to_batch(
+                u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?,
+                &payload.continuation,
+                now,
+            );
             child
                 .validate()
                 .context("repark rejected: re-attach child validate failed")?;
@@ -4518,6 +4520,7 @@ async fn lock_reattached_children_tx<'a>(
 fn prepare_reattached_rows(
     mut locked: BTreeMap<AgentTaskId, AgentTask>,
     reattach: Vec<ReattachedChild>,
+    continuation: &ContinuationEnvelope,
     now: OffsetDateTime,
 ) -> Result<Vec<AgentTask>> {
     let mut rows = Vec::with_capacity(reattach.len());
@@ -4528,8 +4531,7 @@ fn prepare_reattached_rows(
                 attached.child_id
             )
         })?;
-        child.spawn_index = Some(attached.spawn_index);
-        child.updated_at = now;
+        child.reattach_to_batch(attached.spawn_index, continuation, now);
         child
             .validate()
             .context("spawn rejected: re-attach child validate failed")?;
@@ -5601,7 +5603,8 @@ impl PostgresDurableStore {
             ensure_spawn_task_id_available_tx(tx, &child.id, "child").await?;
             tool_rows.push(child);
         }
-        let reattached_rows = prepare_reattached_rows(locked_reattach, reattach, now)?;
+        let reattached_rows =
+            prepare_reattached_rows(locked_reattach, reattach, &payload.continuation, now)?;
         hold_tool_children_behind_siblings(
             &mut tool_rows,
             &reattached_rows,

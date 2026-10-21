@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed: a child paused on a confirmation keeps naming its call across a steering re-park
+
+- A steering re-park (`repark_after_steering`) and a respawn that
+  re-attaches surviving children
+  (`spawn_mixed_children`, a `MixedChildrenSpawn` with `reattach`) give
+  each survivor its slot in the parent's new batch. A survivor paused
+  on a confirmation kept the continuation of the batch it paused in, so
+  every reader that resolves its call as `continuation.pending_tool_calls
+  [spawn_index]` (the task snapshot, `confirmation_guard::awaited_call`,
+  prompt classification) found a finished sibling's call, or none. The
+  snapshot then failed with "awaiting confirmation names no pending tool",
+  the confirmation could not be decided, and the calls held behind it
+  never started, so the turn never ended.
+- The new `AgentTask::reattach_to_batch(spawn_index, continuation, now)`
+  moves such a child onto the new batch's continuation along with its
+  index. All three stores (memory, SQLite, Postgres) use it on both
+  paths. No schema, protocol or `.sqlx` change.
+- Conformance: `steering_repark_keeps_a_paused_confirmation_on_its_call`
+  and `steering_respawn_keeps_a_paused_confirmation_on_its_call`, on every
+  backend.
+
 ### Journal: a fan-in settle folds its parent's queued steering into the wave's last result
 
 - `Write::EnqueueSteeringResume` with `SteeringInput::Queued` after a

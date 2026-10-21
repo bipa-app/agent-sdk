@@ -2137,9 +2137,11 @@ LIMIT 1
                     "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
                 ));
             }
-            child.spawn_index =
-                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
-            child.updated_at = now;
+            child.reattach_to_batch(
+                u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?,
+                &payload.continuation,
+                now,
+            );
             child
                 .validate()
                 .context("repark rejected: re-attach child validate failed")?;
@@ -3670,7 +3672,7 @@ async fn prepare_subagent_batch_rows_tx(
 async fn prepare_mixed_tool_and_reattach_rows_tx(
     tx: &mut Transaction<'_, Sqlite>,
     old_parent: &AgentTask,
-    parent_id: &AgentTaskId,
+    continuation: &ContinuationEnvelope,
     tool_children: &[ToolChildSpawn],
     reattach: Vec<ReattachedChild>,
     child_otel_traceparent: Option<&str>,
@@ -3706,12 +3708,12 @@ async fn prepare_mixed_tool_and_reattach_rows_tx(
                 )
             })?;
         ensure!(
-            child.parent_id.as_ref() == Some(parent_id),
-            "spawn rejected: re-attach child {} is not a child of {parent_id}",
-            attached.child_id
+            child.parent_id.as_ref() == Some(&old_parent.id),
+            "spawn rejected: re-attach child {} is not a child of {}",
+            attached.child_id,
+            old_parent.id
         );
-        child.spawn_index = Some(attached.spawn_index);
-        child.updated_at = now;
+        child.reattach_to_batch(attached.spawn_index, continuation, now);
         child
             .validate()
             .context("spawn rejected: re-attach child validate failed")?;
@@ -4694,13 +4696,12 @@ impl SqliteDurableStore {
             child_otel_traceparent,
         } = spawn;
         let has_precompleted = has_precompleted_tool_child(&tool_children);
-        let parent_id = old_parent.id.clone();
 
         let prepared = prepare_subagent_batch_rows_tx(tx, &old_parent, subagents, now).await?;
         let (tool_rows, reattached_rows) = prepare_mixed_tool_and_reattach_rows_tx(
             tx,
             &old_parent,
-            &parent_id,
+            &payload.continuation,
             &tool_children,
             reattach,
             child_otel_traceparent.as_deref(),

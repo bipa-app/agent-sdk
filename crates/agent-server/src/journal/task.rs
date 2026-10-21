@@ -2096,6 +2096,31 @@ impl AgentTask {
         Ok(self)
     }
 
+    /// Carry this live child into its parent's next batch at `spawn_index`,
+    /// whose continuation is `continuation`.
+    ///
+    /// A child paused on a confirmation keeps the continuation of the batch
+    /// it paused in, and every reader of the pause (the snapshot, the
+    /// confirmation guard, prompt classification) finds the awaited call
+    /// there by `spawn_index`. Re-indexing without moving it to the new
+    /// batch's continuation would name a sibling's call, or none.
+    pub fn reattach_to_batch(
+        &mut self,
+        spawn_index: u32,
+        continuation: &ContinuationEnvelope,
+        now: OffsetDateTime,
+    ) {
+        self.spawn_index = Some(spawn_index);
+        if let TaskState::AwaitingConfirmation {
+            continuation: paused_in,
+            ..
+        } = &mut self.state
+        {
+            **paused_in = continuation.clone();
+        }
+        self.updated_at = now;
+    }
+
     /// Pause a running task on an out-of-band confirmation. Drops the
     /// lease and stores the typed [`TaskState::AwaitingConfirmation`]
     /// payload that the resume path will read back on the way out of
