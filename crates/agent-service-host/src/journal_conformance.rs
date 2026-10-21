@@ -44,6 +44,8 @@ mod tests {
         for case in [
             "mixed_batch_spawns_subagents_and_tools",
             "attached_tool_batch_accepts_empty_spawn_events",
+            "steering_repark_keeps_a_paused_confirmation_on_its_call",
+            "steering_respawn_keeps_a_paused_confirmation_on_its_call",
             "mixed_batch_child_ids_follow_slot_order",
             "mixed_batch_losing_cas_spawns_nothing",
             "mixed_batch_rejects_cancelled_parent",

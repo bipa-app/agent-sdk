@@ -1760,6 +1760,232 @@ async fn case_attached_tool_batch_accepts_empty_spawn_events<S: JournalStore>(
     Ok(())
 }
 
+// ── steering: a child paused on a confirmation keeps naming its call ──
+
+/// The id of the call `task` awaits, read the way every reader of a
+/// confirmation pause reads it: its continuation's call at its
+/// `spawn_index`.
+fn awaited_call_id(task: &AgentTask) -> Option<&str> {
+    let continuation = task.state.continuation()?;
+    let index = usize::try_from(task.spawn_index?).ok()?;
+    continuation
+        .payload
+        .pending_tool_calls
+        .get(index)
+        .map(|call| call.id.as_str())
+}
+
+/// Spawn `calls` tool children under the fixture's parent, then pause the
+/// child at `paused` on its confirmation with the parent's continuation, as
+/// the worker does. Returns the children in slot order.
+async fn batch_with_a_paused_confirmation<S: JournalStore>(
+    store: &S,
+    fixture: &MixedBatchFixture,
+    thread: &ThreadId,
+    calls: usize,
+    paused: usize,
+) -> Result<Vec<AgentTask>> {
+    let suspension = suspension_with_pending_tools(thread, calls);
+    let continuation = suspension.continuation.clone();
+    let (_parked, children) = SpawnChildrenExt::spawn_tool_children(
+        store,
+        &fixture.parent_id,
+        &fixture.worker,
+        &fixture.lease,
+        (0..calls).map(|_| ChildSpawnSpec::new(3)).collect(),
+        suspension,
+        None,
+        Vec::new(),
+        t_plus(2),
+    )
+    .await?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    let child = children.get(paused).context("the paused slot exists")?;
+    AgentTaskStore::try_acquire_task(
+        store,
+        &child.id,
+        worker.clone(),
+        lease.clone(),
+        t_plus(600),
+        t_plus(3),
+    )
+    .await?
+    .context("the confirming child must acquire")?;
+    AgentTaskStore::pause_on_confirmation(
+        store,
+        &child.id,
+        &worker,
+        &lease,
+        continuation,
+        None,
+        t_plus(4),
+    )
+    .await?;
+    Ok(children)
+}
+
+/// Wake the fixture's parked parent for a steering note and lease it to
+/// a new worker.
+async fn wake_for_steering<S: JournalStore>(
+    store: &S,
+    fixture: &MixedBatchFixture,
+    at: i64,
+) -> Result<(WorkerId, LeaseId)> {
+    AgentTaskStore::enqueue_steering_resume(
+        store,
+        &fixture.parent_id,
+        vec![llm::ContentBlock::Text {
+            text: "also check the docs".to_owned(),
+        }],
+        t_plus(at),
+    )
+    .await?
+    .context("the steering note must wake the parent")?;
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    AgentTaskStore::try_acquire_task(
+        store,
+        &fixture.parent_id,
+        worker.clone(),
+        lease.clone(),
+        t_plus(600),
+        t_plus(at + 1),
+    )
+    .await?
+    .context("the woken parent must acquire")?;
+    Ok((worker, lease))
+}
+
+/// A steering re-park that emits no new call re-indexes the survivors
+/// densely. A child paused on a confirmation at slot 1 moves to slot 0, and
+/// must still name its own call there, not the finished sibling's that held
+/// slot 0 in the batch it paused in.
+async fn case_steering_repark_keeps_a_paused_confirmation_on_its_call<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-steer-repark-confirmation");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let children = batch_with_a_paused_confirmation(store, &fixture, &thread, 2, 1).await?;
+    let [finished, paused] = children.as_slice() else {
+        anyhow::bail!("the batch spawns two children, got {}", children.len());
+    };
+    let worker = WorkerId::new();
+    let lease = LeaseId::new();
+    AgentTaskStore::try_acquire_task(
+        store,
+        &finished.id,
+        worker.clone(),
+        lease.clone(),
+        t_plus(600),
+        t_plus(5),
+    )
+    .await?
+    .context("the sibling must acquire")?;
+    AgentTaskStore::complete_task(store, &finished.id, &worker, &lease, t_plus(6)).await?;
+
+    let (worker, lease) = wake_for_steering(store, &fixture, 7).await?;
+    let mut payload = suspension_with_pending_tools(&thread, 2);
+    payload.continuation.payload.pending_tool_calls.remove(0);
+    AgentTaskStore::repark_after_steering(
+        store,
+        &fixture.parent_id,
+        &worker,
+        &lease,
+        payload,
+        vec![paused.id.clone()],
+        t_plus(9),
+    )
+    .await?;
+
+    let reparked = AgentTaskStore::get(store, &paused.id)
+        .await?
+        .context("the paused child must persist")?;
+    ensure!(
+        reparked.status == TaskStatus::AwaitingConfirmation && reparked.spawn_index == Some(0),
+        "the paused child stays paused at its dense slot, got {:?} at {:?}",
+        reparked.status,
+        reparked.spawn_index,
+    );
+    ensure!(
+        awaited_call_id(&reparked) == Some("call_1"),
+        "the re-parked confirmation must name its own call, got {:?}",
+        awaited_call_id(&reparked),
+    );
+    Ok(())
+}
+
+/// A steering re-park that emits a new call puts it first and carries the
+/// survivors after it. A child paused on a confirmation at slot 0 moves to
+/// slot 1, and must still name its own call there, which the batch it
+/// paused in does not even hold.
+async fn case_steering_respawn_keeps_a_paused_confirmation_on_its_call<S: JournalStore>(
+    store: &S,
+) -> Result<()> {
+    let thread = tid("conf-steer-respawn-confirmation");
+    let fixture = mixed_batch_fixture(store, &thread, 0).await?;
+    let children = batch_with_a_paused_confirmation(store, &fixture, &thread, 1, 0).await?;
+    let [paused] = children.as_slice() else {
+        anyhow::bail!("the batch spawns one child, got {}", children.len());
+    };
+
+    let (worker, lease) = wake_for_steering(store, &fixture, 5).await?;
+    let mut payload = suspension_with_pending_tools(&thread, 2);
+    let [emitted, survivor] = payload
+        .continuation
+        .payload
+        .pending_tool_calls
+        .as_mut_slice()
+    else {
+        anyhow::bail!("the re-park batch holds two calls");
+    };
+    "call_new".clone_into(&mut emitted.id);
+    "call_0".clone_into(&mut survivor.id);
+    let spawn = crate::journal::store::MixedChildrenSpawn {
+        delivered_injection_ids: Vec::new(),
+        boundary_events: Vec::new(),
+        trailing_events: Vec::new(),
+        subagents: Vec::new(),
+        tool_children: vec![crate::journal::store::ToolChildSpawn {
+            spawn_index: 0,
+            spec: ChildSpawnSpec::new(3),
+        }],
+        reattach: vec![crate::journal::store::ReattachedChild {
+            child_id: paused.id.clone(),
+            spawn_index: 1,
+        }],
+        payload,
+        child_otel_traceparent: None,
+    };
+    SpawnChildrenExt::spawn_mixed_children(
+        store,
+        &fixture.parent_id,
+        &worker,
+        &lease,
+        spawn,
+        Vec::new(),
+        t_plus(7),
+    )
+    .await
+    .context("the steering re-park must spawn the new call beside the paused one")?;
+
+    let reparked = AgentTaskStore::get(store, &paused.id)
+        .await?
+        .context("the paused child must persist")?;
+    ensure!(
+        reparked.status == TaskStatus::AwaitingConfirmation && reparked.spawn_index == Some(1),
+        "the paused child stays paused behind the new call, got {:?} at {:?}",
+        reparked.status,
+        reparked.spawn_index,
+    );
+    ensure!(
+        awaited_call_id(&reparked) == Some("call_0"),
+        "the re-parked confirmation must name its own call, got {:?}",
+        awaited_call_id(&reparked),
+    );
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Report
 // ─────────────────────────────────────────────────────────────────────
@@ -1867,6 +2093,10 @@ pub async fn run_journal_store_conformance<S: JournalStore + Clone + 'static>(
 
     case_attached_tool_batch_accepts_empty_spawn_events(store).await?;
     report.passed("attached_tool_batch_accepts_empty_spawn_events");
+    case_steering_repark_keeps_a_paused_confirmation_on_its_call(store).await?;
+    report.passed("steering_repark_keeps_a_paused_confirmation_on_its_call");
+    case_steering_respawn_keeps_a_paused_confirmation_on_its_call(store).await?;
+    report.passed("steering_respawn_keeps_a_paused_confirmation_on_its_call");
     case_precompleted_boundary_is_published_before_spawn_returns(store).await?;
     report.passed("precompleted_boundary_is_published_before_spawn_returns");
     case_precompleted_mixed_child_requires_matching_boundary(store).await?;

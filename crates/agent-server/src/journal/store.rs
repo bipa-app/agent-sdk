@@ -3142,9 +3142,11 @@ impl InMemoryAgentTaskStore {
                     "repark rejected: re-attach child {child_id} is not a child of {parent_id}"
                 ));
             }
-            child.spawn_index =
-                Some(u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?);
-            child.updated_at = now;
+            child.reattach_to_batch(
+                u32::try_from(idx).context("repark rejected: reattach index exceeds u32")?,
+                &payload.continuation,
+                now,
+            );
             child
                 .validate()
                 .context("repark rejected: re-attach child validate failed")?;
@@ -5188,6 +5190,7 @@ impl Inner {
         &self,
         parent_id: &AgentTaskId,
         reattach: &[ReattachedChild],
+        continuation: &ContinuationEnvelope,
         now: OffsetDateTime,
     ) -> Result<Vec<AgentTask>> {
         let mut children = Vec::with_capacity(reattach.len());
@@ -5213,8 +5216,7 @@ impl Inner {
                 "spawn rejected: re-attach child {} is not a child of {parent_id}",
                 attached.child_id
             );
-            child.spawn_index = Some(attached.spawn_index);
-            child.updated_at = now;
+            child.reattach_to_batch(attached.spawn_index, continuation, now);
             child
                 .validate()
                 .context("spawn rejected: re-attach child validate failed")?;
@@ -6893,7 +6895,8 @@ impl InMemoryAgentTaskStore {
             child_otel_traceparent.as_deref(),
             now,
         )?;
-        let reattached_rows = inner.build_reattached_children(parent_id, &reattach, now)?;
+        let reattached_rows =
+            inner.build_reattached_children(parent_id, &reattach, &payload.continuation, now)?;
         super::sibling_order::hold_tool_children_behind_siblings(
             &mut tool_rows,
             &reattached_rows,
