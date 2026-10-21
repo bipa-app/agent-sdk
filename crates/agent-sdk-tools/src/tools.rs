@@ -824,21 +824,46 @@ where
     serde_json::from_value(raw).map_err(|error| invalid_tool_input_result(tool_name, &error))
 }
 
+/// Replace scalar strings the schema types otherwise: `"true"`/`"false"`
+/// where it allows only a boolean ([`coerce_boolean_strings`]) and exact
+/// integer strings where it allows only an integer
+/// ([`coerce_integer_strings`]).
+///
+/// Models often send `"limit": "25"` or `"case_insensitive": "true"`.
+pub fn coerce_tool_input(schema: &Value, input: &mut Value) {
+    coerce_leaves(schema, input, &|schema, text| {
+        boolean_from(schema, text).or_else(|| integer_from(schema, text))
+    });
+}
+
 /// Replace the strings `"true"` and `"false"` (any ASCII case) with booleans
 /// wherever `schema` types the value as boolean only.
 ///
-/// Models sometimes send `"case_insensitive": "true"`. A field whose type also
-/// allows `"string"` keeps the string, and nothing else is converted.
-/// Inline `properties` are followed through nested objects and array
-/// `items`; `$ref`, `anyOf` and `oneOf` are not resolved, so a boolean
-/// reached only through one of those is left as sent.
+/// A field whose type also allows `"string"` keeps the string, and nothing
+/// else is converted. Inline `properties` are followed through nested objects
+/// and array `items`; `$ref`, `anyOf` and `oneOf` are not resolved, so a
+/// boolean reached only through one of those is left as sent.
 pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
+    coerce_leaves(schema, input, &boolean_from);
+}
+
+/// Replace exact integer strings (`"25"`, `"-3"`) with integers wherever
+/// `schema` types the value as integer only, with the same reach as
+/// [`coerce_boolean_strings`]. Signs, spaces, decimals, exponents and values
+/// outside `i64`/`u64` stay strings.
+pub fn coerce_integer_strings(schema: &Value, input: &mut Value) {
+    coerce_leaves(schema, input, &integer_from);
+}
+
+fn coerce_leaves(
+    schema: &Value,
+    input: &mut Value,
+    convert: &dyn Fn(&Value, &str) -> Option<Value>,
+) {
     match input {
-        Value::String(text) if schema_is_boolean_only(schema) => {
-            if text.eq_ignore_ascii_case("true") {
-                *input = Value::Bool(true);
-            } else if text.eq_ignore_ascii_case("false") {
-                *input = Value::Bool(false);
+        Value::String(text) => {
+            if let Some(converted) = convert(schema, text) {
+                *input = converted;
             }
         }
         Value::Object(fields) => {
@@ -847,7 +872,7 @@ pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
             };
             for (name, value) in fields.iter_mut() {
                 if let Some(property) = properties.get(name) {
-                    coerce_boolean_strings(property, value);
+                    coerce_leaves(property, value, convert);
                 }
             }
         }
@@ -856,19 +881,48 @@ pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
                 return;
             };
             for element in elements {
-                coerce_boolean_strings(items, element);
+                coerce_leaves(items, element, convert);
             }
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn schema_is_boolean_only(schema: &Value) -> bool {
+fn boolean_from(schema: &Value, text: &str) -> Option<Value> {
+    if !schema_is_only(schema, "boolean") {
+        return None;
+    }
+    if text.eq_ignore_ascii_case("true") {
+        Some(Value::Bool(true))
+    } else if text.eq_ignore_ascii_case("false") {
+        Some(Value::Bool(false))
+    } else {
+        None
+    }
+}
+
+fn integer_from(schema: &Value, text: &str) -> Option<Value> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if !schema_is_only(schema, "integer")
+        || digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    text.parse::<i64>()
+        .map(Value::from)
+        .or_else(|_| text.parse::<u64>().map(Value::from))
+        .ok()
+}
+
+/// Whether `schema` types a value as `kind`, optionally nullable, and as
+/// nothing else.
+fn schema_is_only(schema: &Value, kind: &str) -> bool {
     match schema.get("type") {
-        Some(Value::String(kind)) => kind == "boolean",
+        Some(Value::String(only)) => only == kind,
         Some(Value::Array(kinds)) => {
-            kinds.iter().any(|kind| kind == "boolean")
-                && kinds.iter().all(|kind| kind == "boolean" || kind == "null")
+            kinds.iter().any(|each| each == kind)
+                && kinds.iter().all(|each| each == kind || each == "null")
         }
         _ => false,
     }
@@ -1476,7 +1530,7 @@ where
     }
 
     async fn execute(&self, ctx: &ToolContext<Ctx>, mut input: Value) -> Result<ToolResult> {
-        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
+        coerce_tool_input(&self.inner.input_schema(), &mut input);
         self.inner.execute(ctx, input).await
     }
 }
@@ -1582,7 +1636,7 @@ where
     }
 
     async fn execute(&self, ctx: &ToolContext<Ctx>, mut input: Value) -> Result<ToolOutcome> {
-        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
+        coerce_tool_input(&self.inner.input_schema(), &mut input);
         self.inner.execute(ctx, input).await
     }
 
@@ -1711,7 +1765,7 @@ where
         ctx: &'a ToolContext<Ctx>,
         mut input: Value,
     ) -> Pin<Box<dyn Stream<Item = ListenToolUpdate> + Send + 'a>> {
-        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
+        coerce_tool_input(&self.inner.input_schema(), &mut input);
         let stream = self.inner.listen(ctx, input);
         Box::pin(stream)
     }
@@ -2536,17 +2590,27 @@ mod tests {
                 "properties": {
                     "flag": { "type": "boolean" },
                     "nullable_flag": { "type": ["boolean", "null"] },
+                    "count": { "type": "integer" },
+                    "maybe_count": { "type": ["integer", "null"] },
+                    "ratio": { "type": "number" },
+                    "id": { "type": ["string", "integer"] },
                     "label": { "type": "string" },
                     "either": { "type": ["string", "boolean"] },
                     "nested": {
                         "type": "object",
-                        "properties": { "flag": { "type": "boolean" } }
+                        "properties": {
+                            "flag": { "type": "boolean" },
+                            "count": { "type": "integer" }
+                        }
                     },
                     "items": {
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "properties": { "flag": { "type": "boolean" } }
+                            "properties": {
+                                "flag": { "type": "boolean" },
+                                "count": { "type": "integer" }
+                            }
                         }
                     }
                 }
@@ -2569,7 +2633,10 @@ mod tests {
     fn flag_schema() -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": { "flag": { "type": "boolean" } }
+            "properties": {
+                "flag": { "type": "boolean" },
+                "timeout_ms": { "type": "integer" }
+            }
         })
     }
 
@@ -2663,14 +2730,20 @@ mod tests {
             .context("async tool registered")?;
 
         let outcome = tool
-            .execute(&ToolContext::new(()), serde_json::json!({ "flag": "True" }))
+            .execute(
+                &ToolContext::new(()),
+                serde_json::json!({ "flag": "True", "timeout_ms": "200000" }),
+            )
             .await?;
 
         let ToolOutcome::Success(result) = outcome else {
             anyhow::bail!("the echo tool always succeeds");
         };
         let seen: Value = serde_json::from_str(&result.output)?;
-        assert_eq!(seen, serde_json::json!({ "flag": true }));
+        assert_eq!(
+            seen,
+            serde_json::json!({ "flag": true, "timeout_ms": 200_000 })
+        );
         Ok(())
     }
 
@@ -2686,7 +2759,10 @@ mod tests {
         let ctx = ToolContext::new(());
 
         let update = tool
-            .listen_stream(&ctx, serde_json::json!({ "flag": "false" }))
+            .listen_stream(
+                &ctx,
+                serde_json::json!({ "flag": "false", "timeout_ms": "5" }),
+            )
             .next()
             .await
             .context("one update")?;
@@ -2694,7 +2770,10 @@ mod tests {
         let ListenToolUpdate::Ready { snapshot, .. } = update else {
             anyhow::bail!("the echo tool is ready at once");
         };
-        assert_eq!(snapshot, serde_json::json!({ "flag": false }));
+        assert_eq!(
+            snapshot,
+            serde_json::json!({ "flag": false, "timeout_ms": 5 })
+        );
         Ok(())
     }
 
@@ -2717,6 +2796,54 @@ mod tests {
                 "items": [{ "flag": false }, { "flag": true }],
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn integer_fields_accept_integer_strings() -> Result<()> {
+        let seen = echo_through_registry(serde_json::json!({
+            "count": "3",
+            "maybe_count": "-12",
+            "nested": { "count": "0" },
+            "items": [{ "count": "18446744073709551615" }, { "count": 4 }],
+        }))
+        .await?;
+
+        assert_eq!(
+            seen,
+            serde_json::json!({
+                "count": 3,
+                "maybe_count": -12,
+                "nested": { "count": 0 },
+                "items": [{ "count": 18_446_744_073_709_551_615_u64 }, { "count": 4 }],
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_exact_integer_strings_in_integer_only_fields_are_coerced() -> Result<()> {
+        for value in [
+            "3.5",
+            "+3",
+            " 3",
+            "3 ",
+            "1e3",
+            "0x10",
+            "",
+            "-",
+            "three",
+            "99999999999999999999999",
+        ] {
+            let input = serde_json::json!({ "count": value });
+            assert_eq!(
+                echo_through_registry(input.clone()).await?,
+                input,
+                "{value:?}"
+            );
+        }
+        let input = serde_json::json!({ "ratio": "3", "id": "7", "label": "7", "unknown": "7" });
+        assert_eq!(echo_through_registry(input.clone()).await?, input);
         Ok(())
     }
 

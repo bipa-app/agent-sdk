@@ -524,6 +524,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_grep_accepts_integer_strings() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "before\nneedle\nafter").await?;
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(create_test_tool(fs, AgentCapabilities::full_access()));
+        let tool = registry
+            .get("grep")
+            .ok_or_else(|| anyhow::anyhow!("grep registered"))?;
+
+        let result = tool
+            .execute(&tool_ctx(), json!({"pattern": "needle", "context": "0"}))
+            .await?;
+
+        assert!(result.success, "{}", result.output);
+        assert!(!result.output.contains("before"), "{}", result.output);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn registered_grep_accepts_boolean_strings() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         fs.write_file("test.txt", "WHITE_LISTED\nother").await?;
