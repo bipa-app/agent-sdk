@@ -21,6 +21,13 @@
 //! certificates that parse, not paths that exist, because a slim image
 //! still has an empty `/etc/ssl/certs`.
 //!
+//! On native-tls the bundled roots are merged into what OpenSSL loads by
+//! itself (`set_default_verify_paths`: the compiled-in `OPENSSLDIR`, a
+//! colon-separated `SSL_CERT_DIR`), which openssl-probe does not see. On a
+//! store that is really empty that is the bundled roots alone, and a CA kept
+//! only there still works. rustls uses the bundled roots alone, because its
+//! platform verifier refuses to build on an empty store.
+//!
 //! Only OpenSSL-style unix targets fall back. macOS, iOS, Windows and Android
 //! keep their platform stores, which native-tls reads without these
 //! variables, so an empty `SSL_CERT_FILE` says nothing about them.
@@ -36,13 +43,29 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
         not(target_vendor = "apple"),
         not(target_os = "android"),
     ))]
-    // Only, not merged: there is nothing to merge with, and rustls'
-    // platform verifier refuses to build on an empty store.
-    let builder = match bundled::reqwest_roots() {
+    let builder = with_roots(builder, bundled::reqwest_roots());
+    builder
+}
+
+/// `builder` trusting `roots` when there are any: merged on native-tls,
+/// alone on rustls (see the module docs).
+#[cfg(all(
+    any(feature = "tls-native-tls", feature = "tls-rustls"),
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "android"),
+))]
+fn with_roots(
+    builder: reqwest::ClientBuilder,
+    roots: Option<&[reqwest::Certificate]>,
+) -> reqwest::ClientBuilder {
+    match roots {
+        #[cfg(feature = "tls-native-tls")]
+        Some(roots) => builder.tls_certs_merge(roots.iter().cloned()),
+        #[cfg(not(feature = "tls-native-tls"))]
         Some(roots) => builder.tls_certs_only(roots.iter().cloned()),
         None => builder,
-    };
-    builder
+    }
 }
 
 /// The TLS connector for the Codex WebSocket: the bundled roots when the
@@ -99,8 +122,13 @@ mod bundled {
 
     #[cfg(feature = "tls-native-tls")]
     pub(super) fn system_store_is_empty() -> bool {
-        let probed = openssl_probe::probe();
-        !openssl_paths_hold_a_certificate(probed.cert_file.as_deref(), &probed.cert_dir)
+        system_store_is_empty_from(&openssl_probe::probe())
+    }
+
+    /// Whether native-tls finds no certificate in what `probe` names.
+    #[cfg(feature = "tls-native-tls")]
+    pub(super) fn system_store_is_empty_from(probe: &openssl_probe::ProbeResult) -> bool {
+        !openssl_paths_hold_a_certificate(probe.cert_file.as_deref(), &probe.cert_dir)
     }
 
     #[cfg(not(feature = "tls-native-tls"))]
@@ -115,7 +143,7 @@ mod bundled {
     /// Whether `file` or any file in `dirs` holds a PEM certificate that
     /// parses, so OpenSSL has at least one root to verify against.
     #[cfg(feature = "tls-native-tls")]
-    pub(super) fn openssl_paths_hold_a_certificate(
+    fn openssl_paths_hold_a_certificate(
         file: Option<&std::path::Path>,
         dirs: &[std::path::PathBuf],
     ) -> bool {
@@ -155,8 +183,8 @@ mod bundled {
         #[cfg(feature = "tls-native-tls")]
         {
             static CONNECTOR: LazyLock<Option<native_tls::TlsConnector>> = LazyLock::new(|| {
+                // Merged into what OpenSSL loads by itself, as for reqwest.
                 let mut builder = native_tls::TlsConnector::builder();
-                builder.disable_built_in_roots(true);
                 for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
                     if let Ok(root) = native_tls::Certificate::from_der(der) {
                         builder.add_root_certificate(root);
@@ -435,11 +463,17 @@ mod tests {
         std::fs::write(certs.join("README"), b"no certificates here")?;
         std::os::unix::fs::symlink(dir.path().join("gone.pem"), certs.join("0123abcd.0"))?;
         ensure!(
-            !bundled::openssl_paths_hold_a_certificate(Some(&file), &[certs]),
+            bundled::system_store_is_empty_from(&openssl_probe::ProbeResult {
+                cert_file: Some(file),
+                cert_dir: vec![certs],
+            }),
             "an empty bundle and cert dir counted as a store"
         );
         ensure!(
-            !bundled::openssl_paths_hold_a_certificate(None, &[dir.path().join("missing")]),
+            bundled::system_store_is_empty_from(&openssl_probe::ProbeResult {
+                cert_file: None,
+                cert_dir: vec![dir.path().join("missing")],
+            }),
             "a missing cert dir counted as a store"
         );
         Ok(())
@@ -452,13 +486,56 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::os::unix::fs::symlink(&ca, dir.path().join("5ed36f99.0"))?;
         ensure!(
-            bundled::openssl_paths_hold_a_certificate(Some(&ca), &[]),
+            !bundled::system_store_is_empty_from(&openssl_probe::ProbeResult {
+                cert_file: Some(ca),
+                cert_dir: Vec::new(),
+            }),
             "a bundle with a certificate counted as empty"
         );
         ensure!(
-            bundled::openssl_paths_hold_a_certificate(None, &[dir.path().to_path_buf()]),
+            !bundled::system_store_is_empty_from(&openssl_probe::ProbeResult {
+                cert_file: None,
+                cert_dir: vec![dir.path().to_path_buf()],
+            }),
             "a cert dir with a certificate counted as empty"
         );
+        Ok(())
+    }
+
+    /// The fallback roots reach the client the backend builds. The fixture
+    /// CA stands in for the bundled roots, which no offline server chains
+    /// to: a client given it as fallback roots trusts the fixture server,
+    /// and a plain one, on the host's own store, does not.
+    #[tokio::test]
+    async fn fallback_roots_are_trusted_by_the_built_client() -> Result<()> {
+        let pem = std::fs::read(Path::new(FIXTURES).join("test-ca.pem"))?;
+        let roots = [reqwest::Certificate::from_pem(&pem)?];
+
+        let (port, server) = serve_one_request()?;
+        let response = super::with_roots(reqwest::Client::builder().no_proxy(), Some(&roots))
+            .build()?
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .context("the fallback roots did not reach the client")?;
+        ensure!(
+            response.status() == reqwest::StatusCode::NO_CONTENT,
+            "unexpected status {}",
+            response.status()
+        );
+        let _ = server.join();
+
+        let (port, server) = serve_one_request()?;
+        let refused = super::with_roots(reqwest::Client::builder().no_proxy(), None)
+            .build()?
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await;
+        ensure!(
+            refused.is_err(),
+            "the host store trusted the fixture CA, so this test proves nothing"
+        );
+        let _ = server.join();
         Ok(())
     }
 }
