@@ -257,6 +257,16 @@ struct RenderedMatches {
     lines: Vec<String>,
     shown: usize,
     note: Option<String>,
+    /// Lines up to the last shown match and its trailing context; a render
+    /// cut at the cap ends there, never on context for a match it dropped.
+    complete_len: usize,
+}
+
+impl RenderedMatches {
+    fn cut(mut self) -> Self {
+        self.lines.truncate(self.complete_len);
+        self
+    }
 }
 
 impl<E: Environment> GrepTool<E> {
@@ -281,6 +291,7 @@ impl<E: Environment> GrepTool<E> {
             lines: Vec::new(),
             shown: 0,
             note: None,
+            complete_len: 0,
         };
         let mut read_bytes = 0_usize;
         for (path, mut hits) in files {
@@ -321,26 +332,33 @@ impl<E: Environment> GrepTool<E> {
                 }
             }
 
+            let mut last_hit = 0_usize;
             for (start, end, group) in ranges {
-                let needed = end - start + 1 + usize::from(width > 0 && !rendered.lines.is_empty());
-                if rendered.lines.len() + needed > MAX_OUTPUT_LINES {
-                    return rendered;
-                }
                 if width > 0 && !rendered.lines.is_empty() {
+                    if rendered.lines.len() + 1 >= MAX_OUTPUT_LINES {
+                        return rendered.cut();
+                    }
                     rendered.lines.push("--".to_owned());
                 }
                 for line_number in start..=end {
+                    if rendered.lines.len() >= MAX_OUTPUT_LINES {
+                        return rendered.cut();
+                    }
                     if let Some(hit) = group.iter().find(|m| m.line_number == line_number) {
                         rendered.lines.push(format!(
                             "{path}:{line_number}:{}",
                             truncate_line(&hit.line_content, MAX_LINE_CHARS)
                         ));
                         rendered.shown += 1;
+                        last_hit = line_number;
                     } else if let Some(text) = file_lines.get(line_number - 1) {
                         rendered.lines.push(format!(
                             "{path}-{line_number}-{}",
                             truncate_line(text, MAX_LINE_CHARS)
                         ));
+                    }
+                    if line_number <= last_hit.saturating_add(width) {
+                        rendered.complete_len = rendered.lines.len();
                     }
                 }
             }
@@ -814,8 +832,34 @@ mod tests {
         let output = grep_output(fs, json!({"pattern": "hit"})).await?;
 
         assert!(output.lines().count() <= MAX_OUTPUT_LINES + 1, "{output}");
+        let line_number = |line: &str| -> usize {
+            line.trim_start_matches("/workspace/many.txt")
+                .trim_start_matches([':', '-'])
+                .split([':', '-'])
+                .next()
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_default()
+        };
+        let last_hit = output
+            .lines()
+            .filter(|line| line.starts_with("/workspace/many.txt:"))
+            .map(line_number)
+            .max()
+            .unwrap_or_default();
+        let last_line = output.lines().last().map(line_number).unwrap_or_default();
+        assert_eq!(
+            last_line,
+            last_hit + 2,
+            "a cut render ends on its last match's context: {output}"
+        );
+        assert!(output.contains("/workspace/many.txt:1:hit 0"), "{output}");
+        let shown_hits = output
+            .lines()
+            .filter(|line| line.starts_with("/workspace/many.txt:"))
+            .count();
+        assert!(shown_hits > 0, "{output}");
         assert!(
-            output.starts_with("Found 60 matches (showing first "),
+            output.starts_with(&format!("Found 60 matches (showing first {shown_hits}):")),
             "{output}"
         );
         Ok(())
