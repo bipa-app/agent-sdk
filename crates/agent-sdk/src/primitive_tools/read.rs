@@ -365,8 +365,7 @@ async fn read_artifact(
         }
 
         if !line_windowed
-            && let Some(result) =
-                full_artifact_read_guard(&mut file, artifact_bytes, id, inline_budget)?
+            && let Some(result) = recover_media_artifact(&mut file, artifact_bytes, id)?
         {
             return Ok(result);
         }
@@ -405,15 +404,14 @@ fn artifact_media_capacity(artifact_bytes: u64) -> std::result::Result<usize, St
         .map_err(|_| format!("length {artifact_bytes} cannot be represented as usize"))
 }
 
-/// Guard a full (non-windowed) artifact read: recover media artifacts as
-/// provider attachments and refuse oversized text artifacts before line
-/// streaming. Magic detection deliberately precedes the inline/full-read
-/// refusal: recovered media has its own provider attachment cap.
-fn full_artifact_read_guard(
+/// Recover a media artifact read without a window as a provider attachment,
+/// under its own attachment cap. A text artifact gets `None` and is streamed
+/// from its first line: a window too small for it ends with the selector
+/// that continues the read.
+fn recover_media_artifact(
     file: &mut std::fs::File,
     artifact_bytes: u64,
     id: u64,
-    inline_budget: usize,
 ) -> Result<Option<std::result::Result<ArtifactRead, String>>> {
     if let Some(media_type) = sniff_media_type(file)? {
         let capacity = match artifact_media_capacity(artifact_bytes) {
@@ -435,14 +433,6 @@ fn full_artifact_read_guard(
             ))));
         }
         return Ok(Some(Ok(ArtifactRead::Media { media_type, bytes })));
-    }
-    if artifact_bytes > u64::try_from(inline_budget).context("inline budget exceeds u64")? {
-        return Ok(Some(Err(format!(
-            "artifact {id} is {artifact_bytes} bytes; read a window with \
-             artifact://{id}:lines=START-END (or offset/limit), an exact UTF-8 \
-             byte window with artifact://{id}:bytes=START+COUNT, or arbitrary \
-             bytes with artifact://{id}:base64=START+COUNT"
-        ))));
     }
     Ok(None)
 }
@@ -2035,22 +2025,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_read_of_oversized_artifact_suggests_selectors() -> anyhow::Result<()> {
+    async fn full_read_of_oversized_artifact_returns_its_first_window() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Arc::new(agent_sdk_tools::artifacts::ArtifactStore::new(
-            dir.path().join("artifacts"),
-        ));
-        let saved = store.save("bash", &"x\n".repeat(60 * 1024))?;
-        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let tool = create_test_tool(fs, AgentCapabilities::full_access());
-        let result = tool
-            .execute(
-                &artifact_ctx(store),
-                json!({"path": format!("artifact://{}", saved.id)}),
-            )
-            .await?;
-        assert!(!result.success);
-        assert!(result.output.contains("read a window"), "{}", result.output);
+        for (store, content) in [
+            (
+                agent_sdk_tools::artifacts::ArtifactStore::new(dir.path().join("lines")),
+                "x\n".repeat(60 * 1024),
+            ),
+            (
+                agent_sdk_tools::artifacts::ArtifactStore::new(dir.path().join("bytes"))
+                    .with_inline_budget(1024),
+                "recovery-line\n".repeat(1_000),
+            ),
+        ] {
+            let store = Arc::new(store);
+            let saved = store.save("bash", &content)?;
+            let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+            let tool = create_test_tool(fs, AgentCapabilities::full_access());
+            let result = tool
+                .execute(
+                    &artifact_ctx(Arc::clone(&store)),
+                    json!({"path": format!("artifact://{}", saved.id)}),
+                )
+                .await?;
+            assert!(result.success, "{}", result.output);
+            assert!(result.output.len() <= store.inline_budget());
+            let first_line = content.lines().next().unwrap_or_default();
+            assert!(
+                result.output.starts_with(&format!("L1: {first_line}")),
+                "{}",
+                result.output
+            );
+            assert!(
+                result
+                    .output
+                    .contains(&format!("continue with artifact://{}:lines=", saved.id)),
+                "{}",
+                result.output
+            );
+        }
         Ok(())
     }
 
