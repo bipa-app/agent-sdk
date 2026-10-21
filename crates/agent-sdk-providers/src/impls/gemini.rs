@@ -45,7 +45,7 @@ const MODELS_MAX_PAGES: usize = 100;
 /// Build the shared HTTP client with connect + keepalive timeouts, falling back
 /// to a default client (with a logged warning) if the builder fails.
 fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::tls_roots::http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .tcp_keepalive(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
         .build()

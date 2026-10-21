@@ -71,6 +71,9 @@ pub mod streaming;
 #[cfg(feature = "structured-output")]
 #[cfg_attr(docsrs, doc(cfg(feature = "structured-output")))]
 pub mod structured;
+// Provider HTTPS on hosts with no system CA store: every provider client
+// is built from `tls_roots::http_client_builder`.
+pub(crate) mod tls_roots;
 
 // Convenience re-exports — provider trait and streaming
 pub use fallback::FallbackProvider;

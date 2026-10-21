@@ -141,7 +141,7 @@ pub trait ModelCatalogSource: Send + Sync {
 }
 
 pub(crate) fn build_feed_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::tls_roots::http_client_builder()
         .connect_timeout(Duration::from_secs(FEED_TIMEOUT_SECS))
         .timeout(Duration::from_secs(FEED_TIMEOUT_SECS))
         .build()

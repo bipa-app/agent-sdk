@@ -43,7 +43,7 @@ const OPENAI_MESSAGE_ITEM_TYPE: &str = "message";
 /// connect timeout, so a black-holed connect would wedge `chat`/`chat_stream`
 /// forever.
 fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::tls_roots::http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()

@@ -99,6 +99,15 @@ url = { version = "2.5.8", default-features = false, features = ["std"] }
 tokio-util = { version = "0.7.19", default-features = false }
 html2text = { version = "0.17.1", default-features = false }
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+# Provider TLS on a host with no system CA store (agent-sdk-providers'
+# `tls_roots`): count the certificates the TLS backend would load
+# (openssl-probe's paths for native-tls, rustls-native-certs for rustls) and
+# fall back to the bundled Mozilla roots when there are none.
+# webpki-root-certs 1.0.10 drops the distrusted emSign roots (RUSTSEC-2026-0381).
+openssl-probe = { version = "0.2.1", default-features = false }
+rustls-native-certs = { version = "0.8.4", default-features = false }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["std"] }
+webpki-root-certs = { version = "1.0.10", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "rt-tokio"] }
