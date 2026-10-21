@@ -288,6 +288,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_grep_accepts_boolean_strings() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("test.txt", "WHITE_LISTED\nother").await?;
+        let mut registry = crate::ToolRegistry::new();
+        registry.register(create_test_tool(fs, AgentCapabilities::full_access()));
+        let tool = registry
+            .get("grep")
+            .ok_or_else(|| anyhow::anyhow!("grep registered"))?;
+
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"pattern": "white_listed", "case_insensitive": "true"}),
+            )
+            .await?;
+
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("Found 1 matches"),
+            "{}",
+            result.output
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_grep_regex_pattern() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
         fs.write_file("test.txt", "foo123\nbar456\nfoo789").await?;

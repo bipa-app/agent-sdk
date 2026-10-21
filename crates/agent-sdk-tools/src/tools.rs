@@ -824,6 +824,54 @@ where
     serde_json::from_value(raw).map_err(|error| invalid_tool_input_result(tool_name, &error))
 }
 
+/// Replace the strings `"true"` and `"false"` (any ASCII case) with booleans
+/// wherever `schema` types the value as boolean only.
+///
+/// Models sometimes send `"case_insensitive": "true"`. A field whose type also
+/// allows `"string"` keeps the string, and nothing else is converted.
+/// Properties are followed through nested objects and array `items`.
+pub fn coerce_boolean_strings(schema: &Value, input: &mut Value) {
+    match input {
+        Value::String(text) if schema_is_boolean_only(schema) => {
+            if text.eq_ignore_ascii_case("true") {
+                *input = Value::Bool(true);
+            } else if text.eq_ignore_ascii_case("false") {
+                *input = Value::Bool(false);
+            }
+        }
+        Value::Object(fields) => {
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return;
+            };
+            for (name, value) in fields.iter_mut() {
+                if let Some(property) = properties.get(name) {
+                    coerce_boolean_strings(property, value);
+                }
+            }
+        }
+        Value::Array(elements) => {
+            let Some(items) = schema.get("items") else {
+                return;
+            };
+            for element in elements {
+                coerce_boolean_strings(items, element);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn schema_is_boolean_only(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind == "boolean",
+        Some(Value::Array(kinds)) => {
+            kinds.iter().any(|kind| kind == "boolean")
+                && kinds.iter().all(|kind| kind == "boolean" || kind == "null")
+        }
+        _ => false,
+    }
+}
+
 /// Adapter that turns any [`TypedTool`] into a full [`Tool`].
 ///
 /// It gives the wrapped tool `Name = DynamicToolName`, deserializes the
@@ -1425,7 +1473,8 @@ where
         self.inner.replay()
     }
 
-    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext<Ctx>, mut input: Value) -> Result<ToolResult> {
+        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
         self.inner.execute(ctx, input).await
     }
 }
@@ -1530,7 +1579,8 @@ where
         self.inner.replay()
     }
 
-    async fn execute(&self, ctx: &ToolContext<Ctx>, input: Value) -> Result<ToolOutcome> {
+    async fn execute(&self, ctx: &ToolContext<Ctx>, mut input: Value) -> Result<ToolOutcome> {
+        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
         self.inner.execute(ctx, input).await
     }
 
@@ -1657,8 +1707,9 @@ where
     fn listen_stream<'a>(
         &'a self,
         ctx: &'a ToolContext<Ctx>,
-        input: Value,
+        mut input: Value,
     ) -> Pin<Box<dyn Stream<Item = ListenToolUpdate> + Send + 'a>> {
+        coerce_boolean_strings(&self.inner.input_schema(), &mut input);
         let stream = self.inner.listen(ctx, input);
         Box::pin(stream)
     }
@@ -2458,6 +2509,95 @@ mod tests {
         async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
             Ok(ToolResult::success(input.to_string()))
         }
+    }
+
+    struct EchoTool;
+
+    impl Tool<()> for EchoTool {
+        type Name = DynamicToolName;
+
+        fn name(&self) -> DynamicToolName {
+            DynamicToolName::new("echo")
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Echo"
+        }
+
+        fn description(&self) -> &'static str {
+            "Echoes its input"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "flag": { "type": "boolean" },
+                    "nullable_flag": { "type": ["boolean", "null"] },
+                    "label": { "type": "string" },
+                    "either": { "type": ["string", "boolean"] },
+                    "nested": {
+                        "type": "object",
+                        "properties": { "flag": { "type": "boolean" } }
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "flag": { "type": "boolean" } }
+                        }
+                    }
+                }
+            })
+        }
+
+        async fn execute(&self, _ctx: &ToolContext<()>, input: Value) -> Result<ToolResult> {
+            Ok(ToolResult::success(input.to_string()))
+        }
+    }
+
+    async fn echo_through_registry(input: Value) -> Result<Value> {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTool);
+        let tool = registry.get("echo").context("echo tool registered")?;
+        let result = tool.execute(&ToolContext::new(()), input).await?;
+        Ok(serde_json::from_str(&result.output)?)
+    }
+
+    #[tokio::test]
+    async fn boolean_fields_accept_true_and_false_strings() -> Result<()> {
+        let seen = echo_through_registry(serde_json::json!({
+            "flag": "TRUE",
+            "nullable_flag": "false",
+            "nested": { "flag": "True" },
+            "items": [{ "flag": "false" }, { "flag": true }],
+        }))
+        .await?;
+
+        assert_eq!(
+            seen,
+            serde_json::json!({
+                "flag": true,
+                "nullable_flag": false,
+                "nested": { "flag": true },
+                "items": [{ "flag": false }, { "flag": true }],
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_exact_boolean_strings_in_boolean_only_fields_are_coerced() -> Result<()> {
+        let input = serde_json::json!({
+            "flag": "yes",
+            "label": "true",
+            "either": "false",
+            "unknown": "true",
+            "nested": { "flag": "1" },
+        });
+
+        assert_eq!(echo_through_registry(input.clone()).await?, input);
+        Ok(())
     }
 
     #[tokio::test]
