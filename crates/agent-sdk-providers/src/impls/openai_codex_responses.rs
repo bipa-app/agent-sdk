@@ -29,7 +29,6 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -82,7 +81,7 @@ fn websockets_disabled_from_env() -> bool {
 /// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
 /// connect timeout, so a black-holed connect would wedge `chat`/`chat_stream`.
 fn build_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::tls_roots::http_client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_keepalive(CONNECT_TIMEOUT)
         .build()
@@ -470,7 +469,17 @@ impl OpenAICodexResponsesProvider {
             .context("failed to build OpenAI Codex websocket request")?;
         request.headers_mut().extend(headers);
 
-        let (stream, response) = timeout(CONNECT_TIMEOUT, connect_async(request))
+        // The bundled roots when the system CA store is empty (`tls_roots`).
+        #[cfg(any(feature = "tls-native-tls", feature = "tls-rustls"))]
+        let connecting = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            crate::tls_roots::websocket_connector(),
+        );
+        #[cfg(not(any(feature = "tls-native-tls", feature = "tls-rustls")))]
+        let connecting = tokio_tungstenite::connect_async(request);
+        let (stream, response) = timeout(CONNECT_TIMEOUT, connecting)
             .await
             .context("OpenAI Codex websocket connect timed out")?
             .context("failed to connect OpenAI Codex websocket")?;

@@ -44,6 +44,14 @@ xxhash-rust = { workspace = true }
 # so it is gated behind the `openai-codex` feature.
 tokio-tungstenite = { workspace = true, optional = true }
 
+# The bundled-root fallback (`src/tls_roots.rs`) runs only on OpenSSL-style
+# unix targets; elsewhere the platform store is used as is.
+[target.'cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))'.dependencies]
+openssl-probe = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+webpki-root-certs = { workspace = true, optional = true }
+
 [features]
 # Anthropic is the default provider so the common case works out of the box.
 default = ["anthropic", "structured-output", "tls-native-tls"]
@@ -51,8 +59,10 @@ default = ["anthropic", "structured-output", "tls-native-tls"]
 # ── TLS backend (pick exactly one) ─────────────────────────────────────
 # The backend is the consumer's call: an app already on rustls should not be
 # made to link OpenSSL too. Selecting neither leaves reqwest without TLS.
-tls-native-tls = ["dep:native-tls", "reqwest/native-tls", "tokio-tungstenite?/native-tls"]
-tls-rustls = ["dep:rustls", "reqwest/rustls", "tokio-tungstenite?/rustls-tls-native-roots"]
+# Both add the bundled-root fallback for hosts with an empty system CA store
+# (see `src/tls_roots.rs`); its deps exist only on the unix targets it runs on.
+tls-native-tls = ["dep:native-tls", "reqwest/native-tls", "tokio-tungstenite?/native-tls", "dep:openssl-probe", "dep:rustls-pki-types", "dep:webpki-root-certs"]
+tls-rustls = ["dep:rustls", "reqwest/rustls", "tokio-tungstenite?/rustls-tls-native-roots", "dep:rustls-native-certs", "dep:webpki-root-certs"]
 anthropic = []
 # Separable because `jsonschema` costs ~30 crates. Default-on: switching it off
 # is source-breaking for `run_structured` callers.
@@ -84,6 +94,7 @@ model-discovery = []
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 # Server side of the TLS-rejection test; independent of the client's backend.
 native-tls = { workspace = true }
+tempfile = { workspace = true }
 wiremock = { workspace = true }
 # Tier-C live smoke constructs a `Tool` whose `tier` is the core
 # `ToolTier` enum (not re-exported through the `llm` glob).

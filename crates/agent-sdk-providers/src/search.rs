@@ -92,7 +92,12 @@ impl BraveSearchProvider {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::tls_roots::http_client_builder()
+                .build()
+                .unwrap_or_else(|error| {
+                    log::warn!("failed to build the Brave Search HTTP client ({error}); using the default client");
+                    reqwest::Client::new()
+                }),
             api_key: api_key.into(),
         }
     }

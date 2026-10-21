@@ -399,7 +399,7 @@ impl AnthropicProvider {
         // - 30 second connect timeout (fresh dials only)
         // - TCP keepalive to prevent connection drops
         // - Bounded idle-connection reuse (see POOL_IDLE_TIMEOUT)
-        let client = reqwest::Client::builder()
+        let client = crate::tls_roots::http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .tcp_keepalive(std::time::Duration::from_secs(30))
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)

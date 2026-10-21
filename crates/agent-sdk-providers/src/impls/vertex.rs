@@ -84,7 +84,7 @@ impl VertexProvider {
     /// Create a new Vertex AI provider with full control over all parameters.
     #[must_use]
     pub fn new(access_token: String, project_id: String, region: String, model: String) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::tls_roots::http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .tcp_keepalive(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
             .build()
