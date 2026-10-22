@@ -855,6 +855,15 @@ impl GrpcControlService {
                                 ids.insert(id);
                             }
                         }
+                        // An artifact-backed image or document (a tool's
+                        // screenshot or image read): the fork's history names
+                        // it, so the fork's store needs it too.
+                        agent_sdk_foundation::llm::ContentBlock::Image { source }
+                        | agent_sdk_foundation::llm::ContentBlock::Document { source } => {
+                            ids.extend(agent_sdk_foundation::llm::exact_artifact_uri_id(
+                                &source.data,
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -862,6 +871,9 @@ impl GrpcControlService {
         }
         for event in &params.events {
             if let AgentEvent::ToolCallEnd { result, .. } = event {
+                ids.extend(result.documents.iter().filter_map(|document| {
+                    agent_sdk_foundation::llm::exact_artifact_uri_id(&document.data)
+                }));
                 if let Some(artifact) = &result.artifact {
                     ids.insert(artifact.id);
                 } else if let Some(store) = source_store.as_deref()
@@ -9436,6 +9448,93 @@ mod tests {
             recovered,
             original.as_bytes(),
             "the fork must carry the artifact a late result points at",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_copies_an_artifact_backed_image() -> Result<()> {
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir()?;
+        let artifact_storage = Arc::new(agent_sdk::ArtifactStorage::new(
+            temp.path().join("artifacts"),
+        ));
+        let source = ThreadId::from_string("image-artifact-source");
+        let destination = ThreadId::from_string("image-artifact-destination");
+        let source_store = artifact_storage.for_thread(&source)?;
+        let original = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x80\0\0\x01\xe0".to_vec();
+        let saved = source_store.save_streamed("read", &mut original.as_slice())?;
+
+        let registry = Arc::new(InMemoryAgentDefinitionRegistry::new(mock_definition(
+            Vec::new(),
+        )));
+        let stores = StoreRegistry::in_memory(registry);
+        let resolver = Arc::new(StaticProviderResolver::new());
+        resolver.set_fallback(Arc::new(ScriptedProvider::new(Vec::new())))?;
+        let runtime = Arc::new(
+            ExecutionRuntime::new(
+                resolver,
+                Arc::new(NoopToolExecutor),
+                Arc::new(AllowAllConfirmationPolicy),
+            )
+            .with_artifact_storage(Arc::clone(&artifact_storage)),
+        );
+        let shared = Arc::new(GrpcShared::new(
+            stores,
+            runtime,
+            HealthSurface::shared(),
+            CancellationToken::new(),
+            time::Duration::seconds(30),
+            std::time::Duration::from_secs(10),
+            AdmissionConfig::default(),
+        ));
+        shared
+            .stores
+            .thread_store
+            .get_or_create(&source, OffsetDateTime::UNIX_EPOCH)
+            .await?;
+        let mut checkpoint = close_gate_checkpoint(&source, "image-artifact-task", 1);
+        checkpoint.messages = vec![
+            llm::Message::user("look at the grid"),
+            llm::Message {
+                role: llm::Role::User,
+                content: llm::Content::Blocks(vec![ContentBlock::Image {
+                    source: llm::ContentSource::new(
+                        "image/png",
+                        format!("artifact://{}", saved.id),
+                    ),
+                }]),
+            },
+        ];
+        shared
+            .stores
+            .checkpoint_store
+            .commit_checkpoint(checkpoint)
+            .await?;
+
+        let service = GrpcControlService { shared };
+        service
+            .copy_thread_state(
+                &source,
+                &destination,
+                1,
+                Some(ThreadCreation::Fork {
+                    source_thread_id: source.clone(),
+                    fork_after_committed_turns: 1,
+                }),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await?;
+
+        let mut recovered = Vec::new();
+        artifact_storage
+            .for_thread(&destination)?
+            .resolve(saved.id)?
+            .read_to_end(&mut recovered)?;
+        assert_eq!(
+            recovered, original,
+            "the fork must carry the image artifact its history points at",
         );
         Ok(())
     }

@@ -203,6 +203,28 @@ fn hydrate_request(
                         failure.error
                     );
                 }
+                Err(failure) if failure.degradable_frame => {
+                    // A missing, unreadable or mislabelled artifact (retention
+                    // swept it, a fork did not copy it, its bytes are not
+                    // what it declares) stays in the history: failing here
+                    // would fail every later request of the session.
+                    log::warn!(
+                        "Omitting unavailable attachment artifact from provider request: {:#}",
+                        failure.error
+                    );
+                    let (llm::ContentBlock::Image { source }
+                    | llm::ContentBlock::Document { source }) = &block
+                    else {
+                        continue;
+                    };
+                    blocks.push(llm::ContentBlock::Text {
+                        text: format!(
+                            "[{} attachment {} is no longer available and was omitted from \
+                             this request]",
+                            source.media_type, source.data
+                        ),
+                    });
+                }
                 Err(failure) => return Err(failure.error),
             }
         }
@@ -651,8 +673,43 @@ mod tests {
         Ok(())
     }
 
+    fn only_text(request: &llm::ChatRequest) -> String {
+        let llm::Content::Blocks(blocks) = &request.messages[0].content else {
+            return String::new();
+        };
+        let [ContentBlock::Text { text }] = blocks.as_slice() else {
+            return format!("{blocks:?}");
+        };
+        text.clone()
+    }
+
     #[tokio::test]
-    async fn cross_thread_attachment_reference_fails_closed() -> Result<()> {
+    async fn a_missing_artifact_degrades_to_a_note() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(ArtifactStore::new(dir.path()));
+        prime_positive_artifact_ids(&store)?;
+        let saved = {
+            let mut png = PNG;
+            store.save_streamed("image", &mut png)?
+        };
+        std::fs::remove_file(&saved.path)?;
+        let durable = request(Message::user_with_content(vec![ContentBlock::Image {
+            source: ContentSource::new("image/png", format!("artifact://{}", saved.id)),
+        }]));
+
+        let hydrated = hydrate_request_artifact_sources(&durable, Some(store)).await?;
+
+        let note = only_text(&hydrated);
+        assert!(
+            note.contains(&format!("artifact://{}", saved.id))
+                && note.contains("no longer available"),
+            "{note}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cross_thread_attachment_reference_degrades_to_a_note() -> Result<()> {
         let owner_dir = tempfile::tempdir()?;
         let owner = ArtifactStore::new(owner_dir.path());
         prime_positive_artifact_ids(&owner)?;
@@ -663,15 +720,17 @@ mod tests {
             source: ContentSource::new("application/pdf", format!("artifact://{artifact_id}")),
         }]));
 
-        let error = hydrate_request_artifact_sources(&durable, Some(current))
-            .await
-            .expect_err("cross-thread artifact must not resolve");
-        assert!(format!("{error:#}").contains("resolving current-thread artifact"));
+        let hydrated = hydrate_request_artifact_sources(&durable, Some(current)).await?;
+        let note = only_text(&hydrated);
+        assert!(
+            note.contains("no longer available") && !note.contains("owned elsewhere"),
+            "another thread's artifact never resolves: {note}"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn noncanonical_mime_mismatch_fails_closed() -> Result<()> {
+    async fn noncanonical_mime_mismatch_degrades_to_a_note() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Arc::new(ArtifactStore::new(dir.path()));
         prime_positive_artifact_ids(&store)?;
@@ -680,10 +739,11 @@ mod tests {
             source: ContentSource::new("image/jpeg", format!("artifact://{artifact_id}")),
         }]));
 
-        let error = hydrate_request_artifact_sources(&durable, Some(store))
-            .await
-            .expect_err("wrong declared MIME must fail");
-        assert!(format!("{error:#}").contains("MIME mismatch"));
+        let hydrated = hydrate_request_artifact_sources(&durable, Some(store)).await?;
+        assert!(
+            only_text(&hydrated).contains("no longer available"),
+            "a mislabelled artifact is never sent as the declared type"
+        );
         Ok(())
     }
 

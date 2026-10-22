@@ -917,7 +917,10 @@ const fn is_metadata_free_summary(block: &ContentBlock) -> bool {
     )
 }
 
-fn exact_artifact_uri_id(uri: &str) -> Option<u64> {
+/// The id of an exact `artifact://<positive id>` URI, or `None` for any
+/// other string (a selector, a scheme mismatch, zero, a sign).
+#[must_use]
+pub fn exact_artifact_uri_id(uri: &str) -> Option<u64> {
     let id = uri.strip_prefix("artifact://")?;
     if id.is_empty()
         || !id.bytes().all(|byte| byte.is_ascii_digit())
