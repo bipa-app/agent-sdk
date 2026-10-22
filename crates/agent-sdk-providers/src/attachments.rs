@@ -132,6 +132,10 @@ pub(crate) fn decoded_attachment_len(data: &str) -> Result<usize> {
 /// The text an attachment is replaced with when the request cannot carry it.
 pub(crate) const OMITTED_ATTACHMENT: &str = "[an image or document from an earlier message was \
      omitted to fit this request's attachment limits; read the file again to view it]";
+/// The start of the note an image is replaced with when its bytes are not an
+/// image of its declared type a provider accepts; the reason follows.
+pub(crate) const INVALID_IMAGE_PREFIX: &str = "[an image was omitted: ";
+
 pub(crate) const UNSUPPORTED_ATTACHMENT: &str = "[an image or document was omitted: this \
      provider route does not take attachments]";
 
@@ -173,6 +177,36 @@ pub(crate) fn fit_request_attachments(
     model: &str,
     request: &mut ChatRequest,
 ) -> usize {
+    replace_invalid_images(request) + fit_valid_attachments(provider, model, request)
+}
+
+/// Replace every image block whose bytes are not an image of its declared
+/// type a provider accepts ([`agent_sdk_foundation::media::image_problem`])
+/// with a note saying why, so one bad image from any tool or message can't
+/// make every later request fail. Returns how many were replaced.
+fn replace_invalid_images(request: &mut ChatRequest) -> usize {
+    let mut replaced = 0;
+    for message in &mut request.messages {
+        if let Content::Blocks(blocks) = &mut message.content {
+            for block in blocks.iter_mut() {
+                let ContentBlock::Image { source } = block else {
+                    continue;
+                };
+                if let Some(reason) =
+                    agent_sdk_foundation::media::image_problem(&source.media_type, &source.data)
+                {
+                    *block = ContentBlock::Text {
+                        text: format!("{INVALID_IMAGE_PREFIX}{reason}]"),
+                    };
+                    replaced += 1;
+                }
+            }
+        }
+    }
+    replaced
+}
+
+fn fit_valid_attachments(provider: &str, model: &str, request: &mut ChatRequest) -> usize {
     let policy = attachment_policy(provider, model);
     let mut positions = Vec::new();
     for (message_index, message) in request.messages.iter().enumerate() {
@@ -405,8 +439,10 @@ mod tests {
         let mut request = request_with_blocks(Vec::new());
         request.messages = (0..count)
             .map(|index| {
-                let mut bytes = vec![0_u8; decoded];
-                bytes[0] = u8::try_from(index).unwrap_or(u8::MAX);
+                let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x80\0\0\x01\xe0".to_vec();
+                bytes.resize(decoded.max(bytes.len() + 1), 0);
+                let last = bytes.len() - 1;
+                bytes[last] = u8::try_from(index).unwrap_or(u8::MAX);
                 Message {
                     role: Role::User,
                     content: Content::Blocks(vec![
@@ -516,6 +552,28 @@ mod tests {
         );
         assert_eq!(images_left(&request), Vec::<usize>::new());
         validate_request_attachments("openrouter", "some/model", &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_image_whose_bytes_are_not_its_type_becomes_a_note() -> anyhow::Result<()> {
+        let mut request = image_history(2, 1024);
+        if let Content::Blocks(blocks) = &mut request.messages[0].content {
+            blocks[1] = ContentBlock::Image {
+                source: ContentSource::new("image/png", "A".repeat(4096)),
+            };
+        }
+
+        assert_eq!(
+            fit_request_attachments("anthropic", "claude-opus-5-5", &mut request),
+            1
+        );
+        assert_eq!(images_left(&request), vec![1]);
+        assert!(
+            matches!(&request.messages[0].content, Content::Blocks(blocks)
+            if matches!(&blocks[1], ContentBlock::Text { text } if text.starts_with(INVALID_IMAGE_PREFIX)))
+        );
+        validate_request_attachments("anthropic", "claude-opus-5-5", &request)?;
         Ok(())
     }
 

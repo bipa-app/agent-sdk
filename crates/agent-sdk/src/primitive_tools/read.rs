@@ -10,6 +10,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use super::PrimitiveToolContext;
+pub use agent_sdk_foundation::media::detect_media_magic;
+use agent_sdk_foundation::media::{MAX_IMAGE_SIDE_PX, image_dimensions};
 
 /// Maximum bytes per line before truncation.
 const MAX_LINE_LENGTH: usize = 500;
@@ -924,86 +926,6 @@ fn sniff_media_type(file: &mut std::fs::File) -> Result<Option<&'static str>> {
     file.seek(SeekFrom::Start(0))
         .context("rewinding artifact after media detection")?;
     Ok(detect_media_magic(&prefix[..read]))
-}
-
-pub fn detect_media_magic(prefix: &[u8]) -> Option<&'static str> {
-    if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if prefix.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if prefix.len() >= 12 && &prefix[..4] == b"RIFF" && &prefix[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if prefix.starts_with(b"%PDF-") {
-        Some("application/pdf")
-    } else {
-        None
-    }
-}
-
-/// Longest side, in pixels, of an image providers accept (Anthropic's limit).
-const MAX_IMAGE_SIDE_PX: u32 = 8000;
-
-/// An image's width and height from its header, without decoding it, or
-/// `None` when the header cannot be read.
-fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
-    let be16 = |at: usize| {
-        Some(u32::from(u16::from_be_bytes(
-            bytes.get(at..at + 2)?.try_into().ok()?,
-        )))
-    };
-    let le16 = |at: usize| {
-        Some(u32::from(u16::from_le_bytes(
-            bytes.get(at..at + 2)?.try_into().ok()?,
-        )))
-    };
-    let le24 = |at: usize| {
-        let b = bytes.get(at..at + 3)?;
-        Some(u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16))
-    };
-    let be32 = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
-    match media_type {
-        "image/png" => (bytes.get(12..16)? == b"IHDR").then(|| Some((be32(16)?, be32(20)?)))?,
-        "image/gif" => Some((le16(6)?, le16(8)?)),
-        "image/webp" => match bytes.get(12..16)? {
-            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
-            b"VP8L" => {
-                let b = bytes.get(21..25)?;
-                let width = 1 + (u32::from(b[0]) | (u32::from(b[1] & 0x3f) << 8));
-                let height = 1
-                    + ((u32::from(b[1]) >> 6)
-                        | (u32::from(b[2]) << 2)
-                        | (u32::from(b[3] & 0x0f) << 10));
-                Some((width, height))
-            }
-            b"VP8X" => Some((le24(24)? + 1, le24(27)? + 1)),
-            _ => None,
-        },
-        "image/jpeg" => {
-            let mut at = 2;
-            loop {
-                while *bytes.get(at)? == 0xff && *bytes.get(at + 1)? == 0xff {
-                    at += 1;
-                }
-                if *bytes.get(at)? != 0xff {
-                    return None;
-                }
-                let marker = *bytes.get(at + 1)?;
-                let is_frame =
-                    matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc);
-                if is_frame {
-                    return Some((be16(at + 7)?, be16(at + 5)?));
-                }
-                if matches!(marker, 0x01 | 0xd0..=0xd9) {
-                    at += 2;
-                    continue;
-                }
-                at += 2 + usize::try_from(be16(at + 2)?).ok()?;
-            }
-        }
-        _ => None,
-    }
 }
 
 /// Detect supported binary media types by file extension.

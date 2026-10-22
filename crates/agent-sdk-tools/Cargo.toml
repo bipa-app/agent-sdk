@@ -34,6 +34,7 @@ cap-fs-ext = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+base64 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
 

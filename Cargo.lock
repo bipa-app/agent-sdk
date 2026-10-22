@@ -91,6 +91,7 @@ dependencies = [
 name = "agent-sdk-foundation"
 version = "0.18.0"
 dependencies = [
+ "base64 0.23.1",
  "insta",
  "proptest",
  "proptest-state-machine",
@@ -101,6 +102,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -167,6 +169,7 @@ dependencies = [
  "agent-sdk-foundation",
  "anyhow",
  "async-trait",
+ "base64 0.23.1",
  "cap-fs-ext",
  "cap-std",
  "futures",

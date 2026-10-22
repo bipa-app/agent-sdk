@@ -17,12 +17,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+base64 = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
