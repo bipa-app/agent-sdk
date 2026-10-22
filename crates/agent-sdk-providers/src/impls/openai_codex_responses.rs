@@ -4,7 +4,7 @@
 //! `ChatGPT` Codex backend using OAuth bearer tokens captured from the `ChatGPT`
 //! Plus/Pro login flow.
 
-use crate::attachments::validate_request_attachments;
+use crate::attachments::{fit_request_attachments, validate_request_attachments};
 use crate::provider::LlmProvider;
 use crate::streaming::{
     SseLineBuffer, StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta,
@@ -596,6 +596,7 @@ impl LlmProvider for OpenAICodexResponsesProvider {
                     return;
                 }
             };
+            fit_request_attachments(self.provider(), self.model(), &mut request);
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),

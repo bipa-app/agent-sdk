@@ -58,6 +58,18 @@ const ARTIFACT_ALLOCATOR_RECORD_BYTES: usize = 21;
 /// many bytes is spilled to the artifact store.
 pub const DEFAULT_INLINE_OUTPUT_BUDGET_BYTES: usize = 50 * 1024;
 
+/// Base64 bytes of images a result may carry inline beside its text budget.
+///
+/// They reach the model as image blocks rather than text, so they don't use
+/// the text budget; past this they spill like any other payload. PDFs and
+/// other documents still count as text. Its decoded size
+/// (3.75 MiB) is under every provider's per-image cap (Anthropic's 5 MiB is the
+/// smallest), and providers bound a request's attachments in total.
+pub const INLINE_ATTACHMENT_BUDGET_BYTES: usize = 5 * 1024 * 1024;
+
+/// Image types a model is shown as image blocks.
+const ATTACHMENT_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 /// Smallest accepted inline budget. Below this the head/tail windows and the
 /// elision marker + footer no longer fit meaningfully.
 const MIN_INLINE_OUTPUT_BUDGET_BYTES: usize = 1024;
@@ -117,6 +129,15 @@ fn inline_payload_bytes(result: &ToolResult) -> usize {
         0
     } else {
         serialized_json_bytes(&result.documents).unwrap_or(usize::MAX)
+    };
+    let attachments_only = result
+        .documents
+        .iter()
+        .all(|document| ATTACHMENT_MEDIA_TYPES.contains(&document.media_type.as_str()));
+    let document_bytes = if attachments_only && document_bytes <= INLINE_ATTACHMENT_BUDGET_BYTES {
+        0
+    } else {
+        document_bytes
     };
     result
         .output
@@ -2044,6 +2065,83 @@ mod tests {
         );
         assert_eq!(result.output, original);
         assert_eq!(result.data, Some(serde_json::Value::Null));
+        Ok(())
+    }
+
+    fn image_result(base64_bytes: usize) -> ToolResult {
+        ToolResult::success("Read image/png file: '/tmp/grid.png'").with_documents(vec![
+            agent_sdk_foundation::llm::ContentSource::new("image/png", "A".repeat(base64_bytes)),
+        ])
+    }
+
+    #[test]
+    fn an_image_within_the_attachment_budget_reaches_the_model_inline() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = image_result(2_300_000);
+        let original = result.clone();
+
+        assert!(store.apply_inline_budget(&mut result, "read")?.is_none());
+        assert_eq!(result, original);
+
+        let mut storeless = image_result(200 * 1024);
+        assert!(enforce_inline_budget(&mut storeless, None, "read").is_none());
+        assert!(storeless.success);
+        assert_eq!(storeless.documents.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_image_over_the_attachment_budget_still_spills() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts"));
+        let mut result = image_result(6 * 1024 * 1024);
+
+        let saved = store
+            .apply_inline_budget(&mut result, "read")?
+            .expect("an image past the attachment budget spills");
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
+        assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
+        Ok(())
+    }
+
+    #[test]
+    fn a_pdf_over_the_text_budget_still_spills() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = ToolResult::success("Read application/pdf file: 'spec.pdf'")
+            .with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+                "application/pdf",
+                "A".repeat(200 * 1024),
+            )]);
+
+        assert!(store.apply_inline_budget(&mut result, "read")?.is_some());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_document_the_model_cannot_view_still_counts_as_text() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = ToolResult::success("blob").with_documents(vec![
+            agent_sdk_foundation::llm::ContentSource::new(
+                "application/octet-stream",
+                "A".repeat(4 * 1024),
+            ),
+        ]);
+
+        assert!(store.apply_inline_budget(&mut result, "mcp")?.is_some());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 

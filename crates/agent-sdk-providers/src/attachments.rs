@@ -129,6 +129,107 @@ pub(crate) fn decoded_attachment_len(data: &str) -> Result<usize> {
     Ok((len / 4) * 3 - padding)
 }
 
+/// The text an attachment is replaced with when the request cannot carry it.
+pub(crate) const OMITTED_ATTACHMENT: &str = "[an image or document from an earlier message was \
+     omitted to fit this request's attachment limits; read the file again to view it]";
+pub(crate) const UNSUPPORTED_ATTACHMENT: &str = "[an image or document was omitted: this \
+     provider route does not take attachments]";
+
+/// What a policy lets one request carry in total.
+struct RequestAttachmentLimits {
+    images: usize,
+    documents: usize,
+    bytes: usize,
+}
+
+const fn request_limits(policy: AttachmentPolicy) -> RequestAttachmentLimits {
+    match policy {
+        AttachmentPolicy::Anthropic => RequestAttachmentLimits {
+            images: ANTHROPIC_MAX_IMAGES_PER_REQUEST,
+            documents: ANTHROPIC_MAX_DOCUMENTS_PER_REQUEST,
+            bytes: ANTHROPIC_MAX_INLINE_ATTACHMENT_BYTES,
+        },
+        AttachmentPolicy::Gemini | AttachmentPolicy::OpenAI => RequestAttachmentLimits {
+            images: usize::MAX,
+            documents: usize::MAX,
+            bytes: GEMINI_MAX_INLINE_ATTACHMENT_BYTES,
+        },
+    }
+}
+
+/// Replace the attachments `request` cannot carry with a short text note,
+/// and return how many were replaced.
+///
+/// Images and documents stay in a conversation's history, so enough of them
+/// would push every later request past the provider's per-request count or
+/// total-size limit, or, on a route that takes none, fail every request. The
+/// newest attachments that fit are kept; the first that does not and every
+/// older one become [`OMITTED_ATTACHMENT`], so what is omitted only grows
+/// from the oldest end. On a route with no attachment policy every one
+/// becomes [`UNSUPPORTED_ATTACHMENT`]. A single malformed or oversized
+/// attachment is left for [`validate_request_attachments`] to refuse.
+pub(crate) fn fit_request_attachments(
+    provider: &str,
+    model: &str,
+    request: &mut ChatRequest,
+) -> usize {
+    let policy = attachment_policy(provider, model);
+    let mut positions = Vec::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        if let Content::Blocks(blocks) = &message.content {
+            for (block_index, block) in blocks.iter().enumerate() {
+                let (kind, data) = match block {
+                    ContentBlock::Image { source } => (AttachmentKind::Image, &source.data),
+                    ContentBlock::Document { source } => (AttachmentKind::Document, &source.data),
+                    _ => continue,
+                };
+                positions.push((
+                    message_index,
+                    block_index,
+                    kind,
+                    decoded_attachment_len(data).ok(),
+                ));
+            }
+        }
+    }
+    let (omitted, note) = policy.map_or((positions.len(), UNSUPPORTED_ATTACHMENT), |policy| {
+        let kept = newest_that_fit(&request_limits(policy), &positions);
+        (positions.len() - kept, OMITTED_ATTACHMENT)
+    });
+    for &(message_index, block_index, _, _) in &positions[..omitted] {
+        if let Content::Blocks(blocks) = &mut request.messages[message_index].content {
+            blocks[block_index] = ContentBlock::Text {
+                text: note.to_owned(),
+            };
+        }
+    }
+    omitted
+}
+
+/// How many of `positions`, counted from the newest, fit `limits` before the
+/// first that does not.
+fn newest_that_fit(
+    limits: &RequestAttachmentLimits,
+    positions: &[(usize, usize, AttachmentKind, Option<usize>)],
+) -> usize {
+    let (mut images, mut documents, mut bytes) = (0_usize, 0_usize, 0_usize);
+    let mut kept = 0;
+    for (_, _, kind, decoded) in positions.iter().rev() {
+        let (count, cap) = match kind {
+            AttachmentKind::Image => (&mut images, limits.images),
+            AttachmentKind::Document => (&mut documents, limits.documents),
+        };
+        let size = decoded.unwrap_or(0);
+        if *count + 1 > cap || bytes.saturating_add(size) > limits.bytes {
+            break;
+        }
+        *count += 1;
+        bytes += size;
+        kept += 1;
+    }
+    kept
+}
+
 pub(crate) fn validate_request_attachments(
     provider: &str,
     model: &str,
@@ -296,6 +397,137 @@ mod tests {
             cache: None,
             request_only_reminders: Vec::new(),
         }
+    }
+
+    /// `count` images of `decoded` bytes each, one per message, oldest first,
+    /// each tagged by its index in its first base64 bytes.
+    fn image_history(count: usize, decoded: usize) -> ChatRequest {
+        let mut request = request_with_blocks(Vec::new());
+        request.messages = (0..count)
+            .map(|index| {
+                let mut bytes = vec![0_u8; decoded];
+                bytes[0] = u8::try_from(index).unwrap_or(u8::MAX);
+                Message {
+                    role: Role::User,
+                    content: Content::Blocks(vec![
+                        ContentBlock::Text {
+                            text: format!("read {index}"),
+                        },
+                        ContentBlock::Image {
+                            source: ContentSource::new(
+                                "image/png",
+                                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            ),
+                        },
+                    ]),
+                }
+            })
+            .collect();
+        request
+    }
+
+    fn images_left(request: &ChatRequest) -> Vec<usize> {
+        request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                matches!(&message.content, Content::Blocks(blocks)
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Image { .. })))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    const MAX_READ_IMAGE: usize = 3_932_160;
+
+    #[test]
+    fn images_past_anthropics_request_total_are_omitted_oldest_first() -> anyhow::Result<()> {
+        let mut request = image_history(9, MAX_READ_IMAGE);
+        assert!(validate_request_attachments("anthropic", "claude-opus-5-5", &request).is_err());
+
+        let omitted = fit_request_attachments("anthropic", "claude-opus-5-5", &mut request);
+
+        assert_eq!(omitted, 1);
+        assert_eq!(images_left(&request), (1..9).collect::<Vec<_>>());
+        assert!(
+            matches!(&request.messages[0].content, Content::Blocks(blocks)
+            if matches!(&blocks[1], ContentBlock::Text { text } if text == OMITTED_ATTACHMENT))
+        );
+        validate_request_attachments("anthropic", "claude-opus-5-5", &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn images_past_geminis_request_total_are_omitted_oldest_first() -> anyhow::Result<()> {
+        let mut request = image_history(6, MAX_READ_IMAGE);
+        assert!(validate_request_attachments("gemini", "gemini-3-pro", &request).is_err());
+
+        assert_eq!(
+            fit_request_attachments("gemini", "gemini-3-pro", &mut request),
+            1
+        );
+        assert_eq!(images_left(&request), (1..6).collect::<Vec<_>>());
+        validate_request_attachments("gemini", "gemini-3-pro", &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn anthropics_document_count_keeps_the_newest_five() {
+        let mut request = request_with_blocks(
+            (0..7)
+                .map(|_| ContentBlock::Document {
+                    source: ContentSource::new(
+                        "application/pdf",
+                        base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4"),
+                    ),
+                })
+                .collect(),
+        );
+
+        assert_eq!(
+            fit_request_attachments("anthropic", "claude-opus-5-5", &mut request),
+            2
+        );
+        assert!(validate_request_attachments("anthropic", "claude-opus-5-5", &request).is_ok());
+    }
+
+    #[test]
+    fn attachments_that_fit_are_left_alone() -> anyhow::Result<()> {
+        let mut request = image_history(3, 1024);
+        let original = serde_json::to_value(&request.messages)?;
+
+        assert_eq!(
+            fit_request_attachments("anthropic", "claude-opus-5-5", &mut request),
+            0
+        );
+        assert_eq!(serde_json::to_value(&request.messages)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_route_without_an_attachment_policy_gets_notes_instead_of_images() -> anyhow::Result<()> {
+        let mut request = image_history(2, 1024);
+        assert!(validate_request_attachments("openrouter", "some/model", &request).is_err());
+
+        assert_eq!(
+            fit_request_attachments("openrouter", "some/model", &mut request),
+            2
+        );
+        assert_eq!(images_left(&request), Vec::<usize>::new());
+        validate_request_attachments("openrouter", "some/model", &request)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_oversized_image_is_left_for_validation_to_refuse() {
+        let mut request = image_history(1, 6 * 1024 * 1024);
+
+        assert_eq!(
+            fit_request_attachments("anthropic", "claude-opus-5-5", &mut request),
+            0
+        );
+        assert!(validate_request_attachments("anthropic", "claude-opus-5-5", &request).is_err());
     }
 
     #[cfg(feature = "openai")]

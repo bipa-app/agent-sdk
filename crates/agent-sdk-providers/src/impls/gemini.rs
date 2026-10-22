@@ -5,7 +5,7 @@
 
 pub(crate) mod data;
 
-use crate::attachments::validate_request_attachments;
+use crate::attachments::{fit_request_attachments, validate_request_attachments};
 use crate::provider::{
     BoundedEmbeddingRowsSeed, BoundedEmbeddingVector, EmbeddingError, LlmProvider,
     deserialize_bounded_embedding_json, read_embedding_response,
@@ -235,11 +235,12 @@ impl GeminiProvider {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl LlmProvider for GeminiProvider {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
         let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        fit_request_attachments(self.provider(), self.model(), &mut request);
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
@@ -439,7 +440,7 @@ impl LlmProvider for GeminiProvider {
         decode_gemini_embedding_response(&bytes, request.inputs.len(), requested_dimensions)
     }
 
-    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+    fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
@@ -453,6 +454,7 @@ impl LlmProvider for GeminiProvider {
                     return;
                 }
             };
+            fit_request_attachments(self.provider(), self.model(), &mut request);
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),

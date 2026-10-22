@@ -7,7 +7,7 @@
 pub(crate) mod data;
 mod fingerprint;
 
-use crate::attachments::validate_request_attachments;
+use crate::attachments::{fit_request_attachments, validate_request_attachments};
 use crate::provider::{LlmProvider, thinking_for_forced_tool};
 use crate::streaming::{
     StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
@@ -956,7 +956,7 @@ impl AnthropicProvider {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl LlmProvider for AnthropicProvider {
-    async fn chat(&self, request: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
         if let Err(error) = self.resolve_speed_tier() {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
@@ -967,6 +967,7 @@ impl LlmProvider for AnthropicProvider {
             Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        fit_request_attachments(self.provider(), self.model(), &mut request);
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
@@ -1173,7 +1174,7 @@ impl LlmProvider for AnthropicProvider {
         }))
     }
 
-    fn chat_stream(&self, request: ChatRequest) -> StreamBox<'_> {
+    fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
@@ -1191,6 +1192,8 @@ impl LlmProvider for AnthropicProvider {
                         });
                         return;
                     }
+
+                    fit_request_attachments(self.provider(), self.model(), &mut request);
 
                     if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                         yield Ok(StreamDelta::Error {
