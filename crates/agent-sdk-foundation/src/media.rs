@@ -4,6 +4,7 @@
 use base64::Engine as _;
 
 /// The media type `prefix` starts with: PNG, JPEG, GIF, WebP or PDF.
+#[must_use]
 pub fn detect_media_magic(prefix: &[u8]) -> Option<&'static str> {
     if prefix.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
@@ -25,6 +26,7 @@ pub const MAX_IMAGE_SIDE_PX: u32 = 8000;
 
 /// An image's width and height from its header, without decoding it, or
 /// `None` when the header cannot be read.
+#[must_use]
 pub fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
     let be16 = |at: usize| {
         Some(u32::from(u16::from_be_bytes(
@@ -84,9 +86,10 @@ pub fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
     }
 }
 
-/// Why base64 `data` cannot be shown to a model as the image `media_type`,
-/// or `None` when it can: it decodes, its content is that image type, and
-/// its header gives dimensions within [`MAX_IMAGE_SIDE_PX`].
+/// Why base64 `data` cannot be shown to a model as the image `media_type`.
+///
+/// `None` when it can: it decodes, its content is that image type, and its
+/// header gives dimensions within [`MAX_IMAGE_SIDE_PX`].
 ///
 /// Only as much is decoded as the header needs (a JPEG's frame header can
 /// sit past its metadata), so a large image costs a few kilobytes.

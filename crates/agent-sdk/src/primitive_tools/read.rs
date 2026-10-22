@@ -10,7 +10,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use super::PrimitiveToolContext;
-pub(crate) use agent_sdk_foundation::media::detect_media_magic;
+pub use agent_sdk_foundation::media::detect_media_magic;
 use agent_sdk_foundation::media::{MAX_IMAGE_SIDE_PX, image_dimensions};
 
 /// Maximum bytes per line before truncation.
