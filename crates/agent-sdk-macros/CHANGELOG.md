@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.18.0...agent-sdk-macros-v0.19.0) - 2026-10-22
+
+### Added
+
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+
+### Fixed
+
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-macros-v0.17.0...agent-sdk-macros-v0.18.0) - 2026-08-04
 
 ### Other
