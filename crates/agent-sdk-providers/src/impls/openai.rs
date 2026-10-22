@@ -5539,6 +5539,10 @@ mod tests {
         assert!(!proxy.supports_historical_image_blocks());
     }
 
+    /// A PNG signature and IHDR for 640x480: the smallest image the
+    /// providers' content check accepts.
+    const PNG_640X480: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x80\0\0\x01\xe0";
+
     #[tokio::test]
     async fn gpt4o_downgrades_prior_original_image_detail_on_the_wire() -> anyhow::Result<()> {
         use wiremock::matchers::{method, path};
@@ -5567,7 +5571,7 @@ mod tests {
             );
         let png_base64 = {
             use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode(b"png")
+            base64::engine::general_purpose::STANDARD.encode(PNG_640X480)
         };
         let request = ChatRequest::new(
             String::new(),

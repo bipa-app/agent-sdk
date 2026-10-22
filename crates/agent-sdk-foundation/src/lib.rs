@@ -15,6 +15,7 @@ pub mod audit;
 pub mod batch_order;
 pub mod events;
 pub mod llm;
+pub mod media;
 pub mod privacy;
 pub mod types;
 pub mod view;

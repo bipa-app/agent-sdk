@@ -130,10 +130,13 @@ fn inline_payload_bytes(result: &ToolResult) -> usize {
     } else {
         serialized_json_bytes(&result.documents).unwrap_or(usize::MAX)
     };
-    let attachments_only = result
-        .documents
-        .iter()
-        .all(|document| ATTACHMENT_MEDIA_TYPES.contains(&document.media_type.as_str()));
+    // Only an image the model can be shown skips the text budget; anything
+    // else declared as one is counted as text, and spills like it.
+    let attachments_only = result.documents.iter().all(|document| {
+        ATTACHMENT_MEDIA_TYPES.contains(&document.media_type.as_str())
+            && agent_sdk_foundation::media::image_problem(&document.media_type, &document.data)
+                .is_none()
+    });
     let document_bytes = if attachments_only && document_bytes <= INLINE_ATTACHMENT_BUDGET_BYTES {
         0
     } else {
@@ -2068,10 +2071,34 @@ mod tests {
         Ok(())
     }
 
+    /// A `read` result carrying a 640x480 PNG whose base64 is about
+    /// `base64_bytes` long.
     fn image_result(base64_bytes: usize) -> ToolResult {
+        use base64::Engine as _;
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\x02\x80\0\0\x01\xe0".to_vec();
+        png.resize((base64_bytes / 4 * 3).max(png.len()), 0);
         ToolResult::success("Read image/png file: '/tmp/grid.png'").with_documents(vec![
-            agent_sdk_foundation::llm::ContentSource::new("image/png", "A".repeat(base64_bytes)),
+            agent_sdk_foundation::llm::ContentSource::new(
+                "image/png",
+                base64::engine::general_purpose::STANDARD.encode(&png),
+            ),
         ])
+    }
+
+    #[test]
+    fn content_declared_as_an_image_that_is_not_one_counts_as_text() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = ToolResult::success("forged screenshot").with_documents(vec![
+            agent_sdk_foundation::llm::ContentSource::new("image/png", "A".repeat(200 * 1024)),
+        ]);
+
+        assert!(store.apply_inline_budget(&mut result, "mcp")?.is_some());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
+        Ok(())
     }
 
     #[test]
