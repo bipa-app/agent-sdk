@@ -42,7 +42,7 @@ use agent_sdk_foundation::ToolResult;
 use agent_sdk_foundation::llm::ContentBlock;
 
 use super::commit::CompletedTurnCommit;
-use super::document::{DocExpect, Document, DocumentKey, DocumentWrite};
+use super::document::{DocExpect, DocKind, Document, DocumentKey, DocumentWrite};
 use super::task::{AgentTask, AgentTaskId, TaskStatus};
 use super::transition::{Rejected, SteeringInput, Transition, Write};
 
@@ -103,6 +103,19 @@ pub trait TransitionExtension: Send + Sync {
         queued: &Document,
     ) -> Option<FoldedSteering> {
         let _ = (parent, settled, result, queued);
+        None
+    }
+
+    /// The queue, as a document kind and key on a parent's own thread, that
+    /// a tool child's settle carries as a [`SteeringInput::Queued`] write of
+    /// its parent: folded into the parent's fan-in when the settle is its
+    /// last child's ([`Self::fold_queued_steering`]), and otherwise offered
+    /// to [`Self::take_queued_steering`] to wake the parent if it is still
+    /// parked. A host whose take declines a queue therefore leaves its
+    /// notes for the fan-in instead of interrupting the running calls.
+    ///
+    /// `None` (the default): tool settles carry no steering, as before.
+    fn fan_in_steering_queue(&self) -> Option<(DocKind, String)> {
         None
     }
 }
