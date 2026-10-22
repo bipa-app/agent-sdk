@@ -249,7 +249,17 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
         );
 
         if collected.is_empty() {
-            return Ok(ToolResult::error("offset exceeds file length"));
+            let lines = content.lines().count();
+            return Ok(ToolResult::error(if lines == 0 {
+                format!("offset exceeds file length: '{path}' is empty")
+            } else {
+                format!(
+                    "offset exceeds file length: offset {} is past the end of '{path}', which \
+                     has {lines} line{}; read from an offset between 1 and {lines}",
+                    input.offset,
+                    if lines == 1 { "" } else { "s" },
+                )
+            }));
         }
 
         Ok(ToolResult::success(collected.join("\n")))
@@ -1133,6 +1143,42 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("offset exceeds file length"));
+        assert!(
+            result.output.contains("offset 100") && result.output.contains("has 1 line"),
+            "{}",
+            result.output
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_names_the_files_length() -> anyhow::Result<()> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file("utils.py", &"line\n".repeat(776)).await?;
+        fs.write_file("empty.py", "").await?;
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/utils.py", "offset": "820"}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(
+            result.output.contains("has 776 lines") && result.output.contains("offset 820"),
+            "{}",
+            result.output
+        );
+
+        let result = tool
+            .execute(
+                &tool_ctx(),
+                json!({"path": "/workspace/empty.py", "offset": 5}),
+            )
+            .await?;
+        assert!(!result.success);
+        assert!(result.output.contains("is empty"), "{}", result.output);
         Ok(())
     }
 
