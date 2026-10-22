@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.18.0...agent-sdk-v0.19.0) - 2026-10-22
+
+### Added
+
+- *(journal)* a tool child's settle can carry its parent's queued steering ([#568](https://github.com/bipa-app/agent-sdk/pull/568))
+- *(grep)* two lines of context per match, and minified files skipped ([#564](https://github.com/bipa-app/agent-sdk/pull/564))
+- *(journal)* [**breaking**] a fan-in settle folds its parent's queued steering into the wave's last result ([#554](https://github.com/bipa-app/agent-sdk/pull/554))
+- *(server)* [**breaking**] an LLM attempt's close and its UsageProgress event commit together ([#544](https://github.com/bipa-app/agent-sdk/pull/544))
+- *(journal)* [**breaking**] a transition extension wakes the root it parks with its queued steering ([#549](https://github.com/bipa-app/agent-sdk/pull/549))
+- *(host)* LocalDaemonBuilder::store_options and agent_server.root_turn metrics ([#541](https://github.com/bipa-app/agent-sdk/pull/541))
+- *(server)* [**breaking**] a subagent invocation waits on a host prompt; Write::ParkInvocation and Write::WakeInvocation ([#533](https://github.com/bipa-app/agent-sdk/pull/533))
+- *(observability)* tool-call phase spans for the effect lookup, claim and settlement ([#547](https://github.com/bipa-app/agent-sdk/pull/547))
+- *(server)* a cut-off LLM response is salvaged into the turn that continues ([#534](https://github.com/bipa-app/agent-sdk/pull/534))
+- *(host)* [**breaking**] EpochRecovery::PostgresLeader, one host per Postgres store; epoch fencing ([#523](https://github.com/bipa-app/agent-sdk/pull/523))
+- *(host)* [**breaking**] the worker writes subagent progress and the root-turn stall notice as lease-guarded events ([#531](https://github.com/bipa-app/agent-sdk/pull/531))
+- *(observability)* a host records the waits on a human it found at start ([#527](https://github.com/bipa-app/agent-sdk/pull/527))
+- *(server)* [**breaking**] the transition extension hook commits a host's writes in the same transaction ([#508](https://github.com/bipa-app/agent-sdk/pull/508))
+- *(observability)* count every RPC a thread's status refuses ([#529](https://github.com/bipa-app/agent-sdk/pull/529))
+- *(host)* [**breaking**] the local daemon gives its store handles and awaits a pre-worker gate; a submit wakes a worker ([#525](https://github.com/bipa-app/agent-sdk/pull/525))
+- *(observability)* a tool call run again after a crash is counted and traced ([#526](https://github.com/bipa-app/agent-sdk/pull/526))
+- *(host)* a stalled subagent child says so, with the same signals as a stalled tool ([#521](https://github.com/bipa-app/agent-sdk/pull/521))
+- *(server)* [**breaking**] process epochs; a single host reclaims a dead process's leases at start ([#506](https://github.com/bipa-app/agent-sdk/pull/506))
+- *(server)* [**breaking**] Write::EnqueueSteeringResume wakes a parked parent inside a transition ([#509](https://github.com/bipa-app/agent-sdk/pull/509))
+- *(server)* [**breaking**] a subagent completion hook runs as the invocation's git-step effect, settled with the result ([#519](https://github.com/bipa-app/agent-sdk/pull/519))
+- *(server)* [**breaking**] git-step effects; a subagent invocation retries up to three times ([#518](https://github.com/bipa-app/agent-sdk/pull/518))
+- *(observability)* a lock conflict the store gave up on is its own outcome; every idempotent RPC counts its claim ([#522](https://github.com/bipa-app/agent-sdk/pull/522))
+- *(host)* [**breaking**] a tool child fails as stalled when its tool shows no progress for its stall budget ([#514](https://github.com/bipa-app/agent-sdk/pull/514))
+- *(host)* [**breaking**] durable prompt rows — a host's prompt is answered once and applied by its handler ([#515](https://github.com/bipa-app/agent-sdk/pull/515))
+- *(observability)* recovery and host-loop signals the crash matrix found missing ([#517](https://github.com/bipa-app/agent-sdk/pull/517))
+- *(server)* [**breaking**] a completed root turn settles the root in the same transaction ([#513](https://github.com/bipa-app/agent-sdk/pull/513))
+- *(observability)* wire workers.active, let a host name its service without a warning; record what a live daemon exports ([#512](https://github.com/bipa-app/agent-sdk/pull/512))
+- *(server)* [**breaking**] tool calls run as effects; their record is claimed under the lease and finished with the settle ([#507](https://github.com/bipa-app/agent-sdk/pull/507))
+- *(server)* [**breaking**] documents, typed JSON a transition writes in its own transaction ([#504](https://github.com/bipa-app/agent-sdk/pull/504))
+- *(sdk)* [**breaking**] tools declare replay; recovery never re-runs an undeclared tool ([#488](https://github.com/bipa-app/agent-sdk/pull/488))
+- *(server)* [**breaking**] request-only context hook on AgentDefinition ([#464](https://github.com/bipa-app/agent-sdk/pull/464))
+- *(providers)* GPT-6 family and Claude Fable 5.1; fix prompt_cache_key length and Anthropic keep-alives ([#455](https://github.com/bipa-app/agent-sdk/pull/455))
+- *(providers)* add bounded embedding API ([#440](https://github.com/bipa-app/agent-sdk/pull/440))
+- *(server)* durable tool-input preflight + atomic precompleted mixed-spawn (ENG-9548) ([#442](https://github.com/bipa-app/agent-sdk/pull/442))
+
+### Fixed
+
+- *(artifacts)* a missing attachment artifact degrades to a note, and forks copy image artifacts ([#570](https://github.com/bipa-app/agent-sdk/pull/570))
+- *(attachments)* image content from any tool is checked before it reaches a provider ([#569](https://github.com/bipa-app/agent-sdk/pull/569))
+- *(read)* images reach the model as attachments, not spilled text ([#566](https://github.com/bipa-app/agent-sdk/pull/566))
+- *(read)* an offset past the end of a file names the file's length ([#567](https://github.com/bipa-app/agent-sdk/pull/567))
+- *(tools)* integer parameters accept integer strings ([#565](https://github.com/bipa-app/agent-sdk/pull/565))
+- *(tools)* boolean parameters accept "true" and "false" strings ([#562](https://github.com/bipa-app/agent-sdk/pull/562))
+- *(read)* reading a large artifact without a window returns its first window ([#563](https://github.com/bipa-app/agent-sdk/pull/563))
+- *(host)* prompt-row follow-ups — count the prompt_id claim, pin step=redrive, quieter unclosed warning, crate-private helpers ([#520](https://github.com/bipa-app/agent-sdk/pull/520))
+- *(server)* [**breaking**] fence the lease-guarded event writers, the message-head writers and fork against purged threads; validate a spawn before the in-memory sink check ([#503](https://github.com/bipa-app/agent-sdk/pull/503))
+- *(pricing)* OpenAI rows at their Standard tier, not the Batch tier ([#487](https://github.com/bipa-app/agent-sdk/pull/487))
+- *(gemini)* send type-list tool schemas in a shape the Schema proto parses ([#483](https://github.com/bipa-app/agent-sdk/pull/483))
+- *(tools)* accept null for every optional built-in tool input field ([#482](https://github.com/bipa-app/agent-sdk/pull/482))
+- *(server,sdk)* [**breaking**] run a batch's mutating tool calls alone and in model order ([#476](https://github.com/bipa-app/agent-sdk/pull/476))
+- *(compaction)* [**breaking**] report what crossed which threshold; resolve dated model snapshots ([#478](https://github.com/bipa-app/agent-sdk/pull/478))
+- *(server)* [**breaking**] size worker max_tokens to the serving model; correct output ceilings ([#472](https://github.com/bipa-app/agent-sdk/pull/472))
+- *(server)* early resume never re-presents a running call as new ([#468](https://github.com/bipa-app/agent-sdk/pull/468))
+- *(server,codex)* key daemon requests by thread so Codex prompt caching hits ([#471](https://github.com/bipa-app/agent-sdk/pull/471))
+- *(compaction)* [**breaking**] trigger on real per-model context occupancy ([#465](https://github.com/bipa-app/agent-sdk/pull/465))
+- *(providers)* [**breaking**] unique tool-call ids, strict-safe schemas, argument-stream liveness; thread-scoped execution cache ([#467](https://github.com/bipa-app/agent-sdk/pull/467))
+- *(compaction)* skip a summarization that returns no usable text ([#450](https://github.com/bipa-app/agent-sdk/pull/450))
+- *(compaction)* skip no-progress compaction; sanitize thinking blocks from non-final turns ([#447](https://github.com/bipa-app/agent-sdk/pull/447))
+- *(mcp)* omit absent client capabilities from the initialize handshake ([#444](https://github.com/bipa-app/agent-sdk/pull/444))
+
+### Other
+
+- *(ci)* repair the rust 1.99 clippy and deprecation breakage on main ([#462](https://github.com/bipa-app/agent-sdk/pull/462))
+- *(ci)* repair the rust 1.98 clippy and RustSec gate breakage on main ([#452](https://github.com/bipa-app/agent-sdk/pull/452))
+- *(dev)* make local dev runtime-agnostic, drop the compose dependency ([#438](https://github.com/bipa-app/agent-sdk/pull/438))
+
 ## [0.18.0](https://github.com/bipa-app/agent-sdk/compare/agent-sdk-v0.17.0...agent-sdk-v0.18.0) - 2026-08-04
 
 ### Added
