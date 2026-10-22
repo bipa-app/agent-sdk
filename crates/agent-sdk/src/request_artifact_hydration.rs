@@ -12,9 +12,12 @@ const MAX_HYDRATED_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// The input request is never mutated. Canonical Snapcompact frame slots degrade when their
 /// backing artifact cannot be recovered; every other artifact-backed source fails closed.
 ///
+/// An attachment that can't be hydrated (a non-exact URI, an unavailable,
+/// oversized or MIME-mismatched artifact) becomes a short note instead.
+///
 /// # Errors
-/// Returns a contextual error for a non-canonical, unavailable, oversized, or MIME-mismatched
-/// artifact-backed attachment, or when the blocking hydration task cannot be joined.
+/// Returns an error when canonical Snapcompact frames together exceed the
+/// aggregate limit, or when the blocking hydration task cannot be joined.
 #[doc(hidden)]
 pub async fn hydrate_request_artifact_sources(
     request: &llm::ChatRequest,
@@ -111,9 +114,8 @@ fn plan_budget_degrades(
     // actually being asked about.
     for (message_index, block_index, len) in candidates.into_iter().rev() {
         if len > max_hydrated_bytes {
-            // A SINGLE attachment over the per-request limit keeps its
-            // fatal per-attachment rejection in `hydrate_source`; only the
-            // aggregate overflow degrades.
+            // A SINGLE attachment over the per-request limit is noted on its
+            // own in `hydrate_source`; it takes none of the budget.
             continue;
         }
         if len <= remaining {
@@ -197,17 +199,19 @@ fn hydrate_request(
             });
             match result {
                 Ok(()) => blocks.push(block),
-                Err(failure) if is_canonical_frame && failure.degradable_frame => {
+                Err(failure) if failure.request_wide => return Err(failure.error),
+                Err(failure) if is_canonical_frame => {
                     log::warn!(
                         "Omitting unavailable canonical Snapcompact frame from provider request: {:#}",
                         failure.error
                     );
                 }
-                Err(failure) if failure.degradable_frame => {
-                    // A missing, unreadable or mislabelled artifact (retention
-                    // swept it, a fork did not copy it, its bytes are not
-                    // what it declares) stays in the history: failing here
-                    // would fail every later request of the session.
+                Err(failure) => {
+                    // A missing, unreadable, oversized or mislabelled
+                    // artifact, or a reference that is not an exact
+                    // artifact URI (retention swept it, a fork did not copy
+                    // it, a tool named one), stays in the history: failing
+                    // here would fail every later request of the session.
                     log::warn!(
                         "Omitting unavailable attachment artifact from provider request: {:#}",
                         failure.error
@@ -219,43 +223,65 @@ fn hydrate_request(
                     };
                     blocks.push(llm::ContentBlock::Text {
                         text: format!(
-                            "[{} attachment {} is no longer available and was omitted from \
-                             this request]",
-                            source.media_type, source.data
+                            "[{} attachment {} {} and was omitted from this request]",
+                            bounded_echo(&source.media_type),
+                            bounded_echo(&source.data),
+                            failure.reason,
                         ),
                     });
                 }
-                Err(failure) => return Err(failure.error),
             }
         }
     }
     Ok(request)
 }
 
+/// Tool-supplied text echoed in a note (a media type, a non-exact URI) is
+/// cut to this many characters.
+const MAX_NOTE_ECHO_CHARS: usize = 64;
+
+fn bounded_echo(text: &str) -> String {
+    match text.char_indices().nth(MAX_NOTE_ECHO_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
 struct SourceHydrationFailure {
     error: anyhow::Error,
-    degradable_frame: bool,
+    /// Fails the whole request rather than leaving the attachment out.
+    request_wide: bool,
+    /// Why the attachment was left out, for the note that replaces it.
+    reason: &'static str,
 }
 
 impl SourceHydrationFailure {
+    const UNAVAILABLE: &'static str = "is no longer available";
+
     const fn degradable(error: anyhow::Error) -> Self {
+        Self::degradable_because(error, Self::UNAVAILABLE)
+    }
+
+    const fn degradable_because(error: anyhow::Error, reason: &'static str) -> Self {
         Self {
             error,
-            degradable_frame: true,
+            request_wide: false,
+            reason,
         }
     }
 
-    const fn fatal(error: anyhow::Error) -> Self {
+    const fn request_wide(error: anyhow::Error) -> Self {
         Self {
             error,
-            degradable_frame: false,
+            request_wide: true,
+            reason: Self::UNAVAILABLE,
         }
     }
 
     fn with_context(self, context: String) -> Self {
         Self {
             error: self.error.context(context),
-            degradable_frame: self.degradable_frame,
+            ..self
         }
     }
 }
@@ -268,9 +294,10 @@ fn hydrate_source(
     max_hydrated_bytes: u64,
 ) -> std::result::Result<(), SourceHydrationFailure> {
     let artifact_id = exact_artifact_uri_id(&source.data).ok_or_else(|| {
-        SourceHydrationFailure::fatal(anyhow!(
-            "attachment artifact URI must be exact (artifact://<positive numeric id>)"
-        ))
+        SourceHydrationFailure::degradable_because(
+            anyhow!("attachment artifact URI must be exact (artifact://<positive numeric id>)"),
+            "is not an exact artifact reference",
+        )
     })?;
     let store = store.ok_or_else(|| {
         SourceHydrationFailure::degradable(anyhow!(
@@ -288,22 +315,32 @@ fn hydrate_source(
         .map_err(SourceHydrationFailure::degradable)?;
     let expected_len = metadata.len();
     if expected_len > max_hydrated_bytes {
-        return Err(SourceHydrationFailure::fatal(anyhow!(
-            "artifact {artifact_id} is {expected_len} bytes; provider attachment limit is {max_hydrated_bytes} bytes"
-        )));
+        return Err(SourceHydrationFailure::degradable_because(
+            anyhow!(
+                "artifact {artifact_id} is {expected_len} bytes; provider attachment limit is {max_hydrated_bytes} bytes"
+            ),
+            "is over the provider attachment limit",
+        ));
     }
     let projected_bytes = hydrated_bytes
         .checked_add(expected_len)
         .filter(|total| *total <= max_hydrated_bytes)
         .ok_or_else(|| {
-            SourceHydrationFailure::fatal(anyhow!(
+            // Only canonical frames get here: other attachments past the
+            // budget were already planned out as notes.
+            SourceHydrationFailure::request_wide(anyhow!(
                 "artifact-backed provider attachments exceed aggregate decoded limit of {max_hydrated_bytes} bytes"
             ))
         })?;
 
     let capacity = usize::try_from(expected_len)
         .with_context(|| format!("artifact {artifact_id} length does not fit memory"))
-        .map_err(SourceHydrationFailure::fatal)?;
+        .map_err(|error| {
+            SourceHydrationFailure::degradable_because(
+                error,
+                "is over the provider attachment limit",
+            )
+        })?;
     let mut bytes = vec![0_u8; capacity];
     file.read_exact(&mut bytes)
         .with_context(|| format!("reading current-thread artifact {artifact_id}"))
@@ -662,14 +699,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selector_on_noncanonical_attachment_fails_closed() -> Result<()> {
-        let durable = request(Message::user_with_content(vec![ContentBlock::Image {
-            source: ContentSource::new("image/png", "artifact://1:raw"),
-        }]));
-        let error = hydrate_request_artifact_sources(&durable, None)
-            .await
-            .expect_err("selector must not resolve");
-        assert!(format!("{error:#}").contains("must be exact"));
+    async fn a_non_exact_artifact_uri_degrades_to_a_bounded_note() -> Result<()> {
+        let long = format!("artifact://{}", "x".repeat(10_000));
+        for uri in ["artifact://1:raw", "artifact://abc", "artifact://0", &long] {
+            let durable = request(Message::user_with_content(vec![ContentBlock::Image {
+                source: ContentSource::new("image/png", uri),
+            }]));
+            let hydrated = hydrate_request_artifact_sources(&durable, None).await?;
+            let note = only_text(&hydrated);
+            assert!(
+                note.contains("is not an exact artifact reference"),
+                "{note}"
+            );
+            assert!(
+                note.len() < 200,
+                "the echoed URI is bounded: {}",
+                note.len()
+            );
+        }
         Ok(())
     }
 
@@ -764,10 +811,11 @@ mod tests {
             source: ContentSource::new("image/png", format!("artifact://{}", saved.id)),
         }]));
 
-        let error = hydrate_request_artifact_sources(&durable, Some(store))
-            .await
-            .expect_err("oversized artifact must fail");
-        assert!(format!("{error:#}").contains("provider attachment limit"));
+        let hydrated = hydrate_request_artifact_sources(&durable, Some(store)).await?;
+        assert!(
+            only_text(&hydrated).contains("is over the provider attachment limit"),
+            "an oversized artifact is left out, unread"
+        );
         Ok(())
     }
 
