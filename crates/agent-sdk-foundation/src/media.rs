@@ -92,39 +92,161 @@ pub fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
 /// header gives dimensions within [`MAX_IMAGE_SIDE_PX`].
 ///
 /// Only as much is decoded as the header needs (a JPEG's frame header can
-/// sit past its metadata), so a large image costs a few kilobytes.
+/// sit past its metadata), so a large image costs a few kilobytes. A verdict
+/// that needed more is remembered: a history sends the same image again on
+/// every request.
 #[must_use]
 pub fn image_problem(media_type: &str, data: &str) -> Option<String> {
-    let mut prefix_chars = 4 * 1024;
+    // Base64 is ASCII, so slicing bytes is exact; non-ASCII fails to decode.
+    let data = data.as_bytes();
+    if let Some(Verdict(problem)) = check_prefix(media_type, data, FIRST_PREFIX) {
+        return problem;
+    }
+    let cache = &*VERDICTS;
+    let key = cache.key(media_type, data);
+    if let Some(Verdict(problem)) = cache.lookup(&key, data) {
+        return problem;
+    }
+    let mut prefix = FIRST_PREFIX;
     loop {
-        let whole = prefix_chars >= data.len();
-        let chunk = if whole {
-            data
-        } else {
-            &data[..prefix_chars - prefix_chars % 4]
-        };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(chunk) else {
-            return Some("its data is not valid base64".to_owned());
-        };
-        match detect_media_magic(&bytes) {
-            Some(found) if found == media_type => {}
-            Some(found) => return Some(format!("its content is {found}, not {media_type}")),
-            None if whole || bytes.len() >= 16 => {
-                return Some(format!("its content is not a {media_type} image"));
-            }
-            None => {}
+        prefix *= 16;
+        if let Some(verdict) = check_prefix(media_type, data, prefix) {
+            cache.store(key, data, prefix.min(data.len()), verdict.clone());
+            return verdict.0;
         }
-        if let Some((width, height)) = image_dimensions(&bytes, media_type) {
-            return (width.max(height) > MAX_IMAGE_SIDE_PX).then(|| {
-                format!("it is {width}x{height} px, over {MAX_IMAGE_SIDE_PX} px on a side")
-            });
+    }
+}
+
+/// [`image_problem`]'s answer once the header has been read.
+#[derive(Clone)]
+struct Verdict(Option<String>);
+
+/// The base64 characters decoded first; most headers sit well inside.
+const FIRST_PREFIX: usize = 4 * 1024;
+
+/// The verdict on `data`'s first `prefix` characters, or `None` while its
+/// header lies further on. Always a verdict once `prefix` covers all of it.
+fn check_prefix(media_type: &str, data: &[u8], prefix: usize) -> Option<Verdict> {
+    let whole = prefix >= data.len();
+    let chunk = if whole {
+        data
+    } else {
+        &data[..prefix - prefix % 4]
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(chunk) else {
+        return Some(Verdict(Some("its data is not valid base64".to_owned())));
+    };
+    match detect_media_magic(&bytes) {
+        Some(found) if found == media_type => {}
+        Some(found) => {
+            return Some(Verdict(Some(format!(
+                "its content is {found}, not {media_type}"
+            ))));
         }
-        if whole {
-            return Some(format!(
-                "its {media_type} header has no readable dimensions"
-            ));
+        None if whole || bytes.len() >= 16 => {
+            return Some(Verdict(Some(format!(
+                "its content is not a {media_type} image"
+            ))));
         }
-        prefix_chars *= 16;
+        None => {}
+    }
+    if let Some((width, height)) = image_dimensions(&bytes, media_type) {
+        return Some(Verdict((width.max(height) > MAX_IMAGE_SIDE_PX).then(
+            || format!("it is {width}x{height} px, over {MAX_IMAGE_SIDE_PX} px on a side"),
+        )));
+    }
+    whole.then(|| {
+        Verdict(Some(format!(
+            "its {media_type} header has no readable dimensions"
+        )))
+    })
+}
+
+static VERDICTS: std::sync::LazyLock<VerdictCache> = std::sync::LazyLock::new(VerdictCache::new);
+
+/// Verdicts that needed more than [`FIRST_PREFIX`], keyed by the media type,
+/// the length and a hash of the first [`FIRST_PREFIX`] characters. A hit is
+/// trusted only when the hash of the prefix its verdict was computed from
+/// matches too: the verdict depends on nothing else. The hash is seeded per
+/// process, so content can't be made to collide with an image seen earlier.
+struct VerdictCache {
+    seed: u64,
+    entries: std::sync::Mutex<std::collections::HashMap<VerdictKey, CachedVerdict>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct VerdictKey {
+    media_type: String,
+    len: usize,
+    head: u64,
+}
+
+struct CachedVerdict {
+    decoded: usize,
+    digest: u64,
+    verdict: Verdict,
+}
+
+/// Entries kept before the cache starts over; each is a few dozen bytes.
+const MAX_CACHED_VERDICTS: usize = 4096;
+
+impl VerdictCache {
+    fn new() -> Self {
+        use std::hash::BuildHasher as _;
+        Self {
+            seed: std::collections::hash_map::RandomState::new().hash_one(0_u8),
+            entries: std::sync::Mutex::default(),
+        }
+    }
+
+    fn key(&self, media_type: &str, data: &[u8]) -> VerdictKey {
+        VerdictKey {
+            media_type: media_type.to_owned(),
+            len: data.len(),
+            head: self.digest(data, FIRST_PREFIX),
+        }
+    }
+
+    fn digest(&self, data: &[u8], prefix: usize) -> u64 {
+        xxhash_rust::xxh64::xxh64(&data[..prefix.min(data.len())], self.seed)
+    }
+
+    fn lookup(&self, key: &VerdictKey, data: &[u8]) -> Option<Verdict> {
+        let (decoded, digest, verdict) = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .map(|entry| (entry.decoded, entry.digest, entry.verdict.clone()))?;
+        (self.digest(data, decoded) == digest).then_some(verdict)
+    }
+
+    fn store(&self, key: VerdictKey, data: &[u8], decoded: usize, verdict: Verdict) {
+        let digest = self.digest(data, decoded);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= MAX_CACHED_VERDICTS {
+            entries.clear();
+        }
+        entries.insert(
+            key,
+            CachedVerdict {
+                decoded,
+                digest,
+                verdict,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn holds(&self, media_type: &str, data: &str) -> bool {
+        let key = self.key(media_type, data.as_bytes());
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&key)
     }
 }
 
@@ -184,11 +306,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_jpeg_frame_header_past_its_metadata_is_found() {
+    /// A JPEG whose frame header (`width` x `height`) follows 50 KB of
+    /// metadata, past the first prefix the check decodes.
+    fn jpeg_behind_metadata(width: u16, height: u16) -> Vec<u8> {
         let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1, 0xc3, 0x52];
         jpeg.resize(jpeg.len() + 0xc350, 0);
-        jpeg.extend_from_slice(&[0xff, 0xc0, 0, 8, 8, 1, 0xe0, 2, 0x80]);
-        assert_eq!(image_problem("image/jpeg", &encoded(&jpeg)), None);
+        jpeg.extend_from_slice(&[0xff, 0xc0, 0, 8, 8]);
+        jpeg.extend_from_slice(&height.to_be_bytes());
+        jpeg.extend_from_slice(&width.to_be_bytes());
+        jpeg
+    }
+
+    #[test]
+    fn a_jpeg_frame_header_past_its_metadata_is_found() {
+        assert_eq!(
+            image_problem("image/jpeg", &encoded(&jpeg_behind_metadata(640, 480))),
+            None
+        );
+    }
+
+    #[test]
+    fn non_ascii_data_is_not_base64_wherever_it_falls() {
+        let straddling_first_prefix = format!("{}{}", "A".repeat(4095), "\u{20ac}".repeat(10));
+        let mut header = encoded(&jpeg_behind_metadata(640, 480));
+        header.truncate(65_535);
+        let straddling_second_prefix = format!("{header}{}", "\u{20ac}".repeat(10));
+        for data in [straddling_first_prefix, straddling_second_prefix] {
+            assert_eq!(
+                image_problem("image/jpeg", &data).as_deref(),
+                Some("its data is not valid base64"),
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_verdict_is_only_reused_for_the_same_image() {
+        let small = encoded(&jpeg_behind_metadata(640, 480));
+        let huge = encoded(&jpeg_behind_metadata(9000, 10));
+        assert_eq!(small.len(), huge.len());
+        assert_eq!(small[..FIRST_PREFIX], huge[..FIRST_PREFIX]);
+
+        assert_eq!(image_problem("image/jpeg", &small), None);
+        assert!(VERDICTS.holds("image/jpeg", &small), "the verdict is kept");
+        assert!(
+            image_problem("image/jpeg", &huge).is_some_and(|why| why.contains("9000x10")),
+            "another image with the same head and length is checked anew",
+        );
+        assert_eq!(image_problem("image/jpeg", &small), None);
     }
 }

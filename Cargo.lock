@@ -102,6 +102,7 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
