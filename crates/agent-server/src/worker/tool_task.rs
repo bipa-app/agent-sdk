@@ -55,9 +55,12 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::journal::committed_event::CommittedEvent;
+use crate::journal::document::DocKind;
 use crate::journal::store::AgentTaskStore;
 use crate::journal::task::{AgentTask, AgentTaskId, LeaseId, TaskKind, TaskStatus, WorkerId};
-use crate::journal::transition::{Committed, DurableStore, Settle, Transition};
+use crate::journal::transition::{
+    Committed, DurableStore, Settle, SteeringInput, Transition, Write,
+};
 use crate::worker::activity::ActivityBeacon;
 use crate::worker::tool_stall::{StallSignal, StallTrip, ToolStallReport};
 use agent_sdk_foundation::events::TerminalReason;
@@ -433,7 +436,7 @@ where
     }
 
     let run = run_tool_executor(&bootstrap, executor).await;
-    let transition = settle_transition(&bootstrap, &run)?;
+    let transition = settle_transition(&bootstrap, &run, task_store.fan_in_steering_queue())?;
     let committed = crate::worker::tool_phase::observe(
         crate::worker::tool_phase::ToolPhase::Settlement,
         &bootstrap,
@@ -557,6 +560,7 @@ pub fn stalled_settle_transition(
     settle_transition(
         bootstrap,
         &ToolRun::stalled(bootstrap, trip, Vec::new(), now),
+        None,
     )
 }
 
@@ -565,9 +569,16 @@ pub fn stalled_settle_transition(
 /// transaction, so the row and the event that reports it commit together
 /// or not at all. The lease guard runs first: a worker that lost its lease
 /// writes neither.
+///
+/// With a `steering_queue` ([`DurableStore::fan_in_steering_queue`]), the
+/// settle also carries the parent's queued steering as a
+/// [`SteeringInput::Queued`] write: the store folds it into the parent's
+/// fan-in when this is its last child, and otherwise offers it to wake the
+/// parent if it is still parked.
 pub(crate) fn settle_transition(
     bootstrap: &ToolTaskBootstrap,
     run: &ToolRun,
+    steering_queue: Option<(DocKind, String)>,
 ) -> anyhow::Result<Transition> {
     let (outcome, end_result) = match (&run.result, &run.stalled) {
         (_, Some(report)) => {
@@ -624,14 +635,21 @@ pub(crate) fn settle_transition(
         &bootstrap.tool_call.display_name,
         end_result,
     ));
-    Ok(Transition::settle(
+    let mut transition = Transition::settle(
         bootstrap.task_id.clone(),
         bootstrap.worker_id.clone(),
         bootstrap.lease_id.clone(),
         outcome,
         bootstrap.thread_id.clone(),
         events,
-    ))
+    );
+    if let Some((kind, key)) = steering_queue {
+        transition.writes.push(Write::EnqueueSteeringResume {
+            parent: bootstrap.parent_task.id.clone(),
+            steering: SteeringInput::Queued { kind, key },
+        });
+    }
+    Ok(transition)
 }
 
 /// The outcome of a run whose [`settle_transition`] committed.

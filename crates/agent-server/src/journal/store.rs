@@ -5444,6 +5444,10 @@ fn required_handle<'a, T>(
 /// the durable backends apply both in one database transaction.
 #[async_trait]
 impl super::transition::DurableStore for InMemoryAgentTaskStore {
+    fn fan_in_steering_queue(&self) -> Option<(super::document::DocKind, String)> {
+        self.extension.as_ref()?.fan_in_steering_queue()
+    }
+
     async fn commit(
         &self,
         transition: super::transition::Transition,

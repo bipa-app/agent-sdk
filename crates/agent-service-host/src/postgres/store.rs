@@ -4545,6 +4545,10 @@ fn prepare_reattached_rows(
 /// row. Any error drops the transaction, so nothing was written.
 #[async_trait]
 impl agent_server::journal::DurableStore for PostgresDurableStore {
+    fn fan_in_steering_queue(&self) -> Option<(agent_server::journal::DocKind, String)> {
+        self.extension.as_ref()?.fan_in_steering_queue()
+    }
+
     /// Retries a commit that Postgres aborted for a deadlock or a
     /// serialization failure: the aborted transaction wrote nothing, and a
     /// later attempt reads the rows again. With the lock order of

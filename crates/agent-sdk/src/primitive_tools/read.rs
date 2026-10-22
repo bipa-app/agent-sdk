@@ -209,41 +209,7 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
 
         // Handle images and PDFs as document attachments (like codex-rs view_image).
         if let Some(named_type) = detect_media_type(&path) {
-            // The content decides the type: a JPEG named `.png` is attached as
-            // a JPEG, and a file that is no supported image or PDF is never
-            // sent as one, since a provider would refuse every later request
-            // carrying it.
-            let Some(media_type) = detect_media_magic(&bytes) else {
-                return Ok(ToolResult::error(format!(
-                    "'{path}' is named as {named_type}, but its content is not a PNG, JPEG, GIF, \
-                     WebP or PDF, so it was not attached. If it is text, read it with bash \
-                     (for example `head -c 2000`)."
-                )));
-            };
-            // Cap media attachments before base64-encoding so an oversized
-            // binary cannot be inflated into the model context.
-            if bytes.len() > MAX_MEDIA_BYTES {
-                return Ok(ToolResult::error(format!(
-                    "Media file '{path}' is {} bytes, which exceeds the {MAX_MEDIA_BYTES}-byte attachment \
-                     limit. To view an image, downscale or re-encode it below that (for example \
-                     to a JPEG of at most 1600 px on its longest side) and read the smaller file.",
-                    bytes.len()
-                )));
-            }
-            if let Some((width, height)) = image_dimensions(&bytes, media_type)
-                && width.max(height) > MAX_IMAGE_SIDE_PX
-            {
-                return Ok(ToolResult::error(format!(
-                    "Image '{path}' is {width}x{height} px; providers refuse images over \
-                     {MAX_IMAGE_SIDE_PX} px on a side. Downscale it (for example to at most 1600 px \
-                     on its longest side) and read the smaller file."
-                )));
-            }
-            let encoded = base64_encode(&bytes);
-            return Ok(
-                ToolResult::success(format!("Read {media_type} file: '{path}'"))
-                    .with_documents(vec![ContentSource::new(media_type, encoded)]),
-            );
+            return Ok(media_result(&path, named_type, &bytes));
         }
 
         // Cap text files before formatting them line-by-line.
@@ -905,6 +871,42 @@ fn truncate_line(line: &str) -> String {
             super::truncate_str(line, MAX_LINE_LENGTH)
         )
     }
+}
+
+/// The `read` result for a file named as an image or PDF (`named_type`).
+fn media_result(path: &str, named_type: &str, bytes: &[u8]) -> ToolResult {
+    // The content decides the type: a JPEG named `.png` is attached as
+    // a JPEG, and a file that is no supported image or PDF is never
+    // sent as one, since a provider would refuse every later request
+    // carrying it.
+    let Some(media_type) = detect_media_magic(bytes) else {
+        return ToolResult::error(format!(
+            "'{path}' is named as {named_type}, but its content is not a PNG, JPEG, GIF, \
+             WebP or PDF, so it was not attached. If it is text, read it with bash \
+             (for example `head -c 2000`)."
+        ));
+    };
+    // Cap media attachments before base64-encoding so an oversized
+    // binary cannot be inflated into the model context.
+    if bytes.len() > MAX_MEDIA_BYTES {
+        return ToolResult::error(format!(
+            "Media file '{path}' is {} bytes, which exceeds the {MAX_MEDIA_BYTES}-byte attachment \
+             limit. To view an image, downscale or re-encode it below that (for example \
+             to a JPEG of at most 1600 px on its longest side) and read the smaller file.",
+            bytes.len()
+        ));
+    }
+    if let Some((width, height)) = image_dimensions(bytes, media_type)
+        && width.max(height) > MAX_IMAGE_SIDE_PX
+    {
+        return ToolResult::error(format!(
+            "Image '{path}' is {width}x{height} px; providers refuse images over \
+             {MAX_IMAGE_SIDE_PX} px on a side. Downscale it (for example to at most 1600 px \
+             on its longest side) and read the smaller file."
+        ));
+    }
+    ToolResult::success(format!("Read {media_type} file: '{path}'"))
+        .with_documents(vec![ContentSource::new(media_type, base64_encode(bytes))])
 }
 
 fn sniff_media_type(file: &mut std::fs::File) -> Result<Option<&'static str>> {

@@ -646,6 +646,14 @@ pub trait DurableStore: Send + Sync {
     /// # Errors
     /// The store could not be read.
     async fn effects_for_task(&self, owner: &AgentTaskId) -> anyhow::Result<Vec<EffectRecord>>;
+
+    /// The steering queue a tool child's settle carries for its parent: the
+    /// store's extension's
+    /// [`TransitionExtension::fan_in_steering_queue`](super::TransitionExtension::fan_in_steering_queue).
+    /// `None` without an extension, and for a store that does not delegate.
+    fn fan_in_steering_queue(&self) -> Option<(DocKind, String)> {
+        None
+    }
 }
 
 impl Transition {

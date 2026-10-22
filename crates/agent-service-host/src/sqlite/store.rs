@@ -3823,6 +3823,10 @@ fn is_busy(error: &anyhow::Error) -> bool {
 
 #[async_trait]
 impl agent_server::journal::DurableStore for SqliteDurableStore {
+    fn fan_in_steering_queue(&self) -> Option<(agent_server::journal::DocKind, String)> {
+        self.extension.as_ref()?.fan_in_steering_queue()
+    }
+
     async fn commit(
         &self,
         transition: agent_server::journal::Transition,

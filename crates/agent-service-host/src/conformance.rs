@@ -170,6 +170,26 @@ mod tests {
         }
     }
 
+    /// `suspension_payload` with the parent waiting on one pending `bash`
+    /// call, which a tool child's bootstrap resolves.
+    fn tool_call_payload(name: &str) -> SuspensionPayload {
+        let mut payload = subagent_call_payload(name);
+        let input = serde_json::json!({ "command": "go build ./..." });
+        payload.continuation.payload.pending_tool_calls =
+            vec![agent_sdk_foundation::PendingToolCallInfo {
+                id: "call_bash".into(),
+                name: "bash".into(),
+                display_name: "Run Command".into(),
+                tier: ToolTier::Confirm,
+                concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+                replay: ToolReplay::Unsafe,
+                input: input.clone(),
+                effective_input: input,
+                listen_context: None,
+            }];
+        payload
+    }
+
     // ── Subagent fixtures (cross-thread cancellation / fail-closed) ──
 
     /// The same effective subagent spec the in-memory store tests use,
@@ -4870,6 +4890,10 @@ mod tests {
                 value: serde_json::json!({ "notes": [] }),
             })
         }
+
+        fn fan_in_steering_queue(&self) -> Option<(agent_server::journal::DocKind, String)> {
+            Some((doc_kind("steering").ok()?, String::new()))
+        }
     }
 
     /// One leased tool child of a wave.
@@ -5034,6 +5058,115 @@ mod tests {
                 "{tid}: the queue is left alone"
             );
         }
+        Ok(())
+    }
+
+    /// harnessfix 1b: a tool child settled by the SDK worker carries its
+    /// parent's queued steering when the store's extension names a queue
+    /// ([`TransitionExtension::fan_in_steering_queue`](agent_server::journal::TransitionExtension::fan_in_steering_queue)).
+    /// A note queued while the parent waits on the call leaves it parked,
+    /// and reaches the fan-in with the call's real result: no steering
+    /// exchange, so no interim answer for the call.
+    async fn test_a_worker_settled_tool_child_folds_its_parents_queue(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+    ) -> Result<()> {
+        for through_effect in [false, true] {
+            worker_settled_tool_child_folds(task_store, documents, through_effect).await?;
+        }
+        Ok(())
+    }
+
+    /// One run of [`test_a_worker_settled_tool_child_folds_its_parents_queue`]:
+    /// the child settles through `execute_tool_task`, or through
+    /// `run_tool_effect`'s claimed-effect path.
+    async fn worker_settled_tool_child_folds(
+        task_store: &dyn AgentTaskStore,
+        documents: &dyn agent_server::journal::DocumentStore,
+        through_effect: bool,
+    ) -> Result<()> {
+        let tid = if through_effect {
+            "conformance-tool-settle-fold-effect"
+        } else {
+            "conformance-tool-settle-fold"
+        };
+        let running = running_root(task_store, tid).await?;
+        let (_, children) = task_store
+            .spawn_tool_children(
+                &running.0.id,
+                &running.1,
+                &running.2,
+                vec![ChildSpawnSpec::new(3)],
+                tool_call_payload(tid),
+                None,
+                Vec::new(),
+                t_plus(62),
+            )
+            .await?;
+        let root = running.0;
+        let child = task_store
+            .try_acquire_task(
+                &children[0].id,
+                WorkerId::new(),
+                LeaseId::new(),
+                t_plus(90),
+                t_plus(63),
+            )
+            .await?
+            .context("the tool child is acquirable")?;
+        queue_notes(task_store, tid, &["job 7 finished: exit 0"]).await?;
+        assert_eq!(
+            row(task_store, &root.id).await?.status,
+            TaskStatus::WaitingOnChildren,
+            "a queued note alone does not wake the parent"
+        );
+        assert!(task_store.fan_in_steering_queue().is_some());
+
+        let bootstrap = agent_server::worker::resolve_tool_bootstrap(
+            child.clone(),
+            task_store,
+            agent_server::worker::ActivityBeacon::default(),
+        )
+        .await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let executor = |_, _| async { Ok(agent_sdk_foundation::ToolResult::success("done c1")) };
+        if through_effect {
+            agent_server::worker::run_tool_effect(
+                bootstrap,
+                task_store,
+                &cancel,
+                executor,
+                t_plus(64),
+            )
+            .await?;
+        } else {
+            agent_server::worker::execute_tool_task(
+                bootstrap,
+                task_store,
+                &cancel,
+                executor,
+                t_plus(64),
+            )
+            .await?;
+        }
+
+        assert_eq!(
+            stored_output(&row(task_store, &child.id).await?)?,
+            "done c1\n[steering] job 7 finished: exit 0",
+            "the call's real result, with the note folded in"
+        );
+        let resumed = row(task_store, &root.id).await?;
+        assert_eq!(resumed.status, TaskStatus::Pending);
+        assert!(
+            matches!(&resumed.state, TaskState::ReadyToResume { steering, .. } if steering.is_empty()),
+            "a fan-in, not a steering exchange: {:?}",
+            resumed.state
+        );
+        assert_eq!(
+            doc_value(documents, &steering_queue(tid)?).await?,
+            Some((2, serde_json::json!({ "notes": [] }))),
+            "the settle emptied the queue"
+        );
         Ok(())
     }
 
@@ -9394,7 +9527,14 @@ mod tests {
         )
         .await?;
         test_a_queued_write_for_another_parent_folds_nothing(s.task.as_ref(), s.documents.as_ref())
-            .await
+            .await?;
+        let (extension, _folds) = FoldExtension::new(FoldMode::Fold);
+        let s = fresh_in_memory_stores_with(Some(extension));
+        test_a_worker_settled_tool_child_folds_its_parents_queue(
+            s.task.as_ref(),
+            s.documents.as_ref(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -9545,7 +9685,8 @@ mod tests {
         test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(&store, &store, &folds)
             .await?;
         test_a_settle_that_does_not_fan_in_folds_nothing(&store, &store, &folds).await?;
-        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await
+        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await?;
+        test_a_worker_settled_tool_child_folds_its_parents_queue(&store, &store).await
     }
 
     #[cfg(feature = "sqlite")]
@@ -9858,7 +9999,8 @@ mod tests {
         test_a_fan_in_settle_folds_the_queued_steering_into_the_last_result(&store, &store, &folds)
             .await?;
         test_a_settle_that_does_not_fan_in_folds_nothing(&store, &store, &folds).await?;
-        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await
+        test_a_queued_write_for_another_parent_folds_nothing(&store, &store).await?;
+        test_a_worker_settled_tool_child_folds_its_parents_queue(&store, &store).await
     }
 
     #[cfg(feature = "postgres")]

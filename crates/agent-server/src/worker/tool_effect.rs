@@ -113,7 +113,12 @@ where
             intent,
             start,
             || run_tool_executor(&bootstrap, executor),
-            |run: &ToolRun| Ok((settle_transition(&bootstrap, run)?, end_state(run))),
+            |run: &ToolRun| {
+                Ok((
+                    settle_transition(&bootstrap, run, task_store.fan_in_steering_queue())?,
+                    end_state(run),
+                ))
+            },
             now,
         ),
     )
