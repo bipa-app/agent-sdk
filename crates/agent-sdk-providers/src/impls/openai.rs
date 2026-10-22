@@ -24,7 +24,8 @@
 //! reuse and authenticates identically to a non-rerouted one.
 
 use crate::attachments::{
-    request_has_attachments, request_has_document_attachments, validate_request_attachments,
+    fit_request_attachments, request_has_attachments, request_has_document_attachments,
+    validate_request_attachments,
 };
 use crate::model_features::{ModelApiSurface, get_model_features};
 #[cfg(test)]
@@ -635,6 +636,13 @@ impl OpenAIProvider {
     /// Chat Completions serializes image attachments as standard `image_url`
     /// content parts, so images only need the shared size/media-type caps.
     /// Documents have no portable Chat Completions part and are refused.
+    /// Downgrade image detail the model can't take, then omit the attachments
+    /// the request can't carry ([`fit_request_attachments`]), before routing.
+    fn shape_attachments(&self, request: &mut ChatRequest) {
+        self.downgrade_unsupported_original_image_detail(request);
+        fit_request_attachments(self.provider(), self.model(), request);
+    }
+
     fn validate_chat_attachments(&self, request: &ChatRequest) -> Result<()> {
         if request_has_document_attachments(request) {
             anyhow::bail!(
@@ -907,7 +915,7 @@ impl LlmProvider for OpenAIProvider {
         if let Err(error) = self.validate_requested_api_surface() {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
-        self.downgrade_unsupported_original_image_detail(&mut request);
+        self.shape_attachments(&mut request);
         // Route official OpenAI agentic flows to the Responses API, preserving
         // the pooled client and extra_headers (BYOK / gateway auth).
         if should_use_responses_api(
@@ -1043,7 +1051,7 @@ impl LlmProvider for OpenAIProvider {
                 });
             });
         }
-        self.downgrade_unsupported_original_image_detail(&mut request);
+        self.shape_attachments(&mut request);
         // Route official OpenAI agentic flows to the Responses API, preserving
         // the pooled client and extra_headers (BYOK / gateway auth).
         if should_use_responses_api(

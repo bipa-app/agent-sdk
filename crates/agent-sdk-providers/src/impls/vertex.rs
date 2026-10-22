@@ -8,7 +8,7 @@
 //! - `claude-*` models route to `publishers/anthropic` using `rawPredict`
 //! - All other models route to `publishers/google` using `generateContent`
 
-use crate::attachments::validate_request_attachments;
+use crate::attachments::{fit_request_attachments, validate_request_attachments};
 use crate::impls::anthropic::{
     MODEL_FABLE_5, MODEL_FABLE_51, MODEL_HAIKU_55, MODEL_OPUS_5, MODEL_OPUS_46, MODEL_OPUS_47,
     MODEL_OPUS_48, MODEL_OPUS_55, MODEL_SONNET_5, MODEL_SONNET_46, MODEL_SONNET_55,
@@ -345,11 +345,12 @@ impl LlmProvider for VertexProvider {
 
 impl VertexProvider {
     #[allow(clippy::too_many_lines)]
-    async fn chat_gemini(&self, request: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat_gemini(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
         let thinking = match self.resolve_thinking_config(request.thinking.as_ref()) {
             Ok(thinking) => thinking,
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        fit_request_attachments(self.provider(), self.model(), &mut request);
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
@@ -504,7 +505,7 @@ impl VertexProvider {
         }))
     }
 
-    fn chat_stream_gemini(&self, request: ChatRequest) -> StreamBox<'_> {
+    fn chat_stream_gemini(&self, mut request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
@@ -518,6 +519,7 @@ impl VertexProvider {
                     return;
                 }
             };
+            fit_request_attachments(self.provider(), self.model(), &mut request);
             if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
@@ -716,7 +718,7 @@ fn gemini_response_format(
 // ============================================================================
 
 impl VertexProvider {
-    async fn chat_claude(&self, request: ChatRequest) -> Result<ChatOutcome> {
+    async fn chat_claude(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
         let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
             // Forcing a specific tool is incompatible with extended thinking on
             // Claude (the API 400s), so drop thinking at the wire boundary even
@@ -724,6 +726,7 @@ impl VertexProvider {
             Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        fit_request_attachments(self.provider(), self.model(), &mut request);
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
@@ -828,7 +831,7 @@ impl VertexProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn chat_stream_claude(&self, request: ChatRequest) -> StreamBox<'_> {
+    fn chat_stream_claude(&self, mut request: ChatRequest) -> StreamBox<'_> {
         let served_route = self.route().to_owned();
         let served_model = self.model().to_owned();
         Box::pin(async_stream::stream! {
@@ -846,6 +849,7 @@ impl VertexProvider {
                             return;
                         }
                     };
+                    fit_request_attachments(self.provider(), self.model(), &mut request);
                     if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
                         yield Ok(StreamDelta::Error {
                             message: error.to_string(),

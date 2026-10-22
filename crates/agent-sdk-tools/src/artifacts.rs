@@ -58,23 +58,17 @@ const ARTIFACT_ALLOCATOR_RECORD_BYTES: usize = 21;
 /// many bytes is spilled to the artifact store.
 pub const DEFAULT_INLINE_OUTPUT_BUDGET_BYTES: usize = 50 * 1024;
 
-/// Base64 bytes of images and PDFs a result may carry inline beside its text
-/// budget.
+/// Base64 bytes of images a result may carry inline beside its text budget.
 ///
-/// They reach the model as attachments rather than text, so they don't use the
-/// text budget; past this they spill like any other payload. Its decoded size
+/// They reach the model as image blocks rather than text, so they don't use
+/// the text budget; past this they spill like any other payload. PDFs and
+/// other documents still count as text. Its decoded size
 /// (3.75 MiB) is under every provider's per-image cap (Anthropic's 5 MiB is the
 /// smallest), and providers bound a request's attachments in total.
 pub const INLINE_ATTACHMENT_BUDGET_BYTES: usize = 5 * 1024 * 1024;
 
-/// Media types a model is shown as attachments.
-const ATTACHMENT_MEDIA_TYPES: [&str; 5] = [
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "application/pdf",
-];
+/// Image types a model is shown as image blocks.
+const ATTACHMENT_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// Smallest accepted inline budget. Below this the head/tail windows and the
 /// elision marker + footer no longer fit meaningfully.
@@ -2111,6 +2105,24 @@ mod tests {
             [] as [agent_sdk_foundation::ContentSource; 0]
         );
         assert_eq!(result.artifact, Some(ToolResultArtifact { id: saved.id }));
+        Ok(())
+    }
+
+    #[test]
+    fn a_pdf_over_the_text_budget_still_spills() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = ArtifactStore::new(dir.path().join("artifacts")).with_inline_budget(1024);
+        let mut result = ToolResult::success("Read application/pdf file: 'spec.pdf'")
+            .with_documents(vec![agent_sdk_foundation::llm::ContentSource::new(
+                "application/pdf",
+                "A".repeat(200 * 1024),
+            )]);
+
+        assert!(store.apply_inline_budget(&mut result, "read")?.is_some());
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
         Ok(())
     }
 

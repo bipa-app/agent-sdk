@@ -39,7 +39,7 @@ const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum size (in bytes) of a media file (image/PDF) that will be
 /// base64-encoded and attached: the largest whose base64 (~1.33x) fits the
-/// inline attachment budget, so an attached file always reaches the model.
+/// inline image budget, so an attached image always reaches the model.
 const MAX_MEDIA_BYTES: usize = agent_sdk_tools::artifacts::INLINE_ATTACHMENT_BUDGET_BYTES / 4 * 3;
 /// Maximum size of a magic-sniffed artifact media attachment. Artifact
 /// recovery is intentionally separate from the smaller filesystem-media cap:
@@ -208,7 +208,18 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
             .context("Failed to read file")?;
 
         // Handle images and PDFs as document attachments (like codex-rs view_image).
-        if let Some(media_type) = detect_media_type(&path) {
+        if let Some(named_type) = detect_media_type(&path) {
+            // The content decides the type: a JPEG named `.png` is attached as
+            // a JPEG, and a file that is no supported image or PDF is never
+            // sent as one, since a provider would refuse every later request
+            // carrying it.
+            let Some(media_type) = detect_media_magic(&bytes) else {
+                return Ok(ToolResult::error(format!(
+                    "'{path}' is named as {named_type}, but its content is not a PNG, JPEG, GIF, \
+                     WebP or PDF, so it was not attached. If it is text, read it with bash \
+                     (for example `head -c 2000`)."
+                )));
+            };
             // Cap media attachments before base64-encoding so an oversized
             // binary cannot be inflated into the model context.
             if bytes.len() > MAX_MEDIA_BYTES {
@@ -217,6 +228,15 @@ impl<E: Environment + 'static, Ctx: Send + Sync + 'static> Tool<Ctx> for ReadToo
                      limit. To view an image, downscale or re-encode it below that (for example \
                      to a JPEG of at most 1600 px on its longest side) and read the smaller file.",
                     bytes.len()
+                )));
+            }
+            if let Some((width, height)) = image_dimensions(&bytes, media_type)
+                && width.max(height) > MAX_IMAGE_SIDE_PX
+            {
+                return Ok(ToolResult::error(format!(
+                    "Image '{path}' is {width}x{height} px; providers refuse images over \
+                     {MAX_IMAGE_SIDE_PX} px on a side. Downscale it (for example to at most 1600 px \
+                     on its longest side) and read the smaller file."
                 )));
             }
             let encoded = base64_encode(&bytes);
@@ -910,6 +930,70 @@ pub fn detect_media_magic(prefix: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Longest side, in pixels, of an image providers accept (Anthropic's limit).
+const MAX_IMAGE_SIDE_PX: u32 = 8000;
+
+/// An image's width and height from its header, without decoding it, or
+/// `None` when the header cannot be read.
+fn image_dimensions(bytes: &[u8], media_type: &str) -> Option<(u32, u32)> {
+    let be16 = |at: usize| {
+        Some(u32::from(u16::from_be_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let le16 = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            bytes.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    let le24 = |at: usize| {
+        let b = bytes.get(at..at + 3)?;
+        Some(u32::from(b[0]) | (u32::from(b[1]) << 8) | (u32::from(b[2]) << 16))
+    };
+    let be32 = |at: usize| Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+    match media_type {
+        "image/png" => (bytes.get(12..16)? == b"IHDR").then(|| Some((be32(16)?, be32(20)?)))?,
+        "image/gif" => Some((le16(6)?, le16(8)?)),
+        "image/webp" => match bytes.get(12..16)? {
+            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" => {
+                let b = bytes.get(21..25)?;
+                let width = 1 + (u32::from(b[0]) | (u32::from(b[1] & 0x3f) << 8));
+                let height = 1
+                    + ((u32::from(b[1]) >> 6)
+                        | (u32::from(b[2]) << 2)
+                        | (u32::from(b[3] & 0x0f) << 10));
+                Some((width, height))
+            }
+            b"VP8X" => Some((le24(24)? + 1, le24(27)? + 1)),
+            _ => None,
+        },
+        "image/jpeg" => {
+            let mut at = 2;
+            loop {
+                while *bytes.get(at)? == 0xff && *bytes.get(at + 1)? == 0xff {
+                    at += 1;
+                }
+                if *bytes.get(at)? != 0xff {
+                    return None;
+                }
+                let marker = *bytes.get(at + 1)?;
+                let is_frame =
+                    matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc);
+                if is_frame {
+                    return Some((be16(at + 7)?, be16(at + 5)?));
+                }
+                if matches!(marker, 0x01 | 0xd0..=0xd9) {
+                    at += 2;
+                    continue;
+                }
+                at += 2 + usize::try_from(be16(at + 2)?).ok()?;
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Detect supported binary media types by file extension.
 fn detect_media_type(path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(path).extension()?.to_ascii_lowercase();
@@ -1545,10 +1629,92 @@ mod tests {
         Ok(())
     }
 
+    /// A PNG signature and IHDR for `width` x `height`, padded to `len` bytes.
+    fn png(width: u32, height: u32, len: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.resize(len.max(bytes.len()), 0);
+        bytes
+    }
+
+    async fn read_media(name: &str, bytes: &[u8]) -> anyhow::Result<ToolResult> {
+        let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
+        fs.write_file_bytes(name, bytes).await?;
+        let tool = create_test_tool(fs, AgentCapabilities::full_access());
+        tool.execute(&tool_ctx(), json!({"path": format!("/workspace/{name}")}))
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_file_named_as_an_image_that_is_not_one_is_refused() -> anyhow::Result<()> {
+        let result = read_media("logo.png", b"<svg xmlns='http://www.w3.org/2000/svg'/>").await?;
+
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("not a PNG, JPEG"),
+            "{}",
+            result.output
+        );
+        assert_eq!(
+            result.documents,
+            [] as [agent_sdk_foundation::ContentSource; 0]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_image_is_attached_as_the_type_its_content_has() -> anyhow::Result<()> {
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc0, 0x00, 0x08, 0x08, 0x00,
+            0x20, 0x00, 0x40,
+        ];
+        let result = read_media("photo.png", &jpeg).await?;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(result.documents[0].media_type, "image/jpeg");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_image_wider_than_providers_accept_is_refused() -> anyhow::Result<()> {
+        let result = read_media("panorama.png", &png(9000, 400, 64)).await?;
+
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("9000x400") && result.output.contains("Downscale"),
+            "{}",
+            result.output
+        );
+        assert!(read_media("ok.png", &png(8000, 400, 64)).await?.success);
+        Ok(())
+    }
+
+    #[test]
+    fn image_dimensions_read_each_format_header() {
+        assert_eq!(
+            image_dimensions(&png(640, 480, 64), "image/png"),
+            Some((640, 480))
+        );
+        assert_eq!(
+            image_dimensions(b"GIF89a\x80\x02\xe0\x01", "image/gif"),
+            Some((640, 480))
+        );
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x00, 0x00, 0xff, 0xc2, 0x00, 0x08, 0x08, 0x01,
+            0xe0, 0x02, 0x80,
+        ];
+        assert_eq!(image_dimensions(&jpeg, "image/jpeg"), Some((640, 480)));
+        let mut vp8x = b"RIFF\0\0\0\0WEBPVP8X\0\0\0\0\0\0\0\0".to_vec();
+        vp8x.extend_from_slice(&[0x7f, 0x02, 0x00, 0xdf, 0x01, 0x00]);
+        assert_eq!(image_dimensions(&vp8x, "image/webp"), Some((640, 480)));
+        assert_eq!(image_dimensions(b"\x89PNG\r\n\x1a\n", "image/png"), None);
+    }
+
     #[tokio::test]
     async fn an_image_too_large_to_attach_is_refused_with_a_downscale_hint() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        fs.write_file_bytes("frame.png", &vec![0u8; 4 * 1024 * 1024])
+        fs.write_file_bytes("frame.png", &png(1920, 1080, 4 * 1024 * 1024))
             .await?;
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
 
@@ -1568,7 +1734,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_media_file() -> anyhow::Result<()> {
         let fs = Arc::new(InMemoryFileSystem::new("/workspace"));
-        let big = vec![0u8; MAX_MEDIA_BYTES + 1];
+        let big = png(1920, 1080, MAX_MEDIA_BYTES + 1);
         fs.write_file_bytes("big.png", &big).await?;
 
         let tool = create_test_tool(fs, AgentCapabilities::full_access());
