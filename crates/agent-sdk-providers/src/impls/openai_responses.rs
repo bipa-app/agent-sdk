@@ -1090,7 +1090,8 @@ impl LlmProvider for OpenAIResponsesProvider {
                                 });
                                 if item_id.is_none() {
                                     log::warn!(
-                                        "Dropping a Responses function call argument delta with no item id or known output_index"
+                                        "Dropping a Responses function call argument delta with no item id or known output_index output_index={:?}",
+                                        event.output_index
                                     );
                                 }
                                 if let (Some(item_id), Some(delta)) = (item_id, event.delta) {
@@ -4300,7 +4301,8 @@ mod tests {
         assert!(
             input
                 .iter()
-                .all(|item| item.get("type") != Some(&"reasoning".into()))
+                .all(|item| item.get("type").and_then(serde_json::Value::as_str)
+                    != Some("reasoning"))
         );
         assert!(input.iter().all(|item| item.get("phase").is_none()));
         Ok(())
