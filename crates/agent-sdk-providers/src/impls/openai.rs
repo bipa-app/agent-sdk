@@ -60,7 +60,9 @@ use super::openai_reasoning::{
     is_gpt56_or_later_model, legacy_reasoning_effort, served_speed_from_service_tier,
     service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
-use super::openai_responses::OpenAIResponsesProvider;
+use super::openai_responses::{
+    OpenAIResponsesCompat, OpenAIResponsesProvider, ZERO_RETENTION_STORE_REFUSAL,
+};
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
 use super::tool_call_ids::{ToolCallIdAssigner, ToolCallIdOrigin, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
@@ -249,6 +251,8 @@ pub struct OpenAIProvider {
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
     prompt_cache_key_forwarding: bool,
+    responses_compat: Option<OpenAIResponsesCompat>,
+    zero_retention: bool,
 }
 
 impl OpenAIProvider {
@@ -268,6 +272,8 @@ impl OpenAIProvider {
             speed: None,
             extra_headers: Vec::new(),
             prompt_cache_key_forwarding: false,
+            responses_compat: None,
+            zero_retention: false,
         }
     }
 
@@ -313,6 +319,8 @@ impl OpenAIProvider {
             speed: None,
             extra_headers: Vec::new(),
             prompt_cache_key_forwarding: false,
+            responses_compat: None,
+            zero_retention: false,
         }
     }
 
@@ -580,6 +588,39 @@ impl OpenAIProvider {
         self
     }
 
+    /// Set which optional request fields the Responses endpoint accepts when
+    /// a request goes to the Responses API. Without it the reroute follows
+    /// [`OpenAIResponsesCompat::for_base_url`].
+    #[must_use]
+    pub const fn with_responses_compat(mut self, compat: OpenAIResponsesCompat) -> Self {
+        self.responses_compat = Some(compat);
+        self
+    }
+
+    /// Refuse `store=true` before any request, on Chat Completions and on the
+    /// Responses API. See
+    /// [`OpenAIResponsesProvider::with_zero_retention`]. Chat Completions to a
+    /// host other than `api.openai.com` sends no `store` field, so there the
+    /// mode only guards an explicit `with_store(true)`.
+    #[must_use]
+    pub const fn with_zero_retention(mut self, enabled: bool) -> Self {
+        self.zero_retention = enabled;
+        self
+    }
+
+    fn validate_retention(&self) -> Result<()> {
+        if self.zero_retention
+            && self
+                .reasoning
+                .as_ref()
+                .and_then(OpenAIReasoningConfig::store)
+                == Some(true)
+        {
+            anyhow::bail!(ZERO_RETENTION_STORE_REFUSAL);
+        }
+        Ok(())
+    }
+
     pub(super) fn prompt_cache_key<'a>(&self, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
         prompt_cache_key_for(&self.base_url, self.prompt_cache_key_forwarding, session_id)
     }
@@ -663,6 +704,7 @@ impl OpenAIProvider {
     }
 
     fn validate_requested_api_surface(&self) -> Result<()> {
+        self.validate_retention()?;
         if self
             .reasoning
             .as_ref()
@@ -895,7 +937,11 @@ impl OpenAIProvider {
         )
         .with_client(self.client.clone())
         .with_extra_headers(self.extra_headers.clone())
-        .with_prompt_cache_key_forwarding(self.prompt_cache_key_forwarding);
+        .with_prompt_cache_key_forwarding(self.prompt_cache_key_forwarding)
+        .with_zero_retention(self.zero_retention);
+        if let Some(compat) = self.responses_compat {
+            provider = provider.with_compat(compat);
+        }
         if let Some(thinking) = self.thinking.clone() {
             provider = provider.with_thinking(thinking);
         }

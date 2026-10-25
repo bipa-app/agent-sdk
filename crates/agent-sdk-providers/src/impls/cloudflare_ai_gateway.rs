@@ -48,6 +48,7 @@
 use crate::impls::anthropic::AnthropicProvider;
 use crate::impls::gemini::GeminiProvider;
 use crate::impls::openai::OpenAIProvider;
+use crate::impls::openai_responses::{OpenAIResponsesCompat, OpenAIResponsesField};
 use crate::model_capabilities::ModelCapabilities;
 use crate::provider::{EmbeddingError, LlmProvider};
 use crate::streaming::{StreamBox, StreamDelta};
@@ -143,7 +144,9 @@ impl CloudflareAIGatewayProvider {
     #[must_use]
     pub fn openai(api_key: String, account_id: &str, gateway_id: &str, model: String) -> Self {
         let base_url = gateway_base(account_id, gateway_id, "openai");
-        let inner = OpenAIProvider::with_base_url(api_key, model, base_url);
+        let inner = OpenAIProvider::with_base_url(api_key, model, base_url).with_responses_compat(
+            OpenAIResponsesCompat::OPENAI.with_field(OpenAIResponsesField::PromptCacheKey, false),
+        );
         Self {
             inner: Inner::OpenAI(inner),
         }

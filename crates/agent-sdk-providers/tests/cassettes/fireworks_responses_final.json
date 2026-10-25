@@ -1,0 +1,26 @@
+{
+  "id": null,
+  "object": "response",
+  "created_at": 1761350402,
+  "status": "completed",
+  "model": "accounts/fireworks/models/kimi-k2p5",
+  "store": false,
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_fw_2",
+      "status": "completed",
+      "summary": [{"type": "summary_text", "text": "Both balances are in; report them."}]
+    },
+    {
+      "type": "message",
+      "id": "msg_fw_1",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {"type": "output_text", "text": "Checking holds 1200.00 and savings holds 300.00.", "annotations": []}
+      ]
+    }
+  ],
+  "usage": {"input_tokens": 190, "output_tokens": 22, "total_tokens": 212}
+}
