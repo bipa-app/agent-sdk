@@ -334,7 +334,7 @@ async fn structured_output_goes_as_a_strict_json_schema_text_format() -> Result<
     let schema = serde_json::json!({
         "type": "object",
         "properties": {"payee": {"type": "string"}, "amount": {"type": "string"}},
-        "required": ["payee", "amount"],
+        "required": ["amount", "payee"],
         "additionalProperties": false
     });
     let request = ChatRequest::new(
