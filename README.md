@@ -1026,6 +1026,8 @@ the model's reasoning is carried into the next turn; it follows the base URL (`a
 `api.fireworks.ai`, otherwise the core request only) and can be set with `with_compat` /
 `with_responses_compat`. On OpenAI the encrypted reasoning items go back; on Fireworks, which returns
 no encrypted content, the reasoning summaries do.
+A custom domain in front of OpenAI (Azure OpenAI, a corporate proxy) gets only the core request and
+no reasoning carry-over until it sets `OpenAIResponsesCompat::OPENAI`.
 
 ```rust
 use agent_sdk_providers::{OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAIResponsesProvider};

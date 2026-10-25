@@ -38,6 +38,8 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const ENCRYPTED_REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 const OPENAI_RESPONSES_STATE_PROVIDER: &str = "openai-responses";
 const OPENAI_MESSAGE_ITEM_TYPE: &str = "message";
+pub(super) const ZERO_RETENTION_STORE_REFUSAL: &str =
+    "store=true is refused by a zero-retention provider: the endpoint would keep the conversation";
 
 /// Build an HTTP client with connect/keepalive timeouts matching the sibling
 /// providers (`anthropic`, `vertex`). A bare `reqwest::Client::new()` has no
@@ -148,13 +150,15 @@ impl OpenAIResponsesCompat {
 
     #[must_use]
     pub fn for_base_url(base_url: &str) -> Self {
-        let host = url::Url::parse(base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned));
-        match host.as_deref() {
-            Some("api.openai.com") => Self::OPENAI,
-            Some("api.fireworks.ai") => Self::FIREWORKS,
-            _ => Self::MINIMAL,
+        if is_official_openai_base_url(base_url) {
+            return Self::OPENAI;
+        }
+        let fireworks =
+            url::Url::parse(base_url).is_ok_and(|url| url.host_str() == Some("api.fireworks.ai"));
+        if fireworks {
+            Self::FIREWORKS
+        } else {
+            Self::MINIMAL
         }
     }
 
@@ -208,6 +212,20 @@ impl ReasoningReplay {
             OpenAIReasoningCarry::Encrypted if encrypted => Some(item.clone()),
             OpenAIReasoningCarry::Encrypted | OpenAIReasoningCarry::Drop => None,
             OpenAIReasoningCarry::Plain => {
+                let carries_text = ["summary", "content"].iter().any(|key| {
+                    item.get(key)
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                            })
+                        })
+                });
+                if !carries_text {
+                    return None;
+                }
                 let mut plain = item.as_object()?.clone();
                 for key in ["encrypted_content", "id", "status"] {
                     plain.remove(key);
@@ -323,6 +341,9 @@ impl OpenAIResponsesProvider {
     }
 
     /// Set which optional request fields the endpoint accepts.
+    ///
+    /// [`with_prompt_cache_key_forwarding`](Self::with_prompt_cache_key_forwarding)
+    /// sends `prompt_cache_key` even when this profile does not accept it.
     #[must_use]
     pub const fn with_compat(mut self, compat: OpenAIResponsesCompat) -> Self {
         self.compat = compat;
@@ -380,9 +401,7 @@ impl OpenAIResponsesProvider {
             .and_then(OpenAIReasoningConfig::store)
             .unwrap_or(false);
         if store && self.zero_retention {
-            anyhow::bail!(
-                "store=true is refused by a zero-retention provider: the endpoint would keep the conversation"
-            );
+            anyhow::bail!(ZERO_RETENTION_STORE_REFUSAL);
         }
         let accepts = |field| self.compat.accepts(field);
         let reasoning = build_api_reasoning(config).and_then(|mut reasoning| {
@@ -1069,6 +1088,11 @@ impl LlmProvider for OpenAIResponsesProvider {
                                         })
                                         .map(|(key, _)| key.clone())
                                 });
+                                if item_id.is_none() {
+                                    log::warn!(
+                                        "Dropping a Responses function call argument delta with no item id or known output_index"
+                                    );
+                                }
                                 if let (Some(item_id), Some(delta)) = (item_id, event.delta) {
                                     let order = tool_calls.len();
                                     let acc =
@@ -1305,7 +1329,7 @@ fn build_api_input(request: &ChatRequest, policy: InputPolicy) -> Vec<ApiInputIt
                 }));
             }
             Content::Blocks(blocks) => {
-                append_block_input(&mut items, role, blocks, policy.reasoning)
+                append_block_input(&mut items, role, blocks, policy.reasoning);
             }
         }
     }
@@ -2552,22 +2576,6 @@ struct ApiStreamResponse {
 mod tests {
     use super::*;
     use crate::impls::openai::MODEL_GPT54;
-
-    const OPENAI_STATELESS_REPLAY: ReasoningReplay = ReasoningReplay {
-        store: false,
-        carry: OpenAIReasoningCarry::Encrypted,
-    };
-
-    fn openai_input(request: &ChatRequest, explicit_cache_breakpoints: usize) -> Vec<ApiInputItem> {
-        build_api_input(
-            request,
-            InputPolicy {
-                reasoning: OPENAI_STATELESS_REPLAY,
-                message_phase: true,
-                explicit_cache_breakpoints,
-            },
-        )
-    }
     use agent_sdk_foundation::llm::{CacheConfig, CacheTtl, Message, ThinkingDisplay};
 
     #[test]
@@ -4200,6 +4208,101 @@ mod tests {
         assert_eq!(body["safety_identifier"], "user-hash");
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["input"][0]["phase"], "final_answer");
+        Ok(())
+    }
+
+    const OPENAI_STATELESS_REPLAY: ReasoningReplay = ReasoningReplay {
+        store: false,
+        carry: OpenAIReasoningCarry::Encrypted,
+    };
+
+    fn openai_input(request: &ChatRequest, explicit_cache_breakpoints: usize) -> Vec<ApiInputItem> {
+        build_api_input(
+            request,
+            InputPolicy {
+                reasoning: OPENAI_STATELESS_REPLAY,
+                message_phase: true,
+                explicit_cache_breakpoints,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_host_gets_the_core_request_and_no_reasoning_items()
+    -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_1",
+                "model": "open-model",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let provider = OpenAIResponsesProvider::with_base_url(
+            "test-key".to_owned(),
+            "open-model".to_owned(),
+            server.uri(),
+        )
+        .with_reasoning(
+            OpenAIReasoningConfig::new()
+                .with_effort(OpenAIReasoningEffort::Low)
+                .with_safety_identifier("user-hash"),
+        )
+        .with_speed(SpeedTier::Fast);
+        let history = vec![
+            Message::user("hello"),
+            Message::assistant_with_content(vec![
+                ContentBlock::OpaqueReasoning {
+                    provider: OPENAI_RESPONSES_STATE_PROVIDER.to_owned(),
+                    data: serde_json::json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "summary": [{"type": "summary_text", "text": "Plan."}]
+                    }),
+                },
+                ContentBlock::Text {
+                    text: "hi".to_owned(),
+                },
+            ]),
+            Message::user("again"),
+        ];
+
+        let outcome = provider
+            .chat(ChatRequest::new(String::new(), history))
+            .await?;
+        assert!(matches!(outcome, ChatOutcome::Success(_)), "{outcome:?}");
+
+        let received = server
+            .received_requests()
+            .await
+            .context("mock server did not record requests")?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&received.first().context("no request recorded")?.body)?;
+        assert_eq!(body["store"], false);
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "low"}));
+        for field in [
+            "include",
+            "safety_identifier",
+            "service_tier",
+            "prompt_cache_key",
+        ] {
+            assert!(body.get(field).is_none(), "{field} was sent: {body}");
+        }
+        let input = body["input"].as_array().context("input is not an array")?;
+        assert_eq!(input.len(), 3, "{body}");
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("type") != Some(&"reasoning".into()))
+        );
+        assert!(input.iter().all(|item| item.get("phase").is_none()));
         Ok(())
     }
 }

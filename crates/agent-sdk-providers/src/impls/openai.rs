@@ -60,7 +60,9 @@ use super::openai_reasoning::{
     is_gpt56_or_later_model, legacy_reasoning_effort, served_speed_from_service_tier,
     service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
-use super::openai_responses::{OpenAIResponsesCompat, OpenAIResponsesProvider};
+use super::openai_responses::{
+    OpenAIResponsesCompat, OpenAIResponsesProvider, ZERO_RETENTION_STORE_REFUSAL,
+};
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
 use super::tool_call_ids::{ToolCallIdAssigner, ToolCallIdOrigin, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
@@ -597,7 +599,9 @@ impl OpenAIProvider {
 
     /// Refuse `store=true` before any request, on Chat Completions and on the
     /// Responses API. See
-    /// [`OpenAIResponsesProvider::with_zero_retention`].
+    /// [`OpenAIResponsesProvider::with_zero_retention`]. Chat Completions to a
+    /// host other than `api.openai.com` sends no `store` field, so there the
+    /// mode only guards an explicit `with_store(true)`.
     #[must_use]
     pub const fn with_zero_retention(mut self, enabled: bool) -> Self {
         self.zero_retention = enabled;
@@ -612,9 +616,7 @@ impl OpenAIProvider {
                 .and_then(OpenAIReasoningConfig::store)
                 == Some(true)
         {
-            anyhow::bail!(
-                "store=true is refused by a zero-retention provider: the endpoint would keep the conversation"
-            );
+            anyhow::bail!(ZERO_RETENTION_STORE_REFUSAL);
         }
         Ok(())
     }
@@ -702,6 +704,7 @@ impl OpenAIProvider {
     }
 
     fn validate_requested_api_surface(&self) -> Result<()> {
+        self.validate_retention()?;
         if self
             .reasoning
             .as_ref()
@@ -955,10 +958,7 @@ impl OpenAIProvider {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
-        if let Err(error) = self
-            .validate_requested_api_surface()
-            .and_then(|()| self.validate_retention())
-        {
+        if let Err(error) = self.validate_requested_api_surface() {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
         self.shape_attachments(&mut request);
@@ -1089,10 +1089,7 @@ impl LlmProvider for OpenAIProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
-        if let Err(error) = self
-            .validate_requested_api_surface()
-            .and_then(|()| self.validate_retention())
-        {
+        if let Err(error) = self.validate_requested_api_surface() {
             return Box::pin(async_stream::stream! {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),
