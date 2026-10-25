@@ -1,0 +1,36 @@
+{
+  "id": null,
+  "object": "response",
+  "created_at": 1761350400,
+  "status": "completed",
+  "model": "accounts/fireworks/models/kimi-k2p5",
+  "store": false,
+  "parallel_tool_calls": true,
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_fw_1",
+      "status": "completed",
+      "summary": [
+        {"type": "summary_text", "text": "The user wants two balances; look both up at once."}
+      ]
+    },
+    {
+      "type": "function_call",
+      "id": "fc_fw_1",
+      "call_id": "call_fw_1",
+      "name": "get_balance",
+      "arguments": "{\"account\":\"checking\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_fw_2",
+      "call_id": "call_fw_2",
+      "name": "get_balance",
+      "arguments": "{\"account\":\"savings\"}",
+      "status": "completed"
+    }
+  ],
+  "usage": {"input_tokens": 120, "output_tokens": 48, "total_tokens": 168}
+}

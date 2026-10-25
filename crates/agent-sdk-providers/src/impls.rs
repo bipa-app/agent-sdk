@@ -53,7 +53,9 @@ pub use openai_reasoning::{
     OpenAIReasoningSummary, OpenAITextVerbosity, OpenAIToolChoice, supports_reasoning_summary,
 };
 #[cfg(feature = "openai")]
-pub use openai_responses::OpenAIResponsesProvider;
+pub use openai_responses::{
+    OpenAIReasoningCarry, OpenAIResponsesCompat, OpenAIResponsesField, OpenAIResponsesProvider,
+};
 #[cfg(any(feature = "openai", feature = "openai-codex"))]
 pub use openai_schema::{StrictSchemaError, normalized_strict_schema};
 #[cfg(feature = "vertex")]

@@ -60,7 +60,7 @@ use super::openai_reasoning::{
     is_gpt56_or_later_model, legacy_reasoning_effort, served_speed_from_service_tier,
     service_tier_wire_value, validate_reasoning_config, validate_tool_choice,
 };
-use super::openai_responses::OpenAIResponsesProvider;
+use super::openai_responses::{OpenAIResponsesCompat, OpenAIResponsesProvider};
 use super::openai_schema::{normalize_strict_schema, normalized_strict_schema};
 use super::tool_call_ids::{ToolCallIdAssigner, ToolCallIdOrigin, with_unique_tool_ids};
 use crate::model_features::supports_responses_original_image_detail;
@@ -249,6 +249,8 @@ pub struct OpenAIProvider {
     /// Extra headers applied to every request (e.g. for gateway authentication).
     extra_headers: Vec<(String, String)>,
     prompt_cache_key_forwarding: bool,
+    responses_compat: Option<OpenAIResponsesCompat>,
+    zero_retention: bool,
 }
 
 impl OpenAIProvider {
@@ -268,6 +270,8 @@ impl OpenAIProvider {
             speed: None,
             extra_headers: Vec::new(),
             prompt_cache_key_forwarding: false,
+            responses_compat: None,
+            zero_retention: false,
         }
     }
 
@@ -313,6 +317,8 @@ impl OpenAIProvider {
             speed: None,
             extra_headers: Vec::new(),
             prompt_cache_key_forwarding: false,
+            responses_compat: None,
+            zero_retention: false,
         }
     }
 
@@ -578,6 +584,39 @@ impl OpenAIProvider {
     pub const fn with_prompt_cache_key_forwarding(mut self, enabled: bool) -> Self {
         self.prompt_cache_key_forwarding = enabled;
         self
+    }
+
+    /// Set which optional request fields the Responses endpoint accepts when
+    /// a request goes to the Responses API. Without it the reroute follows
+    /// [`OpenAIResponsesCompat::for_base_url`].
+    #[must_use]
+    pub const fn with_responses_compat(mut self, compat: OpenAIResponsesCompat) -> Self {
+        self.responses_compat = Some(compat);
+        self
+    }
+
+    /// Refuse `store=true` before any request, on Chat Completions and on the
+    /// Responses API. See
+    /// [`OpenAIResponsesProvider::with_zero_retention`].
+    #[must_use]
+    pub const fn with_zero_retention(mut self, enabled: bool) -> Self {
+        self.zero_retention = enabled;
+        self
+    }
+
+    fn validate_retention(&self) -> Result<()> {
+        if self.zero_retention
+            && self
+                .reasoning
+                .as_ref()
+                .and_then(OpenAIReasoningConfig::store)
+                == Some(true)
+        {
+            anyhow::bail!(
+                "store=true is refused by a zero-retention provider: the endpoint would keep the conversation"
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn prompt_cache_key<'a>(&self, session_id: Option<&'a str>) -> Option<Cow<'a, str>> {
@@ -895,7 +934,11 @@ impl OpenAIProvider {
         )
         .with_client(self.client.clone())
         .with_extra_headers(self.extra_headers.clone())
-        .with_prompt_cache_key_forwarding(self.prompt_cache_key_forwarding);
+        .with_prompt_cache_key_forwarding(self.prompt_cache_key_forwarding)
+        .with_zero_retention(self.zero_retention);
+        if let Some(compat) = self.responses_compat {
+            provider = provider.with_compat(compat);
+        }
         if let Some(thinking) = self.thinking.clone() {
             provider = provider.with_thinking(thinking);
         }
@@ -912,7 +955,10 @@ impl OpenAIProvider {
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
     async fn chat(&self, mut request: ChatRequest) -> Result<ChatOutcome> {
-        if let Err(error) = self.validate_requested_api_surface() {
+        if let Err(error) = self
+            .validate_requested_api_surface()
+            .and_then(|()| self.validate_retention())
+        {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
         }
         self.shape_attachments(&mut request);
@@ -1043,7 +1089,10 @@ impl LlmProvider for OpenAIProvider {
 
     #[allow(clippy::too_many_lines)]
     fn chat_stream(&self, mut request: ChatRequest) -> StreamBox<'_> {
-        if let Err(error) = self.validate_requested_api_surface() {
+        if let Err(error) = self
+            .validate_requested_api_surface()
+            .and_then(|()| self.validate_retention())
+        {
             return Box::pin(async_stream::stream! {
                 yield Ok(StreamDelta::Error {
                     message: error.to_string(),

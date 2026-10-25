@@ -110,9 +110,10 @@ pub use impls::{CodexTransport, OpenAICodexResponsesProvider};
 #[cfg(feature = "openai")]
 pub use impls::{
     OpenAIAllowedToolsMode, OpenAIApiSurface, OpenAIPromptCacheMode, OpenAIPromptCacheTtl,
-    OpenAIProvider, OpenAIReasoningConfig, OpenAIReasoningContext, OpenAIReasoningEffort,
-    OpenAIReasoningMode, OpenAIReasoningSummary, OpenAIResponsesProvider, OpenAITextVerbosity,
-    OpenAIToolChoice, supports_reasoning_summary,
+    OpenAIProvider, OpenAIReasoningCarry, OpenAIReasoningConfig, OpenAIReasoningContext,
+    OpenAIReasoningEffort, OpenAIReasoningMode, OpenAIReasoningSummary, OpenAIResponsesCompat,
+    OpenAIResponsesField, OpenAIResponsesProvider, OpenAITextVerbosity, OpenAIToolChoice,
+    supports_reasoning_summary,
 };
 
 // Model capabilities

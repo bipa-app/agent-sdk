@@ -1017,6 +1017,29 @@ let minimax_custom = OpenAIProvider::minimax(
 );
 ```
 
+### Responses API on Other Hosts
+
+`OpenAIResponsesProvider` (or `OpenAIProvider` with `OpenAIApiSurface::Responses`) works on any
+Responses-compatible host. Every turn is stateless: `store=false`, no `previous_response_id`, and
+the full history in `input`. `OpenAIResponsesCompat` names the optional fields a host accepts and how
+the model's reasoning is carried into the next turn; it follows the base URL (`api.openai.com`,
+`api.fireworks.ai`, otherwise the core request only) and can be set with `with_compat` /
+`with_responses_compat`. On OpenAI the encrypted reasoning items go back; on Fireworks, which returns
+no encrypted content, the reasoning summaries do.
+
+```rust
+use agent_sdk_providers::{OpenAIReasoningConfig, OpenAIReasoningEffort, OpenAIResponsesProvider};
+
+let fireworks = OpenAIResponsesProvider::fireworks(
+    std::env::var("FIREWORKS_API_KEY")?,
+    "accounts/fireworks/models/kimi-k2p5".to_string(),
+)
+.with_reasoning(OpenAIReasoningConfig::new().with_effort(OpenAIReasoningEffort::Medium));
+```
+
+`with_zero_retention(true)` refuses `store=true` before any request; `fireworks` turns it on, since
+Fireworks keeps Responses conversations for 30 days unless a request says `store=false`.
+
 ## Built-in Primitive Tools
 
 For agents that need file system access:

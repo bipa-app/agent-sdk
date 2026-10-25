@@ -1,0 +1,20 @@
+{
+  "id": null,
+  "object": "response",
+  "created_at": 1761350404,
+  "status": "completed",
+  "model": "accounts/fireworks/models/kimi-k2p5",
+  "store": false,
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_fw_2",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {"type": "output_text", "text": "{\"payee\":\"Acme Supplies\",\"amount\":\"450.00\"}", "annotations": []}
+      ]
+    }
+  ],
+  "usage": {"input_tokens": 60, "output_tokens": 14, "total_tokens": 74}
+}
