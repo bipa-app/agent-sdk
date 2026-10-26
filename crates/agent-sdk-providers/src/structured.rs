@@ -151,7 +151,7 @@ pub async fn run_structured(
     // Compile the validator once; reuse it across every retry.
     let validator = validator_for_provider(provider, &response_format)?;
 
-    let support = provider.structured_output_support();
+    let support = provider.structured_output_support_for(&response_format);
     if matches!(support, StructuredOutputSupport::ToolForcing) {
         apply_tool_forcing(&mut request, &response_format);
     }
@@ -296,7 +296,7 @@ pub fn run_structured_stream(
             }
         };
 
-        let support = provider.structured_output_support();
+        let support = provider.structured_output_support_for(&response_format);
         if matches!(support, StructuredOutputSupport::ToolForcing) {
             apply_tool_forcing(&mut request, &response_format);
         }

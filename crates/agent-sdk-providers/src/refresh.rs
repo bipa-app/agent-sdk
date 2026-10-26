@@ -356,6 +356,13 @@ where
         self.template.structured_output_support()
     }
 
+    fn structured_output_support_for(
+        &self,
+        format: &agent_sdk_foundation::llm::ResponseFormat,
+    ) -> StructuredOutputSupport {
+        self.template.structured_output_support_for(format)
+    }
+
     fn has_stable_request_route(&self) -> bool {
         self.template.has_stable_request_route()
     }

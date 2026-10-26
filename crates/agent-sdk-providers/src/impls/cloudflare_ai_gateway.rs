@@ -406,6 +406,17 @@ impl LlmProvider for CloudflareAIGatewayProvider {
         }
     }
 
+    fn structured_output_support_for(
+        &self,
+        format: &agent_sdk_foundation::llm::ResponseFormat,
+    ) -> crate::provider::StructuredOutputSupport {
+        match &self.inner {
+            Inner::Anthropic(p) => p.structured_output_support_for(format),
+            Inner::OpenAI(p) => p.structured_output_support_for(format),
+            Inner::Gemini(p) => p.structured_output_support_for(format),
+        }
+    }
+
     fn validate_thinking_config(&self, thinking: Option<&ThinkingConfig>) -> Result<()> {
         match &self.inner {
             Inner::Anthropic(p) => p.validate_thinking_config(thinking),

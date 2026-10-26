@@ -158,6 +158,11 @@ pub enum ToolChoice {
 ///   sends a transformed copy: unsupported constraints (`minimum`,
 ///   `maxLength`, ...) move into descriptions, and every object is closed.
 ///   Validate the response against [`schema`](Self::schema) to enforce them.
+///   A schema with an open object, an object with no listed properties, or
+///   `patternProperties` cannot be sent: a direct `chat` call is refused, and
+///   the structured-output runner forces a tool instead. A response that stops
+///   on `max_tokens` or a refusal may not match the schema; check its
+///   `stop_reason`.
 /// - **Older Claude models and Claude on Vertex**: tool-forcing fallback — the
 ///   runtime injects a single "respond" tool whose `input_schema` is
 ///   [`schema`](Self::schema) and forces the model to call it.

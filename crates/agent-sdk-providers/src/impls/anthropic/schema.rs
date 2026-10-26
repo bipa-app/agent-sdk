@@ -10,6 +10,10 @@
 //! same. The caller's schema is unchanged, so a caller that validates the
 //! response (the structured-output runner does) still enforces every
 //! constraint.
+//!
+//! Keywords the docs do not list (`not`, `if`/`then`/`else`, `contains`,
+//! `dependentSchemas`, `propertyNames`, `unevaluated*`) pass through with
+//! their subschemas transformed; Anthropic may still refuse them.
 
 use std::fmt;
 
@@ -45,13 +49,23 @@ const SUPPORTED_FORMATS: &[&str] = &[
 ];
 
 /// Keywords whose value is one subschema.
-const SUBSCHEMA_KEYWORDS: &[&str] = &["items", "not", "if", "then", "else", "contains"];
+const SUBSCHEMA_KEYWORDS: &[&str] = &[
+    "items",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+];
 
 /// Keywords whose value is a list of subschemas.
 const SUBSCHEMA_LIST_KEYWORDS: &[&str] = &["prefixItems", "anyOf", "allOf", "oneOf"];
 
 /// Keywords whose value maps names to subschemas.
-const SUBSCHEMA_MAP_KEYWORDS: &[&str] = &["properties", "$defs", "definitions"];
+const SUBSCHEMA_MAP_KEYWORDS: &[&str] = &["properties", "$defs", "definitions", "dependentSchemas"];
 
 /// Why a schema cannot reach JSON outputs without changing its meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +77,9 @@ pub enum JsonOutputSchemaError {
     OpenObject,
     /// An object describes property names with `patternProperties`.
     PatternProperties,
+    /// An object lists no properties and does not close itself, so it
+    /// accepts any object. Closing it would accept only `{}`.
+    FreeFormObject,
 }
 
 impl fmt::Display for JsonOutputSchemaError {
@@ -74,6 +91,9 @@ impl fmt::Display for JsonOutputSchemaError {
             Self::PatternProperties => {
                 formatter.write_str("Anthropic JSON outputs do not accept patternProperties")
             }
+            Self::FreeFormObject => formatter.write_str(
+                "Anthropic JSON outputs cannot express an object with no listed properties",
+            ),
         }
     }
 }
@@ -84,8 +104,9 @@ impl std::error::Error for JsonOutputSchemaError {}
 ///
 /// # Errors
 ///
-/// Returns a [`JsonOutputSchemaError`] when an object is open or uses
-/// `patternProperties`: closing it would change what it accepts.
+/// Returns a [`JsonOutputSchemaError`] when an object is open, lists no
+/// properties, or uses `patternProperties`: closing it would change what it
+/// accepts.
 pub fn json_output_schema(schema: &Value) -> Result<Value, JsonOutputSchemaError> {
     let mut wire = schema.clone();
     transform(&mut wire)?;
@@ -156,6 +177,7 @@ fn close_object(map: &mut Map<String, Value>) -> Result<(), JsonOutputSchemaErro
         return Err(JsonOutputSchemaError::PatternProperties);
     }
     match map.get("additionalProperties") {
+        None if !map.contains_key("properties") => Err(JsonOutputSchemaError::FreeFormObject),
         None => {
             map.insert("additionalProperties".to_owned(), Value::Bool(false));
             Ok(())
@@ -167,9 +189,11 @@ fn close_object(map: &mut Map<String, Value>) -> Result<(), JsonOutputSchemaErro
 
 fn describe(map: &mut Map<String, Value>, dropped: &Value) {
     let note = dropped.to_string();
-    let description = match map.get("description").and_then(Value::as_str) {
-        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{note}"),
-        _ => note,
+    let description = match map.get("description") {
+        None => note,
+        Some(Value::String(existing)) if existing.is_empty() => note,
+        Some(Value::String(existing)) => format!("{existing}\n\n{note}"),
+        Some(_) => return,
     };
     map.insert("description".to_owned(), Value::String(description));
 }
@@ -285,8 +309,59 @@ mod tests {
                 }),
                 JsonOutputSchemaError::PatternProperties,
             ),
+            (
+                json!({ "type": "object" }),
+                JsonOutputSchemaError::FreeFormObject,
+            ),
+            (
+                json!({ "type": "object", "properties": { "meta": { "type": ["object", "null"] } } }),
+                JsonOutputSchemaError::FreeFormObject,
+            ),
         ] {
             assert_eq!(json_output_schema(&schema), Err(expected), "{schema}");
         }
+    }
+
+    #[test]
+    fn an_explicitly_closed_empty_object_is_kept() -> anyhow::Result<()> {
+        let schema = json!({ "type": "object", "additionalProperties": false });
+        assert_eq!(json_output_schema(&schema)?, schema);
+        Ok(())
+    }
+
+    #[test]
+    fn min_items_zero_and_one_stay_and_other_keywords_are_recursed() -> anyhow::Result<()> {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "empty_ok": { "type": "array", "minItems": 0, "items": { "type": "string" } },
+                "tags": {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "propertyNames": { "type": "string", "maxLength": 10 },
+                    "dependentSchemas": { "name": { "type": "object", "properties": {} } }
+                },
+                "odd": { "type": "string", "maxLength": 3, "description": 7 }
+            },
+            "required": ["empty_ok", "tags", "odd"]
+        });
+
+        let wire = json_output_schema(&schema)?;
+
+        assert_eq!(wire["properties"]["empty_ok"]["minItems"], 0);
+        assert_eq!(
+            wire["properties"]["tags"]["propertyNames"],
+            json!({ "type": "string", "description": "{\"maxLength\":10}" })
+        );
+        assert_eq!(
+            wire["properties"]["tags"]["dependentSchemas"]["name"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            wire["properties"]["odd"],
+            json!({ "type": "string", "description": 7 }),
+            "a non-string description is left as the caller wrote it"
+        );
+        Ok(())
     }
 }

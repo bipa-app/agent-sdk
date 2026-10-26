@@ -1027,6 +1027,18 @@ pub trait LlmProvider: Send + Sync {
             _ => StructuredOutputSupport::ToolForcing,
         }
     }
+
+    /// How this provider satisfies `format` in particular. A provider whose
+    /// native mode cannot express every schema reports
+    /// [`StructuredOutputSupport::ToolForcing`] for the schemas it cannot
+    /// send. The default is [`structured_output_support`](Self::structured_output_support).
+    fn structured_output_support_for(
+        &self,
+        format: &agent_sdk_foundation::llm::ResponseFormat,
+    ) -> StructuredOutputSupport {
+        let _ = format;
+        self.structured_output_support()
+    }
 }
 
 /// Timeout for [`probe_http_reachability`]: long enough for a slow TLS

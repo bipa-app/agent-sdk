@@ -981,14 +981,20 @@ impl AnthropicProvider {
     }
 
     /// The JSON outputs format for the request's `response_format`, when the
-    /// model takes JSON outputs. A model without them ignores
-    /// `response_format`, and the structured-output runner forces a tool.
+    /// model takes JSON outputs and no tool is forced. A model without them
+    /// ignores `response_format`; so does a request that forces a tool, which
+    /// is how the structured-output runner falls back for a schema JSON
+    /// outputs cannot express.
     fn json_output_format(
         &self,
         request: &ChatRequest,
     ) -> Result<Option<ApiOutputFormat>, schema::JsonOutputSchemaError> {
+        let forces_a_tool = matches!(
+            request.tool_choice,
+            Some(agent_sdk_foundation::llm::ToolChoice::Tool(_))
+        );
         match &request.response_format {
-            Some(format) if self.supports_json_outputs() => {
+            Some(format) if self.supports_json_outputs() && !forces_a_tool => {
                 schema::json_output_schema(&format.schema)
                     .map(|wire| Some(ApiOutputFormat::json_schema(wire)))
             }
@@ -1759,6 +1765,17 @@ impl LlmProvider for AnthropicProvider {
 
     fn structured_output_support(&self) -> StructuredOutputSupport {
         if self.supports_json_outputs() {
+            StructuredOutputSupport::Native
+        } else {
+            StructuredOutputSupport::ToolForcing
+        }
+    }
+
+    fn structured_output_support_for(
+        &self,
+        format: &agent_sdk_foundation::llm::ResponseFormat,
+    ) -> StructuredOutputSupport {
+        if self.supports_json_outputs() && schema::json_output_schema(&format.schema).is_ok() {
             StructuredOutputSupport::Native
         } else {
             StructuredOutputSupport::ToolForcing
@@ -3028,6 +3045,109 @@ mod tests {
             assert_eq!(body["output_config"]["format"]["type"], "json_schema");
             assert!(body.get("tools").is_none(), "no respond tool: {body}");
         }
+        Ok(())
+    }
+
+    fn open_object_format() -> agent_sdk_foundation::llm::ResponseFormat {
+        agent_sdk_foundation::llm::ResponseFormat::new(
+            "labels",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+                },
+                "required": ["labels"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    #[test]
+    fn support_follows_the_schema_as_well_as_the_model() {
+        let sonnet = AnthropicProvider::new("test-api-key", MODEL_SONNET_55);
+        let legacy = AnthropicProvider::new("test-api-key", "claude-sonnet-4-20250514");
+        assert_eq!(
+            sonnet.structured_output_support_for(&reader_like_format()),
+            StructuredOutputSupport::Native
+        );
+        assert_eq!(
+            sonnet.structured_output_support_for(&open_object_format()),
+            StructuredOutputSupport::ToolForcing
+        );
+        assert_eq!(
+            legacy.structured_output_support_for(&reader_like_format()),
+            StructuredOutputSupport::ToolForcing
+        );
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[tokio::test]
+    async fn the_structured_runner_forces_a_tool_for_a_schema_json_outputs_cannot_express()
+    -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL_SONNET_55,
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "respond",
+                    "input": { "labels": { "pt": "Boleto" } }
+                }],
+                "stop_reason": "tool_use",
+                "usage": { "input_tokens": 10, "output_tokens": 5 }
+            })))
+            .mount(&server)
+            .await;
+        let provider =
+            AnthropicProvider::new("test-api-key", MODEL_SONNET_55).with_base_url(server.uri());
+        let request = ChatRequest::new("", vec![agent_sdk_foundation::llm::Message::user("doc")])
+            .with_response_format(open_object_format());
+
+        let output = crate::structured::run_structured(
+            &provider,
+            request,
+            crate::structured::StructuredConfig::default(),
+        )
+        .await?;
+
+        assert_eq!(output.value["labels"]["pt"], "Boleto");
+        let recorded = single_recorded_request(&server).await.context("one call")?;
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        assert_eq!(body["tools"][0]["name"], "respond", "body={body}");
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({ "type": "tool", "name": "respond" }),
+            "body={body}"
+        );
+        assert!(body.get("output_config").is_none(), "body={body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_request_without_response_format_sends_no_output_config() -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider =
+            AnthropicProvider::new("test-api-key", MODEL_SONNET_55).with_base_url(server.uri());
+        let _ = provider
+            .chat(ChatRequest::new(
+                "",
+                vec![agent_sdk_foundation::llm::Message::user("hi")],
+            ))
+            .await;
+
+        let recorded = single_recorded_request(&server).await?;
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        assert!(body.get("output_config").is_none(), "body={body}");
         Ok(())
     }
 
