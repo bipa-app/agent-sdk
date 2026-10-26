@@ -153,9 +153,14 @@ pub enum ToolChoice {
 ///
 /// - **`OpenAI` / Gemini**: native JSON-mode / structured-outputs
 ///   (`response_format` / `responseSchema`).
-/// - **Anthropic**: tool-forcing fallback — the runtime injects a single
-///   "respond" tool whose `input_schema` is [`schema`](Self::schema) and
-///   forces the model to call it.
+/// - **Anthropic**: JSON outputs (`output_config.format`) on the models that
+///   take them. Anthropic accepts a subset of JSON Schema, so the provider
+///   sends a transformed copy: unsupported constraints (`minimum`,
+///   `maxLength`, ...) move into descriptions, and every object is closed.
+///   Validate the response against [`schema`](Self::schema) to enforce them.
+/// - **Older Claude models and Claude on Vertex**: tool-forcing fallback — the
+///   runtime injects a single "respond" tool whose `input_schema` is
+///   [`schema`](Self::schema) and forces the model to call it.
 ///
 /// The runtime validates the model's final output against [`schema`](Self::schema)
 /// and, on mismatch, bounded-re-prompts before failing with a typed error.

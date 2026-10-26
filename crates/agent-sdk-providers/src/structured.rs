@@ -13,12 +13,12 @@
 //!    [`structured_output_support`](crate::LlmProvider::structured_output_support):
 //!    - [`Native`](crate::StructuredOutputSupport::Native) — the provider
 //!      already mapped `response_format` onto its wire request (`OpenAI` JSON
-//!      mode, Gemini `responseSchema`). The structured value is parsed from the
-//!      assistant's text output.
+//!      mode, Gemini `responseSchema`, Anthropic JSON outputs). The structured
+//!      value is parsed from the assistant's text output.
 //!    - [`ToolForcing`](crate::StructuredOutputSupport::ToolForcing) — the
 //!      runner injects a single forced "respond" tool whose `input_schema` is
-//!      the output schema (the Anthropic fallback) and reads the structured
-//!      value from that tool call's input.
+//!      the output schema (older Claude models, Claude on Vertex) and reads the
+//!      structured value from that tool call's input.
 //! 3. The candidate value is validated against the schema with `jsonschema`.
 //!    On success it is returned. On failure the runner appends the model's
 //!    output plus a corrective user message describing the validation errors
@@ -43,7 +43,7 @@ use crate::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 #[cfg(feature = "openai")]
 use crate::impls::openai_schema::normalized_strict_schema;
 
-/// The forced tool name used for the tool-forcing fallback (Anthropic).
+/// The forced tool name used for the tool-forcing fallback.
 const RESPOND_TOOL_NAME: &str = "respond";
 
 /// Bounds for the structured-output re-prompt loop.
@@ -736,7 +736,7 @@ fn strip_code_fence(text: &str) -> &str {
 /// Append the assistant's previous output plus a corrective user message so the
 /// next attempt sees the validation feedback.
 ///
-/// For the tool-forcing path (Anthropic), the assistant turn carries a forced
+/// For the tool-forcing path (older Claude models), the assistant turn carries a forced
 /// `respond` `ContentBlock::ToolUse`. The Anthropic Messages API rejects any
 /// conversation where a `tool_use` is not immediately followed by a matching
 /// `tool_result` in the next user message, so the correction is delivered as a
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(provider.call_count(), 0);
     }
 
-    // ── Happy path: tool-forcing fallback (Anthropic) ─────────────────
+    // ── Happy path: tool-forcing fallback (older Claude models) ───────
 
     #[tokio::test]
     async fn tool_forcing_happy_path_reads_tool_input() -> Result<()> {

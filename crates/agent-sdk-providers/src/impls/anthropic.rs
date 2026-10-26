@@ -6,9 +6,10 @@
 
 pub(crate) mod data;
 mod fingerprint;
+mod schema;
 
 use crate::attachments::{fit_request_attachments, validate_request_attachments};
-use crate::provider::{LlmProvider, thinking_for_forced_tool};
+use crate::provider::{LlmProvider, StructuredOutputSupport, thinking_for_forced_tool};
 use crate::streaming::{
     StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
 };
@@ -19,9 +20,9 @@ use agent_sdk_foundation::llm::{
 use anyhow::Result;
 use async_trait::async_trait;
 use data::{
-    ApiMessagesRequest, ApiOutputConfig, ApiThinkingConfig, ApiToolChoice, build_api_messages,
-    build_api_tools_with_cache, is_message_stop_event, map_content_blocks, map_stop_reason,
-    parse_sse_event, take_next_sse_event,
+    ApiMessagesRequest, ApiOutputConfig, ApiOutputFormat, ApiThinkingConfig, ApiToolChoice,
+    build_api_messages, build_api_tools_with_cache, is_message_stop_event, map_content_blocks,
+    map_stop_reason, parse_sse_event, take_next_sse_event,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -237,6 +238,15 @@ fn adopt_required_claude_code_version(error_body: &str) -> bool {
     }
     *adopted = Some(required);
     true
+}
+
+/// Whether the request sends an effort level. `output_config` may carry only a
+/// JSON outputs format, which needs no effort beta.
+fn effort_on_wire(request: &ApiMessagesRequest<'_>) -> bool {
+    request
+        .output_config
+        .as_ref()
+        .is_some_and(|config| config.effort.is_some())
 }
 
 /// Text of the first conversational wire user turn, the seed of the Claude
@@ -951,6 +961,40 @@ impl AnthropicProvider {
         crate::model_capabilities::get_model_capabilities("anthropic", &self.model)
             .is_some_and(|caps| caps.rejects_budget_thinking)
     }
+
+    /// Whether the model takes JSON outputs (`output_config.format`): every
+    /// catalog model except Claude Sonnet 4, Opus 4 and the 3.5 line, per
+    /// <https://platform.claude.com/docs/en/build-with-claude/structured-outputs>.
+    /// A model the catalog does not know keeps the tool-forcing fallback.
+    fn supports_json_outputs(&self) -> bool {
+        crate::model_capabilities::get_model_capabilities("anthropic", &self.model).is_some_and(
+            |caps| {
+                !matches!(
+                    caps.model_id,
+                    "claude-sonnet-4-20250514"
+                        | "claude-opus-4-20250514"
+                        | "claude-3-5-sonnet-20241022"
+                        | "claude-3-5-haiku-20241022"
+                )
+            },
+        )
+    }
+
+    /// The JSON outputs format for the request's `response_format`, when the
+    /// model takes JSON outputs. A model without them ignores
+    /// `response_format`, and the structured-output runner forces a tool.
+    fn json_output_format(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<Option<ApiOutputFormat>, schema::JsonOutputSchemaError> {
+        match &request.response_format {
+            Some(format) if self.supports_json_outputs() => {
+                schema::json_output_schema(&format.schema)
+                    .map(|wire| Some(ApiOutputFormat::json_schema(wire)))
+            }
+            Some(_) | None => Ok(None),
+        }
+    }
 }
 
 #[async_trait]
@@ -1000,10 +1044,12 @@ impl LlmProvider for AnthropicProvider {
         let thinking = thinking_config
             .as_ref()
             .and_then(ApiThinkingConfig::from_thinking_config);
-        let output_config = thinking_config
-            .as_ref()
-            .and_then(|t| t.effort)
-            .map(|effort| ApiOutputConfig { effort });
+        let format = match self.json_output_format(&request) {
+            Ok(format) => format,
+            Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
+        };
+        let output_config =
+            ApiOutputConfig::new(thinking_config.as_ref().and_then(|t| t.effort), format);
 
         let first_user_message_text = first_wire_user_message_text(&request.messages);
 
@@ -1061,7 +1107,7 @@ impl LlmProvider for AnthropicProvider {
                 .timeout(CHAT_REQUEST_TIMEOUT)
                 .header("Content-Type", "application/json");
             let response = self
-                .apply_auth(builder, api_request.output_config.is_some())
+                .apply_auth(builder, effort_on_wire(&api_request))
                 .body(body)
                 .send()
                 .await
@@ -1249,10 +1295,20 @@ impl LlmProvider for AnthropicProvider {
                     let thinking = thinking_config
                         .as_ref()
                         .and_then(ApiThinkingConfig::from_thinking_config);
-                    let output_config = thinking_config
-                        .as_ref()
-                        .and_then(|t| t.effort)
-                        .map(|effort| ApiOutputConfig { effort });
+                    let format = match self.json_output_format(&request) {
+                        Ok(format) => format,
+                        Err(error) => {
+                            yield Ok(StreamDelta::Error {
+                                message: error.to_string(),
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+                    };
+                    let output_config = ApiOutputConfig::new(
+                        thinking_config.as_ref().and_then(|t| t.effort),
+                        format,
+                    );
 
                     let first_user_message_text = first_wire_user_message_text(&request.messages);
 
@@ -1319,7 +1375,7 @@ impl LlmProvider for AnthropicProvider {
                             .post(self.messages_url())
                             .header("Content-Type", "application/json");
                         let send = self
-                            .apply_auth(builder, api_request.output_config.is_some())
+                            .apply_auth(builder, effort_on_wire(&api_request))
                             .body(body)
                             .send();
                         let response = match tokio::time::timeout(headers_timeout, send).await {
@@ -1699,6 +1755,14 @@ impl LlmProvider for AnthropicProvider {
             self.provider(),
             self.model()
         ))
+    }
+
+    fn structured_output_support(&self) -> StructuredOutputSupport {
+        if self.supports_json_outputs() {
+            StructuredOutputSupport::Native
+        } else {
+            StructuredOutputSupport::ToolForcing
+        }
     }
 
     fn default_max_tokens(&self) -> u32 {
@@ -2723,6 +2787,291 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ===================
+    // JSON outputs (`output_config.format`)
+    // ===================
+
+    fn reader_like_format() -> agent_sdk_foundation::llm::ResponseFormat {
+        agent_sdk_foundation::llm::ResponseFormat::new(
+            "leitura",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["boleto", "other"] },
+                    "amount_cents": { "type": ["integer", "null"], "minimum": 1 },
+                    "options": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": { "text": { "type": "string", "minLength": 1 } },
+                            "required": ["text"]
+                        }
+                    }
+                },
+                "required": ["kind", "amount_cents", "options"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    fn json_output_request() -> ChatRequest {
+        ChatRequest::new(
+            "Read the document.",
+            vec![agent_sdk_foundation::llm::Message::user("doc")],
+        )
+        .with_response_format(reader_like_format())
+    }
+
+    #[tokio::test]
+    async fn a_response_format_reaches_output_config_with_no_tools() -> anyhow::Result<()> {
+        use agent_sdk_foundation::llm::Effort;
+
+        for streaming in [false, true] {
+            for (thinking, expected_effort) in [
+                (
+                    Some(ThinkingConfig::adaptive_with_effort(Effort::High)),
+                    Some("high"),
+                ),
+                (None, None),
+            ] {
+                let server = wiremock::MockServer::start().await;
+                mount_messages_stub(&server).await;
+                let mut provider = AnthropicProvider::new("test-api-key", MODEL_SONNET_55)
+                    .with_base_url(server.uri());
+                if let Some(thinking) = thinking {
+                    provider = provider.with_thinking(thinking);
+                }
+                if streaming {
+                    let _ = provider
+                        .chat_stream(json_output_request())
+                        .collect::<Vec<_>>()
+                        .await;
+                } else {
+                    let _ = provider.chat(json_output_request()).await;
+                }
+
+                let recorded = single_recorded_request(&server).await?;
+                let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+                assert_eq!(
+                    body["output_config"]["format"],
+                    serde_json::json!({
+                        "type": "json_schema",
+                        "schema": schema::json_output_schema(&reader_like_format().schema)?,
+                    }),
+                    "streaming={streaming} body={body}"
+                );
+                assert_eq!(
+                    body["output_config"]["effort"].as_str(),
+                    expected_effort,
+                    "streaming={streaming} body={body}"
+                );
+                assert!(
+                    body.get("tools").is_none(),
+                    "streaming={streaming} body={body}"
+                );
+                assert!(
+                    body.get("tool_choice").is_none(),
+                    "streaming={streaming} body={body}"
+                );
+                assert!(
+                    recorded.headers.get("anthropic-beta").is_none(),
+                    "JSON outputs are GA and need no beta: streaming={streaming}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_oauth_json_output_without_effort_declares_no_effort_beta() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider =
+            AnthropicProvider::new(OAUTH_TEST_TOKEN, MODEL_SONNET_55).with_base_url(server.uri());
+        let _ = provider.chat(json_output_request()).await;
+
+        let recorded = single_recorded_request(&server).await?;
+        let betas = recorded
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok())
+            .context("OAuth requests always declare betas")?;
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+        assert!(body["output_config"].get("effort").is_none(), "body={body}");
+        assert!(
+            !betas.split(',').any(|beta| beta == EFFORT_BETA),
+            "betas={betas}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_model_without_json_outputs_sends_no_format() -> anyhow::Result<()> {
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider = AnthropicProvider::new("test-api-key", "claude-sonnet-4-20250514")
+            .with_base_url(server.uri());
+        assert_eq!(
+            provider.structured_output_support(),
+            StructuredOutputSupport::ToolForcing
+        );
+        let _ = provider.chat(json_output_request()).await;
+
+        let recorded = single_recorded_request(&server).await?;
+        let body: serde_json::Value = serde_json::from_slice(&recorded.body)?;
+        assert!(body.get("output_config").is_none(), "body={body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_schema_json_outputs_cannot_express_is_refused_before_the_request()
+    -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let server = wiremock::MockServer::start().await;
+        mount_messages_stub(&server).await;
+        let provider =
+            AnthropicProvider::new("test-api-key", MODEL_SONNET_55).with_base_url(server.uri());
+        let request = ChatRequest::new("", vec![agent_sdk_foundation::llm::Message::user("doc")])
+            .with_response_format(agent_sdk_foundation::llm::ResponseFormat::new(
+                "open",
+                serde_json::json!({ "type": "object", "additionalProperties": true }),
+            ));
+
+        let outcome = provider.chat(request.clone()).await?;
+        assert!(
+            matches!(&outcome, ChatOutcome::InvalidRequest(message) if message.contains("closed objects")),
+            "{outcome:?}"
+        );
+        let deltas = provider.chat_stream(request).collect::<Vec<_>>().await;
+        assert!(
+            deltas.iter().any(|delta| matches!(
+                delta,
+                Ok(StreamDelta::Error {
+                    kind: StreamErrorKind::InvalidRequest,
+                    ..
+                })
+            )),
+            "{deltas:?}"
+        );
+        let received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        assert!(received.is_empty(), "nothing reaches the API");
+        Ok(())
+    }
+
+    #[cfg(feature = "structured-output")]
+    #[tokio::test]
+    async fn the_structured_runner_reads_json_outputs_and_enforces_the_original_schema()
+    -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let message = |text: &str| {
+            serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL_SONNET_55,
+                "content": [{ "type": "text", "text": text }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 10, "output_tokens": 5 }
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message(
+                r#"{"kind": "boleto", "amount_cents": 0, "options": []}"#,
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message(
+                r#"{"kind": "boleto", "amount_cents": 970, "options": []}"#,
+            )))
+            .mount(&server)
+            .await;
+        let provider =
+            AnthropicProvider::new("test-api-key", MODEL_SONNET_55).with_base_url(server.uri());
+
+        let output = crate::structured::run_structured(
+            &provider,
+            json_output_request(),
+            crate::structured::StructuredConfig::default(),
+        )
+        .await?;
+
+        assert_eq!(output.value["amount_cents"], 970);
+        assert_eq!(
+            output.retries, 1,
+            "amount_cents 0 breaks the dropped minimum"
+        );
+        let received = server
+            .received_requests()
+            .await
+            .context("request recording is disabled")?;
+        assert_eq!(received.len(), 2);
+        for request in &received {
+            let body: serde_json::Value = serde_json::from_slice(&request.body)?;
+            assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+            assert!(body.get("tools").is_none(), "no respond tool: {body}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_outputs_cover_the_documented_models() {
+        let documented = [
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-mythos-5",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-5-5",
+            "claude-haiku-4-5-20251001",
+        ];
+        for caps in crate::model_capabilities::supported_model_capabilities()
+            .iter()
+            .filter(|caps| caps.provider == "anthropic")
+        {
+            let expected = if documented.contains(&caps.model_id) {
+                StructuredOutputSupport::Native
+            } else {
+                StructuredOutputSupport::ToolForcing
+            };
+            assert_eq!(
+                AnthropicProvider::new("test-api-key", caps.model_id).structured_output_support(),
+                expected,
+                "{}",
+                caps.model_id
+            );
+        }
+        assert_eq!(
+            AnthropicProvider::new("test-api-key", "claude-unreleased-9")
+                .structured_output_support(),
+            StructuredOutputSupport::ToolForcing
+        );
     }
 
     // ===================

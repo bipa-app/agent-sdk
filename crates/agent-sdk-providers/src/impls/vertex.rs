@@ -735,10 +735,10 @@ impl VertexProvider {
         let thinking = thinking_config
             .as_ref()
             .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
-        let output_config = thinking_config
-            .as_ref()
-            .and_then(|t| t.effort)
-            .map(|effort| anthropic_data::ApiOutputConfig { effort });
+        let output_config = anthropic_data::ApiOutputConfig::new(
+            thinking_config.as_ref().and_then(|t| t.effort),
+            None,
+        );
         let system = Self::build_vertex_claude_system_prompt(&request.system);
         let tool_choice = request
             .tool_choice
@@ -862,10 +862,10 @@ impl VertexProvider {
                     let thinking = thinking_config
                         .as_ref()
                         .and_then(anthropic_data::ApiThinkingConfig::from_thinking_config);
-                    let output_config = thinking_config
-                        .as_ref()
-                        .and_then(|t| t.effort)
-                        .map(|effort| anthropic_data::ApiOutputConfig { effort });
+                    let output_config = anthropic_data::ApiOutputConfig::new(
+                        thinking_config.as_ref().and_then(|t| t.effort),
+                        None,
+                    );
                     let system = Self::build_vertex_claude_system_prompt(&request.system);
                     let tool_choice = request
                         .tool_choice
