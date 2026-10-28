@@ -1021,11 +1021,23 @@ pub trait LlmProvider: Send + Sync {
                 StructuredOutputSupport::Native
             }
             // Vertex multiplexes Anthropic and Gemini models. Only the Gemini
-            // side has a native structured-output field; Claude-on-Vertex uses
-            // the Messages API shape, which has no `response_format`.
+            // side maps `response_format` natively; Claude on Vertex keeps the
+            // tool-forcing fallback.
             "vertex" if !self.model().starts_with("claude-") => StructuredOutputSupport::Native,
             _ => StructuredOutputSupport::ToolForcing,
         }
+    }
+
+    /// How this provider satisfies `format` in particular. A provider whose
+    /// native mode cannot express every schema reports
+    /// [`StructuredOutputSupport::ToolForcing`] for the schemas it cannot
+    /// send. The default is [`structured_output_support`](Self::structured_output_support).
+    fn structured_output_support_for(
+        &self,
+        format: &agent_sdk_foundation::llm::ResponseFormat,
+    ) -> StructuredOutputSupport {
+        let _ = format;
+        self.structured_output_support()
     }
 }
 
@@ -1438,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_reports_tool_forcing() {
+    fn a_provider_without_an_override_reports_tool_forcing_for_claude() {
         assert_eq!(
             support_for("anthropic", "claude-sonnet-4-5"),
             StructuredOutputSupport::ToolForcing

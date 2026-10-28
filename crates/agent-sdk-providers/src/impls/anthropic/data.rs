@@ -156,10 +156,40 @@ impl ApiThinkingConfig {
     }
 }
 
-/// Output configuration for effort level.
+/// `output_config`: the effort level and the JSON outputs schema.
 #[derive(Serialize)]
 pub struct ApiOutputConfig {
-    pub effort: agent_sdk_foundation::llm::Effort,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<agent_sdk_foundation::llm::Effort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ApiOutputFormat>,
+}
+
+impl ApiOutputConfig {
+    /// `None` when neither is set, so the request carries no `output_config`.
+    pub fn new(
+        effort: Option<agent_sdk_foundation::llm::Effort>,
+        format: Option<ApiOutputFormat>,
+    ) -> Option<Self> {
+        (effort.is_some() || format.is_some()).then_some(Self { effort, format })
+    }
+}
+
+/// `output_config.format`: JSON outputs constrained to a schema.
+#[derive(Serialize)]
+pub struct ApiOutputFormat {
+    #[serde(rename = "type")]
+    pub format_type: &'static str,
+    pub schema: serde_json::Value,
+}
+
+impl ApiOutputFormat {
+    pub const fn json_schema(schema: serde_json::Value) -> Self {
+        Self {
+            format_type: "json_schema",
+            schema,
+        }
+    }
 }
 
 #[derive(Serialize)]
