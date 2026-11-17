@@ -714,6 +714,7 @@ fn replay_after_a_tool_list_change() -> ChatRequest {
                     ContentBlock::Thinking {
                         thinking: String::new(),
                         signature: Some("signed-under-the-old-tool-list".to_owned()),
+                        route: None,
                     },
                     ContentBlock::ToolUse {
                         id: "toolu_1".to_owned(),

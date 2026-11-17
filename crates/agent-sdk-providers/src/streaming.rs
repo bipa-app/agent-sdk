@@ -667,6 +667,8 @@ impl StreamAccumulator {
     #[must_use]
     pub fn into_content_blocks(self) -> Vec<ContentBlock> {
         let mut blocks: Vec<(usize, ContentBlock)> = Vec::new();
+        // The route that served the stream signed its thinking.
+        let route = self.served_route;
 
         // Add thinking blocks with their indices, attaching signatures.
         // An empty-text block is kept when it carries a signature: with
@@ -684,6 +686,7 @@ impl StreamAccumulator {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    route: route.clone(),
                 },
             ));
         }
@@ -696,13 +699,20 @@ impl StreamAccumulator {
                 ContentBlock::Thinking {
                     thinking: String::new(),
                     signature: Some(signature),
+                    route: route.clone(),
                 },
             ));
         }
 
         // Add redacted thinking blocks
         for (idx, data) in self.redacted_thinking_blocks {
-            blocks.push((idx, ContentBlock::RedactedThinking { data }));
+            blocks.push((
+                idx,
+                ContentBlock::RedactedThinking {
+                    data,
+                    route: route.clone(),
+                },
+            ));
         }
 
         // Add provider-owned reasoning state without interpreting its payload.
@@ -932,9 +942,48 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(matches!(
             &blocks[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, route: None }
             if thinking == "Reasoning" && signature.as_deref() == Some("sig_123")
         ));
+    }
+
+    /// The route that served a stream signed its thinking, so every thinking
+    /// block it built records that route.
+    #[test]
+    fn accumulator_records_the_route_that_signed_its_thinking() {
+        let mut acc = StreamAccumulator::new();
+        acc.apply(&StreamDelta::ThinkingDelta {
+            delta: "Reasoning".to_string(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::SignatureDelta {
+            delta: "sig_123".to_string(),
+            block_index: 0,
+        });
+        acc.apply(&StreamDelta::RedactedThinking {
+            data: "redacted".to_string(),
+            block_index: 1,
+        });
+        acc.apply(&StreamDelta::Done {
+            stop_reason: Some(StopReason::EndTurn),
+            served_route: Some("bedrock".to_owned()),
+            served_model: None,
+        });
+
+        assert_eq!(
+            acc.into_content_blocks(),
+            [
+                ContentBlock::Thinking {
+                    thinking: "Reasoning".to_string(),
+                    signature: Some("sig_123".to_string()),
+                    route: Some("bedrock".to_owned()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "redacted".to_string(),
+                    route: Some("bedrock".to_owned()),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -954,7 +1003,7 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(matches!(
             &blocks[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, .. }
             if thinking.is_empty() && signature.as_deref() == Some("sig_omitted")
         ));
         assert!(matches!(

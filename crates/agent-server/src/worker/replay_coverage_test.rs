@@ -239,6 +239,7 @@ impl LlmProvider for ThinkingTextProvider {
                 ContentBlock::Thinking {
                     thinking: self.thinking.clone(),
                     signature: Some("sig_test".into()),
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: self.response_text.clone(),
@@ -287,6 +288,7 @@ impl LlmProvider for ThinkingToolCallProvider {
                     ContentBlock::Thinking {
                         thinking: self.resume_thinking.clone(),
                         signature: Some("sig_resume".into()),
+                        route: None,
                     },
                     ContentBlock::Text {
                         text: self.resume_text.clone(),
@@ -308,6 +310,7 @@ impl LlmProvider for ThinkingToolCallProvider {
         let mut content = vec![ContentBlock::Thinking {
             thinking: self.thinking.clone(),
             signature: Some("sig_first".into()),
+            route: None,
         }];
         for (id, name, input) in &self.tool_calls {
             content.push(ContentBlock::ToolUse {

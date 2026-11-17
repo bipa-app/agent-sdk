@@ -116,7 +116,7 @@ impl TokenEstimator {
                 &agent_sdk_foundation::llm::render_compaction_summary_for_provider(text),
             ),
             ContentBlock::Thinking { thinking, .. } => Self::estimate_text(thinking),
-            ContentBlock::RedactedThinking { data } => {
+            ContentBlock::RedactedThinking { data, .. } => {
                 // The data field is a base64-encoded encrypted blob whose size
                 // correlates with the original thinking content.  Base64 encodes
                 // 3 bytes into 4 chars, so `data.len() * 3 / 4` approximates
@@ -363,7 +363,7 @@ mod tests {
         // Simulate a realistic redacted thinking blob (~8KB base64 data).
         // 8192 base64 chars → ~6144 raw bytes → 6144/4 = 1536 estimated tokens.
         let data = "A".repeat(8192);
-        let block = ContentBlock::RedactedThinking { data };
+        let block = ContentBlock::RedactedThinking { data, route: None };
 
         let estimate = TokenEstimator::estimate_block(&block);
         assert_eq!(estimate, 1536);
@@ -374,7 +374,7 @@ mod tests {
         // Tiny data blob: 100 base64 chars → ~75 raw bytes → 75/4 = 19 tokens.
         // Should be clamped to the minimum (512).
         let data = "A".repeat(100);
-        let block = ContentBlock::RedactedThinking { data };
+        let block = ContentBlock::RedactedThinking { data, route: None };
 
         let estimate = TokenEstimator::estimate_block(&block);
         assert_eq!(estimate, TokenEstimator::REDACTED_THINKING_MIN_TOKENS);
@@ -385,6 +385,7 @@ mod tests {
         // Empty data should return the minimum floor.
         let block = ContentBlock::RedactedThinking {
             data: String::new(),
+            route: None,
         };
 
         let estimate = TokenEstimator::estimate_block(&block);
@@ -459,6 +460,7 @@ mod tests {
         let blocks: Vec<ContentBlock> = (0..5)
             .map(|_| ContentBlock::RedactedThinking {
                 data: "B".repeat(10_000), // 10k base64 → 7500 raw → 1875 tokens
+                route: None,
             })
             .collect();
         let message = Message {

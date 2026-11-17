@@ -3501,6 +3501,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reasoning".to_string(),
                     signature: Some("sig".to_string()),
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: text.to_string(),
@@ -3552,6 +3553,7 @@ mod tests {
             content: Content::Blocks(vec![ContentBlock::Thinking {
                 thinking: "reasoning".to_string(),
                 signature: Some("sig".to_string()),
+                route: None,
             }]),
         };
         let mut messages = vec![

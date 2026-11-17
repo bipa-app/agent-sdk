@@ -10706,6 +10706,7 @@ fn assistant_thinking_tool_use(
             ContentBlock::Thinking {
                 thinking: thinking.to_owned(),
                 signature: Some(signature.to_owned()),
+                route: None,
             },
             ContentBlock::ToolUse {
                 id: tool_id.to_owned(),

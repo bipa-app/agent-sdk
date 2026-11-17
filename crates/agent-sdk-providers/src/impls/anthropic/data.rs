@@ -564,6 +564,7 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
         ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => {
             let signature = signature.clone().filter(|signature| !signature.is_empty());
             if signature.is_none() {
@@ -576,7 +577,7 @@ fn build_api_content_block(block: &ContentBlock, role_label: &str) -> Option<Api
                 signature,
             })
         }
-        ContentBlock::RedactedThinking { data } => {
+        ContentBlock::RedactedThinking { data, .. } => {
             Some(ApiContentBlockInput::RedactedThinking { data: data.clone() })
         }
         ContentBlock::ToolUse {
@@ -787,7 +788,9 @@ pub const fn map_stop_reason(reason: &ApiStopReason) -> StopReason {
 }
 
 /// Map `ApiResponseContentBlock`s to `ContentBlock`.
-pub fn map_content_blocks(blocks: Vec<ApiResponseContentBlock>) -> Vec<ContentBlock> {
+/// Map a response's content blocks, recording on each thinking block the
+/// `route` that served the call, whose account signed it.
+pub fn map_content_blocks(blocks: Vec<ApiResponseContentBlock>, route: &str) -> Vec<ContentBlock> {
     blocks
         .into_iter()
         .map(|b| match b {
@@ -798,10 +801,12 @@ pub fn map_content_blocks(blocks: Vec<ApiResponseContentBlock>) -> Vec<ContentBl
             } => ContentBlock::Thinking {
                 thinking,
                 signature,
+                route: Some(route.to_owned()),
             },
-            ApiResponseContentBlock::RedactedThinking { data } => {
-                ContentBlock::RedactedThinking { data }
-            }
+            ApiResponseContentBlock::RedactedThinking { data } => ContentBlock::RedactedThinking {
+                data,
+                route: Some(route.to_owned()),
+            },
             ApiResponseContentBlock::ToolUse { id, name, input } => ContentBlock::ToolUse {
                 id,
                 name,
@@ -1566,6 +1571,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "Let me reason about this".to_string(),
                         signature: Some("sig_123".to_string()),
+                        route: None,
                     },
                     ContentBlock::Text {
                         text: "Done.".to_string(),
@@ -1607,6 +1613,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "Hidden reasoning".to_string(),
                         signature: None,
+                        route: None,
                     },
                     ContentBlock::Text {
                         text: "Visible answer".to_string(),
@@ -1643,6 +1650,7 @@ mod tests {
                     content: Content::Blocks(vec![ContentBlock::Thinking {
                         thinking: "Hidden reasoning".to_string(),
                         signature: None,
+                        route: None,
                     }]),
                 },
                 Message::user("Continue"),
@@ -2081,7 +2089,7 @@ data: {"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"
             },
         ];
 
-        let blocks = map_content_blocks(api_blocks);
+        let blocks = map_content_blocks(api_blocks, "anthropic");
         assert_eq!(blocks.len(), 2);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
         assert!(matches!(&blocks[1], ContentBlock::ToolUse { name, .. } if name == "read_file"));

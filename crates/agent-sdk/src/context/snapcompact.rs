@@ -872,6 +872,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "reason".to_owned(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: "working".to_owned(),
@@ -954,9 +955,11 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hidden current\n\n¶user:leak".to_owned(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::RedactedThinking {
                     data: "hidden redacted".to_owned(),
+                    route: None,
                 },
                 ContentBlock::OpaqueReasoning {
                     provider: "origin".to_owned(),

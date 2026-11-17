@@ -863,11 +863,18 @@ pub enum ContentBlock {
         /// Opaque signature for round-tripping thinking blocks back to the API.
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        /// The route that served the call that produced the block (`LlmProvider::route`), whose
+        /// account signed it. `None` for a block recorded before routes were stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
     },
 
     #[serde(rename = "redacted_thinking")]
     RedactedThinking {
         data: String,
+        /// The route that served the call that produced the block, as on `Thinking`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
     },
 
     /// Provider-owned reasoning state that must be replayed exactly on a
@@ -1071,9 +1078,15 @@ enum ContentBlockWire {
         thinking: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
     },
     #[serde(rename = "redacted_thinking")]
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+    },
     #[serde(rename = "opaque_reasoning")]
     OpaqueReasoning {
         provider: String,
@@ -1124,11 +1137,15 @@ impl From<ContentBlock> for ContentBlockWire {
             ContentBlock::Thinking {
                 thinking,
                 signature,
+                route,
             } => Self::Thinking {
                 thinking,
                 signature,
+                route,
             },
-            ContentBlock::RedactedThinking { data } => Self::RedactedThinking { data },
+            ContentBlock::RedactedThinking { data, route } => {
+                Self::RedactedThinking { data, route }
+            }
             ContentBlock::OpaqueReasoning { provider, data } => {
                 Self::OpaqueReasoning { provider, data }
             }
@@ -1179,11 +1196,15 @@ impl From<ContentBlockWire> for ContentBlock {
             ContentBlockWire::Thinking {
                 thinking,
                 signature,
+                route,
             } => Self::Thinking {
                 thinking,
                 signature,
+                route,
             },
-            ContentBlockWire::RedactedThinking { data } => Self::RedactedThinking { data },
+            ContentBlockWire::RedactedThinking { data, route } => {
+                Self::RedactedThinking { data, route }
+            }
             ContentBlockWire::OpaqueReasoning { provider, data } => {
                 Self::OpaqueReasoning { provider, data }
             }
@@ -2964,6 +2985,7 @@ mod tests {
         let none = serde_json::to_value(ContentBlock::Thinking {
             thinking: "t".into(),
             signature: None,
+            route: None,
         })?;
         assert_eq!(
             none,
@@ -2973,10 +2995,59 @@ mod tests {
         let some = serde_json::to_value(ContentBlock::Thinking {
             thinking: "t".into(),
             signature: Some("sig".into()),
+            route: None,
         })?;
         assert_eq!(
             some,
             serde_json::json!({"type": "thinking", "thinking": "t", "signature": "sig"})
+        );
+        Ok(())
+    }
+
+    /// A thinking block records the route that signed it, and a block stored
+    /// before routes were recorded reads back with none.
+    #[test]
+    fn content_block_thinking_records_its_route() -> Result<(), serde_json::Error> {
+        let signed = ContentBlock::Thinking {
+            thinking: "t".into(),
+            signature: Some("sig".into()),
+            route: Some("bedrock".into()),
+        };
+        let json = serde_json::to_value(&signed)?;
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "thinking", "thinking": "t", "signature": "sig", "route": "bedrock"
+            })
+        );
+        assert_eq!(serde_json::from_value::<ContentBlock>(json)?, signed);
+
+        let redacted = ContentBlock::RedactedThinking {
+            data: "d".into(),
+            route: Some("anthropic".into()),
+        };
+        assert_eq!(
+            serde_json::from_value::<ContentBlock>(serde_json::to_value(&redacted)?)?,
+            redacted
+        );
+
+        let stored_before_routes: Vec<ContentBlock> = serde_json::from_value(serde_json::json!([
+            {"type": "thinking", "thinking": "t", "signature": "sig"},
+            {"type": "redacted_thinking", "data": "d"}
+        ]))?;
+        assert_eq!(
+            stored_before_routes,
+            [
+                ContentBlock::Thinking {
+                    thinking: "t".into(),
+                    signature: Some("sig".into()),
+                    route: None,
+                },
+                ContentBlock::RedactedThinking {
+                    data: "d".into(),
+                    route: None,
+                },
+            ]
         );
         Ok(())
     }
@@ -3036,7 +3107,10 @@ mod tests {
     #[test]
     fn content_block_remaining_variant_tags() -> Result<(), serde_json::Error> {
         assert_eq!(
-            serde_json::to_value(ContentBlock::RedactedThinking { data: "d".into() })?,
+            serde_json::to_value(ContentBlock::RedactedThinking {
+                data: "d".into(),
+                route: None
+            })?,
             serde_json::json!({"type": "redacted_thinking", "data": "d"})
         );
         assert_eq!(
@@ -3072,8 +3146,12 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "th".into(),
                 signature: Some("s".into()),
+                route: None,
             },
-            ContentBlock::RedactedThinking { data: "d".into() },
+            ContentBlock::RedactedThinking {
+                data: "d".into(),
+                route: None,
+            },
             ContentBlock::OpaqueReasoning {
                 provider: "test-provider".into(),
                 data: serde_json::json!({"id": "reasoning_1", "state": [1, 2, 3]}),
@@ -3492,6 +3570,7 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: "reasoning".to_string(),
                 signature: Some("sig-abc".to_string()),
+                route: None,
             },
             ContentBlock::ToolUse {
                 id: "dup".to_string(),

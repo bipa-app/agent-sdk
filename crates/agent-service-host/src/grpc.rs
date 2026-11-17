@@ -3937,11 +3937,12 @@ fn map_content_block(block: &ContentBlock) -> RpcResult<pb::ConversationContentB
         ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => pb::conversation_content_block::Block::Thinking(pb::ThinkingBlock {
             thinking: thinking.clone(),
             signature: signature.clone(),
         }),
-        ContentBlock::RedactedThinking { data } => {
+        ContentBlock::RedactedThinking { data, .. } => {
             pb::conversation_content_block::Block::RedactedThinking(pb::RedactedThinkingBlock {
                 data: data.clone(),
             })

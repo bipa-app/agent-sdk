@@ -1605,6 +1605,7 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
                 blocks.extend(thinking.into_iter().map(|thinking| ContentBlock::Thinking {
                     thinking,
                     signature: None,
+                    route: None,
                 }));
             }
             ApiOutputItem::Message {
