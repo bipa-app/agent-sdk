@@ -2082,6 +2082,13 @@ data: {"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"
             ApiResponseContentBlock::Text {
                 text: "Hello".to_string(),
             },
+            ApiResponseContentBlock::Thinking {
+                thinking: "reasoning".to_string(),
+                signature: Some("sig".to_string()),
+            },
+            ApiResponseContentBlock::RedactedThinking {
+                data: "redacted".to_string(),
+            },
             ApiResponseContentBlock::ToolUse {
                 id: "tool_1".to_string(),
                 name: "read_file".to_string(),
@@ -2089,9 +2096,23 @@ data: {"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"
             },
         ];
 
-        let blocks = map_content_blocks(api_blocks, "anthropic");
-        assert_eq!(blocks.len(), 2);
+        let blocks = map_content_blocks(api_blocks, "vertex");
+        assert_eq!(blocks.len(), 4);
         assert!(matches!(&blocks[0], ContentBlock::Text { text } if text == "Hello"));
-        assert!(matches!(&blocks[1], ContentBlock::ToolUse { name, .. } if name == "read_file"));
+        assert_eq!(
+            blocks[1..3],
+            [
+                ContentBlock::Thinking {
+                    thinking: "reasoning".to_string(),
+                    signature: Some("sig".to_string()),
+                    route: Some("vertex".to_string()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "redacted".to_string(),
+                    route: Some("vertex".to_string()),
+                },
+            ]
+        );
+        assert!(matches!(&blocks[3], ContentBlock::ToolUse { name, .. } if name == "read_file"));
     }
 }

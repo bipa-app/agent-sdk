@@ -1100,7 +1100,7 @@ impl LlmProvider for AnthropicProvider {
             .is_some();
         match without_foreign_thinking(&mut request, self.route(), thinking_on) {
             Ok(0) => {}
-            Ok(dropped) => log::warn!(
+            Ok(dropped) => log::info!(
                 "left out {dropped} replayed thinking block(s) that another route signed"
             ),
             Err(reason) => return Ok(ChatOutcome::InvalidRequest(reason)),
@@ -1373,7 +1373,7 @@ impl LlmProvider for AnthropicProvider {
                         .is_some();
                     match without_foreign_thinking(&mut request, self.route(), thinking_on) {
                         Ok(0) => {}
-                        Ok(dropped) => log::warn!(
+                        Ok(dropped) => log::info!(
                             "left out {dropped} replayed thinking block(s) that another route signed"
                         ),
                         Err(reason) => {
