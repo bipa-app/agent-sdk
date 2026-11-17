@@ -391,6 +391,44 @@ async fn a_forced_tool_on_sonnet_55_is_refused_before_the_wire() -> anyhow::Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn an_undated_alias_takes_its_snapshots_card() -> anyhow::Result<()> {
+    assert_eq!(
+        bedrock_inference_profile_id("claude-sonnet-4-5", BedrockInferenceProfile::Us).as_deref(),
+        Some("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    );
+    assert_eq!(bedrock_base_model_id("claude-sonnet-4"), None);
+
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_body()),
+    )
+    .await;
+    let provider = BedrockProvider::new(
+        api_key(),
+        "us-east-1",
+        "claude-sonnet-4-5",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    )
+    .with_endpoint(server.uri());
+    assert!(matches!(
+        provider.structured_output_support_for(&closed_format(3)),
+        StructuredOutputSupport::Native
+    ));
+    provider
+        .chat(
+            ChatRequest::new("Read it.", vec![Message::user("a receipt")])
+                .with_response_format(closed_format(3)),
+        )
+        .await?;
+    let requests = recorded(&server).await?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests.first().context("no request")?.body)?;
+    assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+    Ok(())
+}
+
 #[test]
 fn a_schema_past_bedrocks_optional_limit_falls_back_to_tool_forcing() {
     let provider = BedrockProvider::new(api_key(), "us-east-1", MODEL_HAIKU_55, "id");

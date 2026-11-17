@@ -251,10 +251,18 @@ fn encode_path_segment(segment: &str) -> String {
     encoded
 }
 
+/// The model card of an Anthropic model id. An undated alias such as
+/// `claude-sonnet-4-5` names its dated snapshot, as it does for the
+/// capability table.
 fn bedrock_model(anthropic_model: &str) -> Option<&'static BedrockModel> {
     BEDROCK_MODELS
         .iter()
         .find(|model| model.anthropic_id == anthropic_model)
+        .or_else(|| {
+            BEDROCK_MODELS.iter().find(|model| {
+                crate::model_capabilities::snapshot_resolves_to(anthropic_model, model.anthropic_id)
+            })
+        })
 }
 
 /// Bedrock's base model id for an Anthropic model id, when AWS documents one.
