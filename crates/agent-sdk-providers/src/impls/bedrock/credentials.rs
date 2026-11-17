@@ -142,10 +142,17 @@ impl WebIdentityCredentials {
         Ok(fresh)
     }
 
-    /// Forget the cached credentials after AWS rejected them as expired.
-    /// Returns whether anything was dropped, which is when retrying can help.
-    pub async fn invalidate(&self) -> bool {
-        self.cached.lock().await.take().is_some()
+    /// Forget the cached credentials if they are the ones AWS rejected as
+    /// expired. A concurrent request may already have replaced them, and the
+    /// replacement stays.
+    pub async fn invalidate(&self, rejected: &Credentials) {
+        let mut cached = self.cached.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|credentials| credentials.access_key_id() == rejected.access_key_id())
+        {
+            *cached = None;
+        }
     }
 
     async fn web_identity_token(&self) -> Result<String, CredentialsError> {
@@ -183,6 +190,7 @@ impl WebIdentityCredentials {
                 }
                 Err(refusal(
                     status,
+                    None,
                     format!("the metadata server answered {status} for an ID token: {body}"),
                 ))
             }
@@ -220,6 +228,7 @@ impl WebIdentityCredentials {
         if !status.is_success() {
             return Err(refusal(
                 status,
+                xml_text(&body, "Code").as_deref(),
                 format!(
                     "STS AssumeRoleWithWebIdentity answered {status}: {}",
                     sts_error(&body)
@@ -314,9 +323,13 @@ fn is_fresh(credentials: &Credentials, now: SystemTime) -> bool {
         .is_none_or(|expiry| now + REFRESH_MARGIN < expiry)
 }
 
-/// A 4xx is a refusal retrying will not fix; anything else may pass later.
-fn refusal(status: reqwest::StatusCode, message: String) -> CredentialsError {
-    if status.is_client_error() {
+/// A 4xx is a refusal retrying will not fix, except a timeout, a throttle,
+/// and the STS codes for a busy identity provider; anything else may pass
+/// later.
+fn refusal(status: reqwest::StatusCode, code: Option<&str>, message: String) -> CredentialsError {
+    let transient = matches!(status.as_u16(), 408 | 429)
+        || matches!(code, Some("Throttling" | "IDPCommunicationError"));
+    if status.is_client_error() && !transient {
         CredentialsError::invalid_configuration(message)
     } else {
         CredentialsError::provider_error(message)
@@ -532,8 +545,53 @@ mod tests {
 
         // Expiring inside the margin: every call refreshes.
         source.credentials().await?;
+        let current = source.credentials().await?;
+        source.invalidate(&current).await;
         source.credentials().await?;
-        assert!(source.invalidate().await);
+        Ok(())
+    }
+
+    #[test]
+    fn throttles_and_busy_identity_providers_stay_retryable() {
+        let kind = |status: u16, code: Option<&str>| match refusal(
+            reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::BAD_REQUEST),
+            code,
+            String::new(),
+        ) {
+            CredentialsError::InvalidConfiguration(_) => "refused",
+            _ => "retryable",
+        };
+        assert_eq!(kind(403, Some("AccessDenied")), "refused");
+        assert_eq!(kind(400, Some("InvalidIdentityToken")), "refused");
+        assert_eq!(kind(429, None), "retryable");
+        assert_eq!(kind(408, None), "retryable");
+        assert_eq!(kind(400, Some("Throttling")), "retryable");
+        assert_eq!(kind(400, Some("IDPCommunicationError")), "retryable");
+        assert_eq!(kind(503, None), "retryable");
+    }
+
+    #[tokio::test]
+    async fn invalidating_keeps_credentials_a_concurrent_request_already_replaced()
+    -> anyhow::Result<()> {
+        let token_file = tempfile::NamedTempFile::new()?;
+        std::fs::write(token_file.path(), "file.token")?;
+        let sts = MockServer::start().await;
+        let expiration = rfc3339_in(Duration::from_hours(1))?;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sts_response(&expiration)))
+            .expect(1)
+            .mount(&sts)
+            .await;
+        let source = WebIdentityCredentials::new(
+            "arn:aws:iam::123456789012:role/example",
+            "session",
+            WebIdentityToken::File(token_file.path().to_path_buf()),
+            "us-east-1",
+        )
+        .with_sts_endpoint(sts.uri());
+        source.credentials().await?;
+        let stale = Credentials::new("ASIAOLDEXAMPLE", "old-secret", None, None, "test");
+        source.invalidate(&stale).await;
         source.credentials().await?;
         Ok(())
     }

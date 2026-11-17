@@ -847,7 +847,7 @@ async fn refused_credentials_are_an_invalid_request_and_others_are_retried() -> 
 
 // ── Streaming ────────────────────────────────────────────────────────────
 
-fn chunk(event: &serde_json::Value) -> Vec<u8> {
+fn chunk(event: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
     let bytes = base64::engine::general_purpose::STANDARD.encode(event.to_string());
     event_stream::tests::encode(
         &[
@@ -859,7 +859,7 @@ fn chunk(event: &serde_json::Value) -> Vec<u8> {
     )
 }
 
-fn exception(exception_type: &str, payload: &serde_json::Value) -> Vec<u8> {
+fn exception(exception_type: &str, payload: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
     event_stream::tests::encode(
         &[
             (":exception-type", exception_type),
@@ -868,6 +868,15 @@ fn exception(exception_type: &str, payload: &serde_json::Value) -> Vec<u8> {
         ],
         payload.to_string().as_bytes(),
     )
+}
+
+/// The frames of `events`, one `chunk` each.
+fn frames(events: &[serde_json::Value]) -> anyhow::Result<Vec<u8>> {
+    Ok(events
+        .iter()
+        .map(chunk)
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .concat())
 }
 
 fn tool_call_events() -> Vec<serde_json::Value> {
@@ -911,9 +920,7 @@ async fn a_streamed_tool_call_decodes_with_usage_and_route() -> anyhow::Result<(
         .and(path(
             "/model/us.anthropic.claude-sonnet-5-5/invoke-with-response-stream",
         ))
-        .respond_with(event_stream_response(
-            tool_call_events().iter().flat_map(chunk).collect(),
-        ))
+        .respond_with(event_stream_response(frames(&tool_call_events())?))
         .mount(&server)
         .await;
     let deltas = stream_deltas(&server, MODEL_SONNET_55).await?;
@@ -974,11 +981,11 @@ async fn a_streamed_tool_call_decodes_with_usage_and_route() -> anyhow::Result<(
 #[tokio::test]
 async fn the_stream_ends_at_message_stop() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let mut body: Vec<u8> = tool_call_events().iter().flat_map(chunk).collect();
+    let mut body = frames(&tool_call_events())?;
     body.extend(chunk(&json!({
         "type": "content_block_delta", "index": 0,
         "delta": { "type": "text_delta", "text": "after the stop" }
-    })));
+    }))?);
     mount(&server, event_stream_response(body)).await;
     let deltas = stream_deltas(&server, MODEL_SONNET_55).await?;
     assert!(
@@ -1044,8 +1051,8 @@ async fn stream_exceptions_map_to_retry_classes() -> anyhow::Result<()> {
     ];
     for (exception_type, payload, expected) in cases {
         let server = MockServer::start().await;
-        let mut body = chunk(&tool_call_events()[0]);
-        body.extend(exception(exception_type, &payload));
+        let mut body = chunk(&tool_call_events()[0])?;
+        body.extend(exception(exception_type, &payload)?);
         mount(&server, event_stream_response(body)).await;
         let deltas = stream_deltas(&server, MODEL_SONNET_55).await?;
         let Some(StreamDelta::Error { message, kind }) = deltas.last() else {
@@ -1069,9 +1076,9 @@ async fn stream_exceptions_map_to_retry_classes() -> anyhow::Result<()> {
 async fn a_stream_cut_before_message_stop_is_a_server_error() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let events = tool_call_events();
-    let mut body: Vec<u8> = events[..events.len() - 1].iter().flat_map(chunk).collect();
+    let mut body = frames(&events[..events.len() - 1])?;
     // Half of a frame is left buffered when the body ends.
-    let tail = chunk(&events[events.len() - 1]);
+    let tail = chunk(&events[events.len() - 1])?;
     body.extend_from_slice(&tail[..tail.len() / 2]);
     mount(&server, event_stream_response(body)).await;
     let deltas = stream_deltas(&server, MODEL_SONNET_55).await?;
@@ -1091,7 +1098,7 @@ async fn a_stream_cut_before_message_stop_is_a_server_error() -> anyhow::Result<
 #[tokio::test]
 async fn a_corrupt_frame_ends_the_stream_with_a_server_error() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let mut body: Vec<u8> = tool_call_events().iter().flat_map(chunk).collect();
+    let mut body = frames(&tool_call_events())?;
     let last = body.len() - 1;
     body[last] ^= 0xff;
     mount(&server, event_stream_response(body)).await;

@@ -91,7 +91,7 @@ pub mod tests {
     use aws_smithy_types::event_stream::{Header, HeaderValue};
 
     /// One frame, written by `aws-smithy-eventstream`'s encoder.
-    pub fn encode(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+    pub fn encode(headers: &[(&str, &str)], payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         let message = headers.iter().fold(
             Message::new(bytes::Bytes::copy_from_slice(payload)),
             |message, (name, value)| {
@@ -102,13 +102,11 @@ pub mod tests {
             },
         );
         let mut frame = Vec::new();
-        if let Err(error) = aws_smithy_eventstream::frame::write_message_to(&message, &mut frame) {
-            panic!("encoding a test frame: {error}");
-        }
-        frame
+        aws_smithy_eventstream::frame::write_message_to(&message, &mut frame)?;
+        Ok(frame)
     }
 
-    fn chunk_event(payload: &[u8]) -> Vec<u8> {
+    fn chunk_event(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         encode(
             &[
                 (":event-type", "chunk"),
@@ -122,8 +120,8 @@ pub mod tests {
     #[test]
     fn decodes_consecutive_messages_from_one_buffer() -> anyhow::Result<()> {
         let mut decoder = Decoder::default();
-        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#);
-        bytes.extend(chunk_event(br#"{"bytes":"W10="}"#));
+        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#)?;
+        bytes.extend(chunk_event(br#"{"bytes":"W10="}"#)?);
         decoder.push(&bytes);
 
         let first = decoder
@@ -143,7 +141,7 @@ pub mod tests {
 
     #[test]
     fn a_message_split_at_every_byte_decodes_once_whole() -> anyhow::Result<()> {
-        let bytes = chunk_event(br#"{"bytes":"eyJ0eXBlIjoicGluZyJ9"}"#);
+        let bytes = chunk_event(br#"{"bytes":"eyJ0eXBlIjoicGluZyJ9"}"#)?;
         let mut decoder = Decoder::default();
         for (index, byte) in bytes.iter().enumerate() {
             decoder.push(std::slice::from_ref(byte));
@@ -162,27 +160,29 @@ pub mod tests {
     }
 
     #[test]
-    fn a_corrupted_payload_fails_the_message_crc() {
-        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#);
+    fn a_corrupted_payload_fails_the_message_crc() -> anyhow::Result<()> {
+        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#)?;
         let payload_byte = bytes.len() - 6;
         bytes[payload_byte] ^= 0x01;
         let mut decoder = Decoder::default();
         decoder.push(&bytes);
         assert!(matches!(decoder.next_message(), Err(DecodeError::Frame(_))));
+        Ok(())
     }
 
     #[test]
-    fn a_corrupted_prelude_fails_its_crc() {
-        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#);
+    fn a_corrupted_prelude_fails_its_crc() -> anyhow::Result<()> {
+        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#)?;
         bytes[8] ^= 0x01;
         let mut decoder = Decoder::default();
         decoder.push(&bytes);
         assert!(matches!(decoder.next_message(), Err(DecodeError::Frame(_))));
+        Ok(())
     }
 
     #[test]
-    fn an_impossible_length_fails_before_the_body_is_awaited() {
-        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#);
+    fn an_impossible_length_fails_before_the_body_is_awaited() -> anyhow::Result<()> {
+        let mut bytes = chunk_event(br#"{"bytes":"e30="}"#)?;
         bytes[0] = 0x7f;
         let mut decoder = Decoder::default();
         decoder.push(&bytes[..4]);
@@ -190,6 +190,7 @@ pub mod tests {
             decoder.next_message(),
             Err(DecodeError::Length(_))
         ));
+        Ok(())
     }
 
     #[test]
@@ -201,7 +202,7 @@ pub mod tests {
                 (":message-type", "exception"),
             ],
             br#"{"message":"Too many requests, please wait before trying again."}"#,
-        );
+        )?;
         let mut decoder = Decoder::default();
         decoder.push(&bytes);
         let message = decoder

@@ -1,7 +1,8 @@
 //! `SigV4` signing of the Bedrock runtime requests, by AWS's `aws-sigv4`.
 //!
-//! The request is signed over `host` and the body; the signer adds
-//! `x-amz-date`, `authorization` and, with temporary credentials,
+//! The request has no query string and is signed over `host` and the body
+//! only, so signing another header or a query needs a change here. The
+//! signer adds `x-amz-date`, `authorization` and, with temporary credentials,
 //! `x-amz-security-token`. The URL carries the model id percent-encoded once,
 //! and the signer encodes each path segment again, as services other than S3
 //! require.

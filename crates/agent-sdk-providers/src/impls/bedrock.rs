@@ -550,12 +550,13 @@ impl BedrockProvider {
         betas
     }
 
-    /// Sign (or bear) and send one request.
+    /// Sign (or bear) and send one request. Returns the web identity
+    /// credentials it signed with, which an expired-token rejection drops.
     async fn send(
         &self,
         body: &bytes::Bytes,
         streaming: bool,
-    ) -> Result<reqwest::Response, SendError> {
+    ) -> Result<(reqwest::Response, Option<Credentials>), SendError> {
         let url = self.invoke_url(streaming);
         let accept = if streaming {
             EVENT_STREAM_CONTENT_TYPE
@@ -570,6 +571,7 @@ impl BedrockProvider {
         if !streaming {
             builder = builder.timeout(CHAT_REQUEST_TIMEOUT);
         }
+        let mut signed_with = None;
         builder = match &self.auth {
             BedrockAuth::ApiKey(key) => builder.bearer_auth(key),
             BedrockAuth::Credentials(provider) => {
@@ -584,14 +586,16 @@ impl BedrockProvider {
                     .credentials()
                     .await
                     .map_err(|error| SendError::from_credentials(&error))?;
+                signed_with = Some(credentials.clone());
                 Self::sign(builder, &url, body, &self.region, credentials)?
             }
         };
-        builder
+        let response = builder
             .body(body.clone())
             .send()
             .await
-            .map_err(SendError::Transport)
+            .map_err(SendError::Transport)?;
+        Ok((response, signed_with))
     }
 
     fn sign(
@@ -631,15 +635,26 @@ impl BedrockProvider {
     }
 
     /// Whether a rejection means the signing credentials expired, after which
-    /// the cached ones are dropped so the retry fetches new ones. Only web
-    /// identity credentials can be fetched again.
-    async fn expired_credentials(&self, rejection: &Rejection) -> bool {
-        match (&self.auth, rejection) {
-            (BedrockAuth::WebIdentity(source), Rejection::ExpiredCredentials(_)) => {
-                source.invalidate().await
+    /// those credentials are dropped so the retry fetches new ones. Only web
+    /// identity credentials are retried here; a `Credentials` provider that
+    /// caches and refreshes (as `aws-config`'s do) recovers on its next call.
+    async fn expired_credentials(
+        &self,
+        rejection: &Rejection,
+        signed_with: Option<&Credentials>,
+    ) -> bool {
+        match (&self.auth, rejection, signed_with) {
+            (
+                BedrockAuth::WebIdentity(source),
+                Rejection::ExpiredCredentials(_),
+                Some(rejected),
+            ) => {
+                source.invalidate(rejected).await;
+                true
             }
             (
                 BedrockAuth::ApiKey(_) | BedrockAuth::Credentials(_) | BedrockAuth::WebIdentity(_),
+                _,
                 _,
             ) => false,
         }
@@ -656,7 +671,7 @@ impl BedrockProvider {
             )
             .await
             {
-                Ok(Ok(response)) => response,
+                Ok(Ok(sent)) => sent,
                 Ok(Err(SendError::Transport(error))) => {
                     return Err(reqwest_error_delta("request failed", &error));
                 }
@@ -685,11 +700,16 @@ impl BedrockProvider {
                     });
                 }
             };
+            let (response, signed_with) = response;
             if response.status().is_success() {
                 return Ok(response);
             }
             let rejection = rejection(response).await;
-            if !retried_credentials && self.expired_credentials(&rejection).await {
+            if !retried_credentials
+                && self
+                    .expired_credentials(&rejection, signed_with.as_ref())
+                    .await
+            {
                 retried_credentials = true;
                 continue;
             }
@@ -1065,8 +1085,8 @@ impl LlmProvider for BedrockProvider {
         };
         let mut retried_credentials = false;
         let response = loop {
-            let response = match self.send(&body, false).await {
-                Ok(response) => response,
+            let (response, signed_with) = match self.send(&body, false).await {
+                Ok(sent) => sent,
                 Err(SendError::Refused(message)) => {
                     return Ok(ChatOutcome::InvalidRequest(message));
                 }
@@ -1079,7 +1099,11 @@ impl LlmProvider for BedrockProvider {
                 break response;
             }
             let rejection = rejection(response).await;
-            if !retried_credentials && self.expired_credentials(&rejection).await {
+            if !retried_credentials
+                && self
+                    .expired_credentials(&rejection, signed_with.as_ref())
+                    .await
+            {
                 retried_credentials = true;
                 continue;
             }
