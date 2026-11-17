@@ -737,6 +737,12 @@ impl AnthropicProvider {
         Self::haiku_55(api_key)
     }
 
+    /// Create a provider using Claude Haiku 4.5.
+    #[must_use]
+    pub fn haiku_45(api_key: impl Into<String>) -> Self {
+        Self::new(api_key, MODEL_HAIKU_45)
+    }
+
     /// Create a provider using Claude Haiku 5.5.
     ///
     /// Note: Haiku 5.5 is adaptive-only and the API defaults effort to
@@ -1945,6 +1951,14 @@ mod tests {
     }
 
     #[test]
+    fn test_haiku_45_factory_pins_haiku_45() {
+        let provider = AnthropicProvider::haiku_45("test-api-key".to_string());
+
+        assert_eq!(provider.model(), MODEL_HAIKU_45);
+        assert_eq!(provider.provider(), "anthropic");
+    }
+
+    #[test]
     fn test_only_anthropic_46_models_accept_adaptive_thinking() {
         let sonnet_46 = AnthropicProvider::sonnet_46("test-api-key".to_string());
         assert!(
@@ -2483,7 +2497,7 @@ mod tests {
         // mid-loop thinking only appears when this beta header is present.
         for provider in [
             AnthropicProvider::sonnet_45("test-key-not-a-secret"),
-            AnthropicProvider::new("test-key-not-a-secret", MODEL_HAIKU_45),
+            AnthropicProvider::haiku_45("test-key-not-a-secret"),
         ] {
             assert!(!provider.is_oauth());
             assert_eq!(
