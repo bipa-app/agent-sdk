@@ -27,6 +27,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained (no vulnerability, no safe upgrade); it comes in via serde_yaml_ng. Migration tracked in #474." },
+    { id = "RUSTSEC-2026-0459", reason = "Bundled SQLite before 3.54 can leak page-cache bytes when a process opens a database and -wal pair that a less trusted party wrote. The SDK's SQLite stores open only the path their caller passes, for the caller's own session data. The fix (libsqlite3-sys >= 0.39, rusqlite >= 0.41) cannot resolve yet: sqlx-sqlite 0.9.0, the latest, requires libsqlite3-sys < 0.38, and both link sqlite3. Remove when sqlx accepts 0.39." },
 ]
 
 [licenses]

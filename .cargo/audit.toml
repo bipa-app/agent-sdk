@@ -1,0 +1,10 @@
+# cargo-audit's configuration. Keep each ignore in step with deny.toml's
+# [advisories] ignore list, which carries the full reason.
+[advisories]
+ignore = [
+    # libsqlite3-sys before 0.39 bundles SQLite before 3.54 (database and -wal
+    # pair written by a less trusted party). The SDK's SQLite stores open only
+    # their caller's own path, and the fix cannot resolve until sqlx-sqlite
+    # accepts libsqlite3-sys 0.39 (0.9.0 requires < 0.38; both link sqlite3).
+    "RUSTSEC-2026-0459",
+]
