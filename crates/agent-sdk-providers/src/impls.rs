@@ -3,11 +3,14 @@
 //! Each provider is gated behind a cargo feature so consumers only compile
 //! (and only pull the transitive dependencies of) the providers they use.
 //! The `anthropic` feature is enabled by default. `vertex` reuses the
-//! Anthropic + Gemini codecs, and `cloudflare` wraps Anthropic + `OpenAI` +
-//! Gemini, so those features imply their dependencies in `Cargo.toml`.
+//! Anthropic + Gemini codecs, `bedrock` the Anthropic codec, and `cloudflare`
+//! wraps Anthropic + `OpenAI` + Gemini, so those features imply their
+//! dependencies in `Cargo.toml`.
 
 #[cfg(feature = "anthropic")]
 pub mod anthropic;
+#[cfg(feature = "bedrock")]
+pub mod bedrock;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare_ai_gateway;
 #[cfg(feature = "gemini")]
@@ -38,6 +41,8 @@ pub(crate) mod model_listing;
 
 #[cfg(feature = "anthropic")]
 pub use anthropic::{AnthropicProvider, is_oauth_token};
+#[cfg(feature = "bedrock")]
+pub use bedrock::BedrockProvider;
 #[cfg(feature = "cloudflare")]
 pub use cloudflare_ai_gateway::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]

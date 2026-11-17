@@ -2,7 +2,7 @@
 //!
 //! This crate defines the [`LlmProvider`] trait that all LLM backends implement,
 //! streaming types for incremental response processing, attachment validation,
-//! model capability metadata, and seven first-party provider implementations.
+//! model capability metadata, and eight first-party provider implementations.
 //!
 //! # Provider Implementations
 //!
@@ -14,6 +14,7 @@
 //! | OpenAI Codex / ChatGPT | [`impls::openai_codex_responses`] | SSE streaming (WebSocket opt-in) |
 //! | Google Gemini | [`impls::gemini`] | SSE streaming |
 //! | Google Vertex AI | [`impls::vertex`] | SSE streaming |
+//! | Amazon Bedrock (Claude) | [`impls::bedrock`] | AWS event-stream |
 //! | Cloudflare AI Gateway | [`impls::cloudflare_ai_gateway`] | Proxy wrapper |
 
 #![forbid(unsafe_code)]
@@ -97,6 +98,8 @@ pub use structured::{
 pub use agent_sdk_foundation::llm::*;
 
 // Provider re-exports — each is gated behind its provider feature.
+#[cfg(feature = "bedrock")]
+pub use impls::BedrockProvider;
 #[cfg(feature = "cloudflare")]
 pub use impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]

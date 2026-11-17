@@ -236,6 +236,7 @@ jobs:
           - "--no-default-features --features openai-codex"
           - "--no-default-features --features gemini"
           - "--no-default-features --features vertex"
+          - "--no-default-features --features bedrock"
           - "--no-default-features --features cloudflare"
           # Rows above cover `structured-output` OFF; this one covers it ON.
           - "--no-default-features --features anthropic,structured-output"

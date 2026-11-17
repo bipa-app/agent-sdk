@@ -40,6 +40,12 @@ uuid = { workspace = true }
 # omp's Bun.hash.xxHash64).
 sha2 = { workspace = true }
 xxhash-rust = { workspace = true }
+# Bedrock: AWS's SigV4 signer, event-stream decoder and credential types.
+aws-sigv4 = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-smithy-eventstream = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
 # WebSocket transport — only the OpenAI Codex / ChatGPT provider needs it,
 # so it is gated behind the `openai-codex` feature.
 tokio-tungstenite = { workspace = true, optional = true }
@@ -76,6 +82,10 @@ gemini = []
 # The Vertex provider reuses the Anthropic model constants and the Gemini
 # request/response codec, so it requires both of those providers.
 vertex = ["anthropic", "gemini"]
+# Claude on Amazon Bedrock's runtime API. Reuses the Anthropic codec; signs
+# with aws-sigv4 and reads frames with aws-smithy-eventstream. Needs Rust
+# 1.94.1, the rust-version those AWS crates declare.
+bedrock = ["anthropic", "dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-smithy-eventstream", "dep:aws-smithy-runtime-api", "dep:aws-smithy-types", "tokio/fs"]
 # The Cloudflare AI Gateway provider is a thin proxy that wraps the
 # Anthropic, OpenAI, and Gemini providers, so it requires all three.
 cloudflare = ["anthropic", "openai", "gemini"]

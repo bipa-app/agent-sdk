@@ -992,6 +992,15 @@ pub fn parse_sse_event(
     parse_stream_event(&event_type?, &data?, usage, tool_ids, pending_stop_reason)
 }
 
+/// The `type` of one Anthropic stream event's JSON payload, for a transport
+/// that carries the payload without an SSE `event:` line.
+#[cfg(feature = "bedrock")]
+pub fn stream_event_type(data: &str) -> Option<String> {
+    serde_json::from_str::<SseTypeOnly>(data)
+        .ok()
+        .map(|event| event.event_type)
+}
+
 /// Parse one Anthropic stream event, given its type and its JSON payload, into
 /// the corresponding `StreamDelta`.
 pub fn parse_stream_event(

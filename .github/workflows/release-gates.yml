@@ -80,8 +80,28 @@ jobs:
     name: MSRV (pinned toolchain ${{ matrix.rust }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        rust: ["1.91"]
+        include:
+          # Every feature but `bedrock`, whose AWS crates (aws-sigv4,
+          # aws-smithy-*, aws-credential-types) declare rust-version 1.94.1.
+          # Keep the list in sync with the [features] of agent-sdk and
+          # agent-sdk-providers.
+          - rust: "1.91"
+            packages: >-
+              --package agent-sdk-foundation
+              --package agent-sdk-tools
+              --package agent-sdk-providers
+              --package agent-sdk
+              --package agent-sdk-otel
+              --package agent-sdk-cli
+            features: >-
+              --features agent-sdk-providers/anthropic,agent-sdk-providers/cloudflare,agent-sdk-providers/gemini,agent-sdk-providers/model-discovery,agent-sdk-providers/openai,agent-sdk-providers/openai-codex,agent-sdk-providers/record-replay,agent-sdk-providers/structured-output,agent-sdk-providers/tls-native-tls,agent-sdk-providers/tls-rustls,agent-sdk-providers/vertex
+              --features agent-sdk/anthropic,agent-sdk/cloudflare,agent-sdk/gemini,agent-sdk/macros-schema,agent-sdk/mcp,agent-sdk/model-discovery,agent-sdk/openai,agent-sdk/openai-codex,agent-sdk/opentelemetry,agent-sdk/otel,agent-sdk/skills,agent-sdk/sqlite,agent-sdk/structured-output,agent-sdk/tls-native-tls,agent-sdk/tls-rustls,agent-sdk/vertex,agent-sdk/web
+          # The `bedrock` feature's own floor.
+          - rust: "1.94.1"
+            packages: --package agent-sdk-providers --package agent-sdk
+            features: --all-features
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@master
@@ -89,14 +109,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Build publishable crates on MSRV
-        run: >-
-          cargo +${{ matrix.rust }} check --all-features
-          --package agent-sdk-foundation
-          --package agent-sdk-tools
-          --package agent-sdk-providers
-          --package agent-sdk
-          --package agent-sdk-otel
-          --package agent-sdk-cli
+        run: cargo +${{ matrix.rust }} check ${{ matrix.features }} ${{ matrix.packages }}
 
   # Packaging dry-run: proves every publishable crate produces a valid
   # `.crate` (manifest + included files). Leaf crates verify fully; dependent
