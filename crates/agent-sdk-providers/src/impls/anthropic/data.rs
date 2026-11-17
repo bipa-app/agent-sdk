@@ -989,16 +989,34 @@ pub fn parse_sse_event(
     pending_stop_reason: &mut Option<StopReason>,
 ) -> Option<StreamDelta> {
     let (event_type, data) = parse_sse_fields(event_block);
-    let event_type = event_type?;
-    let data = data?;
+    parse_stream_event(&event_type?, &data?, usage, tool_ids, pending_stop_reason)
+}
 
-    match event_type.as_str() {
+/// The `type` of one Anthropic stream event's JSON payload, for a transport
+/// that carries the payload without an SSE `event:` line.
+#[cfg(feature = "bedrock")]
+pub fn stream_event_type(data: &str) -> Option<String> {
+    serde_json::from_str::<SseTypeOnly>(data)
+        .ok()
+        .map(|event| event.event_type)
+}
+
+/// Parse one Anthropic stream event, given its type and its JSON payload, into
+/// the corresponding `StreamDelta`.
+pub fn parse_stream_event(
+    event_type: &str,
+    data: &str,
+    usage: &mut SseUsageState,
+    tool_ids: &mut std::collections::HashMap<usize, String>,
+    pending_stop_reason: &mut Option<StopReason>,
+) -> Option<StreamDelta> {
+    match event_type {
         "message_start" => {
-            apply_message_start_usage(&event_type, &data, usage);
+            apply_message_start_usage(event_type, data, usage);
             None
         }
         "content_block_start" => {
-            match serde_json::from_str::<SseContentBlockStart>(&data) {
+            match serde_json::from_str::<SseContentBlockStart>(data) {
                 Ok(event) => match event.content_block {
                     SseContentBlock::ToolUse { id, name } => {
                         // Store the tool ID for later input deltas
@@ -1021,12 +1039,12 @@ pub fn parse_sse_event(
                     | SseContentBlock::Unknown => None,
                 },
                 Err(error) => {
-                    log_sse_parse_error(&event_type, &data, &error);
+                    log_sse_parse_error(event_type, data, &error);
                     None
                 }
             }
         }
-        "content_block_delta" => match serde_json::from_str::<SseContentBlockDelta>(&data) {
+        "content_block_delta" => match serde_json::from_str::<SseContentBlockDelta>(data) {
             Ok(event) => match event.delta {
                 SseDelta::Text { text } => Some(StreamDelta::TextDelta {
                     delta: text,
@@ -1052,19 +1070,19 @@ pub fn parse_sse_event(
                 SseDelta::Unknown => None,
             },
             Err(error) => {
-                log_sse_parse_error(&event_type, &data, &error);
+                log_sse_parse_error(event_type, data, &error);
                 None
             }
         },
         "message_delta" => {
-            match serde_json::from_str::<SseMessageDelta>(&data) {
+            match serde_json::from_str::<SseMessageDelta>(data) {
                 Ok(event) => {
                     apply_message_delta_usage(&event, usage);
                     // Store the stop reason for emission in message_stop,
                     // ensuring Usage is emitted before Done.
                     *pending_stop_reason = event.delta.stop_reason.as_ref().map(map_stop_reason);
                 }
-                Err(error) => log_sse_parse_error(&event_type, &data, &error),
+                Err(error) => log_sse_parse_error(event_type, data, &error),
             }
             None
         }
@@ -1082,7 +1100,7 @@ pub fn parse_sse_event(
             // "stream ended unexpectedly" ServerError — hiding the real
             // cause and always classifying it retriable. Parse it so the
             // real message + the correct error kind reach the caller.
-            let (message, kind) = parse_stream_error_event(&data);
+            let (message, kind) = parse_stream_error_event(data);
             Some(StreamDelta::Error { message, kind })
         }
         // Anthropic pings periodically while the model works silently

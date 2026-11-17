@@ -954,8 +954,7 @@ where
     #[cfg(feature = "otel")]
     let request_for_capture = observability_store.map(|_| request.clone());
     #[cfg(feature = "otel")]
-    let provider_name_for_observer =
-        crate::observability::provider_name::normalize(provider.provider());
+    let provider_name_for_observer = crate::observability::provider_name::of(provider.as_ref());
     #[cfg(feature = "otel")]
     let request_model_for_metrics = provider.model().to_string();
     #[cfg(feature = "otel")]
@@ -1069,7 +1068,7 @@ where
     use opentelemetry::KeyValue;
 
     let span_name = format!("chat {}", provider.model());
-    let provider_name = crate::observability::provider_name::normalize(provider.provider());
+    let provider_name = crate::observability::provider_name::of(provider);
     let mut init_attrs = vec![
         KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
         KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name),
@@ -1113,8 +1112,7 @@ async fn capture_llm_payloads<P>(
         capture_kind: CaptureKind::TurnChat,
         thread_id: thread_id.clone(),
         turn_number: turn,
-        provider_name: crate::observability::provider_name::normalize(provider.provider())
-            .to_string(),
+        provider_name: crate::observability::provider_name::of(provider.as_ref()).to_string(),
         provider_id: provider.provider().to_string(),
         span_is_recording: span.is_recording(),
         request_model: provider.model().to_string(),
@@ -2488,8 +2486,7 @@ where
     #[cfg(feature = "otel")]
     let turn_started_at = std::time::Instant::now();
     #[cfg(feature = "otel")]
-    let provider_name_for_turn =
-        crate::observability::provider_name::normalize(provider.provider());
+    let provider_name_for_turn = crate::observability::provider_name::of(provider.as_ref());
     #[cfg(feature = "otel")]
     let turn_input_kind = ctx.input_kind;
 

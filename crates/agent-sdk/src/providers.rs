@@ -8,6 +8,11 @@ pub mod anthropic {
     //! Anthropic Messages API provider.
     pub use agent_sdk_providers::impls::anthropic::*;
 }
+#[cfg(feature = "bedrock")]
+pub mod bedrock {
+    //! Claude on Amazon Bedrock's runtime API.
+    pub use agent_sdk_providers::impls::bedrock::*;
+}
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare_ai_gateway {
     //! Cloudflare AI Gateway proxy provider.
@@ -39,6 +44,8 @@ pub mod vertex {
     pub use agent_sdk_providers::impls::vertex::*;
 }
 
+#[cfg(feature = "bedrock")]
+pub use agent_sdk_providers::impls::BedrockProvider;
 #[cfg(feature = "cloudflare")]
 pub use agent_sdk_providers::impls::CloudflareAIGatewayProvider;
 #[cfg(feature = "gemini")]

@@ -26,7 +26,8 @@ before investing significant effort.
 
 ### Prerequisites
 
-- Rust 1.91+ (2024 edition; workspace MSRV, verified by CI)
+- Rust 1.91+ (2024 edition; workspace MSRV, verified by CI). The `bedrock`
+  feature needs 1.94.1, the floor of the AWS crates it uses; CI checks it there.
 - Cargo
 
 ### Building

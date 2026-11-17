@@ -20,6 +20,7 @@ directly):
 | `openai-codex` | OpenAI Codex / Responses (HTTP SSE by default; WebSocket opt-in via `with_transport(CodexTransport::WebSocket)`) |
 | `gemini` | Google Gemini |
 | `vertex` | Google Vertex AI |
+| `bedrock` | Claude on Amazon Bedrock (needs Rust 1.94.1) |
 | `cloudflare` | Cloudflare AI Gateway |
 
 ## Most users want `agent-sdk`

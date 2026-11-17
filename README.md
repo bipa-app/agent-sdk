@@ -42,7 +42,7 @@ An agent is an LLM that can do more than just chat—it can use tools to interac
 
 ## Requirements
 
-- Rust 1.91+ (2024 edition; MSRV verified by CI)
+- Rust 1.91+ (2024 edition; MSRV verified by CI); the `bedrock` feature needs 1.94.1
 - An API key for your chosen LLM provider
 
 ## Installation
@@ -77,6 +77,7 @@ or YAML deps it does not use:
 | `openai-codex` | OpenAI Codex/Responses provider |
 | `gemini` | Google Gemini provider |
 | `vertex` | Google Vertex AI provider |
+| `bedrock` | Claude on Amazon Bedrock (`InvokeModel`, SigV4 or a Bedrock API key). Needs Rust 1.94.1, the floor of the AWS crates it uses |
 | `cloudflare` | Cloudflare Workers AI provider |
 | `model-discovery` | Dynamic model capability/pricing catalog (models.dev / OpenRouter feeds + `ModelRegistry`); wire it into a run's cost budget with `AgentLoopBuilder::cost_estimator` |
 | `web` | Web search + URL fetch tools (pulls in `html2text`) |
@@ -648,6 +649,7 @@ The two mechanisms differ, so the per-provider rules do too:
 | `openai` / `openai-responses` | `service_tier: "priority"` | Most current models; OpenAI rejects the rest server-side |
 | `openai-codex` | — | Refused: a ChatGPT subscription has no priority tier |
 | `vertex` | — | Refused: fast mode is not offered on Google Cloud |
+| `bedrock` | — | Refused: fast mode is not offered on Amazon Bedrock |
 
 Requesting a tier a provider/model cannot serve fails fast as an `InvalidRequest` rather than
 being dropped at the wire boundary, so you never pay standard latency for a request you believe

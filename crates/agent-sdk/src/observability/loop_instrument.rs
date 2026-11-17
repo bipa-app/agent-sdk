@@ -60,10 +60,12 @@ use crate::types::{TokenUsage, ToolTier};
 /// caller. Mirrors the attributes set by `agent_loop::turn::build_llm_span`.
 #[derive(Clone, Copy)]
 pub struct ChatSpanParams<'a> {
-    /// Raw SDK provider id (e.g. `anthropic`, `openai-responses`).
-    /// Normalised to the `gen_ai.provider.name` semconv value
-    /// internally via [`provider_name::normalize`].
+    /// Raw SDK provider id (e.g. `anthropic`, `openai-responses`), written
+    /// to `agent_sdk.provider.id`.
     pub provider_id: &'static str,
+    /// The `gen_ai.provider.name` of the serving endpoint:
+    /// [`provider_name::of`] the provider.
+    pub provider_name: &'static str,
     /// Model the SDK is asking for (`gen_ai.request.model`).
     pub model: &'a str,
     /// Whether the call streams (`agent_sdk.llm.streaming`).
@@ -84,10 +86,9 @@ pub struct ChatSpanParams<'a> {
 #[must_use]
 pub fn build_chat_span(params: ChatSpanParams<'_>) -> BoxedSpan {
     let span_name = format!("chat {}", params.model);
-    let provider = provider_name::normalize(params.provider_id);
     let mut init_attrs = vec![
         KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "chat"),
-        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider),
+        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, params.provider_name),
         KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, params.model.to_string()),
         attrs::kv_bool(attrs::SDK_LLM_STREAMING, params.streaming),
         KeyValue::new(attrs::SDK_PROVIDER_ID, params.provider_id),
@@ -113,16 +114,16 @@ pub fn build_chat_span(params: ChatSpanParams<'_>) -> BoxedSpan {
 /// label sets (via [`Metrics::record_chat_token_usage`] +
 /// [`Metrics::record_chat_operation_duration_success`]).
 ///
-/// `provider_id` is the raw SDK id; it is normalised internally so
-/// the metric `gen_ai.provider.name` label matches the span.
+/// `provider_name` is [`provider_name::of`] the provider (a raw SDK id is
+/// normalised), so the metric `gen_ai.provider.name` label matches the span.
 pub fn finish_chat_span_success(
     span: &mut BoxedSpan,
     response: &ChatResponse,
     elapsed_secs: f64,
-    provider_id: &'static str,
+    provider_name: &'static str,
     request_model: &str,
 ) {
-    let provider = provider_name::normalize(provider_id);
+    let provider = provider_name::normalize(provider_name);
 
     if !response.id.is_empty() {
         span.set_attribute(KeyValue::new(
@@ -195,10 +196,10 @@ pub fn finish_chat_span_error(
     error_type: &'static str,
     message: &str,
     elapsed_secs: f64,
-    provider_id: &'static str,
+    provider_name: &'static str,
     request_model: &str,
 ) {
-    let provider = provider_name::normalize(provider_id);
+    let provider = provider_name::normalize(provider_name);
     spans::set_span_error(span, error_type, message);
     Metrics::global().record_chat_operation_duration_error(
         elapsed_secs,
@@ -401,9 +402,12 @@ pub fn finish_tool_span(
 /// [`remote_parent_context`].
 #[derive(Clone, Copy)]
 pub struct RootTurnSpanParams<'a> {
-    /// Raw SDK provider id (e.g. `anthropic`); normalised to the
-    /// `gen_ai.provider.name` semconv value internally.
+    /// Raw SDK provider id (e.g. `anthropic`), written to
+    /// `agent_sdk.provider.id`.
     pub provider_id: &'static str,
+    /// The `gen_ai.provider.name` of the serving endpoint:
+    /// [`provider_name::of`] the provider.
+    pub provider_name: &'static str,
     /// Model driving the turn (`gen_ai.request.model`).
     pub model: &'a str,
     /// Thread / conversation id (`gen_ai.conversation.id`).
@@ -471,10 +475,9 @@ pub struct StartedRootTurnSpan {
 /// truncated root spans.
 #[must_use]
 pub fn start_root_turn_span(params: RootTurnSpanParams<'_>) -> StartedRootTurnSpan {
-    let provider = provider_name::normalize(params.provider_id);
     let span_attrs = vec![
         KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
-        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider),
+        KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, params.provider_name),
         KeyValue::new(attrs::GEN_AI_REQUEST_MODEL, params.model.to_string()),
         KeyValue::new(
             attrs::GEN_AI_CONVERSATION_ID,

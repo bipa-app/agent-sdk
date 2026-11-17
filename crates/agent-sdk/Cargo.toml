@@ -74,6 +74,7 @@ openai = ["agent-sdk-providers/openai"]
 openai-codex = ["agent-sdk-providers/openai-codex"]
 gemini = ["agent-sdk-providers/gemini"]
 vertex = ["agent-sdk-providers/vertex"]
+bedrock = ["agent-sdk-providers/bedrock"]
 cloudflare = ["agent-sdk-providers/cloudflare"]
 
 # ── TLS backend (pick exactly one) ─────────────────────────────────────
