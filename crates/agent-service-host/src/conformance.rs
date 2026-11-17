@@ -3286,14 +3286,13 @@ mod tests {
                 }
                 TransitionView::CompletedTurn(commit) => {
                     let mut writes: Vec<Write> = turn_doc(&commit.thread_id, &commit.task_id)
-                        .map(|key| {
+                        .map_or_default(|key| {
                             vec![put_doc(
                                 &key,
                                 DocExpect::Absent,
                                 serde_json::json!(commit.turn_usage.input_tokens),
                             )]
-                        })
-                        .unwrap_or_default();
+                        });
                     if self.refuse {
                         writes.push(Write::AppendEvents {
                             thread: commit.thread_id.clone(),

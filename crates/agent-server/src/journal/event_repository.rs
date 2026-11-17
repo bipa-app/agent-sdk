@@ -256,15 +256,12 @@ impl EventRepository for InMemoryEventRepository {
         up_to_sequence: u64,
     ) -> Result<Vec<CommittedEvent>> {
         let inner = self.inner.read().await;
-        let result = inner
-            .events
-            .get(&thread_id.0)
-            .map_or_default(|evts| {
-                evts.iter()
-                    .filter(|e| e.sequence > after_sequence && e.sequence <= up_to_sequence)
-                    .cloned()
-                    .collect()
-            });
+        let result = inner.events.get(&thread_id.0).map_or_default(|evts| {
+            evts.iter()
+                .filter(|e| e.sequence > after_sequence && e.sequence <= up_to_sequence)
+                .cloned()
+                .collect()
+        });
         drop(inner);
         Ok(result)
     }

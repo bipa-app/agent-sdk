@@ -6043,8 +6043,7 @@ mod tests {
                 let committed_turns = response
                     .thread
                     .and_then(|view| view.thread)
-                    .map(|thread| thread.committed_turns)
-                    .unwrap_or_default();
+                    .map_or_default(|thread| thread.committed_turns);
                 Ok((committed_turns == expected_turns).then_some(()))
             }
         })
@@ -7064,8 +7063,7 @@ mod tests {
                     let committed_turns = response
                         .thread
                         .and_then(|view| view.thread)
-                        .map(|thread| thread.committed_turns)
-                        .unwrap_or_default();
+                        .map_or_default(|thread| thread.committed_turns);
                     Ok((committed_turns == 1).then_some(()))
                 }
             })

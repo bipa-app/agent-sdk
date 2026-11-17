@@ -134,8 +134,7 @@ impl ViewCache {
             .iter()
             .position(|(id, _)| id == thread_id)
             .and_then(|at| entries.remove(at))
-            .map(|(_, view)| view)
-            .unwrap_or_default();
+            .map_or_default(|(_, view)| view);
         entries.push_back((thread_id.clone(), Arc::clone(&view)));
         while entries.len() > CACHED_VIEWS {
             entries.pop_front();
