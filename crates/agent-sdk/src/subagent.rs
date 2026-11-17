@@ -822,7 +822,7 @@ where
     let parent_ctx = Context::current();
     let parent_span_context = parent_ctx.span().span_context().clone();
 
-    let normalized_provider_name = provider_name::normalize(tool.provider.provider());
+    let normalized_provider_name = provider_name::of(tool.provider.as_ref());
     let request_model = tool.provider.model().to_string();
     let agent_name = tool.config.name.clone();
 

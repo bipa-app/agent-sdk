@@ -120,7 +120,7 @@ where
     Ctx: Send + Sync + 'static,
     P: LlmProvider,
 {
-    let provider_name_val = provider_name::normalize(provider.provider());
+    let provider_name_val = provider_name::of(provider);
     let mut span_attrs = vec![
         KeyValue::new(attrs::GEN_AI_OPERATION_NAME, "invoke_agent"),
         KeyValue::new(attrs::GEN_AI_PROVIDER_NAME, provider_name_val),
