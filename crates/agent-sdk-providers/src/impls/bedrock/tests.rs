@@ -810,6 +810,52 @@ async fn drop_block_answers_a_replay_whose_tool_list_changed() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn drop_block_rides_to_every_model_that_binds_thinking() -> anyhow::Result<()> {
+    let binding = BEDROCK_MODELS
+        .iter()
+        .filter(|model| model.binds_thinking)
+        .map(|model| model.anthropic_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        binding,
+        [
+            MODEL_FABLE_51,
+            "claude-mythos-5-1",
+            MODEL_OPUS_55,
+            MODEL_SONNET_55,
+            MODEL_HAIKU_55
+        ]
+    );
+    for model in binding {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            ResponseTemplate::new(200).set_body_json(success_body()),
+        )
+        .await;
+        provider(&server, model)
+            .with_thinking(ThinkingConfig::adaptive())
+            .with_prefix_mismatch(PrefixMismatchBehavior::DropBlock)
+            .chat(agent_request())
+            .await?;
+        let requests = recorded(&server).await?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests.first().context("no request")?.body)?;
+        assert_eq!(
+            body["thinking"]["block_binding"],
+            json!({ "prefix_mismatch_behavior": "drop_block" }),
+            "{model}: {body}"
+        );
+        assert_eq!(
+            body["anthropic_beta"],
+            json!(["thinking-binding-controls-2026-08-01"]),
+            "{model}: {body}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn drop_block_rides_only_to_models_that_bind_thinking() -> anyhow::Result<()> {
     for (model, thinking) in [
         (MODEL_OPUS_5, ThinkingConfig::adaptive()),

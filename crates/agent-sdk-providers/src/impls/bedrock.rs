@@ -411,7 +411,9 @@ impl BedrockProvider {
     /// What Bedrock does with a replayed thinking block whose conversation
     /// changed. Set [`PrefixMismatchBehavior::DropBlock`] for a harness whose
     /// tool list grows mid-conversation, or a conversation that already failed
-    /// on such a block never answers again.
+    /// on such a block never answers again. The binding goes only to the
+    /// models this provider's table marks as binding thinking; a model it does
+    /// not know gets none.
     #[must_use]
     pub const fn with_prefix_mismatch(mut self, behavior: PrefixMismatchBehavior) -> Self {
         self.prefix_mismatch = behavior;
