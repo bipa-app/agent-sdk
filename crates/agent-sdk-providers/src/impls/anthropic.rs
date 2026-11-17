@@ -6,7 +6,7 @@
 
 pub(crate) mod data;
 mod fingerprint;
-mod schema;
+pub(crate) mod schema;
 
 use crate::attachments::{fit_request_attachments, validate_request_attachments};
 use crate::provider::{LlmProvider, StructuredOutputSupport, thinking_for_forced_tool};
@@ -339,10 +339,10 @@ fn parse_models_page(body: &str) -> Result<AnthropicModelsPage> {
 /// Cache-control breakpoints resolved for the three cacheable prefixes of an
 /// Anthropic request, in decreasing order of prefix stability. A `None` field
 /// means "do not mark this prefix with `cache_control`".
-struct CacheRegions {
-    tools: Option<data::ApiCacheControl>,
-    system: Option<data::ApiCacheControl>,
-    messages: Option<data::ApiCacheControl>,
+pub(crate) struct CacheRegions {
+    pub(crate) tools: Option<data::ApiCacheControl>,
+    pub(crate) system: Option<data::ApiCacheControl>,
+    pub(crate) messages: Option<data::ApiCacheControl>,
 }
 
 impl CacheRegions {
@@ -656,7 +656,7 @@ impl AnthropicProvider {
     /// prefixes. An opted-out config disables all breakpoints; a TTL flows onto
     /// every breakpoint; and `max_breakpoints` caps how many prefixes are
     /// marked, in decreasing order of stability (tools, system, conversation).
-    fn cache_regions(request: &ChatRequest) -> CacheRegions {
+    pub(crate) fn cache_regions(request: &ChatRequest) -> CacheRegions {
         let (enabled, ttl, max_breakpoints) =
             request.cache.as_ref().map_or((true, None, None), |cfg| {
                 (cfg.enabled, cfg.ttl, cfg.max_breakpoints)
@@ -673,7 +673,7 @@ impl AnthropicProvider {
         }
     }
 
-    fn build_cached_api_messages(
+    pub(crate) fn build_cached_api_messages(
         request: &ChatRequest,
         cache_control: Option<data::ApiCacheControl>,
     ) -> Vec<data::ApiMessage> {
@@ -989,17 +989,29 @@ impl AnthropicProvider {
         &self,
         request: &ChatRequest,
     ) -> Result<Option<ApiOutputFormat>, schema::JsonOutputSchemaError> {
-        let forces_a_tool = matches!(
-            request.tool_choice,
-            Some(agent_sdk_foundation::llm::ToolChoice::Tool(_))
-        );
-        match &request.response_format {
-            Some(format) if self.supports_json_outputs() && !forces_a_tool => {
-                schema::json_output_schema(&format.schema)
-                    .map(|wire| Some(ApiOutputFormat::json_schema(wire)))
-            }
-            Some(_) | None => Ok(None),
+        json_output_format(request, self.supports_json_outputs())
+    }
+}
+
+/// The JSON outputs format for the request's `response_format`, when the
+/// model takes JSON outputs (`supports_json_outputs`) and no tool is forced.
+/// A model without them ignores `response_format`; so does a request that
+/// forces a tool, which is how the structured-output runner falls back for a
+/// schema JSON outputs cannot express.
+pub(crate) fn json_output_format(
+    request: &ChatRequest,
+    supports_json_outputs: bool,
+) -> Result<Option<ApiOutputFormat>, schema::JsonOutputSchemaError> {
+    let forces_a_tool = matches!(
+        request.tool_choice,
+        Some(agent_sdk_foundation::llm::ToolChoice::Tool(_))
+    );
+    match &request.response_format {
+        Some(format) if supports_json_outputs && !forces_a_tool => {
+            schema::json_output_schema(&format.schema)
+                .map(|wire| Some(ApiOutputFormat::json_schema(wire)))
         }
+        Some(_) | None => Ok(None),
     }
 }
 
