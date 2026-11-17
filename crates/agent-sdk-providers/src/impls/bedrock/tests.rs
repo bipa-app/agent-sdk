@@ -765,6 +765,44 @@ async fn sigv4_requests_are_signed_for_bedrock_and_retry_once_on_expired_credent
 }
 
 #[tokio::test]
+async fn a_streamed_request_retries_once_on_expired_credentials() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(expired_token_response())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/model/us.anthropic.claude-sonnet-5-5/invoke-with-response-stream",
+        ))
+        .respond_with(event_stream_response(frames(&tool_call_events())?))
+        .mount(&server)
+        .await;
+    let (sts, _token, credentials) = web_identity().await?;
+
+    let provider = web_identity_provider(&server, credentials);
+    let mut stream = provider.chat_stream(agent_request());
+    let mut deltas = Vec::new();
+    while let Some(delta) = stream.next().await {
+        deltas.push(delta?);
+    }
+    assert!(
+        matches!(
+            deltas.last(),
+            Some(StreamDelta::Done {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            })
+        ),
+        "{deltas:?}"
+    );
+    assert_eq!(recorded(&sts).await?.len(), 2);
+    assert_eq!(recorded(&server).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_second_expired_token_is_an_invalid_request_after_one_retry() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     mount(&server, expired_token_response()).await;
