@@ -131,6 +131,9 @@ struct BedrockModel {
     profiles: &'static [BedrockInferenceProfile],
     /// The model card lists `tool_choice` types `auto` and `none` only.
     refuses_forced_tool: bool,
+    /// Preserved thinking: each thinking block is bound to the conversation
+    /// before it, so [`PrefixMismatchBehavior`] applies.
+    binds_thinking: bool,
 }
 
 /// The Claude models of this SDK's catalog that Bedrock's runtime serves, from
@@ -148,90 +151,105 @@ const BEDROCK_MODELS: &[BedrockModel] = {
             base_id: "anthropic.claude-fable-5-1",
             profiles: &[Us, Global],
             refuses_forced_tool: false,
+            binds_thinking: true,
         },
         BedrockModel {
             anthropic_id: MODEL_FABLE_5,
             base_id: "anthropic.claude-fable-5",
             profiles: &[Us, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: "claude-mythos-5-1",
             base_id: "anthropic.claude-mythos-5-1",
             profiles: &[Us, Global],
             refuses_forced_tool: false,
+            binds_thinking: true,
         },
         BedrockModel {
             anthropic_id: MODEL_OPUS_55,
             base_id: "anthropic.claude-opus-5-5",
             profiles: &[Us, Eu, Au, Jp, Global],
             refuses_forced_tool: true,
+            binds_thinking: true,
         },
         BedrockModel {
             anthropic_id: MODEL_OPUS_5,
             base_id: "anthropic.claude-opus-5",
             profiles: &[Us, Eu, Au, In, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_OPUS_48,
             base_id: "anthropic.claude-opus-4-8",
             profiles: &[Us, Eu, Jp, Au, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_OPUS_47,
             base_id: "anthropic.claude-opus-4-7",
             profiles: &[Us, Eu, Jp, Au, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_OPUS_46,
             base_id: "anthropic.claude-opus-4-6-v1",
             profiles: &[Us, Eu, Au, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: "claude-opus-4-5-20251101",
             base_id: "anthropic.claude-opus-4-5-20251101-v1:0",
             profiles: &[Us, Eu, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_SONNET_55,
             base_id: "anthropic.claude-sonnet-5-5",
             profiles: &[Us, Ca, Eu, Au, Global],
             refuses_forced_tool: true,
+            binds_thinking: true,
         },
         BedrockModel {
             anthropic_id: MODEL_SONNET_5,
             base_id: "anthropic.claude-sonnet-5",
             profiles: &[Us, Eu, Au, In, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_SONNET_46,
             base_id: "anthropic.claude-sonnet-4-6",
             profiles: &[Us, Eu, Au, Jp, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_SONNET_45,
             base_id: "anthropic.claude-sonnet-4-5-20250929-v1:0",
             profiles: &[Us, Eu, Au, Jp, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
         BedrockModel {
             anthropic_id: MODEL_HAIKU_55,
             base_id: "anthropic.claude-haiku-5-5",
             profiles: &[Us, Ca, Eu, Au, Jp, Global],
             refuses_forced_tool: false,
+            binds_thinking: true,
         },
         BedrockModel {
             anthropic_id: MODEL_HAIKU_45,
             base_id: "anthropic.claude-haiku-4-5-20251001-v1:0",
             profiles: &[Us, Eu, Au, Jp, In, Global],
             refuses_forced_tool: false,
+            binds_thinking: false,
         },
     ]
 };
@@ -319,7 +337,8 @@ pub enum PrefixMismatchBehavior {
     /// reasoning and may think again, which costs output tokens. Sent as
     /// `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` with the
     /// `thinking-binding-controls-2026-08-01` beta, on requests that carry
-    /// thinking.
+    /// thinking to a model whose card has preserved thinking; other models'
+    /// requests are unchanged.
     DropBlock,
 }
 
@@ -561,17 +580,19 @@ impl BedrockProvider {
         if let Value::Object(fields) = &mut body {
             // The operation, not the body, says whether Bedrock streams.
             fields.remove("stream");
-            if let Some(Value::Object(thinking)) = fields.get_mut("thinking") {
-                match self.prefix_mismatch {
-                    PrefixMismatchBehavior::Error => {}
-                    PrefixMismatchBehavior::DropBlock => {
-                        thinking.insert(
-                            "block_binding".to_owned(),
-                            serde_json::json!({ "prefix_mismatch_behavior": "drop_block" }),
-                        );
-                        betas.push(THINKING_BINDING_BETA);
-                    }
-                }
+            // A model that binds nothing refuses no replay, and may not take the beta.
+            let drop_block = match self.prefix_mismatch {
+                PrefixMismatchBehavior::Error => false,
+                PrefixMismatchBehavior::DropBlock => self
+                    .bedrock_model()
+                    .is_some_and(|model| model.binds_thinking),
+            };
+            if drop_block && let Some(Value::Object(thinking)) = fields.get_mut("thinking") {
+                thinking.insert(
+                    "block_binding".to_owned(),
+                    serde_json::json!({ "prefix_mismatch_behavior": "drop_block" }),
+                );
+                betas.push(THINKING_BINDING_BETA);
             }
             if !betas.is_empty() {
                 fields.insert(

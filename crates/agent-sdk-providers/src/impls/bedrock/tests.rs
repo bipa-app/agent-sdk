@@ -810,6 +810,40 @@ async fn drop_block_answers_a_replay_whose_tool_list_changed() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn drop_block_rides_only_to_models_that_bind_thinking() -> anyhow::Result<()> {
+    for (model, thinking) in [
+        (MODEL_OPUS_5, ThinkingConfig::adaptive()),
+        ("claude-opus-4-5-20251101", ThinkingConfig::new(2048)),
+    ] {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            ResponseTemplate::new(200).set_body_json(success_body()),
+        )
+        .await;
+        provider(&server, model)
+            .with_thinking(thinking)
+            .with_prefix_mismatch(PrefixMismatchBehavior::DropBlock)
+            .chat(agent_request())
+            .await?;
+        let requests = recorded(&server).await?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&requests.first().context("no request")?.body)?;
+        assert!(
+            body["thinking"].get("block_binding").is_none(),
+            "{model}: {body}"
+        );
+        assert!(
+            !body["anthropic_beta"]
+                .as_array()
+                .is_some_and(|betas| betas.contains(&json!("thinking-binding-controls-2026-08-01"))),
+            "{model}: {body}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn drop_block_rides_only_on_requests_that_carry_thinking() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     mount(
