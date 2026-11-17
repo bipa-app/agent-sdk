@@ -426,10 +426,7 @@ impl MatrixProvider {
     }
 
     fn requests(&self) -> Vec<Vec<(String, bool)>> {
-        self.seen
-            .lock()
-            .map(|seen| seen.clone())
-            .unwrap_or_default()
+        self.seen.lock().map_or_default(|seen| seen.clone())
     }
 }
 
