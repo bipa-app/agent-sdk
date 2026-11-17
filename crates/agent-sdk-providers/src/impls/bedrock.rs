@@ -304,9 +304,10 @@ pub struct BedrockProvider {
 /// changed since the block was made.
 ///
 /// The change can be an edited message, or a different `tools` list, such as
-/// a harness that adds tools mid-conversation. Models with preserved thinking (Sonnet 5.5, Opus 5.5, Haiku 5.5, Fable 5.1 and
-/// later) bind each block to the conversation before it, and Bedrock refuses
-/// a mismatched block on accounts where that check is enforced.
+/// a harness that adds tools mid-conversation. Models with preserved thinking
+/// (Sonnet 5.5, Opus 5.5, Haiku 5.5, Fable 5.1 and later) bind each block to
+/// the conversation before it, and Bedrock refuses a mismatched block on
+/// accounts where that check is enforced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PrefixMismatchBehavior {
     /// The request fails with a 400 (`InvalidRequest`), and so does every
