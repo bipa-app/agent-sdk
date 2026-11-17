@@ -147,10 +147,10 @@ impl WebIdentityCredentials {
     /// replacement stays.
     pub async fn invalidate(&self, rejected: &Credentials) {
         let mut cached = self.cached.lock().await;
-        if cached
-            .as_ref()
-            .is_some_and(|credentials| credentials.access_key_id() == rejected.access_key_id())
-        {
+        if cached.as_ref().is_some_and(|credentials| {
+            credentials.access_key_id() == rejected.access_key_id()
+                && credentials.session_token() == rejected.session_token()
+        }) {
             *cached = None;
         }
     }
