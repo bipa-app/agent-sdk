@@ -141,8 +141,7 @@ impl ToolEventCollector {
     pub fn drain(&self) -> Vec<AgentEvent> {
         self.events
             .lock()
-            .map(|mut e| std::mem::take(&mut *e))
-            .unwrap_or_default()
+            .map_or_default(|mut e| std::mem::take(&mut *e))
     }
 }
 use crate::journal::task_state::TaskState;

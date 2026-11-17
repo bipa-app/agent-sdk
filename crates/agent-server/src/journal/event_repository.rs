@@ -259,13 +259,12 @@ impl EventRepository for InMemoryEventRepository {
         let result = inner
             .events
             .get(&thread_id.0)
-            .map(|evts| {
+            .map_or_default(|evts| {
                 evts.iter()
                     .filter(|e| e.sequence > after_sequence && e.sequence <= up_to_sequence)
                     .cloned()
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         drop(inner);
         Ok(result)
     }

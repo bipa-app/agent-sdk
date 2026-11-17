@@ -67,8 +67,7 @@ impl CapturingProvider {
     fn captured(&self) -> Vec<ChatRequest> {
         self.captured
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .map_or_default(|guard| guard.clone())
     }
 }
 
