@@ -1038,3 +1038,44 @@ async fn seed_compaction_history(store: &SharedStore, thread_id: &ThreadId) -> R
         .await?;
     Ok(())
 }
+
+/// A provider that speaks Anthropic's API through Bedrock names the
+/// endpoint in `gen_ai.provider.name` and keeps its raw id in
+/// `agent_sdk.provider.id`, on the chat span and the root turn span the
+/// worker opens.
+#[tokio::test]
+async fn worker_spans_keep_the_raw_provider_id_beside_the_endpoint_name() -> anyhow::Result<()> {
+    use agent_sdk::observability::loop_instrument::{
+        ChatSpanParams, RootTurnSpanParams, build_chat_span, start_root_turn_span,
+    };
+
+    let _guard = acquire_test_lock().await;
+    let harness = setup_in_memory_provider();
+    let mut chat = build_chat_span(ChatSpanParams {
+        provider_id: "anthropic",
+        provider_name: "aws.bedrock",
+        model: "claude-sonnet-5-5",
+        streaming: true,
+        max_tokens: None,
+    });
+    chat.end();
+    let mut root = start_root_turn_span(RootTurnSpanParams {
+        provider_id: "anthropic",
+        provider_name: "aws.bedrock",
+        model: "claude-sonnet-5-5",
+        conversation_id: "thread-1",
+    })
+    .span;
+    root.end();
+    harness.force_flush_all()?;
+    let spans = harness.spans()?;
+    for name in ["chat claude-sonnet-5-5", "invoke_agent"] {
+        let span = spans
+            .iter()
+            .find(|span| span.name == name)
+            .ok_or_else(|| anyhow::anyhow!("no {name} span"))?;
+        assert_span_attribute(span, attrs::GEN_AI_PROVIDER_NAME, "aws.bedrock");
+        assert_span_attribute(span, attrs::SDK_PROVIDER_ID, "anthropic");
+    }
+    Ok(())
+}

@@ -1972,7 +1972,8 @@ async fn execute_root_turn_inner(
         let started = {
             let _parent_guard = parent.map(opentelemetry::Context::attach);
             loop_instrument::start_root_turn_span(loop_instrument::RootTurnSpanParams {
-                provider_id: agent_sdk::observability::provider_name::of(provider),
+                provider_id: provider.provider(),
+                provider_name: agent_sdk::observability::provider_name::of(provider),
                 model: &model,
                 conversation_id: &conversation_id,
             })
@@ -4885,9 +4886,10 @@ async fn call_llm_once_instrumented(
     // synthetic value the in-process span would omit.
     let max_tokens = request.max_tokens_explicit.then_some(request.max_tokens);
     let request_model = provider.model().to_string();
-    let provider_id = agent_sdk::observability::provider_name::of(provider);
+    let provider_name = agent_sdk::observability::provider_name::of(provider);
     let mut span = loop_instrument::build_chat_span(loop_instrument::ChatSpanParams {
-        provider_id,
+        provider_id: provider.provider(),
+        provider_name,
         model: &request_model,
         // The worker only ever drives the streaming API
         // (`provider.chat_stream`), so this span always reflects a
@@ -4907,7 +4909,7 @@ async fn call_llm_once_instrumented(
                 &mut span,
                 &outcome.response,
                 elapsed,
-                provider_id,
+                provider_name,
                 &request_model,
             );
         }
@@ -4931,7 +4933,7 @@ async fn call_llm_once_instrumented(
                 error_type,
                 message,
                 elapsed,
-                provider_id,
+                provider_name,
                 &request_model,
             );
         }
