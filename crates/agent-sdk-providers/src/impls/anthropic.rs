@@ -727,10 +727,14 @@ impl AnthropicProvider {
         Ok(Self::sonnet(api_key))
     }
 
-    /// Create a provider using Claude Haiku 4.5.
+    /// Create a provider using the current Haiku, Claude Haiku 5.5.
+    ///
+    /// This alias tracks the newest Haiku release and changes when a new one
+    /// ships; see [`Self::haiku_55`] for the thinking constraints that come
+    /// with Haiku 5.5.
     #[must_use]
     pub fn haiku(api_key: impl Into<String>) -> Self {
-        Self::new(api_key, MODEL_HAIKU_45)
+        Self::haiku_55(api_key)
     }
 
     /// Create a provider using Claude Haiku 5.5.
@@ -746,10 +750,14 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_HAIKU_55)
     }
 
-    /// Create a provider using Claude Sonnet 4.6.
+    /// Create a provider using the current Sonnet, Claude Sonnet 5.5.
+    ///
+    /// This alias tracks the newest Sonnet release and changes when a new one
+    /// ships; see [`Self::sonnet_55`] for the thinking constraints that come
+    /// with Sonnet 5.5.
     #[must_use]
     pub fn sonnet(api_key: impl Into<String>) -> Self {
-        Self::new(api_key, MODEL_SONNET_46)
+        Self::sonnet_55(api_key)
     }
 
     /// Create a provider using Claude Sonnet 4.5.
@@ -764,15 +772,15 @@ impl AnthropicProvider {
         Self::new(api_key, MODEL_SONNET_46)
     }
 
-    /// Create a provider using the current Opus flagship, Claude Opus 5.
+    /// Create a provider using the current Opus flagship, Claude Opus 5.5.
     ///
     /// This alias tracks the newest Opus release and changes when a new one
-    /// ships; call [`Self::opus_5`] (or another versioned factory) to pin a
-    /// specific model. See [`Self::opus_5`] for the thinking constraints that
-    /// come with Opus 5.
+    /// ships; call [`Self::opus_55`] (or another versioned factory) to pin a
+    /// specific model. See [`Self::opus_55`] for the thinking constraints that
+    /// come with Opus 5.5.
     #[must_use]
     pub fn opus(api_key: impl Into<String>) -> Self {
-        Self::opus_5(api_key)
+        Self::opus_55(api_key)
     }
 
     /// Create a provider using Claude Opus 4.6.
@@ -1932,7 +1940,7 @@ mod tests {
     fn test_haiku_factory_creates_haiku_provider() {
         let provider = AnthropicProvider::haiku("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_HAIKU_45);
+        assert_eq!(provider.model(), MODEL_HAIKU_55);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -2292,7 +2300,7 @@ mod tests {
     fn test_sonnet_factory_creates_sonnet_provider() {
         let provider = AnthropicProvider::sonnet("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_SONNET_46);
+        assert_eq!(provider.model(), MODEL_SONNET_55);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -2317,7 +2325,7 @@ mod tests {
         // `opus()` is the flagship alias, so it moves with each Opus release.
         let provider = AnthropicProvider::opus("test-api-key".to_string());
 
-        assert_eq!(provider.model(), MODEL_OPUS_5);
+        assert_eq!(provider.model(), MODEL_OPUS_55);
         assert_eq!(provider.provider(), "anthropic");
     }
 
@@ -2475,7 +2483,7 @@ mod tests {
         // mid-loop thinking only appears when this beta header is present.
         for provider in [
             AnthropicProvider::sonnet_45("test-key-not-a-secret"),
-            AnthropicProvider::haiku("test-key-not-a-secret"),
+            AnthropicProvider::new("test-key-not-a-secret", MODEL_HAIKU_45),
         ] {
             assert!(!provider.is_oauth());
             assert_eq!(

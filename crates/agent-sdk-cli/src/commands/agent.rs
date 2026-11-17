@@ -87,7 +87,7 @@ pub struct ProviderArgs {
     /// Model to use. Provider-aware: for `anthropic` the aliases
     /// `haiku`/`sonnet`/`sonnet5`/`opus`/`opus5`/`fable` are accepted in
     /// addition to full model ids; other providers take a full model string.
-    /// `sonnet` and `opus` track the current flagship of their family.
+    /// `haiku`, `sonnet` and `opus` track the newest model of their family.
     /// Defaults per provider.
     #[arg(long)]
     pub model: Option<String>,
@@ -199,7 +199,7 @@ fn build_cloudflare(args: &ProviderArgs) -> Result<CloudflareAIGatewayProvider> 
             let model = args
                 .model
                 .clone()
-                .unwrap_or_else(|| "claude-sonnet-4-6".to_owned());
+                .unwrap_or_else(|| "claude-sonnet-5-5".to_owned());
             let api_key = first_env(&["ANTHROPIC_API_KEY"]).unwrap_or_default();
             ensure_cf_auth(&api_key, gateway_token.as_deref(), "ANTHROPIC_API_KEY")?;
             let base =
@@ -519,11 +519,11 @@ mod tests {
     fn anthropic_aliases_resolve_to_expected_models() {
         assert_eq!(
             anthropic_provider("k".to_owned(), "haiku").model(),
-            "claude-haiku-4-5-20251001"
+            "claude-haiku-5-5"
         );
         assert_eq!(
             anthropic_provider("k".to_owned(), "sonnet").model(),
-            "claude-sonnet-4-6"
+            "claude-sonnet-5-5"
         );
         assert_eq!(
             anthropic_provider("k".to_owned(), "sonnet5").model(),
@@ -531,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             anthropic_provider("k".to_owned(), "opus").model(),
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             anthropic_provider("k".to_owned(), "opus5").model(),
