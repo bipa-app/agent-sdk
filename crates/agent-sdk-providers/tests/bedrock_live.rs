@@ -27,8 +27,8 @@ use agent_sdk_foundation::llm::{
 use agent_sdk_providers::LlmProvider;
 use agent_sdk_providers::impls::AnthropicProvider;
 use agent_sdk_providers::impls::bedrock::{
-    BedrockAuth, BedrockInferenceProfile, BedrockProvider, WebIdentityCredentials,
-    WebIdentityToken, bedrock_inference_profile_id,
+    BedrockAuth, BedrockInferenceProfile, BedrockProvider, PrefixMismatchBehavior,
+    WebIdentityCredentials, WebIdentityToken, bedrock_inference_profile_id,
 };
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
 use anyhow::{Context, Result, bail};
@@ -425,6 +425,135 @@ async fn tier_c_bedrock_errors_map_to_their_classes() -> Result<()> {
         eprintln!("forced tool on Sonnet 5.5: {outcome:?}");
     }
     Ok(())
+}
+
+fn pay_tool() -> agent_sdk_providers::Tool {
+    agent_sdk_providers::Tool {
+        name: "pay_invoice".into(),
+        description: "Pay an invoice by its number".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": { "invoice": { "type": "string" } },
+            "required": ["invoice"],
+        }),
+        display_name: "Pay".into(),
+        tier: agent_sdk_foundation::ToolTier::Confirm,
+        concurrency: agent_sdk_foundation::ToolConcurrency::Exclusive,
+        replay: agent_sdk_foundation::ToolReplay::Unsafe,
+    }
+}
+
+/// A harness that adds a tool after the model has thought (a skill loading
+/// its tools) replays that thinking under a tool list it was not signed with.
+/// Accounts Bedrock enforces preserved thinking on answer that with a 400.
+#[tokio::test]
+#[ignore = "Tier C live smoke: AGENT_SDK_LIVE_SMOKE=1 + Bedrock env (see module docs)"]
+async fn tier_c_bedrock_thinking_survives_a_tool_list_change() -> Result<()> {
+    let Some(live) = live()? else {
+        eprintln!("Tier C Bedrock tool-list change skipped");
+        return Ok(());
+    };
+    let thinking = ThinkingConfig::adaptive().with_effort(Effort::Max);
+    let system = "Use the tools to answer.";
+    let question = Message::user(
+        "Invoice 4471 was issued on 2026-10-03 on net 45, invoice 4472 on 2026-09-30 on net 60, \
+         and invoice 4473 on 2026-10-20 on net 30, counting calendar days. Before you call any \
+         tool, work out by hand which one is due first. Then look that one up to confirm.",
+    );
+    let mut thought = None;
+    for _ in 0..3 {
+        let outcome = live
+            .provider()
+            .with_thinking(thinking.clone())
+            .chat(
+                ChatRequest::new(system, vec![question.clone()])
+                    .with_tools(vec![lookup_tool()])
+                    .with_max_tokens(16_384),
+            )
+            .await?;
+        let ChatOutcome::Success(first) = outcome else {
+            bail!("first turn: {outcome:?}");
+        };
+        if first
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Thinking { .. }))
+        {
+            thought = Some(first);
+            break;
+        }
+    }
+    let Some(first) = thought else {
+        bail!("three first turns answered without thinking, so nothing was bound");
+    };
+    let thinking_blocks = first
+        .content
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
+        .count();
+    let tool_use_id = first
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .context("the first turn called no tool")?;
+    let replay = ChatRequest::new(
+        system,
+        vec![
+            question,
+            Message {
+                role: Role::Assistant,
+                content: Content::Blocks(first.content.clone()),
+            },
+            Message::tool_result(tool_use_id, "2026-12-01", false),
+        ],
+    )
+    .with_tools(vec![lookup_tool(), pay_tool()])
+    .with_max_tokens(16_384);
+    let refused = live
+        .provider()
+        .with_thinking(thinking.clone())
+        .chat(replay.clone())
+        .await?;
+    eprintln!(
+        "thinking blocks: {thinking_blocks}; replay with the default behavior: {}",
+        outcome_summary(&refused)
+    );
+    let outcome = live
+        .provider()
+        .with_thinking(thinking)
+        .with_prefix_mismatch(PrefixMismatchBehavior::DropBlock)
+        .chat(replay)
+        .await?;
+    eprintln!("replay with drop_block: {}", outcome_summary(&outcome));
+    let ChatOutcome::Success(_) = outcome else {
+        bail!("the replay with drop_block failed: {outcome:?}");
+    };
+    Ok(())
+}
+
+/// One line per outcome: the error text, or the stop reason and the block kinds.
+fn outcome_summary(outcome: &ChatOutcome) -> String {
+    match outcome {
+        ChatOutcome::Success(response) => format!(
+            "Success stop={:?} blocks={:?}",
+            response.stop_reason,
+            response
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Thinking { .. } => "thinking",
+                    ContentBlock::RedactedThinking { .. } => "redacted_thinking",
+                    ContentBlock::Text { .. } => "text",
+                    ContentBlock::ToolUse { .. } => "tool_use",
+                    _ => "other",
+                })
+                .collect::<Vec<_>>()
+        ),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Sends a thinking block made on the Anthropic API to Bedrock, the case of a

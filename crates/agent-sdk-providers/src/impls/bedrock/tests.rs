@@ -701,6 +701,134 @@ impl ProvideCredentials for FailingCredentials {
     }
 }
 
+/// The request a harness sends after a tool joins the list: the earlier
+/// thinking block, signed under the old list, replayed with the new one.
+fn replay_after_a_tool_list_change() -> ChatRequest {
+    ChatRequest::new(
+        "You read documents.",
+        vec![
+            Message::user("first question"),
+            Message {
+                role: Role::Assistant,
+                content: Content::Blocks(vec![
+                    ContentBlock::Thinking {
+                        thinking: String::new(),
+                        signature: Some("signed-under-the-old-tool-list".to_owned()),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "toolu_1".to_owned(),
+                        name: "lookup".to_owned(),
+                        input: json!({ "q": "due" }),
+                        thought_signature: None,
+                    },
+                ]),
+            },
+            Message::tool_result("toolu_1", "2026-12-01", false),
+        ],
+    )
+    .with_tools(vec![tool("lookup"), tool("pay")])
+    .with_max_tokens(2048)
+}
+
+/// An enforced account: Bedrock answers a request that lets it drop the
+/// mismatched block, and refuses any other the way it refused the live one.
+async fn enforcing_bedrock() -> anyhow::Result<MockServer> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/model/us.anthropic.claude-sonnet-5-5/invoke-with-response-stream",
+        ))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "thinking": { "block_binding": { "prefix_mismatch_behavior": "drop_block" } },
+            "anthropic_beta": ["thinking-binding-controls-2026-08-01"]
+        })))
+        .respond_with(event_stream_response(frames(&tool_call_events())?))
+        .mount(&server)
+        .await;
+    let mut answer = success_body();
+    answer["input_transformations"] = json!([{
+        "type": "thinking_dropped",
+        "path": "messages.1.content.0",
+        "reason": "prefix_binding_mismatch"
+    }]);
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "thinking": { "block_binding": { "prefix_mismatch_behavior": "drop_block" } },
+            "anthropic_beta": ["thinking-binding-controls-2026-08-01"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .insert_header("x-amzn-ErrorType", "ValidationException")
+                .set_body_json(json!({
+                    "message": "messages.1.content.0: Invalid `signature` in `thinking` block. \
+                                The block is bound to a different conversation. Remove the \
+                                block, or set `thinking.block_binding.prefix_mismatch_behavior` \
+                                to \"drop_block\". That setting requires the \
+                                `thinking-binding-controls-2026-08-01` value in the \
+                                `anthropic-beta` header. The `tools` list differs from the one \
+                                this block was created with."
+                })),
+        )
+        .mount(&server)
+        .await;
+    Ok(server)
+}
+
+#[tokio::test]
+async fn drop_block_answers_a_replay_whose_tool_list_changed() -> anyhow::Result<()> {
+    let server = enforcing_bedrock().await?;
+    let thinking = provider(&server, MODEL_SONNET_55).with_thinking(ThinkingConfig::adaptive());
+
+    let refused = thinking
+        .clone()
+        .chat(replay_after_a_tool_list_change())
+        .await?;
+    assert!(
+        matches!(&refused, ChatOutcome::InvalidRequest(message)
+            if message.contains("bound to a different conversation")),
+        "{refused:?}"
+    );
+
+    let dropping = thinking.with_prefix_mismatch(PrefixMismatchBehavior::DropBlock);
+    let answered = dropping.chat(replay_after_a_tool_list_change()).await?;
+    assert!(matches!(answered, ChatOutcome::Success(_)), "{answered:?}");
+
+    let mut deltas = Vec::new();
+    let mut stream = dropping.chat_stream(replay_after_a_tool_list_change());
+    while let Some(delta) = stream.next().await {
+        deltas.push(delta?);
+    }
+    assert!(
+        matches!(deltas.last(), Some(StreamDelta::Done { .. })),
+        "{deltas:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn drop_block_rides_only_on_requests_that_carry_thinking() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(success_body()),
+    )
+    .await;
+    provider(&server, MODEL_SONNET_55)
+        .with_prefix_mismatch(PrefixMismatchBehavior::DropBlock)
+        .chat(agent_request())
+        .await?;
+    let requests = recorded(&server).await?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests.first().context("no request")?.body)?;
+    assert!(body.get("thinking").is_none(), "{body}");
+    assert!(body.get("anthropic_beta").is_none(), "{body}");
+    Ok(())
+}
+
 fn expired_token_response() -> ResponseTemplate {
     ResponseTemplate::new(403)
         .insert_header("x-amzn-ErrorType", "ExpiredTokenException")

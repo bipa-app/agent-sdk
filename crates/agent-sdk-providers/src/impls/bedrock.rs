@@ -63,6 +63,8 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 /// Bedrock asks for this beta with `output_config.effort` on Claude Opus 4.5;
 /// adaptive-thinking models take effort without it.
 const EFFORT_BETA: &str = "effort-2025-11-24";
+/// The beta `thinking.block_binding` needs.
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 const EVENT_STREAM_CONTENT_TYPE: &str = "application/vnd.amazon.eventstream";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -293,8 +295,31 @@ pub struct BedrockProvider {
     model: String,
     model_id: String,
     thinking: Option<ThinkingConfig>,
+    prefix_mismatch: PrefixMismatchBehavior,
     stream_headers_timeout: Duration,
     stream_idle_timeout: Duration,
+}
+
+/// What Bedrock does with a replayed `thinking` block whose conversation
+/// changed since the block was made.
+///
+/// The change can be an edited message, or a different `tools` list, such as
+/// a harness that adds tools mid-conversation. Models with preserved thinking (Sonnet 5.5, Opus 5.5, Haiku 5.5, Fable 5.1 and
+/// later) bind each block to the conversation before it, and Bedrock refuses
+/// a mismatched block on accounts where that check is enforced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrefixMismatchBehavior {
+    /// The request fails with a 400 (`InvalidRequest`), and so does every
+    /// later request that replays the block. Bedrock's default; the request
+    /// carries no `block_binding`.
+    #[default]
+    Error,
+    /// Bedrock drops the block, unbilled, and answers. The model loses that
+    /// reasoning and may think again, which costs output tokens. Sent as
+    /// `thinking.block_binding.prefix_mismatch_behavior: "drop_block"` with the
+    /// `thinking-binding-controls-2026-08-01` beta, on requests that carry
+    /// thinking.
+    DropBlock,
 }
 
 impl BedrockProvider {
@@ -329,6 +354,7 @@ impl BedrockProvider {
             model: model.into(),
             model_id: model_id.into(),
             thinking: None,
+            prefix_mismatch: PrefixMismatchBehavior::Error,
             stream_headers_timeout: STREAM_HEADERS_TIMEOUT,
             stream_idle_timeout: STREAM_IDLE_TIMEOUT,
         }
@@ -360,6 +386,22 @@ impl BedrockProvider {
     pub const fn with_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.thinking = Some(thinking);
         self
+    }
+
+    /// What Bedrock does with a replayed thinking block whose conversation
+    /// changed. Set [`PrefixMismatchBehavior::DropBlock`] for a harness whose
+    /// tool list grows mid-conversation, or a conversation that already failed
+    /// on such a block never answers again.
+    #[must_use]
+    pub const fn with_prefix_mismatch(mut self, behavior: PrefixMismatchBehavior) -> Self {
+        self.prefix_mismatch = behavior;
+        self
+    }
+
+    /// The behavior [`Self::with_prefix_mismatch`] set.
+    #[must_use]
+    pub const fn prefix_mismatch(&self) -> PrefixMismatchBehavior {
+        self.prefix_mismatch
     }
 
     /// Send requests to another endpoint (a VPC endpoint, or a test server).
@@ -514,10 +556,22 @@ impl BedrockProvider {
 
         let mut body = serde_json::to_value(&api_request)
             .map_err(|error| format!("failed to serialize the Bedrock request: {error}"))?;
-        let betas = self.betas(effort.is_some());
+        let mut betas = self.betas(effort.is_some());
         if let Value::Object(fields) = &mut body {
             // The operation, not the body, says whether Bedrock streams.
             fields.remove("stream");
+            if let Some(Value::Object(thinking)) = fields.get_mut("thinking") {
+                match self.prefix_mismatch {
+                    PrefixMismatchBehavior::Error => {}
+                    PrefixMismatchBehavior::DropBlock => {
+                        thinking.insert(
+                            "block_binding".to_owned(),
+                            serde_json::json!({ "prefix_mismatch_behavior": "drop_block" }),
+                        );
+                        betas.push(THINKING_BINDING_BETA);
+                    }
+                }
+            }
             if !betas.is_empty() {
                 fields.insert(
                     "anthropic_beta".to_owned(),
@@ -889,6 +943,27 @@ fn exception_delta(exception_type: &str, payload: &[u8]) -> StreamDelta {
     }
 }
 
+/// Log what Bedrock removed from a request before the model read it: one
+/// `thinking_dropped` entry for each replayed thinking block that
+/// [`PrefixMismatchBehavior::DropBlock`] let it drop, with its path.
+fn log_input_transformations(model: &str, transformations: Option<&Value>) {
+    let Some(Value::Array(entries)) = transformations else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let dropped = entries
+        .iter()
+        .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("thinking_dropped"))
+        .count();
+    log::info!(
+        "Bedrock {model} dropped {dropped} replayed thinking block(s) whose conversation \
+         changed: {}",
+        Value::Array(entries.clone())
+    );
+}
+
 /// The Anthropic stream event a `chunk` carries, as JSON text.
 fn chunk_event(payload: &[u8]) -> Result<String, String> {
     #[derive(serde::Deserialize)]
@@ -1045,6 +1120,16 @@ impl EventStreamState {
             log::warn!("Bedrock chunk without an event type");
             return Vec::new();
         };
+        if event_type == "message_start"
+            && let Ok(value) = serde_json::from_str::<Value>(event)
+        {
+            log_input_transformations(
+                &self.served_model,
+                value
+                    .get("input_transformations")
+                    .or_else(|| value.pointer("/message/input_transformations")),
+            );
+        }
         let mut deltas = Vec::new();
         if let Some(delta) = data::parse_stream_event(
             &event_type,
@@ -1121,7 +1206,10 @@ impl LlmProvider for BedrockProvider {
             .bytes()
             .await
             .map_err(|error| anyhow::anyhow!("failed to read response body: {error}"))?;
-        let api_response: data::ApiResponse = serde_json::from_slice(&bytes)
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("failed to parse response: {error}"))?;
+        log_input_transformations(&self.model, value.get("input_transformations"));
+        let api_response: data::ApiResponse = serde_json::from_value(value)
             .map_err(|error| anyhow::anyhow!("failed to parse response: {error}"))?;
         Ok(ChatOutcome::Success(self.map_response(api_response)))
     }
