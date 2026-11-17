@@ -51,16 +51,14 @@ impl TransitionExtension for BookTurns {
         let TransitionView::CompletedTurn(commit) = view else {
             return Vec::new();
         };
-        booked(&commit.thread_id)
-            .map(|key| {
-                vec![Write::Document(DocumentWrite::put(
-                    key,
-                    1,
-                    DocExpect::Any,
-                    serde_json::json!({ "turn": commit.expected_turn }),
-                ))]
-            })
-            .unwrap_or_default()
+        booked(&commit.thread_id).map_or_default(|key| {
+            vec![Write::Document(DocumentWrite::put(
+                key,
+                1,
+                DocExpect::Any,
+                serde_json::json!({ "turn": commit.expected_turn }),
+            ))]
+        })
     }
 }
 

@@ -268,8 +268,7 @@ impl GrpcShared {
                         record
                             .owner_task
                             .as_ref()
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
+                            .map_or_default(ToString::to_string),
                         String::new(),
                     ),
                     PromptOwner::Task { task_id, thread_id } => {

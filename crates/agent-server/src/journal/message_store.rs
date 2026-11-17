@@ -406,8 +406,7 @@ impl MessageProjectionStore for InMemoryMessageProjectionStore {
         let result = inner
             .by_thread
             .get(thread_id)
-            .map(MessageProjection::context_history)
-            .unwrap_or_default();
+            .map_or_default(MessageProjection::context_history);
         drop(inner);
         Ok(result)
     }

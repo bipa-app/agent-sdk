@@ -7859,8 +7859,7 @@ impl DurableResume {
         let continuation = projection
             .as_ref()
             .zip(fold)
-            .map(|(projection, fold)| projection.after_parked(fold).to_vec())
-            .unwrap_or_default();
+            .map_or_default(|(projection, fold)| projection.after_parked(fold).to_vec());
         let raw = projection
             .as_ref()
             .map_or(&[][..], |projection| projection.messages.as_slice());
@@ -9876,8 +9875,7 @@ async fn closures_for_suspension(
         .get(thread_id)
         .await
         .context("read raw history before carrying closures")?
-        .map(|projection| projection.messages)
-        .unwrap_or_default();
+        .map_or_default(|projection| projection.messages);
     let delivered = scan_transcript(&raw, &[]).delivered;
     let carried: Vec<llm::ContentBlock> = message_blocks(&closing)
         .iter()

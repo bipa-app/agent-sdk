@@ -7344,8 +7344,7 @@ impl MessageProjectionStore for PostgresDurableStore {
         Ok(self
             .get_message_head_pool(thread_id)
             .await?
-            .map(|projection| projection.context_history())
-            .unwrap_or_default())
+            .map_or_default(|projection| projection.context_history()))
     }
 
     async fn commit_messages(

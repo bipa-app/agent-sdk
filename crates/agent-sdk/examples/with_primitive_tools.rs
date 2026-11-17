@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                     let output = if result.output.chars().count() > 200 {
                         format!("{}...", result.output.chars().take(200).collect::<String>())
                     } else {
-                        result.output.clone()
+                        result.output
                     };
                     println!("[{name} result]: {output}\n");
                 } else {
