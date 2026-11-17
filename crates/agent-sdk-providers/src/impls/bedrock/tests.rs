@@ -224,6 +224,14 @@ fn inference_profile_ids_follow_the_model_cards() {
         bedrock_inference_profile_id(MODEL_HAIKU_45, BedrockInferenceProfile::Us).as_deref(),
         Some("us.anthropic.claude-haiku-4-5-20251001-v1:0")
     );
+    // An undated alias names its snapshot; another family or another dated
+    // snapshot does not.
+    assert_eq!(
+        bedrock_inference_profile_id("claude-sonnet-4-5", BedrockInferenceProfile::Us).as_deref(),
+        Some("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    );
+    assert_eq!(bedrock_base_model_id("claude-sonnet-4"), None);
+    assert_eq!(bedrock_base_model_id("claude-sonnet-4-5-20990101"), None);
     // Undocumented pairs and models have no id.
     assert_eq!(
         bedrock_inference_profile_id(MODEL_SONNET_55, BedrockInferenceProfile::Jp),
@@ -393,12 +401,6 @@ async fn a_forced_tool_on_sonnet_55_is_refused_before_the_wire() -> anyhow::Resu
 
 #[tokio::test]
 async fn an_undated_alias_takes_its_snapshots_card() -> anyhow::Result<()> {
-    assert_eq!(
-        bedrock_inference_profile_id("claude-sonnet-4-5", BedrockInferenceProfile::Us).as_deref(),
-        Some("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-    );
-    assert_eq!(bedrock_base_model_id("claude-sonnet-4"), None);
-
     let server = MockServer::start().await;
     mount(
         &server,
