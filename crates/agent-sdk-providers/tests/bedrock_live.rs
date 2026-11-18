@@ -623,6 +623,11 @@ async fn tier_c_bedrock_takes_a_thinking_block_from_the_anthropic_api() -> Resul
 /// finished exchange followed by a new question. The preserved-thinking docs
 /// say a block from another account is dropped before the model sees it and
 /// the request succeeds; both replays must answer.
+///
+/// The blocks go out with their recorded route cleared, as a block stored
+/// before routes were recorded: with the route kept, the provider leaves the
+/// blocks out or refuses the tool round itself, and the API would never see
+/// them. This test measures the API.
 #[tokio::test]
 #[ignore = "Tier C live smoke: AGENT_SDK_LIVE_SMOKE=1 + Bedrock env + ANTHROPIC_API_KEY"]
 async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()> {
@@ -657,11 +662,31 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         .iter()
         .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
         .count();
+    let unrouted = first
+        .content
+        .iter()
+        .cloned()
+        .map(|block| match block {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                ..
+            } => ContentBlock::Thinking {
+                thinking,
+                signature,
+                route: None,
+            },
+            ContentBlock::RedactedThinking { data, .. } => {
+                ContentBlock::RedactedThinking { data, route: None }
+            }
+            other => other,
+        })
+        .collect();
     let continuation = vec![
         question,
         Message {
             role: Role::Assistant,
-            content: Content::Blocks(first.content.clone()),
+            content: Content::Blocks(unrouted),
         },
         Message::tool_result(tool_use_id, "2026-12-01", false),
     ];
