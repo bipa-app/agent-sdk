@@ -31,7 +31,7 @@ use agent_sdk_providers::impls::bedrock::{
     WebIdentityCredentials, WebIdentityToken, bedrock_inference_profile_id,
 };
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use futures::StreamExt;
 
@@ -623,6 +623,13 @@ async fn tier_c_bedrock_takes_a_thinking_block_from_the_anthropic_api() -> Resul
 /// finished exchange followed by a new question. The preserved-thinking docs
 /// say a block from another account is dropped before the model sees it and
 /// the request succeeds; both replays must answer.
+///
+/// The blocks go out with their recorded route cleared, as a block stored
+/// before routes were recorded: with the route kept, the provider leaves the
+/// blocks out or refuses the tool round itself, and the API would never see
+/// them. This test measures the API. A failure in the tool round means the API
+/// refuses another account's block in that position, which is the case the
+/// provider's refusal of a routed block there exists for.
 #[tokio::test]
 #[ignore = "Tier C live smoke: AGENT_SDK_LIVE_SMOKE=1 + Bedrock env + ANTHROPIC_API_KEY"]
 async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()> {
@@ -657,11 +664,12 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         .iter()
         .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
         .count();
+    let unrouted = without_routes(&first.content, thinking_blocks)?;
     let continuation = vec![
         question,
         Message {
             role: Role::Assistant,
-            content: Content::Blocks(first.content.clone()),
+            content: Content::Blocks(unrouted),
         },
         Message::tool_result(tool_use_id, "2026-12-01", false),
     ];
@@ -700,4 +708,43 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         bail!("the Anthropic API refused Bedrock's block on a new question: {after_the_round:?}");
     }
     Ok(())
+}
+
+/// The blocks of a Bedrock turn with their recorded route cleared, as blocks
+/// stored before routes were recorded. Clearing a route Bedrock never recorded
+/// would test nothing, so the turn must hold thinking, all of it routed to
+/// Bedrock.
+fn without_routes(content: &[ContentBlock], thinking_blocks: usize) -> Result<Vec<ContentBlock>> {
+    ensure!(
+        thinking_blocks > 0,
+        "the Bedrock turn returned no thinking block to replay"
+    );
+    ensure!(
+        content.iter().all(|block| match block {
+            ContentBlock::Thinking { route, .. } | ContentBlock::RedactedThinking { route, .. } => {
+                route.as_deref() == Some("bedrock")
+            }
+            _ => true,
+        }),
+        "Bedrock left a thinking block without its route, so clearing it tests nothing: {content:?}"
+    );
+    Ok(content
+        .iter()
+        .cloned()
+        .map(|block| match block {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                ..
+            } => ContentBlock::Thinking {
+                thinking,
+                signature,
+                route: None,
+            },
+            ContentBlock::RedactedThinking { data, .. } => {
+                ContentBlock::RedactedThinking { data, route: None }
+            }
+            other => other,
+        })
+        .collect())
 }
