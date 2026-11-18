@@ -213,8 +213,8 @@ impl VertexProvider {
         }
     }
 
-    fn map_claude_response(api_response: anthropic_data::ApiResponse) -> ChatResponse {
-        let content = anthropic_data::map_content_blocks(api_response.content);
+    fn map_claude_response(&self, api_response: anthropic_data::ApiResponse) -> ChatResponse {
+        let content = anthropic_data::map_content_blocks(api_response.content, self.route());
         let stop_reason = api_response
             .stop_reason
             .as_ref()
@@ -825,9 +825,7 @@ impl VertexProvider {
             api_response.content.len()
         );
 
-        Ok(ChatOutcome::Success(Self::map_claude_response(
-            api_response,
-        )))
+        Ok(ChatOutcome::Success(self.map_claude_response(api_response)))
     }
 
     #[allow(clippy::too_many_lines)]

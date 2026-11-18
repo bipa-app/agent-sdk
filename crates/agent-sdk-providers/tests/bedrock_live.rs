@@ -615,3 +615,89 @@ async fn tier_c_bedrock_takes_a_thinking_block_from_the_anthropic_api() -> Resul
     eprintln!("direct API thinking blocks: {thinking_blocks}; Bedrock replay: {outcome:?}");
     Ok(())
 }
+
+/// The way back: a thread that ran on Bedrock moves to the Anthropic API, as
+/// a rollback of the transport does. The Anthropic API gets thinking blocks
+/// that Bedrock's account signed, in two shapes: the last assistant turn of a
+/// tool-use continuation (its `tool_use` still waits on the result), and a
+/// finished exchange followed by a new question. The preserved-thinking docs
+/// say a block from another account is dropped before the model sees it and
+/// the request succeeds; both replays must answer.
+#[tokio::test]
+#[ignore = "Tier C live smoke: AGENT_SDK_LIVE_SMOKE=1 + Bedrock env + ANTHROPIC_API_KEY"]
+async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()> {
+    let (Some(live), Some(key)) = (live()?, env("ANTHROPIC_API_KEY")) else {
+        eprintln!("Tier C Anthropic API thinking replay skipped");
+        return Ok(());
+    };
+    let thinking = ThinkingConfig::adaptive().with_display(ThinkingDisplay::Summarized);
+    let system = "Use the tool to answer.";
+    let question = Message::user("When is invoice 4471 due? Think it through first.");
+    let bedrock = live.provider().with_thinking(thinking.clone());
+    let outcome = bedrock
+        .chat(
+            ChatRequest::new(system, vec![question.clone()])
+                .with_tools(vec![lookup_tool()])
+                .with_max_tokens(4096),
+        )
+        .await?;
+    let ChatOutcome::Success(first) = outcome else {
+        bail!("Bedrock turn: {outcome:?}");
+    };
+    let tool_use_id = first
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .context("the Bedrock turn called no tool")?;
+    let thinking_blocks = first
+        .content
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
+        .count();
+    let continuation = vec![
+        question,
+        Message {
+            role: Role::Assistant,
+            content: Content::Blocks(first.content.clone()),
+        },
+        Message::tool_result(tool_use_id, "2026-12-01", false),
+    ];
+    let direct = AnthropicProvider::new(key, live.model.clone()).with_thinking(thinking);
+
+    let in_tool_round = direct
+        .chat(
+            ChatRequest::new(system, continuation.clone())
+                .with_tools(vec![lookup_tool()])
+                .with_max_tokens(4096),
+        )
+        .await?;
+    eprintln!(
+        "Bedrock thinking blocks: {thinking_blocks}; Anthropic API replay in the tool round: \
+         {in_tool_round:?}"
+    );
+    let ChatOutcome::Success(answer) = in_tool_round else {
+        bail!("the Anthropic API refused Bedrock's block in a tool round: {in_tool_round:?}");
+    };
+
+    let mut next_question = continuation;
+    next_question.push(Message {
+        role: Role::Assistant,
+        content: Content::Blocks(answer.content),
+    });
+    next_question.push(Message::user("And invoice 4472? Think it through first."));
+    let after_the_round = direct
+        .chat(
+            ChatRequest::new(system, next_question)
+                .with_tools(vec![lookup_tool()])
+                .with_max_tokens(4096),
+        )
+        .await?;
+    eprintln!("Anthropic API replay after the round: {after_the_round:?}");
+    if !matches!(after_the_round, ChatOutcome::Success(_)) {
+        bail!("the Anthropic API refused Bedrock's block on a new question: {after_the_round:?}");
+    }
+    Ok(())
+}

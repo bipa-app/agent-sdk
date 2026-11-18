@@ -459,6 +459,7 @@ mod tests {
         let blocks = vec![ContentBlock::Thinking {
             thinking: "internal".to_string(),
             signature: None,
+            route: None,
         }];
         let input = AgentInput::Message(blocks);
         assert!(langfuse_trace_input(&input, 100).is_none());

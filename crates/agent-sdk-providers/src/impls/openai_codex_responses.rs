@@ -2291,6 +2291,7 @@ fn build_content_blocks(output: &[ApiOutputItem]) -> Vec<ContentBlock> {
                     ContentBlock::Thinking {
                         thinking,
                         signature: None,
+                        route: None,
                     }
                 }));
             }

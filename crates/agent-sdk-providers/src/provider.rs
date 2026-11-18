@@ -832,6 +832,11 @@ pub trait LlmProvider: Send + Sync {
     /// [`StreamDelta::Done`](crate::streaming::StreamDelta), and wrappers
     /// forward it untouched.
     ///
+    /// The string is persisted: thinking blocks record the route that signed
+    /// them (`ContentBlock::Thinking::route`), and the Anthropic provider
+    /// leaves out a block whose recorded route is not its own. Renaming a
+    /// route makes the blocks recorded under the old name foreign.
+    ///
     /// [`OpenAIProvider`]: crate::impls::openai::OpenAIProvider
     fn route(&self) -> &str {
         self.provider()

@@ -14,8 +14,8 @@ use crate::streaming::{
     StreamBox, StreamDelta, StreamErrorKind, reqwest_body_error_delta, reqwest_error_delta,
 };
 use agent_sdk_foundation::llm::{
-    CacheTtl, ChatOutcome, ChatRequest, ChatResponse, ContentBlock, SpeedTier, ThinkingConfig,
-    ThinkingMode, Usage,
+    CacheTtl, ChatOutcome, ChatRequest, ChatResponse, Content, ContentBlock, Role, SpeedTier,
+    ThinkingConfig, ThinkingMode, Usage,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -1029,6 +1029,71 @@ pub(crate) fn json_output_format(
     }
 }
 
+/// Leaves out of `request` the thinking blocks another route signed, such as
+/// the blocks of a thread's Bedrock turns once the transport moves back to
+/// the Anthropic API: their signatures belong to another account. The
+/// recorded `route` decides it. A block recorded before routes were stored
+/// (`None`) goes out unchanged. Returns how many blocks it left out.
+///
+/// The last assistant turn of an open tool round (its `tool_use` answered by
+/// the messages after it) must start with its thinking while thinking is on,
+/// so a foreign block there cannot be left out: the request is refused
+/// instead, with the reason, and nothing is sent.
+fn without_foreign_thinking(
+    request: &mut ChatRequest,
+    own_route: &str,
+    thinking_on: bool,
+) -> Result<usize, String> {
+    let foreign = |block: &ContentBlock| match block {
+        ContentBlock::Thinking {
+            route: Some(route), ..
+        }
+        | ContentBlock::RedactedThinking {
+            route: Some(route), ..
+        } => route != own_route,
+        _ => false,
+    };
+    let last_assistant = request
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant);
+    if thinking_on
+        && let Some(index) = last_assistant
+        && index + 1 < request.messages.len()
+        && let Content::Blocks(blocks) = &request.messages[index].content
+        && blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        && let Some(route) = blocks.iter().find_map(|block| match block {
+            ContentBlock::Thinking {
+                route: Some(route), ..
+            }
+            | ContentBlock::RedactedThinking {
+                route: Some(route), ..
+            } if route != own_route => Some(route),
+            _ => None,
+        })
+    {
+        return Err(format!(
+            "the last assistant turn of this tool round holds a thinking block that the \
+             `{route}` route signed; with thinking on, that turn must start with its own \
+             thinking, which the `{own_route}` route cannot take, so the request was not sent"
+        ));
+    }
+    let mut dropped = 0;
+    for message in &mut request.messages {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        if let Content::Blocks(blocks) = &mut message.content {
+            let before = blocks.len();
+            blocks.retain(|block| !foreign(block));
+            dropped += before - blocks.len();
+        }
+    }
+    Ok(dropped)
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl LlmProvider for AnthropicProvider {
@@ -1043,6 +1108,17 @@ impl LlmProvider for AnthropicProvider {
             Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
             Err(error) => return Ok(ChatOutcome::InvalidRequest(error.to_string())),
         };
+        let thinking_on = thinking_config
+            .as_ref()
+            .and_then(ApiThinkingConfig::from_thinking_config)
+            .is_some();
+        match without_foreign_thinking(&mut request, self.route(), thinking_on) {
+            Ok(0) => {}
+            Ok(dropped) => log::info!(
+                "left out {dropped} replayed thinking block(s) that another route signed"
+            ),
+            Err(reason) => return Ok(ChatOutcome::InvalidRequest(reason)),
+        }
         fit_request_attachments(self.provider(), self.model(), &mut request);
         if let Err(error) = validate_request_attachments(self.provider(), self.model(), &request) {
             return Ok(ChatOutcome::InvalidRequest(error.to_string()));
@@ -1218,7 +1294,7 @@ impl LlmProvider for AnthropicProvider {
             api_response.content.len()
         );
 
-        let mut content = map_content_blocks(api_response.content);
+        let mut content = map_content_blocks(api_response.content, self.route());
 
         // Reverse-map tool names from Claude Code casing back to original names
         if self.is_oauth() {
@@ -1291,6 +1367,38 @@ impl LlmProvider for AnthropicProvider {
                         return;
                     }
 
+                    let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
+                        // Forcing a specific tool is incompatible with extended thinking
+                        // on Anthropic (the API 400s), so drop thinking at the wire
+                        // boundary even when it was resurrected from the
+                        // provider-configured default.
+                        Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
+                        Err(error) => {
+                            yield Ok(StreamDelta::Error {
+                                message: error.to_string(),
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+                    };
+                    let thinking_on = thinking_config
+                        .as_ref()
+                        .and_then(ApiThinkingConfig::from_thinking_config)
+                        .is_some();
+                    match without_foreign_thinking(&mut request, self.route(), thinking_on) {
+                        Ok(0) => {}
+                        Ok(dropped) => log::info!(
+                            "left out {dropped} replayed thinking block(s) that another route signed"
+                        ),
+                        Err(reason) => {
+                            yield Ok(StreamDelta::Error {
+                                message: reason,
+                                kind: StreamErrorKind::InvalidRequest,
+                            });
+                            return;
+                        }
+                    }
+
                     let CacheRegions {
                         tools: tools_cache,
                         system: system_cache,
@@ -1309,20 +1417,6 @@ impl LlmProvider for AnthropicProvider {
                         })
                     } else {
                         build_api_tools_with_cache(&request, tools_cache)
-                    };
-                    let thinking_config = match self.resolve_thinking_config(request.thinking.as_ref()) {
-                        // Forcing a specific tool is incompatible with extended thinking
-                        // on Anthropic (the API 400s), so drop thinking at the wire
-                        // boundary even when it was resurrected from the
-                        // provider-configured default.
-                        Ok(thinking) => thinking_for_forced_tool(thinking, request.tool_choice.as_ref()),
-                        Err(error) => {
-                            yield Ok(StreamDelta::Error {
-                                message: error.to_string(),
-                                kind: StreamErrorKind::InvalidRequest,
-                            });
-                            return;
-                        }
                     };
                     let thinking = thinking_config
                         .as_ref()
@@ -1823,6 +1917,147 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk_foundation::llm::Message;
+
+    fn thinking_from(route: Option<&str>) -> ContentBlock {
+        ContentBlock::Thinking {
+            thinking: "reasoning".to_owned(),
+            signature: Some("signature".to_owned()),
+            route: route.map(str::to_owned),
+        }
+    }
+
+    fn assistant(blocks: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::Blocks(blocks),
+        }
+    }
+
+    /// A tool round whose last assistant turn ran on Bedrock: its thinking
+    /// and its `tool_use`, answered by the tool's result.
+    fn bedrock_tool_round() -> Vec<Message> {
+        vec![
+            Message::user("When is invoice 4471 due?"),
+            assistant(vec![
+                thinking_from(Some("bedrock")),
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_owned(),
+                    name: "lookup".to_owned(),
+                    input: serde_json::json!({ "invoice": 4471 }),
+                    thought_signature: None,
+                },
+            ]),
+            Message::tool_result("toolu_1", "2026-12-01", false),
+        ]
+    }
+
+    /// After a rollback from Bedrock, the blocks Bedrock signed are left out
+    /// of every finished assistant turn. The provider's own blocks, and blocks
+    /// recorded before routes were stored, go out unchanged.
+    #[test]
+    fn leaves_out_the_thinking_another_route_signed() -> Result<()> {
+        let redacted_on_bedrock = ContentBlock::RedactedThinking {
+            data: "redacted".to_owned(),
+            route: Some("bedrock".to_owned()),
+        };
+        let mut request = ChatRequest::new(
+            "system",
+            vec![
+                Message::user("first"),
+                assistant(vec![
+                    thinking_from(Some("bedrock")),
+                    ContentBlock::Text {
+                        text: "on Bedrock".to_owned(),
+                    },
+                ]),
+                Message::user("second"),
+                assistant(vec![
+                    thinking_from(Some("anthropic")),
+                    thinking_from(None),
+                    redacted_on_bedrock,
+                    ContentBlock::Text {
+                        text: "back on the API".to_owned(),
+                    },
+                ]),
+                Message::user("third"),
+            ],
+        );
+
+        let dropped = without_foreign_thinking(&mut request, "anthropic", true)
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            request.messages[1],
+            assistant(vec![ContentBlock::Text {
+                text: "on Bedrock".to_owned(),
+            }])
+        );
+        assert_eq!(
+            request.messages[3],
+            assistant(vec![
+                thinking_from(Some("anthropic")),
+                thinking_from(None),
+                ContentBlock::Text {
+                    text: "back on the API".to_owned(),
+                },
+            ])
+        );
+        Ok(())
+    }
+
+    /// The last assistant turn of an open tool round must start with its own
+    /// thinking while thinking is on, so a Bedrock block there refuses the
+    /// request unchanged. With thinking off the block is left out and the
+    /// request goes.
+    #[test]
+    fn refuses_a_tool_round_that_bedrock_opened_while_thinking_is_on() -> Result<()> {
+        let mut request = ChatRequest::new("system", bedrock_tool_round());
+
+        let refused = without_foreign_thinking(&mut request, "anthropic", true);
+
+        let Err(reason) = refused else {
+            anyhow::bail!("the tool round went out: {refused:?}");
+        };
+        assert!(reason.contains("`bedrock`"), "{reason}");
+        assert_eq!(request.messages, bedrock_tool_round());
+
+        let mut request = ChatRequest::new("system", bedrock_tool_round());
+        assert_eq!(
+            without_foreign_thinking(&mut request, "anthropic", false),
+            Ok(1)
+        );
+        Ok(())
+    }
+
+    /// The provider refuses such a round before it sends anything: the base
+    /// URL answers nothing, so only a refusal made up front comes back as
+    /// `InvalidRequest`, on both `chat` and `chat_stream`.
+    #[tokio::test]
+    async fn the_provider_refuses_a_bedrock_tool_round_without_a_request() -> Result<()> {
+        let provider = AnthropicProvider::new("test-key", MODEL_SONNET_55)
+            .with_base_url("http://127.0.0.1:9")
+            .with_thinking(ThinkingConfig::adaptive());
+        let request = || ChatRequest::new("system", bedrock_tool_round());
+
+        let outcome = provider.chat(request()).await?;
+        let ChatOutcome::InvalidRequest(reason) = &outcome else {
+            anyhow::bail!("chat: {outcome:?}");
+        };
+        assert!(reason.contains("`bedrock`"), "{reason}");
+
+        let first = provider.chat_stream(request()).next().await;
+        let Some(Ok(StreamDelta::Error {
+            kind: StreamErrorKind::InvalidRequest,
+            message,
+        })) = &first
+        else {
+            anyhow::bail!("chat_stream: {first:?}");
+        };
+        assert!(message.contains("`bedrock`"), "{message}");
+        Ok(())
+    }
 
     const ANTHROPIC_MODELS_FIXTURE: &str = r#"{
       "data": [

@@ -135,8 +135,9 @@ fn content_block_bytes(block: &ContentBlock) -> u64 {
         ContentBlock::Thinking {
             thinking,
             signature,
+            ..
         } => (thinking.len() + signature.as_ref().map_or(0, String::len)) as u64,
-        ContentBlock::RedactedThinking { data } => data.len() as u64,
+        ContentBlock::RedactedThinking { data, .. } => data.len() as u64,
         ContentBlock::OpaqueReasoning { provider, data } => {
             (provider.len() as u64).saturating_add(json_value_bytes(data))
         }

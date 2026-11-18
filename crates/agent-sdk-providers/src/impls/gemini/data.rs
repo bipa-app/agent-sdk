@@ -865,6 +865,7 @@ pub fn build_content_blocks(content: &ApiContent) -> Vec<ContentBlock> {
                     blocks.push(ContentBlock::Thinking {
                         thinking: text.clone(),
                         signature: thought_signature.clone(),
+                        route: None,
                     });
                 } else {
                     blocks.push(ContentBlock::Text { text: text.clone() });
@@ -1834,6 +1835,7 @@ mod tests {
             ContentBlock::Thinking {
                 thinking,
                 signature,
+                ..
             } => {
                 assert_eq!(thinking, "Weighing options.");
                 assert_eq!(signature.as_deref(), Some("sig"));

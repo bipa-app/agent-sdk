@@ -1331,6 +1331,7 @@ fn thinking_only_response() -> ChatOutcome {
         content: vec![agent_sdk::llm::ContentBlock::Thinking {
             thinking: "reasoning with no visible answer".into(),
             signature: None,
+            route: None,
         }],
         model: "mock-model".into(),
         stop_reason: Some(StopReason::EndTurn),

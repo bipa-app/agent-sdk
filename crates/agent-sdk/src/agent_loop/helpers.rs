@@ -220,14 +220,19 @@ pub(super) fn build_assistant_message(response: &ChatResponse) -> Message {
             ContentBlock::Thinking {
                 thinking,
                 signature,
+                route,
             } => {
                 blocks.push(ContentBlock::Thinking {
                     thinking: thinking.clone(),
                     signature: signature.clone(),
+                    route: route.clone(),
                 });
             }
-            ContentBlock::RedactedThinking { data } => {
-                blocks.push(ContentBlock::RedactedThinking { data: data.clone() });
+            ContentBlock::RedactedThinking { data, route } => {
+                blocks.push(ContentBlock::RedactedThinking {
+                    data: data.clone(),
+                    route: route.clone(),
+                });
             }
             ContentBlock::OpaqueReasoning { provider, data } => {
                 blocks.push(ContentBlock::OpaqueReasoning {

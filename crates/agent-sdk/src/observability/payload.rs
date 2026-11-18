@@ -373,6 +373,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "Let me think...".to_string(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: "The answer is 42".to_string(),
@@ -392,6 +393,7 @@ mod tests {
             content: Content::Blocks(vec![
                 ContentBlock::RedactedThinking {
                     data: "secret".to_string(),
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: "visible".to_string(),
@@ -652,6 +654,7 @@ mod tests {
                 thinking: "User CPF is 111.444.777-35 — I should confirm before sending."
                     .to_string(),
                 signature: None,
+                route: None,
             }]),
         };
         let result = baseline_redactor().convert_message(&msg);

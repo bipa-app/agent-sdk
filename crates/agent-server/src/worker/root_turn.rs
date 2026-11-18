@@ -5833,12 +5833,17 @@ fn build_assistant_message(response: &llm::ChatResponse) -> llm::Message {
             llm::ContentBlock::Thinking {
                 thinking,
                 signature,
+                route,
             } => Some(llm::ContentBlock::Thinking {
                 thinking: thinking.clone(),
                 signature: signature.clone(),
+                route: route.clone(),
             }),
-            llm::ContentBlock::RedactedThinking { data } => {
-                Some(llm::ContentBlock::RedactedThinking { data: data.clone() })
+            llm::ContentBlock::RedactedThinking { data, route } => {
+                Some(llm::ContentBlock::RedactedThinking {
+                    data: data.clone(),
+                    route: route.clone(),
+                })
             }
             llm::ContentBlock::OpaqueReasoning { provider, data } => {
                 Some(llm::ContentBlock::OpaqueReasoning {

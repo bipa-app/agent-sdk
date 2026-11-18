@@ -2269,6 +2269,7 @@ fn build_content_blocks(message: &ApiResponseMessage) -> Vec<ContentBlock> {
         blocks.push(ContentBlock::Thinking {
             thinking: reasoning.to_owned(),
             signature: None,
+            route: None,
         });
     }
 
@@ -3998,6 +3999,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "I should call the weather tool.".to_string(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
@@ -4029,6 +4031,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "thinking out loud".to_string(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".to_string(),
@@ -4057,6 +4060,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "pondering".to_string(),
                     signature: None,
+                    route: None,
                 },
             ]),
         ]);
@@ -4079,6 +4083,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "Let me add 2 and 2.".to_string(),
                     signature: None,
+                    route: None,
                 },
                 ContentBlock::Text {
                     text: "4".to_string(),
@@ -4131,6 +4136,7 @@ mod tests {
                     ContentBlock::Thinking {
                         thinking: "user-side thinking".to_string(),
                         signature: None,
+                        route: None,
                     },
                     ContentBlock::Text {
                         text: "question".to_string(),
@@ -4257,7 +4263,7 @@ mod tests {
         let blocks = build_content_blocks(&message);
         assert_eq!(blocks.len(), 1);
         assert!(
-            matches!(&blocks[0], ContentBlock::Thinking { thinking, signature } if thinking == "The answer is 42." && signature.is_none())
+            matches!(&blocks[0], ContentBlock::Thinking { thinking, signature, .. } if thinking == "The answer is 42." && signature.is_none())
         );
     }
 

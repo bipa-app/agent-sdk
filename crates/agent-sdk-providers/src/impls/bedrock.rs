@@ -806,7 +806,7 @@ impl BedrockProvider {
     fn map_response(&self, api_response: data::ApiResponse) -> ChatResponse {
         ChatResponse {
             id: api_response.id,
-            content: data::map_content_blocks(api_response.content),
+            content: data::map_content_blocks(api_response.content, self.route()),
             model: self.model.clone(),
             stop_reason: api_response.stop_reason.as_ref().map(data::map_stop_reason),
             usage: Usage {
