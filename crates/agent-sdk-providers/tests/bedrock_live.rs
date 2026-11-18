@@ -664,40 +664,7 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         .iter()
         .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
         .count();
-    ensure!(
-        thinking_blocks > 0,
-        "the Bedrock turn returned no thinking block to replay"
-    );
-    ensure!(
-        first.content.iter().all(|block| match block {
-            ContentBlock::Thinking { route, .. } | ContentBlock::RedactedThinking { route, .. } => {
-                route.as_deref() == Some("bedrock")
-            }
-            _ => true,
-        }),
-        "Bedrock left a thinking block without its route, so clearing it tests nothing: {:?}",
-        first.content
-    );
-    let unrouted = first
-        .content
-        .iter()
-        .cloned()
-        .map(|block| match block {
-            ContentBlock::Thinking {
-                thinking,
-                signature,
-                ..
-            } => ContentBlock::Thinking {
-                thinking,
-                signature,
-                route: None,
-            },
-            ContentBlock::RedactedThinking { data, .. } => {
-                ContentBlock::RedactedThinking { data, route: None }
-            }
-            other => other,
-        })
-        .collect();
+    let unrouted = without_routes(&first.content, thinking_blocks)?;
     let continuation = vec![
         question,
         Message {
@@ -741,4 +708,43 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         bail!("the Anthropic API refused Bedrock's block on a new question: {after_the_round:?}");
     }
     Ok(())
+}
+
+/// The blocks of a Bedrock turn with their recorded route cleared, as blocks
+/// stored before routes were recorded. Clearing a route Bedrock never recorded
+/// would test nothing, so the turn must hold thinking, all of it routed to
+/// Bedrock.
+fn without_routes(content: &[ContentBlock], thinking_blocks: usize) -> Result<Vec<ContentBlock>> {
+    ensure!(
+        thinking_blocks > 0,
+        "the Bedrock turn returned no thinking block to replay"
+    );
+    ensure!(
+        content.iter().all(|block| match block {
+            ContentBlock::Thinking { route, .. } | ContentBlock::RedactedThinking { route, .. } => {
+                route.as_deref() == Some("bedrock")
+            }
+            _ => true,
+        }),
+        "Bedrock left a thinking block without its route, so clearing it tests nothing: {content:?}"
+    );
+    Ok(content
+        .iter()
+        .cloned()
+        .map(|block| match block {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+                ..
+            } => ContentBlock::Thinking {
+                thinking,
+                signature,
+                route: None,
+            },
+            ContentBlock::RedactedThinking { data, .. } => {
+                ContentBlock::RedactedThinking { data, route: None }
+            }
+            other => other,
+        })
+        .collect())
 }
