@@ -31,7 +31,7 @@ use agent_sdk_providers::impls::bedrock::{
     WebIdentityCredentials, WebIdentityToken, bedrock_inference_profile_id,
 };
 use agent_sdk_providers::streaming::{StreamAccumulator, StreamDelta, StreamErrorKind};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use futures::StreamExt;
 
@@ -627,7 +627,9 @@ async fn tier_c_bedrock_takes_a_thinking_block_from_the_anthropic_api() -> Resul
 /// The blocks go out with their recorded route cleared, as a block stored
 /// before routes were recorded: with the route kept, the provider leaves the
 /// blocks out or refuses the tool round itself, and the API would never see
-/// them. This test measures the API.
+/// them. This test measures the API. A failure in the tool round means the API
+/// refuses another account's block in that position, which is the case the
+/// provider's refusal of a routed block there exists for.
 #[tokio::test]
 #[ignore = "Tier C live smoke: AGENT_SDK_LIVE_SMOKE=1 + Bedrock env + ANTHROPIC_API_KEY"]
 async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()> {
@@ -662,6 +664,20 @@ async fn tier_c_anthropic_api_takes_a_thinking_block_from_bedrock() -> Result<()
         .iter()
         .filter(|block| matches!(block, ContentBlock::Thinking { .. }))
         .count();
+    ensure!(
+        thinking_blocks > 0,
+        "the Bedrock turn returned no thinking block to replay"
+    );
+    ensure!(
+        first.content.iter().all(|block| match block {
+            ContentBlock::Thinking { route, .. } | ContentBlock::RedactedThinking { route, .. } => {
+                route.as_deref() == Some("bedrock")
+            }
+            _ => true,
+        }),
+        "Bedrock left a thinking block without its route, so clearing it tests nothing: {:?}",
+        first.content
+    );
     let unrouted = first
         .content
         .iter()
