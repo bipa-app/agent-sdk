@@ -41,7 +41,7 @@
 //!     "your-anthropic-key".to_string(),
 //!     "your-cf-account-id",
 //!     "your-gateway-id",
-//!     "claude-sonnet-4-6".to_string(),
+//!     "claude-sonnet-5-5".to_string(),
 //! ).with_gateway_token("your-cf-api-token");
 //! ```
 
@@ -110,19 +110,21 @@ impl CloudflareAIGatewayProvider {
         }
     }
 
-    /// Route to Claude Sonnet 4.6 — BYOK mode (CF token only).
+    /// Route to the current Sonnet, Claude Sonnet 5.5 — BYOK mode (CF token
+    /// only). Tracks the newest Sonnet release; pass an explicit model to
+    /// [`Self::anthropic`] to pin one.
     #[must_use]
     pub fn anthropic_sonnet(cf_token: &str, account_id: &str, gateway_id: &str) -> Self {
         Self::anthropic(
             String::new(),
             account_id,
             gateway_id,
-            "claude-sonnet-4-6".to_owned(),
+            crate::impls::anthropic::MODEL_SONNET_55.to_owned(),
         )
         .with_gateway_token(cf_token)
     }
 
-    /// Route to the current Opus flagship, Claude Opus 5 — BYOK mode (CF
+    /// Route to the current Opus flagship, Claude Opus 5.5 — BYOK mode (CF
     /// token only). Tracks the newest Opus release; pass an explicit model to
     /// [`Self::anthropic`] to pin one.
     #[must_use]
@@ -131,7 +133,7 @@ impl CloudflareAIGatewayProvider {
             String::new(),
             account_id,
             gateway_id,
-            crate::impls::anthropic::MODEL_OPUS_5.to_owned(),
+            crate::impls::anthropic::MODEL_OPUS_55.to_owned(),
         )
         .with_gateway_token(cf_token)
     }
@@ -460,14 +462,14 @@ mod tests {
     #[test]
     fn anthropic_sonnet_byok() {
         let p = CloudflareAIGatewayProvider::anthropic_sonnet("cf-tok", "acct", "gw");
-        assert_eq!(p.model(), "claude-sonnet-4-6");
+        assert_eq!(p.model(), "claude-sonnet-5-5");
         assert_eq!(p.provider(), "cloudflare-ai-gateway");
     }
 
     #[test]
     fn anthropic_opus_byok() {
         let p = CloudflareAIGatewayProvider::anthropic_opus("cf-tok", "acct", "gw");
-        assert_eq!(p.model(), "claude-opus-5");
+        assert_eq!(p.model(), "claude-opus-5-5");
     }
 
     #[test]
@@ -505,7 +507,7 @@ mod tests {
         let p = CloudflareAIGatewayProvider::anthropic_sonnet("t", "a", "g");
         let caps = p.capabilities().unwrap();
         assert_eq!(caps.provider, "anthropic");
-        assert_eq!(caps.model_id, "claude-sonnet-4-6");
+        assert_eq!(caps.model_id, "claude-sonnet-5-5");
         assert!(caps.supports_adaptive_thinking);
     }
 

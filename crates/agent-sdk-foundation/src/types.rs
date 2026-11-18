@@ -107,7 +107,7 @@ impl Default for AgentConfig {
             max_turns: None,
             max_tokens: None,
             system_prompt: String::new(),
-            model: String::from("claude-sonnet-4-5-20250929"),
+            model: String::from("claude-sonnet-5-5"),
             retry: RetryConfig::default(),
             streaming: false,
             tool_timeout_ms: None,

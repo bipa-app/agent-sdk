@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     // a database.
     let default_definition = AgentDefinition {
         provider: "anthropic".into(),
-        model: "claude-sonnet-4-5-20250929".into(),
+        model: "claude-sonnet-5-5".into(),
         system_prompt: String::new(),
         max_tokens: 4096,
         tools: Vec::new(),
